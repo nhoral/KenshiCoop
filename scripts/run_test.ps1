@@ -33,7 +33,9 @@ param(
     [switch]$NoKill,
     [int]$JoinDelaySec = 8,
     [int]$ShotLeadSec = 5,
-    [int]$StartTimeoutSec = 90
+    [int]$StartTimeoutSec = 90,
+    [int]$Frames = 5,
+    [int]$FrameIntervalMs = 16
 )
 
 $ErrorActionPreference = "Stop"
@@ -117,8 +119,8 @@ function Wait-ForLogLine {
 function Take-Shot {
     param([int]$ProcId, [string]$Out, [string]$Label)
     try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "screenshot.ps1") -ProcessId $ProcId -Out $Out
-        Write-Host "  captured $Label -> $Out"
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "screenshot.ps1") -ProcessId $ProcId -Out $Out -Frames $Frames -IntervalMs $FrameIntervalMs
+        Write-Host "  captured $Label ($Frames frame(s)) -> $Out"
     } catch {
         Write-Warning "screenshot ($Label) failed: $($_.Exception.Message)"
     }
@@ -191,8 +193,13 @@ Write-Host ""
 Write-Host "== Results =="
 Write-Host "  host log: $hostLog"
 Write-Host "  join log: $joinLog"
-Write-Host "  host png: $hostPng"
-Write-Host "  join png: $joinPng"
+if ($Frames -gt 1) {
+    Write-Host "  host png: $hostPng (+ frames host_1..host_$Frames.png)"
+    Write-Host "  join png: $joinPng (+ frames join_1..join_$Frames.png)"
+} else {
+    Write-Host "  host png: $hostPng"
+    Write-Host "  join png: $joinPng"
+}
 
 # Evaluate one client's log. A client "passed" if it reached gameplay, exited
 # cleanly via the self-exit timer (i.e. did NOT crash mid-run), and logged no

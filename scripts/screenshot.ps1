@@ -32,7 +32,9 @@
 param(
     [int]$ProcessId = 0,
     [string]$WindowTitle = "",
-    [Parameter(Mandatory = $true)][string]$Out
+    [Parameter(Mandatory = $true)][string]$Out,
+    [int]$Frames = 1,
+    [int]$IntervalMs = 16
 )
 
 $ErrorActionPreference = "Stop"
@@ -144,6 +146,27 @@ public static class WinCap
         }
         return bmp2;
     }
+
+    // Capture a short burst of 'frames' bitmaps spaced ~intervalMs apart. Frames
+    // are held in memory so PNG encoding (done by the caller afterwards) doesn't
+    // bloat the inter-frame timing. A Stopwatch paces each capture toward its
+    // target offset; we only sleep when ahead of schedule, so if a single
+    // PrintWindow costs more than intervalMs the frames just space out naturally
+    // rather than being captured artificially fast.
+    public static Bitmap[] CaptureSequence(IntPtr hWnd, int frames, int intervalMs)
+    {
+        if (frames < 1) frames = 1;
+        Bitmap[] outp = new Bitmap[frames];
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        for (int i = 0; i < frames; i++)
+        {
+            long target = (long)i * intervalMs;
+            long now = sw.ElapsedMilliseconds;
+            if (now < target) System.Threading.Thread.Sleep((int)(target - now));
+            outp[i] = Capture(hWnd);
+        }
+        return outp;
+    }
 }
 "@
 
@@ -174,9 +197,30 @@ $hwnd = Resolve-Hwnd
 $dir = Split-Path -Parent $Out
 if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
 
-$bmp = [WinCap]::Capture($hwnd)
-if ($null -eq $bmp) { throw "Capture failed (zero-size window)." }
-$bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
-$bmp.Dispose()
+if ($Frames -lt 1) { $Frames = 1 }
 
-Write-Host "Saved screenshot: $Out"
+$bmps = [WinCap]::CaptureSequence($hwnd, $Frames, $IntervalMs)
+
+if ($Frames -le 1) {
+    # Single-frame: preserve exact original behavior (one file at $Out).
+    $bmp = $bmps[0]
+    if ($null -eq $bmp) { throw "Capture failed (zero-size window)." }
+    $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    Write-Host "Saved screenshot: $Out"
+} else {
+    # Burst: write numbered frames <base>_1..<base>_N alongside $Out, and also
+    # keep frame 1 at the original $Out so tooling reading host.png/join.png works.
+    $dirp = [System.IO.Path]::GetDirectoryName($Out)
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($Out)
+    $ext  = [System.IO.Path]::GetExtension($Out)
+    for ($i = 0; $i -lt $bmps.Length; $i++) {
+        $bmp = $bmps[$i]
+        if ($null -eq $bmp) { Write-Warning "Frame $($i + 1) capture failed (zero-size window)."; continue }
+        $framePath = Join-Path $dirp ("{0}_{1}{2}" -f $base, ($i + 1), $ext)
+        $bmp.Save($framePath, [System.Drawing.Imaging.ImageFormat]::Png)
+        if ($i -eq 0) { $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png) }
+        $bmp.Dispose()
+        Write-Host "Saved frame: $framePath"
+    }
+}

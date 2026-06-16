@@ -47,6 +47,7 @@
 #include <string>
 #include <deque>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "../netproto/Protocol.h"
@@ -62,6 +63,11 @@ coop::u32            g_tick = 0;
 
 // Original main-loop pointer, filled by KenshiLib::AddHook.
 void (*g_mainLoop_orig)(GameWorld*, float) = 0;
+
+// Discovery hook trampoline: Character::runSlaveAnim(const std::string&, float,
+// float). Used to learn which animation CLIP NAMES the engine plays for which
+// TaskType, so we can replicate poses by clip rather than coaxing the local AI.
+void (__fastcall* g_runSlaveAnim_orig)(void*, const std::string*, float, float) = 0;
 
 // Read an env var with a fallback default.
 std::string envOr(const char* key, const char* fallback) {
@@ -210,10 +216,21 @@ struct GhostState {
     DWORD         taskTick;     // when we last issued the task (0 = never)
     bool          taskActive;   // last setCurrentAction resolved a target object
     bool          taskBad;      // reproduced task wandered the NPC off; hold instead
+    bool          idleSet;      // STAND_STILL idle task already issued at rest
+    bool          aiNeutralized;// town AI package stripped (clear goals + own squad)
+    // Locomotion-animation mirror (Protocol v4): the host's CharMovement state.
+    // The engine's AnimationClass picks walk/idle/run from these, so writing them
+    // onto the client copy each frame makes its locomotion clip match the host
+    // (kills "walk-in-place" without per-frame halt, which froze the phase).
+    bool          hostMoving;   // host CharMovement.currentlyMoving
+    float         hostSpeed;    // host CharMovement.currentSpeed
+    Ogre::Vector3 hostMotion;   // host CharMovement.currentMotion (world-space)
     GhostState() : chr(0), tgtHeading(0.0f), lastMoveTick(0), lastSeenTick(0),
                    primed(false), destIssued(false), parked(false),
                    hostTask(coop::NPC_TASK_NONE), taskTick(0), taskActive(false),
-                   taskBad(false) {
+                   taskBad(false), idleSet(false), aiNeutralized(false),
+                   hostMoving(false), hostSpeed(0.0f),
+                   hostMotion(Ogre::Vector3::ZERO) {
         hostSubj[0] = hostSubj[1] = hostSubj[2] = hostSubj[3] = hostSubj[4] = 0;
     }
 };
@@ -340,6 +357,43 @@ bool guardedGetPos(Character* ghost, Ogre::Vector3* out) {
     }
 }
 
+// Read the NPC's locomotion state straight from the reconstructed CharMovement
+// members (no symbol resolve needed). This is how we MEASURE "walking in place"
+// objectively: a body we are holding at rest whose controller still reports
+// currentSpeed>0 / currentlyMoving=true is playing a walk clip without actually
+// translating. A still screenshot can't see that; this number can. SEH-guarded.
+bool guardedReadMotion(Character* c, bool* moving, float* speed, float* desired) {
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        if (moving)  *moving  = mv->currentlyMoving;
+        if (speed)   *speed   = mv->currentSpeed;
+        if (desired) *desired = mv->desiredSpeed;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Permanently quiet a replicated NPC's autonomous AI, the same way we quiet a
+// spawned player ghost: clear its current goals AND eject it from its town/job
+// squad so the AI stops re-acquiring a package and re-issuing walk orders.
+// This is the crux of the idle fix: a one-shot halt or per-frame force-stop only
+// FROZE the body (the local AI kept re-deciding inside the engine's own update,
+// so the idle clip never advanced). With the package gone, the NPC behaves like
+// a player ghost - it stays put and plays a real, advancing idle animation when
+// we settle it once. Idempotent via the caller's aiNeutralized flag. SEH-guarded.
+bool guardedNeutralizeNpc(Character* c) {
+    if (!c) return false;
+    __try {
+        if (g_clearGoalsFn) g_clearGoalsFn(c);
+        if (g_separateFn)   g_separateFn(c, false); // own squad: drop the package
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Order the ghost to move to an absolute destination at RUN speed. This routes
 // through the engine's normal locomotion, so it plays real walk/run animation
 // and faces its travel direction. RUN keeps it from lagging behind a sprinting
@@ -366,6 +420,45 @@ bool guardedPark(Character* ghost, const Ogre::Vector3* pos,
         if (!mv) return false;
         mv->halt();
         mv->_setPositionDirectionAndTeleport(*pos, *rot);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Snap to a transform WITHOUT halting. halt() resets the locomotion path AND
+// the animation phase, so calling it every frame freezes the body on frame 0 of
+// the idle clip (the "frozen NPC" artifact). For held NPCs we settle the body
+// once with guardedPark (a clean stop) and thereafter only re-place it with this
+// no-halt teleport, so the engine's idle/walk clip keeps ADVANCING.
+bool guardedTeleport(Character* ghost, const Ogre::Vector3* pos,
+                     const Ogre::Quaternion* rot) {
+    __try {
+        CharMovement* mv = ghost->movement;
+        if (!mv) return false;
+        mv->_setPositionDirectionAndTeleport(*pos, *rot);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Mirror the host's locomotion state onto the local copy's movement controller.
+// The engine's AnimationClass selects walk/idle/run from currentlyMoving /
+// currentSpeed / currentMotion, so writing the host's values makes the clip
+// match. We write these as the LAST thing each frame (after g_mainLoop_orig), so
+// they are what the renderer samples - the local AI recomputes them at the START
+// of the next tick, but our end-of-frame write wins for the displayed frame.
+// Deliberately does NOT call halt() (that would freeze the phase). SEH-guarded.
+bool guardedApplyMotion(Character* c, bool moving, float speed,
+                        const Ogre::Vector3* motion) {
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        mv->currentlyMoving = moving;
+        mv->currentSpeed    = speed;
+        mv->desiredSpeed    = speed; // keep accel logic from re-deciding to idle
+        if (motion) mv->currentMotion = *motion;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -470,6 +563,23 @@ int guardedReadNpc(RootObject* obj, coop::NpcStateEntry* out) {
         out->y       = p.y;
         out->z       = p.z;
         out->heading = heading;
+        // Locomotion-animation state: stream the host's movement controller so the
+        // client picks the SAME walk/idle/run clip. Defaults to idle if unreadable.
+        out->cspeed   = 0.0f;
+        out->cmotionX = 0.0f;
+        out->cmotionY = 0.0f;
+        out->cmotionZ = 0.0f;
+        out->cmoving  = 0;
+        {
+            CharMovement* mv = c->movement;
+            if (mv) {
+                out->cspeed   = mv->currentSpeed;
+                out->cmotionX = mv->currentMotion.x;
+                out->cmotionY = mv->currentMotion.y;
+                out->cmotionZ = mv->currentMotion.z;
+                out->cmoving  = mv->currentlyMoving ? 1 : 0;
+            }
+        }
         // Pose replication: capture the NPC's current task + its subject object so
         // the client can reproduce the same action at the same fixture. Defaults
         // to "no task" if there's no current action or the reader faults.
@@ -521,11 +631,19 @@ const char* taskName(int t) {
     }
 }
 
-// Pose replication (state-changing): force a Character into 'taskType'
-// targeting the object named by the subject hand fields. Resolves the subject to
-// a RootObject via hand::getRootObject, clears the NPC's goals, then calls
-// CharBody::setCurrentAction(TaskType, target). Returns: 2 ok (target resolved),
-// 1 ok (null target), 0 missing fns/body, -1 fault. SEH-guarded.
+// Pose replication (state-changing): force a Character into 'taskType' targeting
+// the object named by the subject hand fields. Resolves the subject to a
+// RootObject via hand::getRootObject; ONLY if that fixture actually resolves here
+// do we commit setCurrentAction(TaskType, target) so the NPC adopts the matching
+// pose (sit/operate) at the same object.
+//
+// We deliberately do NOT issue the task with a null target: a null-target task
+// (e.g. OPERATE_MACHINERY with no specific machine) makes the engine AUTO-PICK a
+// nearby machine and WALK the NPC to it - dragging the local copy tens of metres
+// off the host position, and seated tasks then ignore our teleport. So an
+// unresolved subject returns "not applied" and the caller falls back to a quiet
+// idle-park instead. Returns: 2 applied (fixture resolved), 1 not applied
+// (subject not loaded here), 0 missing fns/body, -1 fault. SEH-guarded.
 int guardedSetTask(Character* c, int taskType, const coop::u32 subj[5]) {
     if (!c || !g_setActionFn || !g_handGetRootFn || !g_handCtorFn) return 0;
     __try {
@@ -535,11 +653,31 @@ int guardedSetTask(Character* c, int taskType, const coop::u32 subj[5]) {
         // hand ctor order: (index, serial, type, container, containerSerial).
         g_handCtorFn(h, subj[3], subj[4], (itemType)subj[0], subj[1], subj[2]);
         RootObject* target = g_handGetRootFn(h);
+        if (!target) return 1; // fixture not loaded here -> caller idle-parks
         CharBody* b = c->body;
         if (!b) return -1;
         if (g_clearGoalsFn) g_clearGoalsFn(c);
         g_setActionFn(b, taskType, target);
-        return target ? 2 : 1;
+        return 2;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// Put an NPC into a self-contained task that needs no target object (e.g.
+// STAND_STILL / IDLE). We use this for at-rest NPCs that have no reproducible
+// host task: clearing AI goals every frame lets the local AI re-decide, start a
+// step, then get frozen mid-stride (the "frozen walk" artifact). Issuing one
+// concrete STAND_STILL task instead gives a calm idle and stops the AI churning.
+// Clears goals first, then setCurrentAction(taskType, null). SEH-guarded.
+int guardedSetIdleTask(Character* c, int taskType) {
+    if (!c || !g_setActionFn) return 0;
+    __try {
+        CharBody* b = c->body;
+        if (!b) return -1;
+        if (g_clearGoalsFn) g_clearGoalsFn(c);
+        g_setActionFn(b, taskType, 0);
+        return 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
@@ -975,6 +1113,9 @@ void receiveNpcStates(GameWorld* gw) {
             gs.hostSubj[2]  = e.scontainerSerial;
             gs.hostSubj[3]  = e.sindex;
             gs.hostSubj[4]  = e.sserial;
+            gs.hostMoving   = (e.cmoving != 0);
+            gs.hostSpeed    = e.cspeed;
+            gs.hostMotion   = Ogre::Vector3(e.cmotionX, e.cmotionY, e.cmotionZ);
             g_npcs[it->first] = gs;
         } else {
             ++tracked;
@@ -1003,6 +1144,9 @@ void receiveNpcStates(GameWorld* gw) {
             gs.hostSubj[2]  = e.scontainerSerial;
             gs.hostSubj[3]  = e.sindex;
             gs.hostSubj[4]  = e.sserial;
+            gs.hostMoving   = (e.cmoving != 0);
+            gs.hostSpeed    = e.cspeed;
+            gs.hostMotion   = Ogre::Vector3(e.cmotionX, e.cmotionY, e.cmotionZ);
         }
     }
 
@@ -1039,7 +1183,10 @@ bool driveNpcKinematic(GhostState& gs) {
                               ? gs.tgtPos
                               : actual + delta * EASE;
     Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading), Ogre::Vector3::UNIT_Y);
-    return guardedPark(gs.chr, &place, &rot); // halt + teleport to 'place'
+    // No-halt teleport: halting every frame would freeze the walk clip on frame
+    // 0. The host's locomotion state is mirrored separately (guardedApplyMotion)
+    // so the body plays the matching walk/run cycle while it slides.
+    return guardedTeleport(gs.chr, &place, &rot);
 }
 
 // Per frame (client): drive every replicated NPC toward its target. On timeout
@@ -1058,32 +1205,6 @@ void updateNpcs(GameWorld* gw) {
     while (it != g_npcs.end()) {
         GhostState& gs = it->second;
         if (!gs.primed || !gs.chr) { ++it; continue; }
-
-        // Per-NPC diagnostic: pointer validity + whether live pos tracks target.
-        if (diag) {
-            Ogre::Vector3 a;
-            bool ok = guardedGetPos(gs.chr, &a);
-            char buf[200];
-            if (ok) {
-                float d = (gs.tgtPos - a).length();
-                bool moving = (now - gs.lastMoveTick) < 500;
-                _snprintf(buf, sizeof(buf) - 1,
-                    "KenshiCoop: npc[%d] chr=%p getpos=1 actual(%.1f,%.1f,%.1f) "
-                    "tgt(%.1f,%.1f,%.1f) gap=%.1f regime=%s task=%d(%s) act=%d",
-                    diagIdx, (void*)gs.chr, a.x, a.y, a.z,
-                    gs.tgtPos.x, gs.tgtPos.y, gs.tgtPos.z,
-                    d, moving ? "MOVE" : "PARK",
-                    (int)gs.hostTask, taskName((int)gs.hostTask),
-                    gs.taskActive ? 1 : 0);
-            } else {
-                _snprintf(buf, sizeof(buf) - 1,
-                    "KenshiCoop: npc[%d] chr=%p getpos=0 (FAULT - bad pointer)",
-                    diagIdx, (void*)gs.chr);
-            }
-            buf[sizeof(buf) - 1] = '\0';
-            coopLog(buf);
-        }
-        ++diagIdx;
 
         if ((now - gs.lastSeenTick) > TIMEOUT_MS) {
             // No update-list surgery to undo: the NPC stayed ticked the whole
@@ -1104,7 +1225,6 @@ void updateNpcs(GameWorld* gw) {
         //     the host's exact sit/idle pose would require streaming the host's
         //     animation state; tracked as a follow-up.)
         const DWORD STOP_MS = 500;
-        const float HOLD_SQ = 0.3f * 0.3f;
         bool moving = (now - gs.lastMoveTick) < STOP_MS;
         bool ok = true;
 
@@ -1113,10 +1233,15 @@ void updateNpcs(GameWorld* gw) {
             gs.taskTick = 0;          // re-issue the task next time it rests
             gs.taskActive = false;
             gs.taskBad = false;
+            gs.idleSet = false;       // re-issue STAND_STILL next time it rests
+            gs.aiNeutralized = false; // re-neutralize if it stops again
             guardedClearGoals(gs.chr);
             ok = driveNpcKinematic(gs);
+            // Mirror the host's locomotion so the body plays the matching walk/run
+            // cycle (at the host's speed/direction) while we slide it into place,
+            // instead of moonwalking in a static idle pose.
+            guardedApplyMotion(gs.chr, gs.hostMoving, gs.hostSpeed, &gs.hostMotion);
         } else {
-            gs.parked = true;
             // Reproduce the HOST's task at the HOST's fixture so the local copy
             // adopts the same pose AND position. Issue ONCE on entering rest (the
             // engine keeps the task running); a host task change re-arms it via
@@ -1144,16 +1269,52 @@ void updateNpcs(GameWorld* gw) {
                 }
             }
             if (!gs.taskActive) {
-                // No reproducible task (or it was abandoned): suppress AI and hold
-                // at the host position.
-                guardedClearGoals(gs.chr);
-                Ogre::Vector3 a;
-                if (guardedGetPos(gs.chr, &a) &&
-                    (gs.tgtPos - a).squaredLength() > HOLD_SQ) {
-                    Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading),
-                                         Ogre::Vector3::UNIT_Y);
-                    guardedMovePuppet(gs.chr, &gs.tgtPos, &rot);
+                // No reproducible host fixture. Three things, each ONCE, make this
+                // NPC behave like a quiet player ghost that still animates:
+                //  1) neutralize its town AI package (clear goals + own squad) so
+                //     it stops autonomously re-issuing walk orders;
+                //  2) give it a concrete STAND_STILL task - a real, NON-walking
+                //     idle. (Neutralize+park alone left ~1/3 of NPCs marching in
+                //     place; a concrete idle task is what holds them. We use
+                //     STAND_STILL rather than the host's task because tasks like
+                //     OPERATE_MACHINERY with no specific fixture auto-walk the NPC
+                //     to some machine and drift it tens of metres off.)
+                //  3) settle to the host transform ONCE (halt+teleport) and then
+                //     leave it alone, so the engine's idle clip actually ADVANCES
+                //     rather than being reset to frame 0 every tick (= frozen).
+                // Re-park only on a generous drift so we don't blip the animation.
+                if (!gs.aiNeutralized) {
+                    guardedNeutralizeNpc(gs.chr);
+                    gs.aiNeutralized = true;
+                    gs.parked        = false; // force one fresh settle below
                 }
+                if (!gs.idleSet) {
+                    guardedSetIdleTask(gs.chr, STAND_STILL);
+                    gs.idleSet = true;
+                }
+                const float REPARK_SQ = 1.0f * 1.0f;
+                Ogre::Vector3 a;
+                if (guardedGetPos(gs.chr, &a)) {
+                    if (!gs.parked) {
+                        // First settle: one clean stop (halt+teleport) to kill any
+                        // in-progress step, then we never halt again so the idle
+                        // clip advances.
+                        Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading),
+                                             Ogre::Vector3::UNIT_Y);
+                        ok = guardedPark(gs.chr, &gs.tgtPos, &rot);
+                        if (ok) gs.parked = true;
+                    } else if ((gs.tgtPos - a).squaredLength() > REPARK_SQ) {
+                        // Drifted: re-place WITHOUT halting (no phase reset).
+                        Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading),
+                                             Ogre::Vector3::UNIT_Y);
+                        ok = guardedTeleport(gs.chr, &gs.tgtPos, &rot);
+                    }
+                }
+                // Mirror the host's locomotion every frame so the AI's residual
+                // "walk" intent (which marches a pinned body in place) is overwritten
+                // by the host's true state - idle when the host is idle. No halt, so
+                // the idle clip keeps advancing rather than freezing on frame 0.
+                guardedApplyMotion(gs.chr, gs.hostMoving, gs.hostSpeed, &gs.hostMotion);
             }
         }
 
@@ -1163,6 +1324,39 @@ void updateNpcs(GameWorld* gw) {
             g_npcs.erase(dead);
             continue;
         }
+
+        // Per-NPC diagnostic, logged AFTER our drive so the locomotion numbers
+        // reflect what the renderer will sample this frame, not the AI's
+        // pre-empted intent. For a PARK NPC, mv=1/spd>0 == walk-in-place.
+        if (diag) {
+            Ogre::Vector3 a;
+            bool gp = guardedGetPos(gs.chr, &a);
+            char buf[256];
+            if (gp) {
+                float d = (gs.tgtPos - a).length();
+                bool moving = (now - gs.lastMoveTick) < STOP_MS;
+                bool  mvMoving = false; float mvSpeed = 0.0f, mvDesired = 0.0f;
+                guardedReadMotion(gs.chr, &mvMoving, &mvSpeed, &mvDesired);
+                _snprintf(buf, sizeof(buf) - 1,
+                    "KenshiCoop: npc[%d] chr=%p getpos=1 actual(%.1f,%.1f,%.1f) "
+                    "tgt(%.1f,%.1f,%.1f) gap=%.1f regime=%s task=%d(%s) act=%d "
+                    "mv=%d spd=%.2f des=%.2f host{mv=%d spd=%.2f}",
+                    diagIdx, (void*)gs.chr, a.x, a.y, a.z,
+                    gs.tgtPos.x, gs.tgtPos.y, gs.tgtPos.z,
+                    d, moving ? "MOVE" : "PARK",
+                    (int)gs.hostTask, taskName((int)gs.hostTask),
+                    gs.taskActive ? 1 : 0,
+                    mvMoving ? 1 : 0, mvSpeed, mvDesired,
+                    gs.hostMoving ? 1 : 0, gs.hostSpeed);
+            } else {
+                _snprintf(buf, sizeof(buf) - 1,
+                    "KenshiCoop: npc[%d] chr=%p getpos=0 (FAULT - bad pointer)",
+                    diagIdx, (void*)gs.chr);
+            }
+            buf[sizeof(buf) - 1] = '\0';
+            coopLog(buf);
+        }
+        ++diagIdx;
         ++it;
     }
 }
@@ -1257,6 +1451,49 @@ void titleUpdate_hook(TitleScreen* self) {
     // else: singleton not ready yet - try again next frame.
 }
 
+// ---- Discovery: what clips does the engine play, and for which tasks? --------
+// SEH-isolated reader: copy the animation name + the character's current task
+// key into POD out-params (no C++-unwinding objects here, so __try is legal).
+bool guardedReadAnimCall(Character* c, const std::string* anim,
+                         char* nameOut, int nameCap, int* taskOut) {
+    __try {
+        const char* s = anim ? anim->c_str() : 0;
+        int i = 0;
+        if (s) { for (; i < nameCap - 1 && s[i]; ++i) nameOut[i] = s[i]; }
+        nameOut[i] = '\0';
+        *taskOut = -1;
+        CharBody* b = c ? c->body : 0;
+        Tasker* t = b ? b->currentAction : 0;
+        if (t && g_taskerKeyFn) *taskOut = (int)g_taskerKeyFn(t);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Hook on Character::runSlaveAnim. Logs each unique (taskType, animName) pair
+// ONCE so the log stays small while we harvest the clip vocabulary. Always calls
+// through to the real animation so gameplay is unaffected.
+void __fastcall runSlaveAnim_hook(void* self, const std::string* anim,
+                                  float speed, float sync) {
+    char nm[96]; int tk = -1;
+    if (guardedReadAnimCall(static_cast<Character*>(self), anim, nm, sizeof(nm), &tk)) {
+        static std::set<std::string> seen; // dedupe by "task|anim"
+        char key[160];
+        _snprintf(key, sizeof(key) - 1, "%d|%s", tk, nm);
+        key[sizeof(key) - 1] = '\0';
+        if (seen.insert(key).second) {
+            char buf[224];
+            _snprintf(buf, sizeof(buf) - 1,
+                "KenshiCoop: SLAVEANIM task=%d(%s) anim='%s' spd=%.2f sync=%.2f",
+                tk, taskName(tk), nm, speed, sync);
+            buf[sizeof(buf) - 1] = '\0';
+            coopLog(buf);
+        }
+    }
+    g_runSlaveAnim_orig(self, anim, speed, sync);
+}
+
 // Our main-thread tick hook. The single safe point where we touch game state.
 void mainLoop_hook(GameWorld* gw, float dt) {
     ++g_tick;
@@ -1285,16 +1522,22 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     updateGhosts(gw, dt);    // Phase 1: drive ghosts + despawn timed-out ones
 
     // Phase 2: host streams nearby NPC transforms (~20 Hz); client applies them.
+    // The CLIENT drains the latest transforms BEFORE the main loop (so targets
+    // are current) but applies them (updateNpcs) AFTER it: the engine's AI runs
+    // inside g_mainLoop_orig and re-issues walk orders to our held NPCs every
+    // tick, so driving them beforehand let the AI overwrite us (the bodies then
+    // marched in place). Driving AFTER the loop gives us the last word - our
+    // force-idle/teleport is what the renderer samples this frame.
     if (g_isHostMode) {
         static DWORD lastGather = 0;
         DWORD now = GetTickCount();
         if (now - lastGather >= 50) { lastGather = now; publishNpcStates(gw); }
+        g_mainLoop_orig(gw, dt); // always call through
     } else {
         receiveNpcStates(gw);
-        updateNpcs(gw);
+        g_mainLoop_orig(gw, dt); // run the engine (incl. local AI) first...
+        updateNpcs(gw);          // ...then impose host state as the last word
     }
-
-    g_mainLoop_orig(gw, dt); // always call through
 }
 
 void startNetworking() {
@@ -1354,6 +1597,15 @@ __declspec(dllexport) void startPlugin() {
 
     resolveGhostFns(); // Phase 1: map spawn/teleport to real runtime addresses
     resolveSaveFns();  // SaveManager::getSingleton/load for auto-load
+
+    // Discovery: hook runSlaveAnim to harvest which clip names the engine plays
+    // per TaskType (informs the pose-by-clip replication). Non-fatal if it fails.
+    if (KenshiLib::SUCCESS !=
+        KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&Character::runSlaveAnim),
+            &runSlaveAnim_hook, &g_runSlaveAnim_orig)) {
+        coopErr("KenshiCoop: could not install runSlaveAnim discovery hook");
+    }
 
     // Auto-load: only hook the title screen when a save name was provided. The
     // hook triggers the load once the menu is up (see titleUpdate_hook).

@@ -24,7 +24,11 @@ typedef float              f32;
 // Bump when the wire format changes incompatibly. Checked during handshake.
 // v3: NpcStateEntry gains the NPC's current task + the task's subject object, so
 // the client can reproduce the host's pose (sit/operate/etc.) at the same fixture.
-const u16 PROTOCOL_VERSION = 3;
+// v4: NpcStateEntry gains the host's CharMovement state (currentSpeed, currentMotion
+// vector, currentlyMoving). The engine's AnimationClass selects walk/idle/run from
+// these, so mirroring them onto the client makes the locomotion animation match the
+// host (fixes "walk-in-place" on held NPCs) without guessing clip names.
+const u16 PROTOCOL_VERSION = 4;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -95,14 +99,21 @@ struct NpcStateEntry {
     u32 scontainerSerial; // subject hand.containerSerial
     u32 sindex;           // subject hand.index
     u32 sserial;          // subject hand.serial
-}; // 58 bytes
+    // Locomotion-animation state: the engine picks walk/idle/run from these, so
+    // mirroring them makes the client copy animate like the host.
+    f32 cspeed;           // CharMovement.currentSpeed
+    f32 cmotionX;         // CharMovement.currentMotion.x (world-space motion)
+    f32 cmotionY;         // CharMovement.currentMotion.y
+    f32 cmotionZ;         // CharMovement.currentMotion.z
+    u8  cmoving;          // CharMovement.currentlyMoving (0/1)
+}; // 75 bytes
 
 // Sentinel task value meaning "the host NPC had no current task this tick".
 const u16 NPC_TASK_NONE = 0xFFFFu;
 
 // An NPC batch packet is: [u8 type=PKT_NPC_STATE][u8 count][NpcStateEntry*count].
 // Capped so a full batch stays comfortably inside one unreliable datagram.
-const unsigned int NPC_BATCH_MAX = 24; // 24*58 + 2 = 1394 bytes
+const unsigned int NPC_BATCH_MAX = 18; // 18*75 + 2 = 1352 bytes
 
 struct NpcBatchHeader {
     u8 type;  // = PKT_NPC_STATE
