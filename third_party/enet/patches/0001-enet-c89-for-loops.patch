@@ -1,0 +1,28 @@
+ENet 1.3.18 uses one C99 construct (declarations inside `for` initializers) in
+enet_protocol_send_outgoing_commands(). The VC++ 2010 (v100) C compiler is C89-only
+and rejects it. This patch hoists the declarations to the top of the function.
+
+Apply from the repo root after fetching ENet (the vendored source under
+third_party/enet/enet/ is git-ignored):
+
+    git apply third_party/enet/patches/0001-enet-c89-for-loops.patch
+
+--- a/third_party/enet/enet/protocol.c
++++ b/third_party/enet/enet/protocol.c
+@@ -1606,11 +1606,14 @@ enet_protocol_send_outgoing_commands (ENetHost * host, ENetEvent * event, int ch
+     int sentLength = 0;
+     size_t shouldCompress = 0;
+     ENetList sentUnreliableCommands;
++    /* C89 (VC10) compatibility: declarations hoisted out of the for-init clauses. */
++    int sendPass, continueSending;
++    ENetPeer * currentPeer;
+ 
+     enet_list_clear (& sentUnreliableCommands);
+ 
+-    for (int sendPass = 0, continueSending = 0; sendPass <= continueSending; ++ sendPass)
+-    for (ENetPeer * currentPeer = host -> peers;
++    for (sendPass = 0, continueSending = 0; sendPass <= continueSending; ++ sendPass)
++    for (currentPeer = host -> peers;
+          currentPeer < & host -> peers [host -> peerCount];
+          ++ currentPeer)
+     {

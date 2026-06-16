@@ -1,0 +1,1381 @@
+// KenshiCoop - RE_Kenshi / KenshiLib plugin entry point.
+//
+// Milestone 1: load under RE_Kenshi and print to the debug log.
+// Milestone 2: hook the main-thread tick and read the local player's position.
+// Milestone 4: bridge a background net thread into the tick via MainThreadQueue.
+// Milestone 5: send local player state each tick; log received remote states.
+//
+// Mode is chosen via environment variables read at load time:
+//   KENSHICOOP_MODE = "host" (default) | "join"
+//   KENSHICOOP_IP   = host IP when joining (default 127.0.0.1)
+//   KENSHICOOP_PORT = UDP port (default 27800)
+
+// Some KenshiLib headers (e.g. RootObjectFactory.h) include <boost/thread/...>,
+// whose Boost auto-link pragma would force linking a compiled libboost_thread
+// we neither ship nor use - we only reference reconstructed class layouts and
+// call game functions resolved at runtime. Disable Boost auto-linking entirely.
+#define BOOST_ALL_NO_LIB 1
+// ...and make Boost.System (pulled in transitively by boost/thread) header-only
+// so system_category()/generic_category() are defined inline rather than needing
+// a compiled libboost_system.
+#define BOOST_ERROR_CODE_HEADER_ONLY 1
+#define BOOST_SYSTEM_NO_DEPRECATED 1
+
+// ---- KenshiLib / Kenshi headers --------------------------------------------
+// Verified against KenshiLib (KenshiReclaimer/KenshiLib, branch RE_Kenshi_mods).
+// Headers live under <KENSHILIB_DIR>/Include: Debug.h at the root, the hooking
+// API under core/, and the reconstructed game structures under kenshi/.
+#include <Debug.h>                  // DebugLog(const char*) / ErrorLog
+#include <core/Functions.h>         // KenshiLib::AddHook / GetRealAddress / SUCCESS
+#include <kenshi/GameWorld.h>       // GameWorld + _NV_mainLoop_GPUSensitiveStuff
+#include <kenshi/PlayerInterface.h> // PlayerInterface::playerCharacters (lektor<Character*>)
+#include <kenshi/Enums.h>           // MoveSpeed { WALK, RUN }
+#include <kenshi/Character.h>       // Character (getPosition/getOrientation/teleport)
+#include <kenshi/CharMovement.h>    // CharMovement::_setPositionDirectionAndTeleport/halt
+#include <kenshi/CharBody.h>        // CharBody::currentAction (the NPC's active task)
+#include <kenshi/Tasker.h>          // Tasker::key() -> TaskType, Tasker::subject (target)
+#include <kenshi/RootObject.h>      // RootObjectContainer (Character::container type)
+#include <kenshi/RootObjectFactory.h> // RootObjectFactory::createRandomCharacter
+#include <kenshi/SaveManager.h>     // SaveManager::getSingleton()/load() - auto-load a save
+#include <kenshi/gui/TitleScreen.h> // TitleScreen::_NV_update - safe point to trigger load
+#include <kenshi/util/hand.h>       // hand: save-stable composite entity key
+#include <kenshi/util/lektor.h>     // lektor<T>: engine vector (getCharactersWithinSphere out)
+
+#include <cstdlib>   // getenv
+#include <cstdio>    // _snprintf (VC10 has no C99 snprintf)
+#include <cstring>   // memset (build a hand in a scratch buffer)
+#include <string>
+#include <deque>
+#include <map>
+#include <vector>
+
+#include "../netproto/Protocol.h"
+#include "MainThreadQueue.h"
+#include "NetClient.h"
+#include "CoopLog.h"
+
+namespace {
+
+coop::NetClient      g_net;
+coop::MainThreadQueue g_inbound;
+coop::u32            g_tick = 0;
+
+// Original main-loop pointer, filled by KenshiLib::AddHook.
+void (*g_mainLoop_orig)(GameWorld*, float) = 0;
+
+// Read an env var with a fallback default.
+std::string envOr(const char* key, const char* fallback) {
+    const char* v = std::getenv(key);
+    return v ? std::string(v) : std::string(fallback);
+}
+
+// ---- Logging ---------------------------------------------------------------
+// Every KenshiCoop log call goes through these wrappers so events land BOTH in
+// the dedicated, machine-readable coop log (CoopLog: timestamped, flushed,
+// thread-safe) AND in the engine's kenshi.log via KenshiLib's helpers, exactly
+// as before. Defined AFTER the global DebugLog->coopLog rename so these are the
+// only call sites left referencing the real KenshiLib functions (no recursion).
+void coopLog(const char* msg) { coop::logLine(msg);    DebugLog(msg); }
+void coopErr(const char* msg) { coop::logErrLine(msg); ErrorLog(msg); }
+
+// ---- Auto-load + test-runner config (read once at plugin load) -------------
+std::string g_saveName;        // KENSHICOOP_SAVE: save to auto-load (empty = manual menu)
+int         g_testSeconds = 0; // KENSHICOOP_TEST_SECONDS: self-exit after N s of gameplay (0 = off)
+
+bool  g_autoLoadDone    = false; // load() already issued from the title screen?
+DWORD g_titleFirstTick  = 0;     // when the title screen first updated (GetTickCount)
+DWORD g_autoLoadDelayMs = 5000;  // settle this long before auto-loading
+                                 // (override via KENSHICOOP_AUTOLOAD_DELAY_MS)
+bool  g_gameStarted     = false; // first in-game tick observed (arms self-exit timer)
+DWORD g_gameStartTick   = 0;     // when gameplay began (GetTickCount)
+
+// TitleScreen::_NV_update hook trampoline (filled by KenshiLib::AddHook).
+void (*g_titleUpdate_orig)(TitleScreen*) = 0;
+
+// SaveManager entry points, resolved at load. getSingleton is a static member
+// (plain function pointer); load(const std::string&) is a non-virtual member,
+// so `this` is the first arg and the string reference is passed as a pointer.
+typedef SaveManager* (__fastcall* SaveMgrGetFn)();
+typedef void         (__fastcall* SaveMgrLoadNameFn)(SaveManager* self, const std::string* name);
+typedef bool         (__fastcall* SaveMgrSavesExistFn)(SaveManager* self);
+SaveMgrGetFn        g_saveMgrGetFn        = 0;
+SaveMgrLoadNameFn   g_saveMgrLoadFn       = 0;
+SaveMgrSavesExistFn g_saveMgrSavesExistFn = 0;
+
+// ---- Phase 1: ghost characters --------------------------------------------
+// Each remote player is represented by a real Kenshi Character ("ghost") that
+// we spawn once and teleport to the latest received position every tick.
+//
+// Spawning/teleporting characters drives deep, version-specific engine code, so
+// EVERY such call is wrapped in SEH (__try/__except). A bad call then disables
+// the ghost feature and logs, instead of crashing the game - which keeps the
+// build safe to iterate on (worst case: no ghost appears). This mirrors how
+// Kenshi-Online guards its factory/teleport calls.
+//
+// All ghost state lives on and is touched only by the MAIN thread.
+
+// Raw, ABI-correct call shapes. On x64 there is a single calling convention;
+// `this` is the first argument. By-value Ogre::Vector3 (POD, trivial dtor) is
+// passed exactly as the game's own ABI does, and references become pointers.
+typedef RootObject* (__fastcall* SpawnFn)(
+    RootObjectFactory* self, Faction* faction, Ogre::Vector3 position,
+    RootObjectContainer* owner, GameData* characterTemplate, Building* home,
+    float age);
+// clearAllAIGoals: best-effort, used to quiet the ghost. We position the ghost
+// through its CharMovement controller (virtual calls, no resolve needed), since
+// that controller owns the authoritative Havok position - writing anywhere else
+// gets snapped back each frame, which is what made the puppet "blink".
+typedef void (__fastcall* ClearGoalsFn)(Character* self);
+// separateIntoMyOwnSquad: spawning borrows the player's container, which enlists
+// the ghost in the player's active squad. This pulls it back out into its own
+// squad so it is not a controllable member of your party. Return value (a
+// Platoon*) is ignored. Non-virtual, resolved by address.
+typedef void* (__fastcall* SeparateSquadFn)(Character* self, bool permanent);
+// GameWorld::destroy(obj, justUnloaded, debugInfo): the engine's own removal of
+// a dynamic RootObject. Used to despawn a ghost when its owner disconnects or
+// times out. Overloaded in the header, so we cast to the exact signature.
+typedef bool (__fastcall* DestroyObjFn)(
+    GameWorld* self, RootObject* obj, bool justUnloaded, const char* debugInfo);
+// Phase 2 NPC replication: interest query + AI-tick membership control.
+// getCharactersWithinSphere fills 'results' with nearby characters; the
+// add/remove update-list calls toggle whether the engine AI-ticks a character.
+typedef void (__fastcall* GetCharsInSphereFn)(
+    GameWorld* self, lektor<RootObject*>* results, const Ogre::Vector3* pos,
+    float farRadius, float nearRadius, float always, int maxFar, int maxNear,
+    RootObject* skip);
+typedef void (__fastcall* UpdateListFn)(GameWorld* self, Character* c);
+// hand::getCharacter resolves a save-stable handle back to the local Character*
+// (the client uses this to find its own copy of a host-driven NPC). The 5-arg
+// hand constructor builds a proper hand (sets the vptr) from received fields.
+typedef Character* (__fastcall* HandGetCharFn)(const hand* self);
+typedef hand* (__fastcall* HandCtor5Fn)(
+    hand* self, unsigned int index, unsigned int serial, itemType type,
+    unsigned int container, unsigned int containerSerial);
+// Pose-replication spike: Tasker::key() returns the current TaskType (e.g.
+// SIT_AROUND / RELAX_IN_TOWN_PACKAGE for bar-sitting). Non-virtual, resolvable.
+typedef int (__fastcall* TaskerKeyFn)(const void* self);
+// hand::getRootObject resolves a (subject) handle to its world RootObject - the
+// fixture/node an NPC's task targets. CharBody::setCurrentAction(TaskType,target)
+// commits the NPC to a task on that object (the reproduction primitive). The
+// _NV_ variant has the same RVA as the virtual and is directly callable.
+typedef RootObject* (__fastcall* HandGetRootFn)(const hand* self);
+typedef bool        (__fastcall* SetActionFn)(void* charBody, int taskType,
+                                              RootObject* target);
+
+SpawnFn            g_spawnFn        = 0;
+ClearGoalsFn       g_clearGoalsFn   = 0;
+SeparateSquadFn    g_separateFn     = 0;
+DestroyObjFn       g_destroyFn      = 0;
+GetCharsInSphereFn g_getCharsFn     = 0;
+UpdateListFn       g_removeUpdateFn = 0;
+UpdateListFn       g_addUpdateFn    = 0;
+HandGetCharFn      g_handGetCharFn  = 0;
+HandCtor5Fn        g_handCtorFn     = 0;
+TaskerKeyFn        g_taskerKeyFn    = 0;
+HandGetRootFn      g_handGetRootFn  = 0;
+SetActionFn        g_setActionFn    = 0;
+bool               g_ghostResolved  = false;
+bool               g_ghostDisabled  = false;
+bool               g_isHostMode     = true; // set in startNetworking
+int                g_spawnFailures  = 0;
+
+// Reused across interest queries so the engine grows the buffer once instead of
+// allocating every tick (lektor has no destructor of its own).
+lektor<RootObject*> g_npcQuery;
+
+// Per-ghost state. We can't force an animation clip directly (AnimationClass is
+// private) and a teleport zeroes the engine's perceived speed (no animation), so
+// we combine two regimes:
+//   MOVING  -> drive the engine's locomotion toward an EXTRAPOLATED point a bit
+//              ahead of travel, at RUN, so it animates AND keeps up (instead of
+//              trailing the last-known position).
+//   STOPPED -> teleport to the EXACT networked position and halt, so the two
+//              clients' resting positions match precisely (no drift).
+struct GhostState {
+    Character*    chr;
+    Ogre::Vector3 tgtPos;       // latest received position
+    Ogre::Vector3 prevTgtPos;   // previous received position (for velocity)
+    Ogre::Vector3 vel;          // per-packet displacement (extrapolation)
+    float         tgtHeading;
+    Ogre::Vector3 lastDest;     // last destination we actually issued
+    DWORD         lastMoveTick; // when the target last moved meaningfully
+    DWORD         lastSeenTick; // when we last received any state for this player
+    bool          primed;
+    bool          destIssued;
+    bool          parked;       // currently snapped+halted at rest?
+    // Pose replication: the host NPC's current task + the object it targets, plus
+    // bookkeeping for re-issuing setCurrentAction on the local copy.
+    coop::u16     hostTask;     // latest received TaskType (NPC_TASK_NONE if none)
+    coop::u32     hostSubj[5];  // subject hand {type,container,containerSerial,index,serial}
+    DWORD         taskTick;     // when we last issued the task (0 = never)
+    bool          taskActive;   // last setCurrentAction resolved a target object
+    bool          taskBad;      // reproduced task wandered the NPC off; hold instead
+    GhostState() : chr(0), tgtHeading(0.0f), lastMoveTick(0), lastSeenTick(0),
+                   primed(false), destIssued(false), parked(false),
+                   hostTask(coop::NPC_TASK_NONE), taskTick(0), taskActive(false),
+                   taskBad(false) {
+        hostSubj[0] = hostSubj[1] = hostSubj[2] = hostSubj[3] = hostSubj[4] = 0;
+    }
+};
+
+std::map<coop::u32, GhostState> g_ghosts; // remote playerId -> ghost state
+
+// ---- Phase 2: replicated NPCs ---------------------------------------------
+// The host streams nearby NPC transforms keyed by their save-stable `hand`.
+// The client resolves each hand to its own local Character, suppresses that
+// NPC's local AI, and drives it with the SAME dual-regime mover used for player
+// ghosts. On timeout (host stopped sending) the NPC is handed back to local AI
+// rather than destroyed - it is a real world inhabitant, not a spawned puppet.
+struct HandKey {
+    coop::u32 type, container, containerSerial, index, serial;
+    bool operator<(const HandKey& o) const {
+        if (type            != o.type)            return type            < o.type;
+        if (container        != o.container)        return container        < o.container;
+        if (containerSerial != o.containerSerial) return containerSerial < o.containerSerial;
+        if (index            != o.index)            return index            < o.index;
+        return serial < o.serial;
+    }
+};
+
+HandKey makeKey(const coop::NpcStateEntry& e) {
+    HandKey k;
+    k.type            = e.htype;
+    k.container        = e.hcontainer;
+    k.containerSerial = e.hcontainerSerial;
+    k.index            = e.hindex;
+    k.serial            = e.hserial;
+    return k;
+}
+
+std::map<HandKey, GhostState> g_npcs; // hand -> driven NPC state (client side)
+
+// Resolve the non-virtual game functions to their real runtime addresses once.
+// GetRealAddress maps KenshiLib's reconstructed symbol to the loaded exe.
+void resolveGhostFns() {
+    if (g_ghostResolved) return;
+    g_ghostResolved = true;
+
+    g_spawnFn = (SpawnFn)KenshiLib::GetRealAddress(
+        &RootObjectFactory::createRandomCharacter);
+
+    // Optional: used to quiet the ghost's autonomous behaviour. Non-fatal.
+    g_clearGoalsFn = (ClearGoalsFn)KenshiLib::GetRealAddress(
+        &Character::clearAllAIGoals);
+
+    // Optional: eject the ghost from the player's squad. Non-fatal.
+    g_separateFn = (SeparateSquadFn)KenshiLib::GetRealAddress(
+        &Character::separateIntoMyOwnSquad);
+
+    // Optional: despawn a ghost on disconnect/timeout. destroy() is overloaded,
+    // so select the (RootObject*, bool, const char*) variant explicitly.
+    g_destroyFn = (DestroyObjFn)KenshiLib::GetRealAddress(
+        static_cast<bool (GameWorld::*)(RootObject*, bool, const char*)>(
+            &GameWorld::destroy));
+
+    // Phase 2 NPC replication. Non-fatal if any fail (feature stays off).
+    g_getCharsFn = (GetCharsInSphereFn)KenshiLib::GetRealAddress(
+        &GameWorld::getCharactersWithinSphere);
+    g_removeUpdateFn = (UpdateListFn)KenshiLib::GetRealAddress(
+        &GameWorld::removeFromUpdateListMain);
+    g_addUpdateFn = (UpdateListFn)KenshiLib::GetRealAddress(
+        &GameWorld::addToUpdateListMain);
+
+    // Resolve hand->Character lookup and the 5-arg hand constructor (overloaded,
+    // so disambiguate via an explicit member-pointer cast). Non-fatal.
+    g_handGetCharFn = (HandGetCharFn)KenshiLib::GetRealAddress(&hand::getCharacter);
+    g_handCtorFn = (HandCtor5Fn)KenshiLib::GetRealAddress(
+        static_cast<hand* (hand::*)(unsigned int, unsigned int, itemType,
+                                    unsigned int, unsigned int)>(&hand::_CONSTRUCTOR));
+
+    // Pose-replication spike: current-task reader. Non-fatal if unresolved.
+    g_taskerKeyFn = (TaskerKeyFn)KenshiLib::GetRealAddress(&Tasker::key);
+    g_handGetRootFn = (HandGetRootFn)KenshiLib::GetRealAddress(&hand::getRootObject);
+    g_setActionFn = (SetActionFn)KenshiLib::GetRealAddress(
+        static_cast<bool (CharBody::*)(TaskType, RootObject*)>(
+            &CharBody::_NV_setCurrentAction));
+
+    if (!g_spawnFn) {
+        g_ghostDisabled = true;
+        coopErr("KenshiCoop: could not resolve ghost spawn function");
+    }
+}
+
+// SEH-isolated helpers. These contain NO objects requiring C++ unwinding
+// (Ogre::Vector3/Quaternion have trivial destructors), so __try is legal here.
+Character* guardedSpawn(RootObjectFactory* factory, Faction* faction,
+                        const Ogre::Vector3* pos, RootObjectContainer* owner,
+                        GameData* tmpl) {
+    RootObject* r = 0;
+    __try {
+        r = g_spawnFn(factory, faction, *pos, owner, tmpl, 0, 20.0f);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return static_cast<Character*>(r);
+}
+
+// Drive the puppet through its movement controller so the Havok position, the
+// logical position and the rendered transform all move together (no snap-back).
+// _setPositionDirectionAndTeleport and halt() are virtual calls on the real
+// object, so no GetRealAddress is needed.
+bool guardedMovePuppet(Character* ghost, const Ogre::Vector3* pos,
+                       const Ogre::Quaternion* rot) {
+    __try {
+        CharMovement* mv = ghost->movement; // direct member (offset 0x640)
+        if (!mv) return false;
+        mv->_setPositionDirectionAndTeleport(*pos, *rot);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Read the ghost's live world position (virtual getPosition()). SEH-guarded.
+bool guardedGetPos(Character* ghost, Ogre::Vector3* out) {
+    __try {
+        *out = ghost->getPosition();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Order the ghost to move to an absolute destination at RUN speed. This routes
+// through the engine's normal locomotion, so it plays real walk/run animation
+// and faces its travel direction. RUN keeps it from lagging behind a sprinting
+// remote (the engine still auto-walks when it's close to the destination).
+// setDestination / setDesiredSpeed are virtual on CharMovement -> plain calls.
+bool guardedSetDestination(Character* ghost, const Ogre::Vector3* dest) {
+    __try {
+        CharMovement* mv = ghost->movement;
+        if (!mv) return false;
+        mv->setDesiredSpeed(RUN);
+        mv->setDestination(*dest, HIGH_PRIORITY, false);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Snap the ghost to an exact transform and stop it (used at rest so the two
+// clients agree precisely). teleport + halt are virtual -> plain calls.
+bool guardedPark(Character* ghost, const Ogre::Vector3* pos,
+                 const Ogre::Quaternion* rot) {
+    __try {
+        CharMovement* mv = ghost->movement;
+        if (!mv) return false;
+        mv->halt();
+        mv->_setPositionDirectionAndTeleport(*pos, *rot);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Remove a ghost from the world via the engine's own object destruction. After
+// this the Character pointer is dead and must not be touched again.
+void guardedDespawn(GameWorld* gw, Character* ghost) {
+    if (!gw || !ghost || !g_destroyFn) return;
+    __try {
+        g_destroyFn(gw, ghost, false, "KenshiCoop ghost");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// ---- Phase 2 guarded game calls (no C++ unwinding objects -> SEH legal) -----
+
+// Resolve a received hand (5 fields) to this machine's local Character*, or 0.
+// Builds a proper hand in a scratch buffer via the engine constructor (so the
+// vptr is valid) then calls getCharacter(). Returns 0 if the NPC isn't loaded
+// here or the handle doesn't resolve.
+Character* guardedHandToChar(const coop::NpcStateEntry& e) {
+    if (!g_handGetCharFn || !g_handCtorFn) return 0;
+    __try {
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, e.hindex, e.hserial, (itemType)e.htype,
+                     e.hcontainer, e.hcontainerSerial);
+        return g_handGetCharFn(h);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Pull an NPC out of the engine's main AI update list and clear its goals so it
+// stops simulating locally; the host's streamed transforms drive it instead.
+bool guardedSuppressNpc(GameWorld* gw, Character* c) {
+    if (!gw || !c || !g_removeUpdateFn) return false;
+    __try {
+        g_removeUpdateFn(gw, c);
+        if (g_clearGoalsFn) g_clearGoalsFn(c);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Hand an NPC back to the engine's local AI (used when the host stops streaming
+// it, so the world keeps living instead of leaving a frozen body).
+void guardedRestoreNpc(GameWorld* gw, Character* c) {
+    if (!gw || !c || !g_addUpdateFn) return;
+    __try {
+        g_addUpdateFn(gw, c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Clear an NPC's autonomous AI goals so it stops wandering/pathing on its own.
+// We keep the NPC IN the engine update list (unlike removeFromUpdateListMain,
+// which freezes its movement controller and makes our teleport/setDestination
+// silently no-op), and instead quiet it by clearing goals every frame, then
+// drive it like a ghost. SEH-guarded.
+void guardedClearGoals(Character* c) {
+    if (!c || !g_clearGoalsFn) return;
+    __try {
+        g_clearGoalsFn(c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Fill g_npcQuery with characters near 'center'. Reuses one buffer across calls.
+bool guardedQueryNpcs(GameWorld* gw, const Ogre::Vector3* center) {
+    __try {
+        g_npcQuery.clear();
+        // farRadius, nearRadius, always, maxFar, maxNear, skip(none).
+        // ~200u far radius approximates Kenshi-Online's interest footprint (it
+        // syncs a 3x3 grid of 128u zones, ~192u, around each player).
+        g_getCharsFn(gw, &g_npcQuery, center, 200.0f, 120.0f, 30.0f, 96, 96, 0);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Read one query result into an NpcStateEntry. Returns 1 on success, 0 if the
+// object isn't a Character, -1 on fault. All virtual reads are guarded here.
+int guardedReadNpc(RootObject* obj, coop::NpcStateEntry* out) {
+    __try {
+        if (obj->getDataType() != CHARACTER) return 0;
+        Character* c = static_cast<Character*>(obj);
+        const hand& h = c->handle;
+        Ogre::Vector3 p = c->getPosition();
+        float heading = c->getOrientation().getYaw().valueRadians();
+        out->htype            = (coop::u32)h.type;
+        out->hcontainer       = h.container;
+        out->hcontainerSerial = h.containerSerial;
+        out->hindex           = h.index;
+        out->hserial          = h.serial;
+        out->x       = p.x;
+        out->y       = p.y;
+        out->z       = p.z;
+        out->heading = heading;
+        // Pose replication: capture the NPC's current task + its subject object so
+        // the client can reproduce the same action at the same fixture. Defaults
+        // to "no task" if there's no current action or the reader faults.
+        out->task             = coop::NPC_TASK_NONE;
+        out->stype            = 0;
+        out->scontainer       = 0;
+        out->scontainerSerial = 0;
+        out->sindex           = 0;
+        out->sserial          = 0;
+        if (g_taskerKeyFn) {
+            CharBody* b = c->body;
+            Tasker* t = b ? b->currentAction : 0;
+            if (t) {
+                out->task             = (coop::u16)g_taskerKeyFn(t);
+                const hand& s         = t->subject;
+                out->stype            = (coop::u32)s.type;
+                out->scontainer       = s.container;
+                out->scontainerSerial = s.containerSerial;
+                out->sindex           = s.index;
+                out->sserial          = s.serial;
+            }
+        }
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// Human-readable name for the rest-related TaskTypes we care about (uses the
+// compiler's enum values, so it stays correct regardless of ordinals).
+const char* taskName(int t) {
+    switch (t) {
+        case IDLE:                     return "IDLE";
+        case HOLD_POSITION:            return "HOLD_POSITION";
+        case STAND_STILL:              return "STAND_STILL";
+        case STAND_AT_NODE:            return "STAND_AT_NODE";
+        case STAND_AT_SHOPKEEPER_NODE: return "STAND_AT_SHOPKEEPER_NODE";
+        case WANDER_TOWN:              return "WANDER_TOWN";
+        case OPERATE_MACHINERY:        return "OPERATE_MACHINERY";
+        case REST:                     return "REST";
+        case SIT_AROUND:               return "SIT_AROUND";
+        case RELAX_IN_TOWN_PACKAGE:    return "RELAX_IN_TOWN_PACKAGE";
+        case SIT_ON_THRONE:            return "SIT_ON_THRONE";
+        case GO_TO_THE_BAR_AND_DRINK:  return "GO_TO_THE_BAR_AND_DRINK";
+        case USE_BED:                  return "USE_BED";
+        case USE_BED_ORDER:            return "USE_BED_ORDER";
+        case SLEEP_ON_FLOOR:           return "SLEEP_ON_FLOOR";
+        default:                       return "other";
+    }
+}
+
+// Pose replication (state-changing): force a Character into 'taskType'
+// targeting the object named by the subject hand fields. Resolves the subject to
+// a RootObject via hand::getRootObject, clears the NPC's goals, then calls
+// CharBody::setCurrentAction(TaskType, target). Returns: 2 ok (target resolved),
+// 1 ok (null target), 0 missing fns/body, -1 fault. SEH-guarded.
+int guardedSetTask(Character* c, int taskType, const coop::u32 subj[5]) {
+    if (!c || !g_setActionFn || !g_handGetRootFn || !g_handCtorFn) return 0;
+    __try {
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        // hand ctor order: (index, serial, type, container, containerSerial).
+        g_handCtorFn(h, subj[3], subj[4], (itemType)subj[0], subj[1], subj[2]);
+        RootObject* target = g_handGetRootFn(h);
+        CharBody* b = c->body;
+        if (!b) return -1;
+        if (g_clearGoalsFn) g_clearGoalsFn(c);
+        g_setActionFn(b, taskType, target);
+        return target ? 2 : 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+// Best-effort: rename, clear autonomous AI goals (stops wandering/dialogue),
+// and eject from the player's squad. We do NOT halt here - movement is driven
+// by setDestination so the ghost walks toward the networked position. The
+// std::string lives in the caller's frame (no unwinding object in this __try
+// function), keeping SEH legal here.
+void guardedQuiet(Character* ghost, const std::string& name) {
+    __try {
+        ghost->setName(name);            // virtual, relabels the body
+        if (g_clearGoalsFn) g_clearGoalsFn(ghost);
+        if (g_separateFn) g_separateFn(ghost, false); // leave the player's squad
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Spawn (if needed) and record the latest received transform as the ghost's
+// interpolation TARGET. Does NOT move the body - updateGhosts() eases toward
+// the target every frame. Main thread only.
+void receiveRemoteState(GameWorld* gw, const coop::PlayerStatePacket& p) {
+    if (g_ghostDisabled) return;
+    if (p.playerId == g_net.localId()) return; // never ghost ourselves
+
+    // We borrow the local player's own faction / data template / container so
+    // the spawn always uses valid, loaded game data (same as the player).
+    if (!gw || !gw->player || !gw->theFactory) return;
+    if (gw->player->playerCharacters.size() == 0) return;
+    Character* local = gw->player->playerCharacters[0];
+    if (!local) return;
+
+    Ogre::Vector3 target(p.x, p.y, p.z);
+
+    std::map<coop::u32, GhostState>::iterator it = g_ghosts.find(p.playerId);
+    if (it == g_ghosts.end()) {
+        Faction* faction = local->getFaction();            // virtual, safe
+        GameData* tmpl   = local->getGameData();            // virtual, safe
+        RootObjectContainer* owner = local->container;      // direct member
+
+        Character* ghost = guardedSpawn(gw->theFactory, faction, &target, owner, tmpl);
+        if (!ghost) {
+            if (++g_spawnFailures >= 5) {
+                g_ghostDisabled = true;
+                coopErr("KenshiCoop: ghost spawning failed; feature disabled");
+            }
+            return;
+        }
+
+        char namebuf[64];
+        _snprintf(namebuf, sizeof(namebuf) - 1, "Remote Player %u", p.playerId);
+        namebuf[sizeof(namebuf) - 1] = '\0';
+        std::string name(namebuf);
+        guardedQuiet(ghost, name);
+
+        GhostState gs;
+        gs.chr          = ghost;
+        gs.tgtPos       = target;
+        gs.prevTgtPos   = target;
+        gs.vel          = Ogre::Vector3::ZERO;
+        gs.tgtHeading   = p.heading;
+        gs.lastDest     = target;
+        gs.lastMoveTick = GetTickCount();
+        gs.lastSeenTick = GetTickCount();
+        gs.primed       = true;
+        gs.destIssued   = false;
+        gs.parked       = false;
+        g_ghosts[p.playerId] = gs;
+
+        char buf[128];
+        _snprintf(buf, sizeof(buf) - 1,
+            "KenshiCoop: spawned ghost for player %u at (%.1f, %.1f, %.1f)",
+            p.playerId, p.x, p.y, p.z);
+        buf[sizeof(buf) - 1] = '\0';
+        coopLog(buf);
+        return;
+    }
+
+    // Existing ghost: update target + velocity, and note whether it moved.
+    GhostState& gs = it->second;
+    Ogre::Vector3 step = target - gs.tgtPos;
+    const float MOVE_EPS = 0.15f;
+    if (step.squaredLength() > MOVE_EPS * MOVE_EPS) {
+        gs.vel          = step;            // per-packet displacement
+        gs.lastMoveTick = GetTickCount();
+    }
+    gs.prevTgtPos   = gs.tgtPos;
+    gs.tgtPos       = target;
+    gs.tgtHeading   = p.heading;
+    gs.lastSeenTick = GetTickCount();
+}
+
+// Despawn one ghost (or all, when id == PLAYER_ID_ALL) and drop it from the map.
+void despawnGhost(GameWorld* gw, coop::u32 id) {
+    if (id == coop::PLAYER_ID_ALL) {
+        for (std::map<coop::u32, GhostState>::iterator it = g_ghosts.begin();
+             it != g_ghosts.end(); ++it) {
+            guardedDespawn(gw, it->second.chr);
+        }
+        if (!g_ghosts.empty()) coopLog("KenshiCoop: despawned all ghosts");
+        g_ghosts.clear();
+        return;
+    }
+    std::map<coop::u32, GhostState>::iterator it = g_ghosts.find(id);
+    if (it == g_ghosts.end()) return;
+    guardedDespawn(gw, it->second.chr);
+    g_ghosts.erase(it);
+    char buf[96];
+    _snprintf(buf, sizeof(buf) - 1, "KenshiCoop: despawned ghost for player %u", id);
+    buf[sizeof(buf) - 1] = '\0';
+    coopLog(buf);
+}
+
+// Drive ONE puppet (player ghost or replicated NPC) one frame toward its
+// networked target, using the dual-regime mover:
+//  - STOPPED (no recent target movement): teleport to the exact networked
+//    transform and halt, once, so both clients agree precisely at rest.
+//  - MOVING: drive engine locomotion toward an extrapolated point ahead of the
+//    last position (so it keeps up and animates), snapping only on a large gap.
+// Returns false only if a guarded game call faulted (caller should drop it).
+// Plain C++ (no __try here) - it only calls the SEH-guarded helpers.
+bool driveOnePuppet(GhostState& gs, DWORD now) {
+    const DWORD STOP_MS     = 200;          // no target move for this long = at rest
+    const float LEAD        = 1.5f;         // extrapolate this many packet-steps ahead
+    const float SNAP_DIST   = 25.0f;        // large gap -> hard snap
+    const float SNAP_SQ     = SNAP_DIST * SNAP_DIST;
+    const float REDEST_DIST = 1.0f;         // re-path only when dest moved this far
+    const float REDEST_SQ   = REDEST_DIST * REDEST_DIST;
+
+    Ogre::Vector3 actual;
+    if (!guardedGetPos(gs.chr, &actual)) return true; // transient; keep it
+
+    Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading), Ogre::Vector3::UNIT_Y);
+    bool moving = (now - gs.lastMoveTick) < STOP_MS;
+    bool ok = true;
+
+    const float PARK_FIX_SQ = 1.0f; // re-snap if a parked body drifts >1m
+
+    if (!moving) {
+        // Settle to the exact position, and re-correct if it drifts (e.g. local
+        // AI nudged it before goals were cleared, or a shove from another NPC).
+        if (!gs.parked || (gs.tgtPos - actual).squaredLength() > PARK_FIX_SQ) {
+            ok = guardedPark(gs.chr, &gs.tgtPos, &rot);
+            if (ok) { gs.parked = true; gs.destIssued = false; }
+        }
+    } else {
+        gs.parked = false;
+        if ((gs.tgtPos - actual).squaredLength() > SNAP_SQ) {
+            ok = guardedMovePuppet(gs.chr, &gs.tgtPos, &rot);
+            gs.destIssued = false;
+        } else {
+            // Aim a little ahead of the last position along travel direction.
+            Ogre::Vector3 dest = gs.tgtPos + gs.vel * LEAD;
+            if (!gs.destIssued ||
+                (dest - gs.lastDest).squaredLength() > REDEST_SQ) {
+                ok = guardedSetDestination(gs.chr, &dest);
+                if (ok) { gs.lastDest = dest; gs.destIssued = true; }
+            }
+        }
+    }
+    return ok;
+}
+
+// Per frame: drive every player ghost, and despawn ghosts whose owner has gone
+// silent (disconnect/crash/quit).
+void updateGhosts(GameWorld* gw, float dt) {
+    if (g_ghosts.empty()) return;
+    (void)dt;
+
+    const DWORD TIMEOUT_MS = 3000; // no packets for this long -> despawn
+    DWORD now = GetTickCount();
+
+    std::map<coop::u32, GhostState>::iterator it = g_ghosts.begin();
+    while (it != g_ghosts.end()) {
+        GhostState& gs = it->second;
+        if (!gs.primed || !gs.chr) { ++it; continue; }
+
+        if ((now - gs.lastSeenTick) > TIMEOUT_MS) {
+            guardedDespawn(gw, gs.chr);
+            char buf[96];
+            _snprintf(buf, sizeof(buf) - 1,
+                "KenshiCoop: ghost %u timed out; despawned", it->first);
+            buf[sizeof(buf) - 1] = '\0';
+            coopLog(buf);
+            std::map<coop::u32, GhostState>::iterator dead = it++;
+            g_ghosts.erase(dead);
+            continue;
+        }
+
+        if (!driveOnePuppet(gs, now)) {
+            coopErr("KenshiCoop: ghost drive failed; dropping ghost");
+            std::map<coop::u32, GhostState>::iterator dead = it++;
+            g_ghosts.erase(dead);
+            continue;
+        }
+        ++it;
+    }
+}
+
+// Drain remote player states delivered by the net thread and apply them to
+// ghost characters. Runs on the MAIN thread (safe to call DebugLog here).
+void processInbound(GameWorld* gw) {
+    std::deque<coop::PlayerStatePacket> items;
+    g_inbound.drain(items);
+    if (items.empty()) return;
+
+    // Collapse to the most-recent state per player. Several packets can arrive
+    // between frames; only the newest matters since it just sets the
+    // interpolation target that updateGhosts() eases toward each frame. Process
+    // PKT_PLAYER_LEFT markers in order: a disconnect drops the ghost and clears
+    // any earlier queued state, while a later state for the same id re-joins.
+    std::map<coop::u32, coop::PlayerStatePacket> latest;
+    for (size_t i = 0; i < items.size(); ++i) {
+        const coop::PlayerStatePacket& it = items[i];
+        if (it.type == coop::PKT_PLAYER_LEFT) {
+            if (it.playerId == coop::PLAYER_ID_ALL) latest.clear();
+            else                                    latest.erase(it.playerId);
+            despawnGhost(gw, it.playerId);
+        } else {
+            latest[it.playerId] = it;
+        }
+    }
+
+    static DWORD lastLog = 0;
+    DWORD now = GetTickCount();
+    bool doLog = (now - lastLog >= 1000);
+    if (doLog) lastLog = now;
+
+    std::map<coop::u32, coop::PlayerStatePacket>::iterator it;
+    for (it = latest.begin(); it != latest.end(); ++it) {
+        const coop::PlayerStatePacket& p = it->second;
+        if (doLog) {
+            char buf[160];
+            _snprintf(buf, sizeof(buf) - 1,
+                "KenshiCoop: remote player %u tick %u pos (%.1f, %.1f, %.1f)",
+                p.playerId, p.tick, p.x, p.y, p.z);
+            buf[sizeof(buf) - 1] = '\0';
+            coopLog(buf);
+        }
+        receiveRemoteState(gw, p);
+    }
+}
+
+// Publish the local player's transform for the net thread to transmit.
+// Runs on the MAIN thread inside the tick hook.
+void publishLocalState(GameWorld* gw) {
+    if (!gw || !gw->player) return;
+    if (gw->player->playerCharacters.size() == 0) return;
+
+    Character* chr = gw->player->playerCharacters[0];
+    if (!chr) return;
+
+    // getPosition() is RootObjectBase::getPosition() (virtual, returns
+    // Ogre::Vector3); getOrientation() is RootObject::getOrientation() (virtual,
+    // returns Ogre::Quaternion). Both are normal virtual calls here - the
+    // "GetRealAddress doesn't work on virtuals" caveat only applies to hooking.
+    Ogre::Vector3 pos = chr->getPosition();
+    float heading = chr->getOrientation().getYaw().valueRadians();
+
+    coop::PlayerStatePacket p;
+    p.type     = coop::PKT_PLAYER_STATE;
+    p.playerId = g_net.localId();
+    p.tick     = g_tick;
+    p.x        = pos.x;
+    p.y        = pos.y;
+    p.z        = pos.z;
+    p.heading  = heading;
+
+    g_net.setLocalState(p);
+
+    // Throttled visibility (~once/second): proves the tick hook is reading live
+    // game state. Remove or lower frequency once two-client sync is verified.
+    static DWORD lastLog = 0;
+    DWORD now = GetTickCount();
+    if (now - lastLog >= 1000) {
+        lastLog = now;
+        char buf[160];
+        _snprintf(buf, sizeof(buf) - 1,
+            "KenshiCoop: local player pos (%.1f, %.1f, %.1f) heading %.2f",
+            pos.x, pos.y, pos.z, heading);
+        buf[sizeof(buf) - 1] = '\0';
+        coopLog(buf);
+    }
+}
+
+// ---- Phase 2 NPC replication: host side ------------------------------------
+// Gather the transforms of NPCs near any player (host + remote ghosts), dedup
+// by hand, drop our own squad, and publish the batch for the net thread to
+// broadcast. Plain C++ (vectors/maps) calling only the SEH-guarded helpers.
+void publishNpcStates(GameWorld* gw) {
+    if (!g_getCharsFn || !gw || !gw->player) return;
+    PlayerInterface* pl = gw->player;
+    if (pl->playerCharacters.size() == 0) return;
+
+    // Interest centers: the host's own player, plus every remote player's last
+    // known position (their ghost target) so NPCs near a joined client stream.
+    std::vector<Ogre::Vector3> centers;
+    {
+        Ogre::Vector3 pp;
+        if (guardedGetPos(pl->playerCharacters[0], &pp)) centers.push_back(pp);
+    }
+    for (std::map<coop::u32, GhostState>::iterator g = g_ghosts.begin();
+         g != g_ghosts.end(); ++g) {
+        if (g->second.primed) centers.push_back(g->second.tgtPos);
+    }
+    if (centers.empty()) return;
+
+    const size_t MAX_NPCS = 128;
+    std::map<HandKey, coop::NpcStateEntry> picked; // dedup across centers
+
+    // Pose-replication spike: log every picked NPC's current task once per second.
+    bool logTasks = false;
+    {
+        static DWORD lastTaskLog = 0;
+        DWORD tnow = GetTickCount();
+        if (tnow - lastTaskLog >= 1000) { lastTaskLog = tnow; logTasks = true; }
+    }
+
+    for (size_t ci = 0; ci < centers.size() && picked.size() < MAX_NPCS; ++ci) {
+        if (!guardedQueryNpcs(gw, &centers[ci])) continue;
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total && picked.size() < MAX_NPCS; ++i) {
+            RootObject* obj = g_npcQuery[i];
+            if (!obj) continue;
+
+            // Never replicate the host's own controllable squad members.
+            bool isPlayer = false;
+            unsigned int pc = pl->playerCharacters.size();
+            for (unsigned int j = 0; j < pc; ++j) {
+                if (static_cast<RootObject*>(pl->playerCharacters[j]) == obj) {
+                    isPlayer = true; break;
+                }
+            }
+            if (isPlayer) continue;
+
+            coop::NpcStateEntry e;
+            if (guardedReadNpc(obj, &e) != 1) continue;
+            picked[makeKey(e)] = e;
+
+            if (logTasks) {
+                char tb[176];
+                _snprintf(tb, sizeof(tb) - 1,
+                    "KenshiCoop: task npc pos(%.0f,%.0f,%.0f) type=%d(%s) "
+                    "subj{t=%u c=%u cs=%u i=%u s=%u}",
+                    e.x, e.y, e.z, (int)e.task, taskName((int)e.task),
+                    e.stype, e.scontainer, e.scontainerSerial, e.sindex, e.sserial);
+                tb[sizeof(tb) - 1] = '\0';
+                coopLog(tb);
+            }
+        }
+    }
+
+    std::vector<coop::NpcStateEntry> out;
+    out.reserve(picked.size());
+    for (std::map<HandKey, coop::NpcStateEntry>::iterator it = picked.begin();
+         it != picked.end(); ++it) {
+        out.push_back(it->second);
+    }
+    g_net.setNpcStates(out.empty() ? 0 : &out[0], (unsigned int)out.size());
+
+    static DWORD lastLog = 0;
+    DWORD now = GetTickCount();
+    if (now - lastLog >= 1000) {
+        lastLog = now;
+        char buf[96];
+        _snprintf(buf, sizeof(buf) - 1,
+            "KenshiCoop: host streaming %u NPC(s)", (unsigned int)out.size());
+        buf[sizeof(buf) - 1] = '\0';
+        coopLog(buf);
+    }
+}
+
+// ---- Phase 2 NPC replication: client side ----------------------------------
+// Drain received NPC transforms, resolve each hand to the local Character,
+// suppress its AI on first sight, and record the latest target. Main thread.
+void receiveNpcStates(GameWorld* gw) {
+    std::deque<coop::NpcStateEntry> items;
+    g_inbound.drainNpc(items);
+    if (items.empty() || !gw) return;
+
+    // Collapse to the newest entry per hand (several batches may have arrived).
+    std::map<HandKey, coop::NpcStateEntry> latest;
+    for (size_t i = 0; i < items.size(); ++i) latest[makeKey(items[i])] = items[i];
+
+    DWORD now = GetTickCount();
+    int newlySuppressed = 0;
+    int resolvedOk = 0, resolveFail = 0, tracked = 0;
+
+    for (std::map<HandKey, coop::NpcStateEntry>::iterator it = latest.begin();
+         it != latest.end(); ++it) {
+        const coop::NpcStateEntry& e = it->second;
+        Ogre::Vector3 target(e.x, e.y, e.z);
+
+        std::map<HandKey, GhostState>::iterator f = g_npcs.find(it->first);
+        if (f == g_npcs.end()) {
+            Character* c = guardedHandToChar(e);
+            if (!c) { ++resolveFail; continue; } // not loaded / handle didn't resolve
+            ++resolvedOk;
+            {
+                Ogre::Vector3 ipos;
+                bool iok = guardedGetPos(c, &ipos);
+                char dbg[176];
+                _snprintf(dbg, sizeof(dbg) - 1,
+                    "KenshiCoop: resolved npc chr=%p getpos=%d pos(%.1f,%.1f,%.1f) "
+                    "tgt(%.1f,%.1f,%.1f) hand{t=%u c=%u cs=%u i=%u s=%u}",
+                    (void*)c, iok ? 1 : 0, ipos.x, ipos.y, ipos.z,
+                    e.x, e.y, e.z, e.htype, e.hcontainer, e.hcontainerSerial,
+                    e.hindex, e.hserial);
+                dbg[sizeof(dbg) - 1] = '\0';
+                coopLog(dbg);
+            }
+            // Do NOT clear goals on first sight: a resting NPC must keep its
+            // local job so it can sit/idle in the same pose as the host. We only
+            // suppress AI while we are actively driving a MOVING NPC (see below).
+            ++newlySuppressed;
+
+            GhostState gs;
+            gs.chr          = c;
+            gs.tgtPos       = target;
+            gs.prevTgtPos   = target;
+            gs.vel          = Ogre::Vector3::ZERO;
+            gs.tgtHeading   = e.heading;
+            gs.lastDest     = target;
+            gs.lastMoveTick = 0; // start "at rest" so a static NPC is left alone
+            gs.lastSeenTick = now;
+            gs.primed       = true;
+            gs.destIssued   = false;
+            gs.parked       = false;
+            gs.hostTask     = e.task;
+            gs.hostSubj[0]  = e.stype;
+            gs.hostSubj[1]  = e.scontainer;
+            gs.hostSubj[2]  = e.scontainerSerial;
+            gs.hostSubj[3]  = e.sindex;
+            gs.hostSubj[4]  = e.sserial;
+            g_npcs[it->first] = gs;
+        } else {
+            ++tracked;
+            GhostState& gs = f->second;
+            Ogre::Vector3 step = target - gs.tgtPos;
+            const float MOVE_EPS = 0.15f;
+            if (step.squaredLength() > MOVE_EPS * MOVE_EPS) {
+                gs.vel          = step;
+                gs.lastMoveTick = now;
+            }
+            gs.prevTgtPos   = gs.tgtPos;
+            gs.tgtPos       = target;
+            gs.tgtHeading   = e.heading;
+            gs.lastSeenTick = now;
+            // If the host changed this NPC's task or its subject, mark it for
+            // re-issue so the local copy follows (e.g. it got up and sat elsewhere).
+            if (gs.hostTask != e.task || gs.hostSubj[3] != e.sindex ||
+                gs.hostSubj[4] != e.sserial) {
+                gs.taskTick   = 0;     // force re-apply on the next rest frame
+                gs.taskActive = false;
+                gs.taskBad    = false; // give the new task a fresh chance
+            }
+            gs.hostTask     = e.task;
+            gs.hostSubj[0]  = e.stype;
+            gs.hostSubj[1]  = e.scontainer;
+            gs.hostSubj[2]  = e.scontainerSerial;
+            gs.hostSubj[3]  = e.sindex;
+            gs.hostSubj[4]  = e.sserial;
+        }
+    }
+
+    (void)newlySuppressed;
+    static DWORD lastLog = 0;
+    if (now - lastLog >= 1000) {
+        lastLog = now;
+        char buf[160];
+        _snprintf(buf, sizeof(buf) - 1,
+            "KenshiCoop: npc rx recv=%u resolved=%d tracked=%d unresolved=%d active=%u",
+            (unsigned int)latest.size(), resolvedOk, tracked, resolveFail,
+            (unsigned int)g_npcs.size());
+        buf[sizeof(buf) - 1] = '\0';
+        coopLog(buf);
+    }
+}
+
+// Kinematic puppet drive for replicated NPCs. Unlike player ghosts (which we
+// path via setDestination so they animate), NPCs are eased toward the networked
+// target with a per-frame teleport: no engine pathfinding, so they never snag on
+// furniture, and the halt()+teleport each frame overrides any residual local-AI
+// drift. Large gaps snap hard; small gaps ease for a smooth slide. Returns false
+// only on a guarded fault.
+bool driveNpcKinematic(GhostState& gs) {
+    Ogre::Vector3 actual;
+    if (!guardedGetPos(gs.chr, &actual)) return true; // transient; keep it
+
+    const float SNAP_DIST = 8.0f;            // beyond this, jump straight there
+    const float SNAP_SQ   = SNAP_DIST * SNAP_DIST;
+    const float EASE      = 0.35f;           // fraction of remaining gap per frame
+
+    Ogre::Vector3 delta = gs.tgtPos - actual;
+    Ogre::Vector3 place = (delta.squaredLength() > SNAP_SQ)
+                              ? gs.tgtPos
+                              : actual + delta * EASE;
+    Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading), Ogre::Vector3::UNIT_Y);
+    return guardedPark(gs.chr, &place, &rot); // halt + teleport to 'place'
+}
+
+// Per frame (client): drive every replicated NPC toward its target. On timeout
+// (host stopped streaming it) hand the body back to local AI - never destroy it.
+void updateNpcs(GameWorld* gw) {
+    if (g_npcs.empty()) return;
+    const DWORD TIMEOUT_MS = 3000;
+    DWORD now = GetTickCount();
+
+    static DWORD lastDiag = 0;
+    bool diag = (now - lastDiag >= 1000);
+    if (diag) lastDiag = now;
+    int diagIdx = 0;
+
+    std::map<HandKey, GhostState>::iterator it = g_npcs.begin();
+    while (it != g_npcs.end()) {
+        GhostState& gs = it->second;
+        if (!gs.primed || !gs.chr) { ++it; continue; }
+
+        // Per-NPC diagnostic: pointer validity + whether live pos tracks target.
+        if (diag) {
+            Ogre::Vector3 a;
+            bool ok = guardedGetPos(gs.chr, &a);
+            char buf[200];
+            if (ok) {
+                float d = (gs.tgtPos - a).length();
+                bool moving = (now - gs.lastMoveTick) < 500;
+                _snprintf(buf, sizeof(buf) - 1,
+                    "KenshiCoop: npc[%d] chr=%p getpos=1 actual(%.1f,%.1f,%.1f) "
+                    "tgt(%.1f,%.1f,%.1f) gap=%.1f regime=%s task=%d(%s) act=%d",
+                    diagIdx, (void*)gs.chr, a.x, a.y, a.z,
+                    gs.tgtPos.x, gs.tgtPos.y, gs.tgtPos.z,
+                    d, moving ? "MOVE" : "PARK",
+                    (int)gs.hostTask, taskName((int)gs.hostTask),
+                    gs.taskActive ? 1 : 0);
+            } else {
+                _snprintf(buf, sizeof(buf) - 1,
+                    "KenshiCoop: npc[%d] chr=%p getpos=0 (FAULT - bad pointer)",
+                    diagIdx, (void*)gs.chr);
+            }
+            buf[sizeof(buf) - 1] = '\0';
+            coopLog(buf);
+        }
+        ++diagIdx;
+
+        if ((now - gs.lastSeenTick) > TIMEOUT_MS) {
+            // No update-list surgery to undo: the NPC stayed ticked the whole
+            // time, so simply stop driving it and let local AI take back over.
+            coopLog("KenshiCoop: npc released (timeout)");
+            std::map<HandKey, GhostState>::iterator dead = it++;
+            g_npcs.erase(dead);
+            continue;
+        }
+
+        // Position is host-authoritative (local AI diverges by 30-100m if left
+        // alone), so we always own the body:
+        //   MOVING (host target moved recently): slide kinematically with the host.
+        //   AT REST (host target still): suppress the local AI (so it does not try
+        //     to walk -- which, while we pin the body, looks like marching in
+        //     place) and hold the NPC at the host transform with a small deadzone.
+        //     This gives a calm standing idle at the correct position. (Matching
+        //     the host's exact sit/idle pose would require streaming the host's
+        //     animation state; tracked as a follow-up.)
+        const DWORD STOP_MS = 500;
+        const float HOLD_SQ = 0.3f * 0.3f;
+        bool moving = (now - gs.lastMoveTick) < STOP_MS;
+        bool ok = true;
+
+        if (moving) {
+            gs.parked = false;
+            gs.taskTick = 0;          // re-issue the task next time it rests
+            gs.taskActive = false;
+            gs.taskBad = false;
+            guardedClearGoals(gs.chr);
+            ok = driveNpcKinematic(gs);
+        } else {
+            gs.parked = true;
+            // Reproduce the HOST's task at the HOST's fixture so the local copy
+            // adopts the same pose AND position. Issue ONCE on entering rest (the
+            // engine keeps the task running); a host task change re-arms it via
+            // receiveNpcStates. DRIFT GUARD: some tasks (e.g. OPERATE_MACHINERY)
+            // let the local AI re-pick a *different* nearby object, sending the NPC
+            // tens of metres off. If a reproduced task wanders the NPC past
+            // DRIFT_MAX from the host position (after a grace period to allow a
+            // legitimate short walk), abandon it and hold the host position instead
+            // (correct place, generic idle pose). Tasks whose subject doesn't
+            // resolve here fall straight through to hold.
+            const DWORD GRACE_MS    = 4000;
+            const float DRIFT_MAX_SQ = 4.0f * 4.0f;
+            bool haveTask = (gs.hostTask != coop::NPC_TASK_NONE) && !gs.taskBad;
+            if (haveTask && gs.taskTick == 0) {
+                int r = guardedSetTask(gs.chr, (int)gs.hostTask, gs.hostSubj);
+                gs.taskTick   = now;
+                gs.taskActive = (r >= 2); // a real fixture target resolved
+            }
+            if (gs.taskActive && (now - gs.taskTick) > GRACE_MS) {
+                Ogre::Vector3 a;
+                if (guardedGetPos(gs.chr, &a) &&
+                    (gs.tgtPos - a).squaredLength() > DRIFT_MAX_SQ) {
+                    gs.taskActive = false;
+                    gs.taskBad    = true; // stop re-issuing this divergent task
+                }
+            }
+            if (!gs.taskActive) {
+                // No reproducible task (or it was abandoned): suppress AI and hold
+                // at the host position.
+                guardedClearGoals(gs.chr);
+                Ogre::Vector3 a;
+                if (guardedGetPos(gs.chr, &a) &&
+                    (gs.tgtPos - a).squaredLength() > HOLD_SQ) {
+                    Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading),
+                                         Ogre::Vector3::UNIT_Y);
+                    guardedMovePuppet(gs.chr, &gs.tgtPos, &rot);
+                }
+            }
+        }
+
+        if (!ok) {
+            coopLog("KenshiCoop: npc released (drive fault)");
+            std::map<HandKey, GhostState>::iterator dead = it++;
+            g_npcs.erase(dead);
+            continue;
+        }
+        ++it;
+    }
+}
+
+// ---- Auto-load a save ------------------------------------------------------
+// Resolve SaveManager's singleton accessor and the load(name) overload. Both
+// are non-virtual, so GetRealAddress works (it does not on virtuals). load() is
+// overloaded, so we disambiguate with an explicit member-pointer cast.
+void resolveSaveFns() {
+    g_saveMgrGetFn = (SaveMgrGetFn)KenshiLib::GetRealAddress(&SaveManager::getSingleton);
+    g_saveMgrLoadFn = (SaveMgrLoadNameFn)KenshiLib::GetRealAddress(
+        static_cast<void (SaveManager::*)(const std::string&)>(&SaveManager::load));
+    // Readiness gate: only used to confirm the save subsystem is up before we
+    // issue the (deferred) load. Non-fatal if it can't be resolved.
+    g_saveMgrSavesExistFn = (SaveMgrSavesExistFn)KenshiLib::GetRealAddress(
+        &SaveManager::savesExist);
+    if (!g_saveMgrGetFn || !g_saveMgrLoadFn)
+        coopErr("KenshiCoop: could not resolve SaveManager load functions");
+}
+
+// SEH-guarded: fetch the SaveManager singleton and ask it to load 'name'.
+// Returns false if the singleton isn't ready yet (caller retries next frame) or
+// a guarded call faulted. No C++-unwinding objects live in this frame ('name'
+// is a reference param), so __try is legal here.
+//
+// load(name) is DEFERRED: it sets the manager's LOADGAME signal and returns
+// immediately; the engine's own SaveManager::execute() performs the actual
+// world load a few frames later (verified empirically - load() returned ~2.7s
+// before the world finished loading). So this is safe to call from the title
+// update; the only requirement is that the menu/save subsystem has settled
+// first (see titleUpdate_hook), otherwise the deferred load crashes mid-load.
+bool guardedLoadSave(const std::string& name) {
+    if (!g_saveMgrGetFn || !g_saveMgrLoadFn) return false;
+    __try {
+        SaveManager* mgr = g_saveMgrGetFn();
+        if (!mgr) return false;
+        g_saveMgrLoadFn(mgr, &name);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// SEH-guarded readiness probe: does the save subsystem report existing saves
+// yet? Used only to confirm it is up before issuing the load. Returns true when
+// unresolved so it never blocks auto-load on a machine where the symbol is
+// missing (the time-based settle is the primary gate).
+bool guardedSavesExist() {
+    if (!g_saveMgrGetFn || !g_saveMgrSavesExistFn) return true;
+    __try {
+        SaveManager* mgr = g_saveMgrGetFn();
+        if (!mgr) return false;
+        return g_saveMgrSavesExistFn(mgr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Title-screen update hook: a safe main-thread point that fires every frame the
+// main menu is up. We must NOT trigger the load the instant the menu appears -
+// the deferred world load crashes if issued before the menu/save subsystem has
+// settled (issuing it ~64ms after "Main menu loaded" reliably crashed). So we
+// wait g_autoLoadDelayMs of wall-clock time after the first title frame AND
+// until savesExist() reports the subsystem is up, then issue the load once.
+// Installed only when KENSHICOOP_SAVE is set.
+void titleUpdate_hook(TitleScreen* self) {
+    g_titleUpdate_orig(self); // let the menu update first
+
+    if (g_autoLoadDone || g_saveName.empty()) return;
+
+    DWORD now = GetTickCount();
+    if (g_titleFirstTick == 0) { g_titleFirstTick = now; return; } // start the clock
+    if ((now - g_titleFirstTick) < g_autoLoadDelayMs) return;      // let it settle
+
+    if (!g_saveMgrGetFn || !g_saveMgrLoadFn) {
+        g_autoLoadDone = true; // nothing to retry; don't spam
+        coopErr("KenshiCoop: auto-load skipped (SaveManager unresolved)");
+        return;
+    }
+
+    if (!guardedSavesExist()) return; // save subsystem not ready yet; retry next frame
+
+    if (guardedLoadSave(g_saveName)) {
+        g_autoLoadDone = true;
+        char m[128];
+        _snprintf(m, sizeof(m) - 1,
+                  "KenshiCoop: auto-load issued for save '%s' (after %lu ms settle)",
+                  g_saveName.c_str(), (unsigned long)(now - g_titleFirstTick));
+        m[sizeof(m) - 1] = '\0';
+        coopLog(m);
+    }
+    // else: singleton not ready yet - try again next frame.
+}
+
+// Our main-thread tick hook. The single safe point where we touch game state.
+void mainLoop_hook(GameWorld* gw, float dt) {
+    ++g_tick;
+
+    // Test-runner self-exit: once gameplay is live (player squad exists), arm a
+    // timer and quit cleanly after the configured duration. This makes
+    // unattended Cursor runs terminate on their own and flush their logs.
+    // Disabled entirely when KENSHICOOP_TEST_SECONDS is 0 (normal co-op play).
+    if (g_testSeconds > 0) {
+        if (!g_gameStarted && gw && gw->player &&
+            gw->player->playerCharacters.size() > 0) {
+            g_gameStarted   = true;
+            g_gameStartTick = GetTickCount();
+            coopLog("KenshiCoop: gameplay started; self-exit timer armed");
+        }
+        if (g_gameStarted &&
+            (GetTickCount() - g_gameStartTick) >= (DWORD)g_testSeconds * 1000u) {
+            coopLog("KenshiCoop: test duration elapsed; exiting");
+            coop::logClose();
+            ExitProcess(0);
+        }
+    }
+
+    publishLocalState(gw);   // Milestone 2 + send (Milestone 5)
+    processInbound(gw);      // Milestone 4/5: receive + set ghost targets
+    updateGhosts(gw, dt);    // Phase 1: drive ghosts + despawn timed-out ones
+
+    // Phase 2: host streams nearby NPC transforms (~20 Hz); client applies them.
+    if (g_isHostMode) {
+        static DWORD lastGather = 0;
+        DWORD now = GetTickCount();
+        if (now - lastGather >= 50) { lastGather = now; publishNpcStates(gw); }
+    } else {
+        receiveNpcStates(gw);
+        updateNpcs(gw);
+    }
+
+    g_mainLoop_orig(gw, dt); // always call through
+}
+
+void startNetworking() {
+    std::string mode = envOr("KENSHICOOP_MODE", "host");
+    std::string ip   = envOr("KENSHICOOP_IP",   "127.0.0.1");
+    int port         = std::atoi(envOr("KENSHICOOP_PORT", "27800").c_str());
+
+    bool ok;
+    if (mode == "join") {
+        g_isHostMode = false;
+        coopLog("KenshiCoop: starting as CLIENT");
+        ok = g_net.startClient(ip, port, &g_inbound);
+    } else {
+        g_isHostMode = true;
+        coopLog("KenshiCoop: starting as HOST");
+        ok = g_net.startHost(port, &g_inbound);
+    }
+    if (!ok) coopErr("KenshiCoop: failed to start networking");
+}
+
+} // namespace
+
+// RE_Kenshi calls this once when the plugin loads. RE_Kenshi resolves the entry
+// point by its C++-mangled name (?startPlugin@@YAXXZ), exactly as the HelloWorld
+// example does - so this must NOT be extern "C" (that would export plain
+// "startPlugin" and RE_Kenshi would fail with "Could not initialize plugin").
+__declspec(dllexport) void startPlugin() {
+    // Read config early so logging and auto-load are set up before any hook
+    // fires. Mode also picks the default log filename so host/join (which run
+    // from different working dirs) never write to the same file.
+    std::string mode = envOr("KENSHICOOP_MODE", "host");
+    g_saveName       = envOr("KENSHICOOP_SAVE", "");
+    g_testSeconds    = std::atoi(envOr("KENSHICOOP_TEST_SECONDS", "0").c_str());
+    {
+        int d = std::atoi(envOr("KENSHICOOP_AUTOLOAD_DELAY_MS", "5000").c_str());
+        if (d > 0) g_autoLoadDelayMs = (DWORD)d; // settle before auto-load
+    }
+
+    bool isJoin = (mode == "join");
+    std::string defLog  = isJoin ? "KenshiCoop_join.log" : "KenshiCoop_host.log";
+    std::string logPath = envOr("KENSHICOOP_LOG", defLog.c_str());
+    coop::logInit(logPath.c_str(), isJoin ? "JOIN" : "HOST");
+
+    coopLog("KenshiCoop loaded!"); // Milestone 1
+
+    // Milestone 2/4/5: hook the main-thread tick. Verified in GameWorld.h: the
+    // class exposes both virtual mainLoop_GPUSensitiveStuff and a non-virtual
+    // _NV_mainLoop_GPUSensitiveStuff (same RVA 0x7877A0). We must use the _NV_
+    // variant because GetRealAddress does not work on virtual functions.
+    if (KenshiLib::SUCCESS !=
+        KenshiLib::AddHook(
+            KenshiLib::GetRealAddress(&GameWorld::_NV_mainLoop_GPUSensitiveStuff),
+            &mainLoop_hook, &g_mainLoop_orig)) {
+        coopErr("KenshiCoop: could not install main-loop hook!");
+        return;
+    }
+
+    resolveGhostFns(); // Phase 1: map spawn/teleport to real runtime addresses
+    resolveSaveFns();  // SaveManager::getSingleton/load for auto-load
+
+    // Auto-load: only hook the title screen when a save name was provided. The
+    // hook triggers the load once the menu is up (see titleUpdate_hook).
+    if (!g_saveName.empty()) {
+        if (KenshiLib::SUCCESS !=
+            KenshiLib::AddHook(
+                KenshiLib::GetRealAddress(&TitleScreen::_NV_update),
+                &titleUpdate_hook, &g_titleUpdate_orig)) {
+            coopErr("KenshiCoop: could not install title-screen hook (auto-load disabled)");
+        } else {
+            std::string m = "KenshiCoop: auto-load armed for save '" + g_saveName + "'";
+            coopLog(m.c_str());
+        }
+    }
+    if (g_testSeconds > 0) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1,
+                  "KenshiCoop: test mode - self-exit %d s after gameplay starts",
+                  g_testSeconds);
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+    }
+
+    startNetworking();
+}

@@ -1,0 +1,43 @@
+# Build output
+build/
+bin/
+out/
+
+# Vendored dependency source (fetched via clone/submodule, not committed)
+third_party/enet/enet/
+
+# KenshiLib + Boost deps (cloned via git-LFS from KenshiLib_Examples_deps; ~500MB extracted)
+third_party/KenshiLib_deps/
+
+# Downloaded toolchain installers (large Microsoft binaries, not committed)
+tools/
+
+# Visual Studio / MSBuild
+.vs/
+x64/
+Debug/
+Release/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Compiled / intermediate artifacts
+*.obj
+*.o
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+nul
