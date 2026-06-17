@@ -16,10 +16,13 @@
   `PKT_PLAYER_STATE`. Squad (plural), interpolation buffer, own-squad prediction,
   and player pose/animation were not delivered.
 - **Phase 2 - NPC Presence: DONE (the NPC half).** Interest-managed (~200u, up to
-  128 NPCs), transform + task/pose streamed at 20 Hz; the client drives NPCs
-  kinematically when moving and reproduces the host's task (sit/operate at the
-  same fixture) at rest, with a drift guard. Roughly 7/9 NPCs land at 0.0-0.2m
-  with correct poses. The charter's "combat" half of Phase 2 is untouched.
+  128 NPCs), transform + task/pose + **locomotion state** streamed at 20 Hz; the
+  client drives NPCs kinematically when moving and reproduces the host's task
+  (sit/operate at the same fixture) at rest, with a drift guard. Roughly 7/9 NPCs
+  land at 0.0-0.2m with correct poses. Resting NPCs now animate a correct,
+  advancing idle - "walk-in-place" and the "frozen/floating" artifact were fixed
+  by **movement-state mirroring (Protocol v4)**, see the addendum below. The
+  charter's "combat" half of Phase 2 is untouched.
 
 ## Phase 1 retrospective (player presence)
 
@@ -83,8 +86,47 @@ machinery we later built for NPCs - not a separate spawn-ghost path.
   and falls back to position-hold. Bounds worst-case divergence without
   hand-tuning per task.
 - **Automated host+join test harness.** Build -> deploy -> launch both clients ->
-  screenshot -> parse logs, driven by `KENSHICOOP_SAVE/_TEST_SECONDS/_LOG`. Made
-  empirical, screenshot-and-metrics iteration fast.
+  screenshot (incl. 5-frame bursts for animation) -> parse logs, driven by
+  `KENSHICOOP_SAVE/_TEST_SECONDS/_LOG`. Made empirical, screenshot-and-metrics
+  iteration fast.
+- **Compiled scenario harness** (`Scenario.h/.cpp`, `ScenarioApi.h`). Deterministic,
+  time-gated state machines that run in `mainLoop_hook` on BOTH clients once
+  gameplay is live, selected by `KENSHICOOP_SCENARIO`. A scenario calls only the
+  `ScenarioApi` facade (spawn/teleport/move/read), so all game mutation stays
+  SEH-guarded on the main thread. The host emits `SCENARIO MEMBER hand= pos=`, the
+  observer emits `SCENARIO RECV` (from `receiveNpcStates`), and `run_test.ps1`
+  matches them by `hand` within a tolerance (`CROSSCHECK`). This turns "is squad X
+  replicated?" into an automated RED/GREEN test instead of a visual judgement.
+
+### Animation fidelity: from task-coaxing to movement-state mirroring (v4)
+
+Once positions were tight, resting NPCs still "walked in place" (a walk clip that
+never translates), and an aggressive fix left them frozen/floating. Two dead-ends
+and the fix:
+
+- **Dead-end A - coax the local AI into idle.** Clearing goals + issuing
+  `STAND_STILL` + ejecting the town package, once per rest, plateaued at ~72-92%
+  idle. The local AI kept re-deciding inside the engine's own update and re-issued
+  a step every tick, so a body we pinned in place marched. Coaxing intent could
+  not reliably win against the AI that re-runs every frame.
+- **Dead-end B - `runSlaveAnim` clip replication.** Hypothesis: map `TaskType` ->
+  animation clip and force the clip directly, ignoring local AI. A discovery hook
+  on `Character::runSlaveAnim` logged **zero** calls across both clients over 45 s
+  with 9 sitting/standing/operating NPCs. Idle/sit/stand/operate are **not** slave
+  animations - `runSlaveAnim` is for scripted one-shots. And `AnimationClass` is
+  opaque (forward-declared everywhere, no definition), so reading the host's exact
+  clip+phase was not viable either.
+- **The fix - mirror the movement state (Protocol v4).** `CharMovement.h` shows the
+  engine's `AnimationClass` selects walk/idle/run from `currentlyMoving` /
+  `currentSpeed` / `currentMotion`. The host now streams those three; the client
+  writes them onto the local copy's `CharMovement` as the LAST thing each frame
+  (after `g_mainLoop_orig`), so they are what the renderer samples - the local AI
+  recomputes them next tick, but our end-of-frame write wins for the displayed
+  frame. Crucially we stopped calling `halt()` every frame: `halt()` resets the
+  clip to frame 0 (that was the "frozen" artifact) and teleport-after-physics
+  caused the "floating". Now we settle once with a clean stop, then only no-halt
+  teleport on >1 m drift, so the idle clip advances. Result: every resting NPC
+  reads `mv=0/spd=0` (walk-in-place eliminated) at tight positions, no freeze/float.
 
 ### What it cost
 
@@ -97,15 +139,20 @@ transform problem" earlier would have saved several iterations.
 
 ### Open gaps
 
-- **Seated NPCs ignore teleport.** When a host-static seated machine-operator's
-  client copy seats itself at a *different* fixture, the drift-guard fallback
-  can't pull it back because the engine ignores teleport while seated (the 2
-  remaining outliers).
+- **`OPERATE_MACHINERY` operators that don't resolve a fixture stand idle.** When
+  the streamed subject `hand` (the specific machine) doesn't resolve to a local
+  `RootObject`, the operator falls back to `STAND_STILL` - so it stands where it
+  should be hunched/operating. With the v4 movement mirror these are now at the
+  right place (`gap <= ~1 m`); it is a *pose* fallback, not the old 18 m drift.
+  Roughly 2 of 4 operators hit this in the test save.
 - **No combat / KO / death / lying / ragdoll** replication.
 - **No NPC spawn/despawn lifecycle.** Host-only NPCs simply fail to resolve
   (counted as `resolveFail`); nothing is spawned or destroyed.
-- **No exact animation-frame streaming.** We reproduce the task and trust the
-  local engine to animate; we do not stream the host's precise animation state.
+- **No precise animation-phase streaming.** We mirror the host's *locomotion
+  state* (speed/motion/moving) so the engine picks the same walk/idle/run clip,
+  but we do not sync the exact clip nor its phase - `AnimationClass` is opaque, so
+  e.g. two idlers may be at different points in the same idle loop. Good enough for
+  locomotion; insufficient for scripted one-shots (eating, gestures).
 
 ## Doctrine (reusable design rules)
 
@@ -117,5 +164,108 @@ transform problem" earlier would have saved several iterations.
 3. **There is no determinism, so always keep an authority drift-guard / snap.**
    Local AI will diverge; detect it and correct or abandon.
 4. **The test harness is a force multiplier.** Keep investing in it - especially
-   automated gap metrics and multi-scenario coverage - because visual + numeric
-   feedback is what made the pose work tractable.
+   automated gap metrics, burst-frame capture, and the compiled scenario harness
+   (RED/GREEN `CROSSCHECK`) - because visual + numeric feedback is what made the
+   pose work tractable.
+5. **Locomotion animation is a function of movement state, not a paintable clip.**
+   The engine's `AnimationClass` selects walk/idle/run from
+   `currentlyMoving/currentSpeed/currentMotion`. To make a driven copy animate
+   like its source, mirror those scalars (as the last write of the frame) and let
+   the engine's own selector animate; never `halt()` per frame (it resets the clip
+   phase). Reserve clip-level control for scripted one-shots, which is a separate,
+   harder problem (`runSlaveAnim` + opaque `AnimationClass`).
+6. **Validate replication with a deterministic in-game scenario, not just eyes.**
+   A scripted host action + a cross-client `hand`->position match within tolerance
+   makes "is this entity class replicated?" a repeatable pass/fail.
+
+## Addendum: Co-op Drive Refoundation (shared-save inhabit + ownership partition)
+
+Written after re-baselining squad sync on the master plan's shared-save model and
+validating on the `sync` bar save (burst screenshots + `npc[...]` diag logs).
+
+### What we confirmed
+
+- **Shared save is mandatory for v1.** NPC (and squad) identity is resolve-by-
+  `hand`; identical hands only exist when both clients load the *same* save. The
+  earlier "distinct-save" experiment (each client its own save) mints different
+  hands and is therefore a dead-end - it is now flagged unsupported in
+  `manual_session.ps1`. On the shared save, NPC sync lands at `gap 0-1 m` with
+  matching poses across clients (validated visually + in logs).
+- **The "frozen leader" bug was an authority gap, not a sync regression.** On a
+  shared save both clients load the *same* squad, so each was claiming every
+  member and the receive-side own-guard skipped them -> neither drove the other's
+  leader. The fix is an **ownership partition**: each player OWNS a disjoint
+  subset of the shared squad (locally controls + streams it) and DRIVES the
+  peer's subset from their stream via the existing resolve-and-drive path. With
+  the partition, host streams its member and drives the guest's, and vice-versa -
+  no frozen/missing leaders.
+- **Ownership identity: hand-derived rank, NOT `squadMemberID`.** We intended to
+  key ownership on `Character::squadMemberID` (resources §5.4), but the engine
+  reports `squadMemberID == 0` for *every* member of the player squad (verified in
+  the inhabit logs: `[memberID: 0,0]`), so it cannot disambiguate members. The
+  working key is a **stable hand-derived rank**: sort the squad's members by their
+  save-stable `hand` and use the ordinal (0 = leader). Both clients load the
+  identical shared squad, so the ranks match cross-client and survive list
+  reordering. The `KENSHICOOP_OWN_INDICES` knob ("0" / "~0") now selects on rank.
+
+### What did NOT work: `removeFromUpdateListMain` as the drive foundation
+
+The refoundation hypothesis was to suppress a driven entity by pulling it out of
+the engine's main AI update list (`GameWorld::removeFromUpdateListMain`, resources
+§5.1) instead of fighting the AI every frame. **Empirically it freezes the body.**
+With suppression on, a moving NPC's `actual` position stayed *byte-identical*
+while its target moved 480 m away (`sup=1`, `gap=479`): the body still *renders*,
+but `_setPositionDirectionAndTeleport` no longer flushes to the live transform
+because the controller's per-tick step is gone. **The teleport/kinematic drive
+REQUIRES the body to remain in the update list** so the controller applies the
+write. We therefore keep the proven per-frame approach (quiet the AI via
+`clearGoals`/`neutralize`, mirror locomotion v4, teleport while ticked) as the
+live path, behind `KENSHICOOP_SUPPRESS_AI` (default `0`); the suppression branch
+is retained off by default for a future experiment that pairs it with
+`CharMovement::manualMovement` (velocity drive) instead of teleport.
+
+### Movement animation: walk the body, don't teleport-slide it
+
+A second pass (after user feedback that driven NPCs *floated* during movement)
+found the moving-NPC drive still teleported the body to the host position every
+frame (`driveNpcKinematic` -> `_setPositionDirectionAndTeleport`) and only
+*mirrored* the locomotion scalars. Because `updateNpcs` runs AFTER `g_mainLoop_orig`,
+the engine had already computed this frame's animation from the AI's (idle)
+locomotion state before our mirror write landed - so a teleported body that never
+actually walks renders a static/idle pose sliding across the floor (the "float"),
+and the mirror is always one tick too late to fix it.
+
+Fix (`KENSHICOOP_WALK_DRIVE`, default on): for a MOVING body, issue
+`setDestination(hostPos)` at a gap-proportional catch-up speed (`setDesiredSpeed`)
+instead of teleporting. The engine then genuinely WALKS the body on its next tick -
+grounded, real walk cycle, `currentlyMoving/currentSpeed` set by the engine itself
+(verified: `mv=1 spd≈15` with NO mirror) - so the clip is correct without any
+mirror hack. A large gap (>8 m, e.g. the body fell behind a fast runner) still
+hard-snaps via teleport. Cost: position is looser while moving (~0-6 m chase lag
+vs ~0-2 m for teleport) because it walks rather than warps; the catch-up speed
+bounds it and the snap covers the worst case. Resting bodies are unchanged (pose
+via task + settle once + no-halt). The old teleport-kinematic mover remains behind
+`KENSHICOOP_WALK_DRIVE=0` for tight-position-over-animation needs.
+
+### Doctrine added
+
+7. **Drive replicated bodies while they stay ON the engine update list.** A direct
+   position write (`_setPositionDirectionAndTeleport`) only reaches the renderer
+   because the movement controller's per-tick step flushes it. Removing the body
+   from the update list to "cleanly" suppress AI also removes that step, freezing
+   the body (it still renders, so a single screenshot hides it - the log's
+   per-entity `gap` over time is what exposes it). Quiet the AI in-place instead.
+7b. **For MOVING bodies, drive locomotion (`setDestination`), don't teleport.**
+   Teleporting a body the engine isn't actually walking slides a static pose
+   ("float"), and mirroring locomotion scalars can't fix it because our post-tick
+   write lands after the frame's animation was computed. Let the engine walk the
+   body so it animates itself; reserve teleport for at-rest settle and large-gap
+   snaps. Validate movement animation across BURST frames (leg/pose change between
+   frames) + engine-real `mv/spd`, not a single still (which can't show a slide).
+8. **Co-op v1 is shared-save + ownership partition.** Both clients load the same
+   save; each owns a disjoint, hand-ranked subset of the shared squad, streams its
+   own, and drives the peer's. Distinct saves break resolve-by-`hand`.
+9. **Never validate an undeployed build.** `manual_session.ps1 -SkipBuild` used to
+   skip *deploy* too, so tests ran the old DLL. Build and deploy are now separate
+   (`-SkipDeploy` is explicit) and the plugin logs `inhabit ownership = ...;
+   suppressAI=N` at load, which the runner watches for before trusting a result.

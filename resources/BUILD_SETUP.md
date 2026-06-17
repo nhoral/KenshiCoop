@@ -160,6 +160,9 @@ no recompile is needed to switch roles:
   (default `KenshiCoop_host.log` / `KenshiCoop_join.log` in the working dir). This
   log is machine-readable (timestamp + `[HOST]`/`[JOIN]` tag per line) and is
   written in addition to RE_Kenshi's `kenshi.log`.
+- `KENSHICOOP_SCENARIO` = name of a compiled scenario to run after the save loads
+  (default empty = normal co-op tick). A scenario scripts a deterministic in-game
+  setup + actions and self-exits when complete. See **Part E**.
 
 Because two Kenshi instances on one machine is impractical (single-instance and
 save locking), use two machines (or one machine + a VM) on the same LAN.
@@ -274,4 +277,115 @@ powershell -ExecutionPolicy Bypass -File scripts/screenshot.ps1 -ProcessId 12345
 
 Note: run the game in windowed/borderless (not exclusive-fullscreen) mode so
 capture is reliable.
+
+---
+
+## Part E - Scenario functional tests
+
+A **scenario** is a named, compiled state machine (selected by
+`KENSHICOOP_SCENARIO`) that runs in the main-loop hook *after* the auto-loaded
+save reaches live gameplay. It sets up a deterministic in-game state (spawn NPCs,
+configure the squad), performs actions (move/teleport), and logs the observed
+state in a fixed schema. Both clients run the same scenario object: the **host**
+drives the authoritative actions, the **join** observes replicated state, and
+`run_test.ps1` compares the two logs numerically for the verdict. The scenario
+self-exits when it completes (so a scenario run is short; `KENSHICOOP_TEST_SECONDS`
+remains as a hard backstop).
+
+### Running a scenario
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/dev_cycle.ps1 -Save "c" -Scenario squad_spawn_sync -Sync
+```
+
+or just the test:
+
+```bash
+powershell -ExecutionPolicy Bypass -File scripts/run_test.ps1 -Save "c" -Scenario squad_spawn_sync -Sync
+```
+
+When `-Scenario` is set, the runner:
+- sets `KENSHICOOP_SCENARIO` for both clients,
+- anchors the screenshot to the first `SCENARIO MEMBER` line in either log (the
+  authoritative side has started logging positions), so `host.png`/`join.png`
+  reflect the post-action state regardless of load/launch stagger; it falls back
+  to a fixed `-ScenarioShotDelaySec` (default 5) if no `MEMBER` line appears,
+- treats `SCENARIO RESULT` (not the self-exit timer) as the clean-exit marker, and
+- adds scenario checks to the verdict (below). `-Tolerance` (default `3.0` world
+  units) controls the cross-client position match.
+
+### Verdict (scenario mode)
+
+`RESULT: PASS` requires **all** of:
+- each client reached gameplay, exited cleanly (logged `SCENARIO RESULT`), and
+  logged no `ERROR:` lines (the normal per-client check),
+- no `CHECK <key> FAIL` lines in either log,
+- both launched clients logged `SCENARIO RESULT PASS`, and
+- the cross-client check passes: every authoritative `SCENARIO MEMBER` (keyed by
+  `hand`) has a matching observer `SCENARIO RECV` within `-Tolerance` units
+  (`CROSSCHECK [<dir>] squad_positions_match PASS`).
+
+The runner auto-detects the direction: whichever side logs `SCENARIO MEMBER` is
+the authoritative actor and is compared against the OTHER side's `SCENARIO RECV`.
+So `squad_spawn_sync` (host acts) checks `host->join`, while `squad_move_sync`
+(join acts) checks `join->host`; a scenario that drives both sides is checked
+both ways.
+
+### Log schema (parsed by the runner)
+
+```
+SCENARIO <name> start
+SCENARIO STEP <n> <desc>
+CHECK <key> <PASS|FAIL> expected=<e> actual=<a>
+SCENARIO MEMBER hand=<index,serial,type,container,containerSerial> pos=<x,y,z>   (authoritative side)
+SCENARIO RECV   hand=<index,serial,type,container,containerSerial> pos=<x,y,z>   (observing side)
+SCENARIO RESULT <PASS|FAIL>
+```
+
+### Scenarios
+
+- **`squad_spawn_sync`** - the host spawns 3 NPCs into the player squad, teleports
+  them to fixed offsets around the player, and logs each member's `hand` +
+  position; the join logs `SCENARIO RECV` for any squad members it receives.
+
+  This is intentionally a **RED test** today: `publishNpcStates` skips the player's
+  own squad members, so the join receives no `RECV` lines and the cross-client
+  check fails. It is the TDD target for the upcoming synchronized-squad-visuals
+  work - once squad members stream to the join, this scenario turns green.
+
+- **`squad_move_sync`** - join-authoritative. BOTH clients spawn 2 units into
+  their own squad (each ends up controlling a squad of 3); the JOIN then moves its
+  squad slightly away (+10 u on X) and logs its 3 members' authoritative positions
+  (`SCENARIO MEMBER`). The HOST is expected to observe them (`SCENARIO RECV`), and
+  the runner checks `join->host`. To stay deterministic across the staggered
+  launch, each client gates its steps on a local clock that starts when the peer
+  is first seen (`remotePlayerCount() > 0`), not on time-since-gameplay.
+
+  ```bash
+  powershell -ExecutionPolicy Bypass -File scripts/dev_cycle.ps1 -Save "c" -Scenario squad_move_sync -Seconds 90 -Sync
+  ```
+
+  Use a generous `-Seconds` backstop (e.g. 90): the host only arms after the join
+  is in-game, which can be well after the host's own gameplay starts.
+
+  This is also a **RED test**: the join's non-leader squad units are not streamed
+  to the host (only the leader is, via `PKT_PLAYER_STATE`), so the host logs no
+  `RECV` for them and `CROSSCHECK [join->host]` fails. `host.png` will show only
+  the join's leader ghost move, not the 2 extra units - the gap this drives. It
+  turns green once join->host squad streaming lands.
+
+### How to add a scenario
+
+1. In `src/plugin/Scenario.cpp`, subclass `coop::Scenario`:
+   - `name()` returns the id that matches `KENSHICOOP_SCENARIO`,
+   - `onStart(ctx)` runs once on the first in-game frame,
+   - `onTick(ctx)` runs each frame; return `true` when done (gate steps on
+     `ctx.elapsedMs` for determinism), and branch on `ctx.isHost`,
+   - `passed()` returns the in-plugin verdict.
+2. Register it in `makeScenario()` (same file): `if (name == "my_scenario") return new MyScenario();`.
+3. Touch the game **only** through the `coop::` action facade in
+   `src/plugin/ScenarioApi.h` (spawn/teleport/move/positions/squad size) - never
+   the engine directly, so all mutation stays SEH-guarded on the main thread.
+4. Emit `CHECK` / `SCENARIO MEMBER` lines so the runner can assert. Rebuild with
+   `dev_cycle.ps1` (it rebuilds automatically) and run with `-Scenario my_scenario`.
 

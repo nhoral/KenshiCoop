@@ -27,8 +27,20 @@ if not exist "%KENSHI%\kenshi_x64.exe" (
 
 if not exist "%DST%" mkdir "%DST%"
 
-copy /Y "%DLL%"  "%DST%\KenshiCoop.dll"   >nul && echo Copied KenshiCoop.dll
-copy /Y "%JSON%" "%DST%\RE_Kenshi.json"   >nul && echo Copied RE_Kenshi.json
+copy /Y "%DLL%"  "%DST%\KenshiCoop.dll"   >nul
+if errorlevel 1 (
+    echo ERROR: could not copy KenshiCoop.dll to "%DST%".
+    echo        The file is locked - a Kenshi instance is probably still running.
+    echo        Close all Kenshi processes and retry.
+    exit /b 1
+)
+echo Copied KenshiCoop.dll
+copy /Y "%JSON%" "%DST%\RE_Kenshi.json"   >nul
+if errorlevel 1 (
+    echo ERROR: could not copy RE_Kenshi.json to "%DST%" ^(locked?^).
+    exit /b 1
+)
+echo Copied RE_Kenshi.json
 
 REM A .mod file is required for Kenshi to list the mod so it can be enabled.
 REM It is a binary FCS file and cannot be generated here. If missing, copy any
@@ -55,7 +67,13 @@ set "JOINDIR=%USERPROFILE%\Kenshi-Join"
 if not "%KENSHI%"=="%JOINDIR%" if exist "%JOINDIR%\kenshi_x64.exe" (
     set "JDST=%JOINDIR%\mods\KenshiCoop"
     if not exist "!JDST!" mkdir "!JDST!"
-    copy /Y "%DLL%"  "!JDST!\KenshiCoop.dll" >nul && echo Copied KenshiCoop.dll  -^> join install
+    copy /Y "%DLL%"  "!JDST!\KenshiCoop.dll" >nul
+    if errorlevel 1 (
+        echo ERROR: could not copy KenshiCoop.dll to join install "!JDST!".
+        echo        The file is locked - a Kenshi-Join instance is probably still running.
+        exit /b 1
+    )
+    echo Copied KenshiCoop.dll  -^> join install
     copy /Y "%JSON%" "!JDST!\RE_Kenshi.json" >nul && echo Copied RE_Kenshi.json  -^> join install
     if not exist "!JDST!\KenshiCoop.mod" if exist "%DST%\KenshiCoop.mod" (
         copy /Y "%DST%\KenshiCoop.mod" "!JDST!\KenshiCoop.mod" >nul

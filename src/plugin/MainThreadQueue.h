@@ -17,6 +17,14 @@
 
 namespace coop {
 
+// A received squad member plus the network id of the peer that owns it. Kept in
+// its own queue (separate from NPCs) so the receiver can apply squad authority
+// rules and tag remote-owned hands by owner.
+struct OwnedNpcState {
+    u32           ownerId;
+    NpcStateEntry e;
+};
+
 class MainThreadQueue {
 public:
     MainThreadQueue()  { InitializeCriticalSection(&cs_); }
@@ -52,10 +60,26 @@ public:
         LeaveCriticalSection(&cs_);
     }
 
+    // NET thread: enqueue one received squad member (owner-tagged). Phase 2.5.
+    void pushSquad(u32 ownerId, const NpcStateEntry& e) {
+        OwnedNpcState o; o.ownerId = ownerId; o.e = e;
+        EnterCriticalSection(&cs_);
+        squad_.push_back(o);
+        LeaveCriticalSection(&cs_);
+    }
+
+    // MAIN thread: drain all pending squad members.
+    void drainSquad(std::deque<OwnedNpcState>& out) {
+        EnterCriticalSection(&cs_);
+        out.swap(squad_);
+        LeaveCriticalSection(&cs_);
+    }
+
 private:
     CRITICAL_SECTION cs_;
     std::deque<PlayerStatePacket> q_;
     std::deque<NpcStateEntry>     npc_;
+    std::deque<OwnedNpcState>     squad_;
 
     MainThreadQueue(const MainThreadQueue&);
     MainThreadQueue& operator=(const MainThreadQueue&);

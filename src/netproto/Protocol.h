@@ -28,7 +28,11 @@ typedef float              f32;
 // vector, currentlyMoving). The engine's AnimationClass selects walk/idle/run from
 // these, so mirroring them onto the client makes the locomotion animation match the
 // host (fixes "walk-in-place" on held NPCs) without guessing clip names.
-const u16 PROTOCOL_VERSION = 4;
+// v5: adds PKT_SQUAD_STATE - a bidirectional, owner-tagged batch of a peer's OWN
+// player-squad members (reuses NpcStateEntry). Unlike the host-only NPC stream,
+// BOTH peers stream their own squad; the receiver tags those hands by ownerId so
+// it can apply the right authority rule (and, later, exclude them from NPC pick).
+const u16 PROTOCOL_VERSION = 5;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -38,7 +42,8 @@ enum PacketType {
     PKT_PING         = 4, // liveness / RTT probe
     PKT_PONG         = 5,
     PKT_PLAYER_LEFT  = 6, // net thread -> game thread: a player disconnected
-    PKT_NPC_STATE    = 7  // host -> client: a batch of nearby NPC transforms
+    PKT_NPC_STATE    = 7, // host -> client: a batch of nearby NPC transforms
+    PKT_SQUAD_STATE  = 8  // either direction: a batch of the sender's OWN squad
 };
 
 // Sentinel playerId meaning "all remote players" (used on local disconnect, when
@@ -118,6 +123,17 @@ const unsigned int NPC_BATCH_MAX = 18; // 18*75 + 2 = 1352 bytes
 struct NpcBatchHeader {
     u8 type;  // = PKT_NPC_STATE
     u8 count; // number of NpcStateEntry that follow
+};
+
+// A squad batch packet is:
+//   [SquadBatchHeader][NpcStateEntry * count]
+// ownerId identifies the streaming peer (its network player id). The receiver
+// tags every contained hand as owned by that peer. Same per-datagram cap as the
+// NPC batch (a player squad is small, so one batch is plenty).
+struct SquadBatchHeader {
+    u8  type;    // = PKT_SQUAD_STATE
+    u32 ownerId; // network player id of the squad's owner
+    u8  count;   // number of NpcStateEntry that follow
 };
 
 #pragma pack(pop)

@@ -115,10 +115,14 @@ Explicitly deferred / out of scope for v1:
     adaptive drift guard. ~7/9 NPCs land at 0.0-0.2m with correct poses.
   - Combat: server-authoritative combat resolution and hit/KO/death replication
     is not yet started.
-- **Phase 2.5 - Unify player + NPC replication: NEXT (chosen priority).** Stream
-  each player's *full* squad through the proven NPC pipeline (identity by `hand`,
-  transform-when-moving, task-when-resting) and retire the spawn-ghost path for
-  remote players. Detailed design below.
+- **Phase 2.5 - Unify player + NPC replication: WORKING on the shared-save inhabit
+  path.** Each player's *full* squad streams through the proven NPC pipeline
+  (identity by `hand`, transform-when-moving, task-when-resting); the spawn-ghost
+  path for remote players is retired. Authority is an ownership partition: each
+  player owns a disjoint, hand-ranked subset of the *shared* squad, streams its
+  own, and drives the peer's. Validated on the `sync` save (no frozen leaders,
+  NPCs at `gap 0-1 m`). Distinct saves are unsupported (break resolve-by-`hand`).
+  Detailed design + resolved questions below; see `POSTMORTEM.md` addendum.
 - **Phase 3 - NPC fidelity:** fix the seated-teleport edge case (force-unseat
   before reposition) and optionally stream a compact pose/anim state for cases the
   task system cannot reproduce.
@@ -182,6 +186,27 @@ Open questions to resolve at implementation time:
 - Whether to keep a lightweight `PlayerStatePacket` self-heartbeat (presence,
   join/leave) alongside the squad batch.
 - Interpolation needs once tested over real latency rather than localhost.
+
+Resolved during the Co-op Drive Refoundation (see `POSTMORTEM.md` addendum):
+
+- **Shared save is mandatory.** Resolve-by-`hand` only works when both clients
+  load the identical save; distinct saves are a dead-end (flagged unsupported in
+  `manual_session.ps1`).
+- **Authority model = ownership partition (the "inhabit" model).** Both clients
+  load the same save, but each player OWNS a disjoint subset of the shared squad:
+  it locally controls + streams its owned members and DRIVES the peer's owned
+  members from their stream. This fixed the "frozen leader" gap (previously each
+  client claimed the whole squad and the own-guard skipped the peer's members).
+- **Ownership identity = stable hand-derived rank**, NOT `Character::squadMemberID`
+  (the engine reports `0` for every player-squad member, so it can't disambiguate).
+  Members are sorted by save-stable `hand`; the ordinal (0 = leader) is identical
+  cross-client and survives list reordering. `KENSHICOOP_OWN_INDICES` selects on
+  this rank as a test override; production ownership should derive from a stable
+  identity assigned at join.
+- **Suppress AI in-place, do NOT remove from the update list.** `removeFromUpdateListMain`
+  freezes the movement controller (the body renders but stops moving). Driven
+  bodies must stay on the update list so the controller flushes our teleport;
+  quiet the AI via `clearGoals`/`neutralize` + the v4 locomotion mirror instead.
 
 ## Success criteria
 

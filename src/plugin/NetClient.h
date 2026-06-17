@@ -45,6 +45,11 @@ public:
     // copies under a lock.
     void setNpcStates(const NpcStateEntry* arr, unsigned int count);
 
+    // MAIN-thread API (both peers): publish this client's OWN squad members for
+    // the net thread to transmit (host broadcasts; client sends to host) tagged
+    // with ownerId. Bidirectional, unlike setNpcStates. Thread-safe.
+    void setSquadStates(u32 ownerId, const NpcStateEntry* arr, unsigned int count);
+
     bool isRunning() const { return running_ != 0; }
     u32  localId()   const { return myId_; }
 
@@ -71,6 +76,12 @@ private:
     // host-only outbound NPC batch (main thread writes, net thread reads)
     CRITICAL_SECTION           npcCs_;
     std::vector<NpcStateEntry> npcOut_;
+
+    // outbound OWN-squad batch, sent by both peers (main writes, net reads)
+    CRITICAL_SECTION           squadCs_;
+    std::vector<NpcStateEntry> squadOut_;
+    u32                        squadOwnerId_;
+    bool                       haveSquad_;
 
     HANDLE        thread_;
     volatile LONG running_;

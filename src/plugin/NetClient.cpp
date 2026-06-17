@@ -33,14 +33,17 @@ NetClient::NetClient()
     : isHost_(false), port_(0),
       enetHost_(0), serverPeer_(0),
       inbound_(0), haveLocal_(false),
+      squadOwnerId_(0), haveSquad_(false),
       thread_(0), running_(0), stopFlag_(0), myId_(0) {
     InitializeCriticalSection(&localCs_);
     InitializeCriticalSection(&npcCs_);
+    InitializeCriticalSection(&squadCs_);
     std::memset(&localState_, 0, sizeof(localState_));
 }
 
 NetClient::~NetClient() {
     stop();
+    DeleteCriticalSection(&squadCs_);
     DeleteCriticalSection(&npcCs_);
     DeleteCriticalSection(&localCs_);
 }
@@ -98,6 +101,15 @@ void NetClient::setNpcStates(const NpcStateEntry* arr, unsigned int count) {
     EnterCriticalSection(&npcCs_);
     npcOut_.assign(arr, arr + count);
     LeaveCriticalSection(&npcCs_);
+}
+
+void NetClient::setSquadStates(u32 ownerId, const NpcStateEntry* arr, unsigned int count) {
+    EnterCriticalSection(&squadCs_);
+    squadOwnerId_ = ownerId;
+    if (count > 0 && arr) squadOut_.assign(arr, arr + count);
+    else                  squadOut_.clear();
+    haveSquad_ = true;
+    LeaveCriticalSection(&squadCs_);
 }
 
 DWORD WINAPI NetClient::threadEntry(LPVOID self) {
@@ -199,6 +211,24 @@ void NetClient::threadLoop() {
                                 }
                             }
                         }
+                    } else if (type == PKT_SQUAD_STATE) {
+                        // [SquadBatchHeader][NpcStateEntry * count]
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(SquadBatchHeader) && inbound_) {
+                            SquadBatchHeader h;
+                            std::memcpy(&h, ev.packet->data, sizeof(h));
+                            unsigned need =
+                                sizeof(SquadBatchHeader) + (unsigned)h.count * sizeof(NpcStateEntry);
+                            if (len >= need) {
+                                const enet_uint8* p =
+                                    ev.packet->data + sizeof(SquadBatchHeader);
+                                for (unsigned i = 0; i < h.count; ++i) {
+                                    NpcStateEntry e;
+                                    std::memcpy(&e, p + i * sizeof(NpcStateEntry), sizeof(e));
+                                    inbound_->pushSquad(h.ownerId, e);
+                                }
+                            }
+                        }
                     }
                     enet_packet_destroy(ev.packet);
                     break;
@@ -270,6 +300,47 @@ void NetClient::threadLoop() {
                 std::memcpy(out->data + sizeof(h), &npcs[off],
                             count * sizeof(NpcStateEntry));
                 enet_host_broadcast(enetHost_, CH_UNRELIABLE, out);
+            }
+        }
+
+        // Both peers: transmit our OWN squad (owner-tagged), chunked per
+        // datagram. Host broadcasts to all; client sends to the host. The host
+        // relays nothing here - in a >2-player topology the host would need to
+        // re-broadcast clients' squads, but that's out of scope for now.
+        {
+            std::vector<NpcStateEntry> squad;
+            u32  owner = 0;
+            bool haveS = false;
+            EnterCriticalSection(&squadCs_);
+            squad = squadOut_;
+            owner = squadOwnerId_;
+            haveS = haveSquad_;
+            LeaveCriticalSection(&squadCs_);
+
+            if (haveS && !squad.empty()) {
+                for (size_t off = 0; off < squad.size(); off += NPC_BATCH_MAX) {
+                    unsigned count = (unsigned)(squad.size() - off);
+                    if (count > NPC_BATCH_MAX) count = NPC_BATCH_MAX;
+
+                    unsigned bytes =
+                        sizeof(SquadBatchHeader) + count * sizeof(NpcStateEntry);
+                    ENetPacket* out = enet_packet_create(0, bytes, 0 /*unreliable*/);
+                    SquadBatchHeader h;
+                    h.type    = PKT_SQUAD_STATE;
+                    h.ownerId = owner;
+                    h.count   = (u8)count;
+                    std::memcpy(out->data, &h, sizeof(h));
+                    std::memcpy(out->data + sizeof(h), &squad[off],
+                                count * sizeof(NpcStateEntry));
+                    if (isHost_) {
+                        enet_host_broadcast(enetHost_, CH_UNRELIABLE, out);
+                    } else if (serverPeer_ &&
+                               serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                        enet_peer_send(serverPeer_, CH_UNRELIABLE, out);
+                    } else {
+                        enet_packet_destroy(out);
+                    }
+                }
             }
         }
     }

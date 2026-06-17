@@ -61,9 +61,18 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="KenshiCoop.cpp" />
-    <ClCompile Include="NetClient.cpp" />
+    <!-- Clean rebuild entry + modules. The legacy monolith (KenshiCoop.cpp,
+         NetClient.cpp, Scenario.cpp) stays on disk as a read-only reference until
+         the rebuild reaches squad parity (Stage 4), but is NOT compiled - only
+         one startPlugin export may exist. -->
+    <ClCompile Include="Plugin.cpp" />
     <ClCompile Include="CoopLog.cpp" />
+    <ClCompile Include="core\Config.cpp" />
+    <ClCompile Include="net\NetLink.cpp" />
+    <ClCompile Include="game\Engine.cpp" />
+    <ClCompile Include="sync\Interp.cpp" />
+    <ClCompile Include="sync\Replicator.cpp" />
+    <ClCompile Include="test\Scenario.cpp" />
     <!-- ENet (Windows source set). unix.c is intentionally excluded. -->
     <ClCompile Include="..\..\third_party\enet\enet\callbacks.c" />
     <ClCompile Include="..\..\third_party\enet\enet\compress.c" />
@@ -75,10 +84,15 @@
     <ClCompile Include="..\..\third_party\enet\enet\win32.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="NetClient.h" />
-    <ClInclude Include="MainThreadQueue.h" />
     <ClInclude Include="CoopLog.h" />
-    <ClInclude Include="..\netproto\Protocol.h" />
+    <ClInclude Include="core\Config.h" />
+    <ClInclude Include="core\Inbound.h" />
+    <ClInclude Include="net\NetLink.h" />
+    <ClInclude Include="game\Engine.h" />
+    <ClInclude Include="sync\Interp.h" />
+    <ClInclude Include="sync\Replicator.h" />
+    <ClInclude Include="test\Scenario.h" />
+    <ClInclude Include="..\netproto\Wire.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

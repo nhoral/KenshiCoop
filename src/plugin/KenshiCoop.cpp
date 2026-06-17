@@ -54,6 +54,8 @@
 #include "MainThreadQueue.h"
 #include "NetClient.h"
 #include "CoopLog.h"
+#include "Scenario.h"
+#include "ScenarioApi.h"
 
 namespace {
 
@@ -88,12 +90,76 @@ void coopErr(const char* msg) { coop::logErrLine(msg); ErrorLog(msg); }
 std::string g_saveName;        // KENSHICOOP_SAVE: save to auto-load (empty = manual menu)
 int         g_testSeconds = 0; // KENSHICOOP_TEST_SECONDS: self-exit after N s of gameplay (0 = off)
 
+// KENSHICOOP_AUTOSPAWN: manual-validation helper (host only, no scenario). After
+// gameplay is live, spawn N distinct-hand units into the host's squad ONCE, then
+// stop. You drive them around and the join renders/follows them via the squad
+// pipeline - exercising the cross-client squad-render path with no save juggling.
+int         g_autoSpawnCount = 0;
+bool        g_autoSpawnDone  = false;
+const DWORD AUTOSPAWN_DELAY_MS = 4000; // let the world + peer settle before spawning
+
+// Ownership partition for the "inhabit" co-op model: both clients load the SAME
+// save (so NPC resolve-by-hand still works), but each OWNS a different subset of
+// the shared squad. A client locally controls + streams the members it owns, and
+// DRIVES the peer's owned members from their stream (the M3 resolve-and-drive
+// path) instead of skipping them. Membership is keyed by the engine's STABLE
+// Character::squadMemberID (save data, identical cross-client, survives squad
+// reordering / recruits) - see weOwnSquadMember. Configured via the test-override
+// knob KENSHICOOP_OWN_INDICES (values are squadMemberIDs, not list positions):
+//   ""    -> own ALL members (default; legacy single-squad / distinct-save behavior)
+//   "0"   -> own only the leader (squadMemberID 0)
+//   "~0"  -> own ALL members EXCEPT the leader (e.g. join inhabits the rest)
+//   "1,3" -> own squadMemberIDs 1 and 3
+bool                   g_ownAll     = true;
+bool                   g_ownExcept  = false;  // the index list is an EXCLUSION set
+std::set<unsigned int> g_ownIndices;
+
+// Drive authority (Refoundation P1): when true, a driven entity is pulled out of
+// the engine's main AI update list ONCE on acquire (removeFromUpdateListMain) and
+// then driven purely by streamed transforms + the v4 motion mirror, restored to
+// local AI on release/timeout.
+//
+// EMPIRICAL RESULT (P1 validation on the `sync` save, 2026-06): suppression is
+// DEFAULT OFF because removeFromUpdateListMain freezes the movement controller:
+// the body still RENDERS, but _setPositionDirectionAndTeleport no longer flushes
+// to the live transform (a moving NPC's `actual` position stayed byte-identical
+// while its target moved 480m away, sup=1). The teleport-based drive REQUIRES the
+// body to remain in the update list so the controller's per-tick step applies the
+// write. We therefore keep the proven per-frame approach (quiet the AI via
+// clearGoals/neutralize, mirror motion v4, teleport while ticked) as the live
+// path, and retain the suppression branch behind KENSHICOOP_SUPPRESS_AI=1 only
+// for future experiments (e.g. paired with manualMovement instead of teleport).
+bool                   g_suppressAI = false;
+
+// Moving-NPC drive style (fix for "floating"/teleport-slide during movement):
+// when true, a moving driven body is WALKED to the host position via the engine's
+// own locomotion (setDestination at the host's speed) so it plays a real, grounded
+// walk cycle instead of being teleported every frame (which slides a static pose -
+// the "float"). A large gap still hard-snaps (teleport) to catch up. Set 0 to fall
+// back to the pure teleport-kinematic mover (tight position, but slides). Resting
+// NPCs are unaffected (they pose via task + settle once). KENSHICOOP_WALK_DRIVE.
+bool                   g_walkDrive  = true;
+
 bool  g_autoLoadDone    = false; // load() already issued from the title screen?
 DWORD g_titleFirstTick  = 0;     // when the title screen first updated (GetTickCount)
 DWORD g_autoLoadDelayMs = 5000;  // settle this long before auto-loading
                                  // (override via KENSHICOOP_AUTOLOAD_DELAY_MS)
 bool  g_gameStarted     = false; // first in-game tick observed (arms self-exit timer)
 DWORD g_gameStartTick   = 0;     // when gameplay began (GetTickCount)
+
+// ---- Scenario harness (KENSHICOOP_SCENARIO) --------------------------------
+std::string      g_scenarioName;          // selected scenario (empty = none)
+coop::Scenario*  g_scenario       = 0;    // live scenario object (host & join)
+bool             g_scenarioStarted = false; // onStart() already called?
+DWORD            g_scenarioStartTick = 0;  // when the scenario armed (GetTickCount)
+unsigned         g_scenarioTick    = 0;    // onTick() counter
+DWORD            g_scenarioDoneTick = 0;   // when onTick first returned true (0 = not done)
+// After a scenario completes we HOLD the final synced frame on screen instead of
+// self-exiting instantly: the observer client used to vanish in the ~1s between
+// the host's first SCENARIO MEMBER (the runner's capture anchor) and the actual
+// screenshot, so join.png came back blank. Holding keeps both bodies rendered
+// and the windows alive long enough for a clean burst capture, then we exit.
+const DWORD      SCENARIO_HOLD_MS  = 5000;
 
 // TitleScreen::_NV_update hook trampoline (filled by KenshiLib::AddHook).
 void (*g_titleUpdate_orig)(TitleScreen*) = 0;
@@ -167,6 +233,12 @@ typedef int (__fastcall* TaskerKeyFn)(const void* self);
 typedef RootObject* (__fastcall* HandGetRootFn)(const hand* self);
 typedef bool        (__fastcall* SetActionFn)(void* charBody, int taskType,
                                               RootObject* target);
+// Scenario facade: recruit a Character into the player squad (overloaded, so we
+// resolve the (Character*, bool) variant), and look up a GameData template by
+// its string id (e.g. a character race) from the world's GameDataManager.
+typedef bool      (__fastcall* RecruitFn)(PlayerInterface* self, Character* c, bool editor);
+typedef GameData* (__fastcall* GetDataFn)(GameDataManager* self, const std::string* sid,
+                                          itemType category);
 
 SpawnFn            g_spawnFn        = 0;
 ClearGoalsFn       g_clearGoalsFn   = 0;
@@ -180,10 +252,13 @@ HandCtor5Fn        g_handCtorFn     = 0;
 TaskerKeyFn        g_taskerKeyFn    = 0;
 HandGetRootFn      g_handGetRootFn  = 0;
 SetActionFn        g_setActionFn    = 0;
+RecruitFn          g_recruitFn      = 0;
+GetDataFn          g_getDataFn      = 0;
 bool               g_ghostResolved  = false;
 bool               g_ghostDisabled  = false;
 bool               g_isHostMode     = true; // set in startNetworking
 int                g_spawnFailures  = 0;
+DWORD              g_lastSpawnExCode = 0;   // SEH code of the last guardedSpawn fault (0 = none)
 
 // Reused across interest queries so the engine grows the buffer once instead of
 // allocating every tick (lektor has no destructor of its own).
@@ -218,6 +293,7 @@ struct GhostState {
     bool          taskBad;      // reproduced task wandered the NPC off; hold instead
     bool          idleSet;      // STAND_STILL idle task already issued at rest
     bool          aiNeutralized;// town AI package stripped (clear goals + own squad)
+    bool          suppressed;   // P1: removed from the engine AI update list (drive-authority)
     // Locomotion-animation mirror (Protocol v4): the host's CharMovement state.
     // The engine's AnimationClass picks walk/idle/run from these, so writing them
     // onto the client copy each frame makes its locomotion clip match the host
@@ -225,17 +301,28 @@ struct GhostState {
     bool          hostMoving;   // host CharMovement.currentlyMoving
     float         hostSpeed;    // host CharMovement.currentSpeed
     Ogre::Vector3 hostMotion;   // host CharMovement.currentMotion (world-space)
+    // Phase 2.5 (M4): true if WE spawned this body as a local stand-in for a
+    // peer-owned squad member that has no Character in our save. A proxy must be
+    // DESTROYED (not handed back to local AI) when its owner stops streaming.
+    bool          isProxy;
     GhostState() : chr(0), tgtHeading(0.0f), lastMoveTick(0), lastSeenTick(0),
                    primed(false), destIssued(false), parked(false),
                    hostTask(coop::NPC_TASK_NONE), taskTick(0), taskActive(false),
                    taskBad(false), idleSet(false), aiNeutralized(false),
+                   suppressed(false),
                    hostMoving(false), hostSpeed(0.0f),
-                   hostMotion(Ogre::Vector3::ZERO) {
+                   hostMotion(Ogre::Vector3::ZERO), isProxy(false) {
         hostSubj[0] = hostSubj[1] = hostSubj[2] = hostSubj[3] = hostSubj[4] = 0;
     }
 };
 
-std::map<coop::u32, GhostState> g_ghosts; // remote playerId -> ghost state
+// M5: presence-only. A remote player no longer gets a spawned "ghost" body - the
+// player's controlled character is squad member 0 and is rendered by the squad
+// pipeline (M3/M4) like any other unit, so a separate ghost would double-render
+// them. This map is now a lightweight PRESENCE record per remote player (latest
+// position + last-seen tick), feeding remotePlayerCount() (scenario arming) and
+// publishNpcStates() NPC interest centers. GhostState is reused; chr stays null.
+std::map<coop::u32, GhostState> g_ghosts; // remote playerId -> presence record
 
 // ---- Phase 2: replicated NPCs ---------------------------------------------
 // The host streams nearby NPC transforms keyed by their save-stable `hand`.
@@ -265,6 +352,50 @@ HandKey makeKey(const coop::NpcStateEntry& e) {
 }
 
 std::map<HandKey, GhostState> g_npcs; // hand -> driven NPC state (client side)
+
+// Phase 2.5 (M2) authority de-confliction: hands we have received in a peer's
+// PKT_SQUAD_STATE (i.e. owned/simulated by another player), mapped to the last
+// tick we saw them. The host excludes these from its NPC interest pick so it
+// never re-streams a peer's squad members back as host NPCs (which would make
+// that peer fight itself over its own units). Entries auto-expire so a peer that
+// leaves stops suppressing those hands.
+std::map<HandKey, DWORD> g_remoteOwnedHands;
+const DWORD REMOTE_OWN_TTL_MS = 3000;
+
+bool isRemoteOwnedHand(const HandKey& k, DWORD now) {
+    std::map<HandKey, DWORD>::iterator it = g_remoteOwnedHands.find(k);
+    if (it == g_remoteOwnedHands.end()) return false;
+    if (now - it->second > REMOTE_OWN_TTL_MS) return false; // stale -> not owned
+    return true;
+}
+
+// Phase 2.5 (M4) proxy lifecycle: a peer-owned squad member with no Character in
+// our save (e.g. one the peer spawned at runtime) can't be resolved by hand, so
+// we spawn a local stand-in ("proxy") to render it. Count consecutive unresolved
+// sightings before spawning, so a hand that's merely loading doesn't get a proxy.
+std::map<HandKey, int> g_proxyMiss;
+const int   PROXY_SPAWN_AFTER_MISSES = 3;
+int         g_squadProxyFailures     = 0;
+bool        g_squadProxyDisabled     = false;
+
+// Local hands of bodies WE spawned to REPRESENT a remote entity (squad proxies
+// and remote-player ghosts). These must never be streamed back to the peer: a
+// proxy/ghost is our private rendering of the peer's unit, and if we broadcast it
+// the peer would proxy it in turn, each hop minting a new hand - an unbounded
+// feedback explosion. Excluded from BOTH publishSquadState and publishNpcStates.
+std::set<HandKey> g_syntheticHands;
+
+// Convert a guardedGetHand() {index,serial,type,container,containerSerial} tuple
+// into the HandKey used by the driven-entity maps.
+HandKey makeKeyFromHand(const coop::u32 h[5]) {
+    HandKey k;
+    k.index           = h[0];
+    k.serial          = h[1];
+    k.type            = h[2];
+    k.container       = h[3];
+    k.containerSerial = h[4];
+    return k;
+}
 
 // Resolve the non-virtual game functions to their real runtime addresses once.
 // GetRealAddress maps KenshiLib's reconstructed symbol to the loaded exe.
@@ -311,9 +442,30 @@ void resolveGhostFns() {
         static_cast<bool (CharBody::*)(TaskType, RootObject*)>(
             &CharBody::_NV_setCurrentAction));
 
+    // Scenario facade. recruit() is overloaded; pick the (Character*, bool)
+    // variant. getData() is overloaded; pick the (string, itemType) variant.
+    // Both non-fatal: a scenario that needs them just fails its own CHECKs.
+    g_recruitFn = (RecruitFn)KenshiLib::GetRealAddress(
+        static_cast<bool (PlayerInterface::*)(Character*, bool)>(
+            &PlayerInterface::recruit));
+    g_getDataFn = (GetDataFn)KenshiLib::GetRealAddress(
+        static_cast<GameData* (GameDataManager::*)(const std::string&, itemType)>(
+            &GameDataManager::getData));
+
     if (!g_spawnFn) {
         g_ghostDisabled = true;
         coopErr("KenshiCoop: could not resolve ghost spawn function");
+    }
+
+    {
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+            "KenshiCoop: resolved fns spawn=%p recruit=%p clearGoals=%p "
+            "separate=%p getData=%p",
+            (void*)g_spawnFn, (void*)g_recruitFn, (void*)g_clearGoalsFn,
+            (void*)g_separateFn, (void*)g_getDataFn);
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
     }
 }
 
@@ -323,9 +475,10 @@ Character* guardedSpawn(RootObjectFactory* factory, Faction* faction,
                         const Ogre::Vector3* pos, RootObjectContainer* owner,
                         GameData* tmpl) {
     RootObject* r = 0;
+    g_lastSpawnExCode = 0;
     __try {
         r = g_spawnFn(factory, faction, *pos, owner, tmpl, 0, 20.0f);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (g_lastSpawnExCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
     return static_cast<Character*>(r);
@@ -411,6 +564,28 @@ bool guardedSetDestination(Character* ghost, const Ogre::Vector3* dest) {
     }
 }
 
+// Walk the body to an absolute destination at a SPECIFIC speed (matching the
+// host's currentSpeed) through the engine's own locomotion. Unlike guardedSetDestination
+// (which forces RUN), this paces the copy to the host so it neither overshoots
+// (then idles, stutter) nor lags. Routing through setDestination means the engine
+// grounds the body and plays a real walk cycle - the fix for the teleport-slide
+// "float". Re-issued each frame toward the host's current position; the engine
+// acts on it on the next tick. setDestination / setDesiredSpeed are virtual ->
+// plain calls. SEH-guarded.
+bool guardedWalkTo(Character* ghost, const Ogre::Vector3* dest, float speed) {
+    __try {
+        CharMovement* mv = ghost->movement;
+        if (!mv) return false;
+        float s = speed;
+        if (s < 1.0f) s = (float)RUN; // host speed unknown/tiny: default to RUN
+        mv->setDesiredSpeed(s);
+        mv->setDestination(*dest, HIGH_PRIORITY, false);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Snap the ghost to an exact transform and stop it (used at rest so the two
 // clients agree precisely). teleport + halt are virtual -> plain calls.
 bool guardedPark(Character* ghost, const Ogre::Vector3* pos,
@@ -472,6 +647,85 @@ void guardedDespawn(GameWorld* gw, Character* ghost) {
     __try {
         g_destroyFn(gw, ghost, false, "KenshiCoop ghost");
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// ---- Scenario facade guarded primitives ------------------------------------
+// SEH-isolated leaves used by the ScenarioApi facade. Kept here (with the other
+// guarded helpers and the resolved function pointers) so scenarios never touch
+// the engine directly. No C++-unwinding objects live in these frames.
+
+// Recruit a spawned character into the player squad. Best-effort.
+bool guardedRecruit(PlayerInterface* pl, Character* c) {
+    if (!pl || !c || !g_recruitFn) return false;
+    __try {
+        return g_recruitFn(pl, c, false);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Read a character's STABLE squad-member id (Character::squadMemberID, 0x418).
+// This is save data, so it is identical on both clients for the same character
+// and - unlike the positional index into playerCharacters - it does NOT shift
+// when the squad is reordered or a recruit is added. Used as the ownership-
+// partition key (see weOwnSquadMember). SEH-guarded.
+bool guardedSquadMemberId(Character* c, int* out) {
+    if (!c) return false;
+    __try {
+        *out = c->squadMemberID;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Read a character's save-stable hand into {index,serial,type,container,
+// containerSerial}. SEH-guarded.
+bool guardedGetHand(Character* c, coop::u32 out[5]) {
+    if (!c) return false;
+    __try {
+        const hand& h = c->handle;
+        out[0] = h.index;
+        out[1] = h.serial;
+        out[2] = (coop::u32)h.type;
+        out[3] = h.container;
+        out[4] = h.containerSerial;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Tag (add) or untag (remove) a body WE spawned - a squad proxy or a remote-
+// player ghost - by its LOCAL hand, so our streamers never re-broadcast it.
+// See g_syntheticHands. Best-effort: a hand we can't read just won't be tagged.
+void markSynthetic(Character* c, bool add) {
+    if (!c) return;
+    coop::u32 h[5];
+    if (!guardedGetHand(c, h)) return;
+    HandKey k = makeKeyFromHand(h);
+    if (add) g_syntheticHands.insert(k);
+    else     g_syntheticHands.erase(k);
+}
+
+// Look up a GameData template by string id from the world's GameDataManager.
+GameData* guardedLookupTemplate(GameWorld* gw, const std::string* sid) {
+    if (!gw || !g_getDataFn || !sid) return 0;
+    __try {
+        return g_getDataFn(&gw->gamedata, sid, CHARACTER);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Squad member count (reads the player's lektor under SEH). -1 on fault.
+int guardedSquadSize(GameWorld* gw) {
+    if (!gw || !gw->player) return -1;
+    __try {
+        return (int)gw->player->playerCharacters.size();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
     }
 }
 
@@ -697,179 +951,81 @@ void guardedQuiet(Character* ghost, const std::string& name) {
     }
 }
 
-// Spawn (if needed) and record the latest received transform as the ghost's
-// interpolation TARGET. Does NOT move the body - updateGhosts() eases toward
-// the target every frame. Main thread only.
+// M5: record a remote player's PKT_PLAYER_STATE as a lightweight PRESENCE
+// heartbeat - latest position + last-seen tick. We no longer spawn or drive a
+// "ghost" body: the player's controlled character arrives via PKT_SQUAD_STATE
+// (squad member 0) and is rendered by the squad pipeline (M3/M4), so a separate
+// ghost body would double-render them. Presence still backs remotePlayerCount()
+// (scenario arming) and publishNpcStates() interest centers. Main thread only.
 void receiveRemoteState(GameWorld* gw, const coop::PlayerStatePacket& p) {
-    if (g_ghostDisabled) return;
-    if (p.playerId == g_net.localId()) return; // never ghost ourselves
-
-    // We borrow the local player's own faction / data template / container so
-    // the spawn always uses valid, loaded game data (same as the player).
-    if (!gw || !gw->player || !gw->theFactory) return;
-    if (gw->player->playerCharacters.size() == 0) return;
-    Character* local = gw->player->playerCharacters[0];
-    if (!local) return;
+    (void)gw;
+    if (p.playerId == g_net.localId()) return; // never track ourselves
 
     Ogre::Vector3 target(p.x, p.y, p.z);
+    DWORD now = GetTickCount();
 
-    std::map<coop::u32, GhostState>::iterator it = g_ghosts.find(p.playerId);
-    if (it == g_ghosts.end()) {
-        Faction* faction = local->getFaction();            // virtual, safe
-        GameData* tmpl   = local->getGameData();            // virtual, safe
-        RootObjectContainer* owner = local->container;      // direct member
-
-        Character* ghost = guardedSpawn(gw->theFactory, faction, &target, owner, tmpl);
-        if (!ghost) {
-            if (++g_spawnFailures >= 5) {
-                g_ghostDisabled = true;
-                coopErr("KenshiCoop: ghost spawning failed; feature disabled");
-            }
-            return;
-        }
-
-        char namebuf[64];
-        _snprintf(namebuf, sizeof(namebuf) - 1, "Remote Player %u", p.playerId);
-        namebuf[sizeof(namebuf) - 1] = '\0';
-        std::string name(namebuf);
-        guardedQuiet(ghost, name);
-
-        GhostState gs;
-        gs.chr          = ghost;
-        gs.tgtPos       = target;
-        gs.prevTgtPos   = target;
-        gs.vel          = Ogre::Vector3::ZERO;
-        gs.tgtHeading   = p.heading;
-        gs.lastDest     = target;
-        gs.lastMoveTick = GetTickCount();
-        gs.lastSeenTick = GetTickCount();
-        gs.primed       = true;
-        gs.destIssued   = false;
-        gs.parked       = false;
-        g_ghosts[p.playerId] = gs;
-
+    GhostState& gs = g_ghosts[p.playerId]; // inserts a default record if new
+    if (!gs.primed) {
+        gs.chr      = 0;        // presence only - never a body
+        gs.tgtPos   = target;   // seed so the first delta below is zero
         char buf[128];
         _snprintf(buf, sizeof(buf) - 1,
-            "KenshiCoop: spawned ghost for player %u at (%.1f, %.1f, %.1f)",
+            "KenshiCoop: remote player %u present at (%.1f, %.1f, %.1f)",
             p.playerId, p.x, p.y, p.z);
         buf[sizeof(buf) - 1] = '\0';
         coopLog(buf);
-        return;
     }
 
-    // Existing ghost: update target + velocity, and note whether it moved.
-    GhostState& gs = it->second;
     Ogre::Vector3 step = target - gs.tgtPos;
     const float MOVE_EPS = 0.15f;
     if (step.squaredLength() > MOVE_EPS * MOVE_EPS) {
-        gs.vel          = step;            // per-packet displacement
-        gs.lastMoveTick = GetTickCount();
+        gs.vel          = step;
+        gs.lastMoveTick = now;
     }
     gs.prevTgtPos   = gs.tgtPos;
     gs.tgtPos       = target;
     gs.tgtHeading   = p.heading;
-    gs.lastSeenTick = GetTickCount();
+    gs.lastSeenTick = now;
+    gs.primed       = true;
 }
 
-// Despawn one ghost (or all, when id == PLAYER_ID_ALL) and drop it from the map.
+// M5: drop a remote player's PRESENCE record (or all, when id == PLAYER_ID_ALL).
+// No body to destroy anymore - the player's squad bodies time out and despawn on
+// their own through the squad pipeline (updateNpcs).
 void despawnGhost(GameWorld* gw, coop::u32 id) {
+    (void)gw;
     if (id == coop::PLAYER_ID_ALL) {
-        for (std::map<coop::u32, GhostState>::iterator it = g_ghosts.begin();
-             it != g_ghosts.end(); ++it) {
-            guardedDespawn(gw, it->second.chr);
-        }
-        if (!g_ghosts.empty()) coopLog("KenshiCoop: despawned all ghosts");
+        if (!g_ghosts.empty()) coopLog("KenshiCoop: cleared all remote presence");
         g_ghosts.clear();
         return;
     }
-    std::map<coop::u32, GhostState>::iterator it = g_ghosts.find(id);
-    if (it == g_ghosts.end()) return;
-    guardedDespawn(gw, it->second.chr);
-    g_ghosts.erase(it);
-    char buf[96];
-    _snprintf(buf, sizeof(buf) - 1, "KenshiCoop: despawned ghost for player %u", id);
-    buf[sizeof(buf) - 1] = '\0';
-    coopLog(buf);
-}
-
-// Drive ONE puppet (player ghost or replicated NPC) one frame toward its
-// networked target, using the dual-regime mover:
-//  - STOPPED (no recent target movement): teleport to the exact networked
-//    transform and halt, once, so both clients agree precisely at rest.
-//  - MOVING: drive engine locomotion toward an extrapolated point ahead of the
-//    last position (so it keeps up and animates), snapping only on a large gap.
-// Returns false only if a guarded game call faulted (caller should drop it).
-// Plain C++ (no __try here) - it only calls the SEH-guarded helpers.
-bool driveOnePuppet(GhostState& gs, DWORD now) {
-    const DWORD STOP_MS     = 200;          // no target move for this long = at rest
-    const float LEAD        = 1.5f;         // extrapolate this many packet-steps ahead
-    const float SNAP_DIST   = 25.0f;        // large gap -> hard snap
-    const float SNAP_SQ     = SNAP_DIST * SNAP_DIST;
-    const float REDEST_DIST = 1.0f;         // re-path only when dest moved this far
-    const float REDEST_SQ   = REDEST_DIST * REDEST_DIST;
-
-    Ogre::Vector3 actual;
-    if (!guardedGetPos(gs.chr, &actual)) return true; // transient; keep it
-
-    Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading), Ogre::Vector3::UNIT_Y);
-    bool moving = (now - gs.lastMoveTick) < STOP_MS;
-    bool ok = true;
-
-    const float PARK_FIX_SQ = 1.0f; // re-snap if a parked body drifts >1m
-
-    if (!moving) {
-        // Settle to the exact position, and re-correct if it drifts (e.g. local
-        // AI nudged it before goals were cleared, or a shove from another NPC).
-        if (!gs.parked || (gs.tgtPos - actual).squaredLength() > PARK_FIX_SQ) {
-            ok = guardedPark(gs.chr, &gs.tgtPos, &rot);
-            if (ok) { gs.parked = true; gs.destIssued = false; }
-        }
-    } else {
-        gs.parked = false;
-        if ((gs.tgtPos - actual).squaredLength() > SNAP_SQ) {
-            ok = guardedMovePuppet(gs.chr, &gs.tgtPos, &rot);
-            gs.destIssued = false;
-        } else {
-            // Aim a little ahead of the last position along travel direction.
-            Ogre::Vector3 dest = gs.tgtPos + gs.vel * LEAD;
-            if (!gs.destIssued ||
-                (dest - gs.lastDest).squaredLength() > REDEST_SQ) {
-                ok = guardedSetDestination(gs.chr, &dest);
-                if (ok) { gs.lastDest = dest; gs.destIssued = true; }
-            }
-        }
+    if (g_ghosts.erase(id) > 0) {
+        char buf[96];
+        _snprintf(buf, sizeof(buf) - 1, "KenshiCoop: remote player %u left", id);
+        buf[sizeof(buf) - 1] = '\0';
+        coopLog(buf);
     }
-    return ok;
 }
 
-// Per frame: drive every player ghost, and despawn ghosts whose owner has gone
-// silent (disconnect/crash/quit).
+// M5: presence is body-less, so there is nothing to drive each frame - we only
+// expire records for players we've stopped hearing from (disconnect/crash/quit),
+// which keeps remotePlayerCount() and the NPC interest centers honest. The
+// player's actual squad bodies time out and despawn through updateNpcs.
 void updateGhosts(GameWorld* gw, float dt) {
+    (void)gw; (void)dt;
     if (g_ghosts.empty()) return;
-    (void)dt;
 
-    const DWORD TIMEOUT_MS = 3000; // no packets for this long -> despawn
+    const DWORD TIMEOUT_MS = 3000; // no heartbeat for this long -> drop presence
     DWORD now = GetTickCount();
 
     std::map<coop::u32, GhostState>::iterator it = g_ghosts.begin();
     while (it != g_ghosts.end()) {
-        GhostState& gs = it->second;
-        if (!gs.primed || !gs.chr) { ++it; continue; }
-
-        if ((now - gs.lastSeenTick) > TIMEOUT_MS) {
-            guardedDespawn(gw, gs.chr);
+        if ((now - it->second.lastSeenTick) > TIMEOUT_MS) {
             char buf[96];
             _snprintf(buf, sizeof(buf) - 1,
-                "KenshiCoop: ghost %u timed out; despawned", it->first);
+                "KenshiCoop: remote player %u presence timed out", it->first);
             buf[sizeof(buf) - 1] = '\0';
             coopLog(buf);
-            std::map<coop::u32, GhostState>::iterator dead = it++;
-            g_ghosts.erase(dead);
-            continue;
-        }
-
-        if (!driveOnePuppet(gs, now)) {
-            coopErr("KenshiCoop: ghost drive failed; dropping ghost");
             std::map<coop::u32, GhostState>::iterator dead = it++;
             g_ghosts.erase(dead);
             continue;
@@ -878,8 +1034,8 @@ void updateGhosts(GameWorld* gw, float dt) {
     }
 }
 
-// Drain remote player states delivered by the net thread and apply them to
-// ghost characters. Runs on the MAIN thread (safe to call DebugLog here).
+// Drain remote player states delivered by the net thread and update each peer's
+// PRESENCE record (M5: no ghost body). Runs on the MAIN thread.
 void processInbound(GameWorld* gw) {
     std::deque<coop::PlayerStatePacket> items;
     g_inbound.drain(items);
@@ -988,6 +1144,7 @@ void publishNpcStates(GameWorld* gw) {
 
     const size_t MAX_NPCS = 128;
     std::map<HandKey, coop::NpcStateEntry> picked; // dedup across centers
+    DWORD nowPick = GetTickCount(); // for remote-owned-hand freshness checks
 
     // Pose-replication spike: log every picked NPC's current task once per second.
     bool logTasks = false;
@@ -1016,7 +1173,14 @@ void publishNpcStates(GameWorld* gw) {
 
             coop::NpcStateEntry e;
             if (guardedReadNpc(obj, &e) != 1) continue;
-            picked[makeKey(e)] = e;
+            // M2: never re-stream a peer's squad member as a host NPC. The peer
+            // owns and simulates it (and streams it via PKT_SQUAD_STATE); if we
+            // also streamed it as an NPC, the peer would receive contradictory
+            // host-authoritative transforms for its own unit and fight itself.
+            HandKey key = makeKey(e);
+            if (isRemoteOwnedHand(key, nowPick)) continue;
+            if (g_syntheticHands.count(key)) continue; // our own proxy/ghost body
+            picked[key] = e;
 
             if (logTasks) {
                 char tb[176];
@@ -1051,6 +1215,312 @@ void publishNpcStates(GameWorld* gw) {
     }
 }
 
+// ---- Phase 2.5 squad replication: publish our OWN squad (bidirectional) -----
+// Enumerate the ENTIRE local playerCharacters lektor and read each via the same
+// guardedReadNpc used for NPCs, then hand the batch to the net thread tagged with
+// our network id. Unlike publishNpcStates this runs on BOTH host and join, and it
+// deliberately does NOT skip player members - streaming them is the whole point.
+// The net layer chunks the batch per datagram, so no cap is needed here.
+// Stable, cross-client ordinal for a player-squad member: the number of (non-
+// synthetic) player characters whose save-stable hand sorts before this one's.
+// Both clients load the identical shared squad, so sorting by hand yields the
+// SAME ordinal on each machine, and (unlike the raw playerCharacters list index)
+// it does not depend on enumeration order. We would prefer Character::squadMemberID
+// as the identity, but the engine reports 0 for every member of the player squad
+// (verified empirically in the inhabit logs), so it cannot disambiguate members.
+// Returns -1 on fault so the caller can fall back to the positional index.
+int squadMemberRank(PlayerInterface* pl, Character* target) {
+    if (!pl || !target) return -1;
+    coop::u32 th[5];
+    if (!guardedGetHand(target, th)) return -1;
+    HandKey tk = makeKeyFromHand(th);
+    unsigned int n = pl->playerCharacters.size();
+    int rank = 0;
+    for (unsigned int i = 0; i < n; ++i) {
+        Character* c = pl->playerCharacters[i];
+        if (!c || c == target) continue;
+        coop::u32 h[5];
+        if (!guardedGetHand(c, h)) continue;
+        HandKey k = makeKeyFromHand(h);
+        if (g_syntheticHands.count(k)) continue; // ignore proxies / remote ghosts
+        if (k < tk) ++rank;
+    }
+    return rank;
+}
+
+// True if THIS client owns a given player-squad member under the configured
+// ownership partition (see g_ownAll / KENSHICOOP_OWN_INDICES). An owned member
+// is locally controlled + streamed; a non-owned member is driven from the peer's
+// stream (the inhabit model).
+//
+// Identity is the hand-derived stable rank above (principled ownership: stable
+// cross-client and under list reordering), NOT the raw positional index. The
+// KENSHICOOP_OWN_INDICES knob is interpreted against this rank (so "0" = the
+// leader, "~0" = everyone else), kept as a test override. Falls back to the
+// positional index if the rank can't be computed, so a transient fault never
+// makes BOTH clients disown the same member (which would refreeze it).
+bool weOwnSquadMember(PlayerInterface* pl, Character* c, unsigned int fallbackIndex) {
+    if (g_ownAll) return true;
+    int rank = squadMemberRank(pl, c);
+    unsigned int key = (rank >= 0) ? (unsigned int)rank : fallbackIndex;
+    bool listed = g_ownIndices.count(key) != 0;
+    return g_ownExcept ? !listed : listed;
+}
+
+void publishSquadState(GameWorld* gw) {
+    if (!gw || !gw->player) return;
+    PlayerInterface* pl = gw->player;
+    unsigned int n = pl->playerCharacters.size();
+    if (n == 0) { g_net.setSquadStates(g_net.localId(), 0, 0); return; }
+
+    static DWORD lastLog = 0;
+    DWORD now = GetTickCount();
+    bool  doLog = (now - lastLog >= 1000);
+    std::string ownedIds; // squadMemberIDs we streamed (diagnostic)
+
+    std::vector<coop::NpcStateEntry> out;
+    out.reserve(n);
+    for (unsigned int i = 0; i < n; ++i) {
+        Character* c = pl->playerCharacters[i];
+        if (!c) continue;
+        if (!weOwnSquadMember(pl, c, i)) continue; // peer owns this member; don't stream it
+        coop::NpcStateEntry e;
+        if (guardedReadNpc(static_cast<RootObject*>(c), &e) != 1) continue;
+        // Skip synthetic bodies (proxies / remote-player ghosts) that the engine
+        // enrolled in our playerCharacters: streaming them back would make the
+        // peer proxy our proxy, in an unbounded feedback loop.
+        if (g_syntheticHands.count(makeKey(e))) continue;
+        out.push_back(e);
+        if (doLog) {
+            int rank = squadMemberRank(pl, c);
+            char nb[16]; _snprintf(nb, sizeof(nb) - 1, "%d", rank); nb[15] = '\0';
+            if (!ownedIds.empty()) ownedIds += ",";
+            ownedIds += nb;
+        }
+    }
+    g_net.setSquadStates(g_net.localId(),
+                         out.empty() ? 0 : &out[0], (unsigned int)out.size());
+
+    if (doLog) {
+        lastLog = now;
+        char buf[128];
+        _snprintf(buf, sizeof(buf) - 1,
+            "KenshiCoop: streaming %u own-squad member(s) [rank: %s]",
+            (unsigned int)out.size(), ownedIds.empty() ? "-" : ownedIds.c_str());
+        buf[sizeof(buf) - 1] = '\0';
+        coopLog(buf);
+    }
+}
+
+// Build a fresh GhostState (driven-entity record) for a resolved-or-proxy body
+// from a received wire entry. Mirrors the NPC receiver's first-sight setup.
+void initDrivenGhost(GhostState& gs, Character* c, const coop::NpcStateEntry& e,
+                     DWORD now, bool isProxy) {
+    Ogre::Vector3 target(e.x, e.y, e.z);
+    gs.chr          = c;
+    gs.tgtPos       = target;
+    gs.prevTgtPos   = target;
+    gs.vel          = Ogre::Vector3::ZERO;
+    gs.tgtHeading   = e.heading;
+    gs.lastDest     = target;
+    gs.lastMoveTick = 0;       // start "at rest" so a static member is left calm
+    gs.lastSeenTick = now;
+    gs.primed       = true;
+    gs.destIssued   = false;
+    gs.parked       = false;
+    gs.hostTask     = e.task;
+    gs.hostSubj[0]  = e.stype;
+    gs.hostSubj[1]  = e.scontainer;
+    gs.hostSubj[2]  = e.scontainerSerial;
+    gs.hostSubj[3]  = e.sindex;
+    gs.hostSubj[4]  = e.sserial;
+    gs.hostMoving   = (e.cmoving != 0);
+    gs.hostSpeed    = e.cspeed;
+    gs.hostMotion   = Ogre::Vector3(e.cmotionX, e.cmotionY, e.cmotionZ);
+    gs.isProxy      = isProxy;
+}
+
+// Update an existing driven GhostState from a newer wire entry (same regime the
+// NPC receiver uses for already-tracked entries: velocity, task re-arm, mirror).
+void updateDrivenGhost(GhostState& gs, const coop::NpcStateEntry& e, DWORD now) {
+    Ogre::Vector3 target(e.x, e.y, e.z);
+    Ogre::Vector3 step = target - gs.tgtPos;
+    const float MOVE_EPS = 0.15f;
+    if (step.squaredLength() > MOVE_EPS * MOVE_EPS) {
+        gs.vel          = step;
+        gs.lastMoveTick = now;
+    }
+    gs.prevTgtPos   = gs.tgtPos;
+    gs.tgtPos       = target;
+    gs.tgtHeading   = e.heading;
+    gs.lastSeenTick = now;
+    if (gs.hostTask != e.task || gs.hostSubj[3] != e.sindex ||
+        gs.hostSubj[4] != e.sserial) {
+        gs.taskTick   = 0;
+        gs.taskActive = false;
+        gs.taskBad    = false;
+    }
+    gs.hostTask     = e.task;
+    gs.hostSubj[0]  = e.stype;
+    gs.hostSubj[1]  = e.scontainer;
+    gs.hostSubj[2]  = e.scontainerSerial;
+    gs.hostSubj[3]  = e.sindex;
+    gs.hostSubj[4]  = e.sserial;
+    gs.hostMoving   = (e.cmoving != 0);
+    gs.hostSpeed    = e.cspeed;
+    gs.hostMotion   = Ogre::Vector3(e.cmotionX, e.cmotionY, e.cmotionZ);
+}
+
+// Spawn a local stand-in for a peer-owned squad member that has no Character in
+// our save (M4). Borrows the local player's faction/template/container (always
+// valid loaded data, same as the player-ghost path), then quiets it (clear goals
+// + leave our squad) so only our networked drive moves it. Returns 0 on failure.
+Character* spawnSquadProxy(GameWorld* gw, const coop::NpcStateEntry& e) {
+    if (!gw || !gw->player || !gw->theFactory) return 0;
+    if (gw->player->playerCharacters.size() == 0) return 0;
+    Character* local = gw->player->playerCharacters[0];
+    if (!local) return 0;
+    Faction*             faction = local->getFaction();
+    GameData*            tmpl    = local->getGameData();
+    // owner = NULL: a proxy renders the PEER's unit, so it must NOT join our
+    // player squad (otherwise we'd be able to select/command the other player's
+    // characters). createRandomCharacter tolerates a null container (proven by
+    // the M0 spawn-into-squad work) - it makes a free world body we then drive.
+    Ogre::Vector3 at(e.x, e.y, e.z);
+    Character* proxy = guardedSpawn(gw->theFactory, faction, &at, /*owner=*/0, tmpl);
+    if (!proxy) return 0;
+    char namebuf[64];
+    _snprintf(namebuf, sizeof(namebuf) - 1, "Remote Squad %u", e.hindex);
+    namebuf[sizeof(namebuf) - 1] = '\0';
+    std::string name(namebuf);
+    guardedQuiet(proxy, name); // setName + clear goals + separate from our squad
+    markSynthetic(proxy, true); // never stream our proxy back to the peer
+    return proxy;
+}
+
+// ---- Phase 2.5 squad replication: receive peer squads -----------------------
+// Drain owner-tagged squad members. During a scenario, log each as a SCENARIO
+// RECV line (matches the host's SCENARIO MEMBER by hand for CROSSCHECK). Then
+// render the peer's squad (M3/M4): resolve shared-save members to their local
+// Character and drive them; proxy-spawn peer-only members that don't resolve.
+// Members WE own (in our playerCharacters) are skipped - we simulate those.
+void receiveSquadState(GameWorld* gw) {
+    std::deque<coop::OwnedNpcState> items;
+    g_inbound.drainSquad(items);
+    if (items.empty() || !gw) return;
+
+    // Collapse to the newest entry per hand (several batches may have arrived).
+    std::map<HandKey, coop::OwnedNpcState> latest;
+    for (size_t i = 0; i < items.size(); ++i) latest[makeKey(items[i].e)] = items[i];
+
+    // M2 de-confliction: register every received squad hand as remote-owned so
+    // our own NPC stream (publishNpcStates) excludes it. Refreshed each receipt;
+    // entries expire via REMOTE_OWN_TTL_MS when the owner stops streaming.
+    DWORD nowOwn = GetTickCount();
+    for (std::map<HandKey, coop::OwnedNpcState>::iterator it = latest.begin();
+         it != latest.end(); ++it) {
+        g_remoteOwnedHands[it->first] = nowOwn;
+    }
+
+    if (!g_scenarioName.empty()) {
+        static DWORD lastRecvLog = 0;
+        DWORD now = GetTickCount();
+        if (now - lastRecvLog >= 500) {
+            lastRecvLog = now;
+            for (std::map<HandKey, coop::OwnedNpcState>::iterator it = latest.begin();
+                 it != latest.end(); ++it) {
+                const coop::NpcStateEntry& e = it->second.e;
+                char b[176];
+                _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RECV hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f",
+                    e.hindex, e.hserial, e.htype, e.hcontainer, e.hcontainerSerial,
+                    e.x, e.y, e.z);
+                b[sizeof(b) - 1] = '\0';
+                coopLog(b);
+            }
+        }
+    }
+
+    // M3/M4 visual layer: render the peer's squad. Driving and (especially)
+    // proxy-spawning require a live local world: until our own player squad is
+    // loaded, guardedSpawn faults and createRandomCharacter has no scene to spawn
+    // into. Bail before then so we don't burn the proxy-failure budget while this
+    // client is still on the loading screen (the squad keeps streaming in over the
+    // net, so we just pick it up once we're in-game).
+    if (!gw->player || gw->player->playerCharacters.size() == 0) return;
+
+    // Build the set of hands WE own (simulated locally; never drive them). Under
+    // the inhabit partition this is only OUR owned subset - members the PEER owns
+    // are intentionally NOT here, so they fall through to the resolve-and-drive
+    // path below (the shared-save body exists locally and is driven by the peer's
+    // stream). With the default (own-all) partition this is every member, i.e.
+    // the legacy behavior where nothing the peer sends collides with our squad.
+    DWORD now = GetTickCount();
+    std::set<HandKey> ownHands;
+    {
+        PlayerInterface* pl = gw->player;
+        unsigned int n = pl ? pl->playerCharacters.size() : 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            Character* c = pl->playerCharacters[i];
+            if (!c) continue;
+            if (!weOwnSquadMember(pl, c, i)) continue; // peer-owned: let it resolve-and-drive
+            coop::u32 h[5];
+            if (guardedGetHand(c, h)) ownHands.insert(makeKeyFromHand(h));
+        }
+    }
+
+    for (std::map<HandKey, coop::OwnedNpcState>::iterator it = latest.begin();
+         it != latest.end(); ++it) {
+        const HandKey&             key = it->first;
+        const coop::NpcStateEntry& e   = it->second.e;
+
+        if (ownHands.count(key)) continue; // our own member - simulated locally
+
+        std::map<HandKey, GhostState>::iterator f = g_npcs.find(key);
+        if (f != g_npcs.end()) {            // already driven -> just update target
+            updateDrivenGhost(f->second, e, now);
+            continue;
+        }
+
+        // New remote member. M3: a shared-save member resolves to a local body.
+        Character* c = guardedHandToChar(e);
+        if (c) {
+            GhostState gs;
+            initDrivenGhost(gs, c, e, now, false);
+            g_npcs[key] = gs;
+            g_proxyMiss.erase(key);
+            continue;
+        }
+
+        // M4: GENUINELY peer-spawned member with no local Character (e.g. a recruit
+        // the peer hired at runtime, whose hand does not exist in the shared save).
+        // This is the ONLY case that proxies in v1: on the shared-save inhabit path
+        // every existing squad member resolves above and takes resolve-and-drive, so
+        // we never proxy a body that already exists locally. Spawn the proxy only
+        // after a few unresolved frames (debounce transient loads).
+        if (g_squadProxyDisabled) continue;
+        if (++g_proxyMiss[key] < PROXY_SPAWN_AFTER_MISSES) continue;
+        Character* proxy = spawnSquadProxy(gw, e);
+        if (!proxy) {
+            if (++g_squadProxyFailures >= 5) {
+                g_squadProxyDisabled = true;
+                coopErr("KenshiCoop: squad proxy spawning failed; disabled");
+            }
+            continue;
+        }
+        GhostState gs;
+        initDrivenGhost(gs, proxy, e, now, true);
+        g_npcs[key] = gs;
+        g_proxyMiss.erase(key);
+        char buf[160];
+        _snprintf(buf, sizeof(buf) - 1,
+            "KenshiCoop: spawned squad proxy for hand %u,%u at (%.1f,%.1f,%.1f)",
+            e.hindex, e.hserial, e.x, e.y, e.z);
+        buf[sizeof(buf) - 1] = '\0';
+        coopLog(buf);
+    }
+}
+
 // ---- Phase 2 NPC replication: client side ----------------------------------
 // Drain received NPC transforms, resolve each hand to the local Character,
 // suppress its AI on first sight, and record the latest target. Main thread.
@@ -1064,6 +1534,28 @@ void receiveNpcStates(GameWorld* gw) {
     for (size_t i = 0; i < items.size(); ++i) latest[makeKey(items[i])] = items[i];
 
     DWORD now = GetTickCount();
+
+    // Scenario observation (join side): log every received NPC as a RECV line in
+    // the same schema the host emits SCENARIO MEMBER, so run_test.ps1 can match
+    // them by hand. Throttled to ~500ms to keep the log readable.
+    if (!g_scenarioName.empty()) {
+        static DWORD lastRecvLog = 0;
+        if (now - lastRecvLog >= 500) {
+            lastRecvLog = now;
+            for (std::map<HandKey, coop::NpcStateEntry>::iterator rt = latest.begin();
+                 rt != latest.end(); ++rt) {
+                const coop::NpcStateEntry& e = rt->second;
+                char b[176];
+                _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RECV hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f",
+                    e.hindex, e.hserial, e.htype, e.hcontainer, e.hcontainerSerial,
+                    e.x, e.y, e.z);
+                b[sizeof(b) - 1] = '\0';
+                coopLog(b);
+            }
+        }
+    }
+
     int newlySuppressed = 0;
     int resolvedOk = 0, resolveFail = 0, tracked = 0;
 
@@ -1207,9 +1699,19 @@ void updateNpcs(GameWorld* gw) {
         if (!gs.primed || !gs.chr) { ++it; continue; }
 
         if ((now - gs.lastSeenTick) > TIMEOUT_MS) {
-            // No update-list surgery to undo: the NPC stayed ticked the whole
-            // time, so simply stop driving it and let local AI take back over.
-            coopLog("KenshiCoop: npc released (timeout)");
+            if (gs.isProxy) {
+                // A proxy has no business existing once its owner stops streaming
+                // it (the peer-spawned unit it stood in for is gone): destroy it.
+                coopLog("KenshiCoop: squad proxy despawned (timeout)");
+                markSynthetic(gs.chr, false);
+                guardedDespawn(gw, gs.chr);
+            } else {
+                // A resolved local body: hand it back to local AI. If we pulled
+                // it out of the update list to drive it (P1), re-enroll it so the
+                // world keeps living instead of leaving a frozen body behind.
+                if (gs.suppressed) guardedRestoreNpc(gw, gs.chr);
+                coopLog("KenshiCoop: npc released (timeout)");
+            }
             std::map<HandKey, GhostState>::iterator dead = it++;
             g_npcs.erase(dead);
             continue;
@@ -1228,19 +1730,109 @@ void updateNpcs(GameWorld* gw) {
         bool moving = (now - gs.lastMoveTick) < STOP_MS;
         bool ok = true;
 
-        if (moving) {
+        if (g_suppressAI) {
+            // ---- Drive-authority path (P1) -------------------------------------
+            // Pull the body out of the engine's main AI update list ONCE, so the
+            // engine stops simulating it autonomously and we own its transform.
+            // This replaces the old per-frame "fight" (clearGoals every move,
+            // neutralize + STAND_STILL at rest): with the AI gone there is no
+            // residual walk intent to overwrite, so we just drive position, pose
+            // the task once, and mirror the host's locomotion clip.
+            if (!gs.suppressed) gs.suppressed = guardedSuppressNpc(gw, gs.chr);
+
+            if (moving) {
+                gs.parked     = false;
+                gs.taskTick   = 0;      // re-pose the task next time it rests
+                gs.taskActive = false;
+                gs.taskBad    = false;
+                ok = driveNpcKinematic(gs);
+                guardedApplyMotion(gs.chr, gs.hostMoving, gs.hostSpeed, &gs.hostMotion);
+            } else {
+                // Reproduce the host's task at the host's fixture (same pose AND
+                // place), ONCE on entering rest, with the same drift guard. A host
+                // task change re-arms it via receiveNpcStates.
+                const DWORD GRACE_MS     = 4000;
+                const float DRIFT_MAX_SQ = 4.0f * 4.0f;
+                bool haveTask = (gs.hostTask != coop::NPC_TASK_NONE) && !gs.taskBad;
+                if (haveTask && gs.taskTick == 0) {
+                    int r = guardedSetTask(gs.chr, (int)gs.hostTask, gs.hostSubj);
+                    gs.taskTick   = now;
+                    gs.taskActive = (r >= 2); // a real fixture target resolved
+                }
+                if (gs.taskActive && (now - gs.taskTick) > GRACE_MS) {
+                    Ogre::Vector3 a;
+                    if (guardedGetPos(gs.chr, &a) &&
+                        (gs.tgtPos - a).squaredLength() > DRIFT_MAX_SQ) {
+                        gs.taskActive = false;
+                        gs.taskBad    = true;
+                    }
+                }
+                if (!gs.taskActive) {
+                    // No reproducible fixture: settle to the host transform ONCE
+                    // (clean halt+teleport), then only re-place on drift WITHOUT
+                    // halting so the idle clip keeps advancing. No neutralize /
+                    // STAND_STILL needed - the AI is already off the update list.
+                    const float REPARK_SQ = 1.0f * 1.0f;
+                    Ogre::Vector3 a;
+                    if (guardedGetPos(gs.chr, &a)) {
+                        Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading),
+                                             Ogre::Vector3::UNIT_Y);
+                        if (!gs.parked) {
+                            ok = guardedPark(gs.chr, &gs.tgtPos, &rot);
+                            if (ok) gs.parked = true;
+                        } else if ((gs.tgtPos - a).squaredLength() > REPARK_SQ) {
+                            ok = guardedTeleport(gs.chr, &gs.tgtPos, &rot);
+                        }
+                    }
+                    guardedApplyMotion(gs.chr, gs.hostMoving, gs.hostSpeed, &gs.hostMotion);
+                }
+            }
+        } else if (moving) {
             gs.parked = false;
             gs.taskTick = 0;          // re-issue the task next time it rests
             gs.taskActive = false;
             gs.taskBad = false;
             gs.idleSet = false;       // re-issue STAND_STILL next time it rests
             gs.aiNeutralized = false; // re-neutralize if it stops again
-            guardedClearGoals(gs.chr);
-            ok = driveNpcKinematic(gs);
-            // Mirror the host's locomotion so the body plays the matching walk/run
-            // cycle (at the host's speed/direction) while we slide it into place,
-            // instead of moonwalking in a static idle pose.
-            guardedApplyMotion(gs.chr, gs.hostMoving, gs.hostSpeed, &gs.hostMotion);
+            if (g_walkDrive) {
+                // Engine-WALK the body to the host position so the engine grounds
+                // it and plays a real walk cycle (no teleport-slide "float"). We
+                // re-aim it at the host's current position each frame; the engine
+                // acts on the next tick (this drive runs after g_mainLoop_orig).
+                // No per-frame clearGoals: the HIGH_PRIORITY destination overrides
+                // the AI's movement, and clearing would cancel the walk we issue.
+                // No motion mirror either: the body is genuinely moving, so the
+                // engine selects the grounded walk clip itself. A large gap (it
+                // fell behind / host warped) still hard-snaps to catch up.
+                Ogre::Vector3 actual;
+                bool haveActual = guardedGetPos(gs.chr, &actual);
+                const float SNAP_SQ = 8.0f * 8.0f;
+                if (haveActual && (gs.tgtPos - actual).squaredLength() > SNAP_SQ) {
+                    Ogre::Quaternion rot(Ogre::Radian(gs.tgtHeading),
+                                         Ogre::Vector3::UNIT_Y);
+                    ok = guardedTeleport(gs.chr, &gs.tgtPos, &rot);
+                } else {
+                    // Catch-up speed: walk at the host's pace, but faster the
+                    // further we've fallen behind (we chase a moving destination,
+                    // so a flat speed lags). Boost is gap-proportional and capped
+                    // so it tightens position while still playing a walk/run clip.
+                    float spd = gs.hostSpeed;
+                    if (haveActual) {
+                        float gap = (gs.tgtPos - actual).length();
+                        spd += gap * 2.0f;
+                        float cap = (gs.hostSpeed > 1.0f ? gs.hostSpeed : (float)RUN) * 2.5f;
+                        if (spd > cap) spd = cap;
+                    }
+                    ok = guardedWalkTo(gs.chr, &gs.tgtPos, spd);
+                }
+            } else {
+                // Legacy teleport-kinematic mover: tight position, but slides a
+                // static pose (the "float"). Mirror the host locomotion so the
+                // clip at least matches while it slides.
+                guardedClearGoals(gs.chr);
+                ok = driveNpcKinematic(gs);
+                guardedApplyMotion(gs.chr, gs.hostMoving, gs.hostSpeed, &gs.hostMotion);
+            }
         } else {
             // Reproduce the HOST's task at the HOST's fixture so the local copy
             // adopts the same pose AND position. Issue ONCE on entering rest (the
@@ -1319,7 +1911,14 @@ void updateNpcs(GameWorld* gw) {
         }
 
         if (!ok) {
-            coopLog("KenshiCoop: npc released (drive fault)");
+            if (gs.isProxy) {
+                coopLog("KenshiCoop: squad proxy despawned (drive fault)");
+                markSynthetic(gs.chr, false);
+                guardedDespawn(gw, gs.chr);
+            } else {
+                if (gs.suppressed) guardedRestoreNpc(gw, gs.chr);
+                coopLog("KenshiCoop: npc released (drive fault)");
+            }
             std::map<HandKey, GhostState>::iterator dead = it++;
             g_npcs.erase(dead);
             continue;
@@ -1339,11 +1938,11 @@ void updateNpcs(GameWorld* gw) {
                 guardedReadMotion(gs.chr, &mvMoving, &mvSpeed, &mvDesired);
                 _snprintf(buf, sizeof(buf) - 1,
                     "KenshiCoop: npc[%d] chr=%p getpos=1 actual(%.1f,%.1f,%.1f) "
-                    "tgt(%.1f,%.1f,%.1f) gap=%.1f regime=%s task=%d(%s) act=%d "
+                    "tgt(%.1f,%.1f,%.1f) gap=%.1f regime=%s sup=%d task=%d(%s) act=%d "
                     "mv=%d spd=%.2f des=%.2f host{mv=%d spd=%.2f}",
                     diagIdx, (void*)gs.chr, a.x, a.y, a.z,
                     gs.tgtPos.x, gs.tgtPos.y, gs.tgtPos.z,
-                    d, moving ? "MOVE" : "PARK",
+                    d, moving ? "MOVE" : "PARK", gs.suppressed ? 1 : 0,
                     (int)gs.hostTask, taskName((int)gs.hostTask),
                     gs.taskActive ? 1 : 0,
                     mvMoving ? 1 : 0, mvSpeed, mvDesired,
@@ -1498,28 +2097,109 @@ void __fastcall runSlaveAnim_hook(void* self, const std::string* anim,
 void mainLoop_hook(GameWorld* gw, float dt) {
     ++g_tick;
 
-    // Test-runner self-exit: once gameplay is live (player squad exists), arm a
-    // timer and quit cleanly after the configured duration. This makes
-    // unattended Cursor runs terminate on their own and flush their logs.
+    // Detect the first live gameplay frame (player squad exists). This single
+    // gate arms BOTH the test-runner self-exit timer and the scenario harness,
+    // so scenarios work whether or not KENSHICOOP_TEST_SECONDS is set.
+    if ((g_testSeconds > 0 || g_scenario || g_autoSpawnCount > 0) && !g_gameStarted &&
+        gw && gw->player && gw->player->playerCharacters.size() > 0) {
+        g_gameStarted   = true;
+        g_gameStartTick = GetTickCount();
+        coopLog("KenshiCoop: gameplay started");
+    }
+
+    // Test-runner self-exit: quit cleanly after the configured duration so
+    // unattended Cursor runs terminate on their own and flush their logs. Also
+    // serves as a hard backstop for a scenario that never reports completion.
     // Disabled entirely when KENSHICOOP_TEST_SECONDS is 0 (normal co-op play).
-    if (g_testSeconds > 0) {
-        if (!g_gameStarted && gw && gw->player &&
-            gw->player->playerCharacters.size() > 0) {
-            g_gameStarted   = true;
-            g_gameStartTick = GetTickCount();
-            coopLog("KenshiCoop: gameplay started; self-exit timer armed");
+    if (g_testSeconds > 0 && g_gameStarted &&
+        (GetTickCount() - g_gameStartTick) >= (DWORD)g_testSeconds * 1000u) {
+        coopLog("KenshiCoop: test duration elapsed; exiting");
+        coop::logClose();
+        // TerminateProcess (not ExitProcess): we're calling from the game's
+        // main-loop hook while GPU/audio/net worker threads are live. ExitProcess
+        // runs orderly thread teardown + DLL detach under the loader lock and
+        // deadlocks against those threads, leaving a non-responding zombie that
+        // keeps the mod DLL file-locked (breaks the next deploy). TerminateProcess
+        // exits immediately; our log is already flushed/closed above.
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
+
+    // Manual-validation auto-spawn (KENSHICOOP_AUTOSPAWN): host only, no scenario.
+    // Once gameplay is live and settled, spawn N distinct-hand units into our squad
+    // ONCE, fanned out near the leader so they're visible together. They get fresh
+    // hands (not in the join's playerCharacters), so the join renders them as
+    // proxies and follows as you move them - the cross-client squad-render path.
+    if (g_autoSpawnCount > 0 && !g_autoSpawnDone && !g_scenario && g_isHostMode &&
+        g_gameStarted && gw && gw->player && gw->player->playerCharacters.size() > 0 &&
+        (GetTickCount() - g_gameStartTick) >= AUTOSPAWN_DELAY_MS) {
+        g_autoSpawnDone = true; // one-shot regardless of per-unit success
+        Ogre::Vector3 base;
+        Character* leader = gw->player->playerCharacters[0];
+        if (!leader || !coop::getCharPos(leader, &base)) base = Ogre::Vector3::ZERO;
+        int made = 0;
+        for (int i = 0; i < g_autoSpawnCount; ++i) {
+            Ogre::Vector3 at = base;
+            at.x += (float)((i + 1) * 2);  // simple fan-out so they don't stack
+            at.z += (float)((i % 2) * 2);
+            if (coop::spawnIntoPlayerSquad(gw, 0, at)) ++made;
         }
-        if (g_gameStarted &&
-            (GetTickCount() - g_gameStartTick) >= (DWORD)g_testSeconds * 1000u) {
-            coopLog("KenshiCoop: test duration elapsed; exiting");
-            coop::logClose();
-            ExitProcess(0);
+        char b[96];
+        _snprintf(b, sizeof(b) - 1,
+            "KenshiCoop: AUTOSPAWN spawned %d/%d manual squad members",
+            made, g_autoSpawnCount);
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+    }
+
+    // Scenario harness: once gameplay is live, drive the selected scenario's
+    // state machine. onStart() fires once; onTick() runs each frame until it
+    // reports completion, then we log the PASS/FAIL verdict and exit (flushing
+    // the dedicated log first). Both host and join run the same object; the
+    // scenario itself branches on ctx.isHost.
+    if (g_scenario && g_gameStarted && gw) {
+        if (g_scenarioDoneTick != 0) {
+            // Scenario already finished: HOLD the final synced state on screen so
+            // the runner can screenshot both clients, then self-exit. We keep
+            // falling through to the publish/receive/updateNpcs below so the
+            // replicated bodies stay driven (rendered) during the hold.
+            if (GetTickCount() - g_scenarioDoneTick >= SCENARIO_HOLD_MS) {
+                coop::logClose();
+                // TerminateProcess (not ExitProcess): avoids the loader-lock
+                // deadlock when quitting from inside the live game loop.
+                TerminateProcess(GetCurrentProcess(), 0);
+            }
+        } else {
+            coop::ScenarioContext ctx;
+            ctx.gw      = gw;
+            ctx.isHost  = g_isHostMode;
+            ctx.localId = g_net.localId();
+            if (!g_scenarioStarted) {
+                g_scenarioStarted   = true;
+                g_scenarioStartTick = GetTickCount();
+                ctx.elapsedMs = 0;
+                ctx.tick      = g_scenarioTick;
+                char m[160];
+                _snprintf(m, sizeof(m) - 1, "SCENARIO %s start", g_scenario->name());
+                m[sizeof(m) - 1] = '\0';
+                coopLog(m);
+                g_scenario->onStart(ctx);
+            }
+            ctx.elapsedMs = GetTickCount() - g_scenarioStartTick;
+            ctx.tick      = ++g_scenarioTick;
+            if (g_scenario->onTick(ctx)) {
+                bool ok = g_scenario->passed();
+                char m[64];
+                _snprintf(m, sizeof(m) - 1, "SCENARIO RESULT %s", ok ? "PASS" : "FAIL");
+                m[sizeof(m) - 1] = '\0';
+                coopLog(m);
+                g_scenarioDoneTick = GetTickCount(); // begin the capture hold
+            }
         }
     }
 
-    publishLocalState(gw);   // Milestone 2 + send (Milestone 5)
-    processInbound(gw);      // Milestone 4/5: receive + set ghost targets
-    updateGhosts(gw, dt);    // Phase 1: drive ghosts + despawn timed-out ones
+    publishLocalState(gw);   // send our presence heartbeat (PKT_PLAYER_STATE)
+    processInbound(gw);      // update remote-player PRESENCE from heartbeats
+    updateGhosts(gw, dt);    // M5: expire stale presence (no body to drive)
 
     // Phase 2: host streams nearby NPC transforms (~20 Hz); client applies them.
     // The CLIENT drains the latest transforms BEFORE the main loop (so targets
@@ -1528,13 +2208,26 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // tick, so driving them beforehand let the AI overwrite us (the bodies then
     // marched in place). Driving AFTER the loop gives us the last word - our
     // force-idle/teleport is what the renderer samples this frame.
+    // Phase 2.5: squad streaming is BIDIRECTIONAL - each peer publishes its OWN
+    // squad (~20 Hz) and observes the other's. receiveSquadState renders the
+    // peer's squad: shared-save members are resolved and driven (M3), peer-only
+    // members are proxy-spawned and driven (M4); updateNpcs drives both.
+    {
+        static DWORD lastSquad = 0;
+        DWORD now = GetTickCount();
+        if (now - lastSquad >= 50) { lastSquad = now; publishSquadState(gw); }
+    }
+
     if (g_isHostMode) {
         static DWORD lastGather = 0;
         DWORD now = GetTickCount();
         if (now - lastGather >= 50) { lastGather = now; publishNpcStates(gw); }
-        g_mainLoop_orig(gw, dt); // always call through
+        receiveSquadState(gw);   // observe + render the peer's squad (proxies)
+        g_mainLoop_orig(gw, dt); // run the engine (incl. local AI) first...
+        updateNpcs(gw);          // ...then drive the peer's squad bodies last
     } else {
         receiveNpcStates(gw);
+        receiveSquadState(gw);   // observe + render the host's squad (proxies)
         g_mainLoop_orig(gw, dt); // run the engine (incl. local AI) first...
         updateNpcs(gw);          // ...then impose host state as the last word
     }
@@ -1560,6 +2253,123 @@ void startNetworking() {
 
 } // namespace
 
+// ---- Scenario action facade (declared in ScenarioApi.h) --------------------
+// Defined here, where the resolved function pointers and SEH-guarded leaves
+// live. These are the ONLY game-touching entry points a scenario uses. The
+// anonymous-namespace helpers above are at global scope, so unqualified lookup
+// from inside namespace coop finds them.
+namespace coop {
+
+void scenarioLog(const char* msg) { coopLog(msg); }
+
+int remotePlayerCount() { return (int)g_ghosts.size(); }
+
+Character* localPlayer(GameWorld* gw) {
+    if (!gw || !gw->player) return 0;
+    if (gw->player->playerCharacters.size() == 0) return 0;
+    return gw->player->playerCharacters[0];
+}
+
+Faction* playerFaction(GameWorld* gw) {
+    Character* p = localPlayer(gw);
+    return p ? p->getFaction() : 0; // virtual, safe (same call ghosts use)
+}
+
+RootObjectContainer* playerSquadContainer(GameWorld* gw) {
+    // The player character's container IS its active-squad container (this is
+    // exactly what the ghost spawn borrows to enlist into the player squad).
+    Character* p = localPlayer(gw);
+    return p ? p->container : 0;
+}
+
+GameData* playerTemplate(GameWorld* gw) {
+    Character* p = localPlayer(gw);
+    return p ? p->getGameData() : 0; // virtual, safe
+}
+
+GameData* lookupTemplate(GameWorld* gw, const char* stringId) {
+    if (!stringId || !stringId[0]) return playerTemplate(gw);
+    std::string sid(stringId);
+    GameData* d = guardedLookupTemplate(gw, &sid);
+    return d ? d : playerTemplate(gw); // fall back to a guaranteed-valid template
+}
+
+int playerSquadSize(GameWorld* gw) { return guardedSquadSize(gw); }
+
+Character* spawnIntoPlayerSquad(GameWorld* gw, GameData* tmpl,
+                                const Ogre::Vector3& pos) {
+    if (!gw || !gw->theFactory) {
+        coopLog("KenshiCoop: spawnIntoPlayerSquad FAIL reason=no_world_or_factory");
+        return 0;
+    }
+    Faction*             fac   = playerFaction(gw);
+    RootObjectContainer* owner = playerSquadContainer(gw);
+    GameData*            t     = tmpl ? tmpl : playerTemplate(gw);
+    // owner (the player's squad container) is intentionally NOT required: the
+    // player character's RootObject::container is frequently null right after a
+    // load, and createRandomCharacter tolerates a null certainContainer (it
+    // makes its own) - this is exactly what the working ghost spawn path relies
+    // on. We pass owner through when we have it, and enlist via recruit below.
+    // Only faction + template are genuine preconditions.
+    if (!fac || !t) {
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+            "KenshiCoop: spawnIntoPlayerSquad FAIL reason=null_input "
+            "factory=%p faction=%p owner=%p tmpl=%p spawnFn=%p",
+            (void*)gw->theFactory, (void*)fac, (void*)owner, (void*)t,
+            (void*)g_spawnFn);
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+        return 0;
+    }
+
+    Character* c = guardedSpawn(gw->theFactory, fac, &pos, owner, t);
+    if (!c) {
+        char b[160];
+        if (g_lastSpawnExCode != 0) {
+            _snprintf(b, sizeof(b) - 1,
+                "KenshiCoop: spawnIntoPlayerSquad FAIL reason=spawn_threw "
+                "code=0x%08lX spawnFn=%p", g_lastSpawnExCode, (void*)g_spawnFn);
+        } else {
+            _snprintf(b, sizeof(b) - 1,
+                "KenshiCoop: spawnIntoPlayerSquad FAIL reason=spawn_null "
+                "spawnFn=%p faction=%p owner=%p tmpl=%p",
+                (void*)g_spawnFn, (void*)fac, (void*)owner, (void*)t);
+        }
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+        return 0;
+    }
+    // Spawning into the player's container already enlists the character in the
+    // active squad; recruit() is belt-and-suspenders (best-effort, guarded).
+    guardedRecruit(gw->player, c);
+    return c;
+}
+
+bool getCharPos(Character* c, Ogre::Vector3* out) {
+    if (!c || !out) return false;
+    return guardedGetPos(c, out);
+}
+
+bool getCharHand(Character* c, u32 out[5]) { return guardedGetHand(c, out); }
+
+bool teleportChar(Character* c, const Ogre::Vector3& pos, float headingRad) {
+    if (!c) return false;
+    Ogre::Quaternion rot(Ogre::Radian(headingRad), Ogre::Vector3::UNIT_Y);
+    return guardedPark(c, &pos, &rot); // halt + place: a clean, stopped pose
+}
+
+bool moveCharTo(Character* c, const Ogre::Vector3& dest) {
+    if (!c) return false;
+    return guardedSetDestination(c, &dest);
+}
+
+void clearCharGoals(Character* c) { guardedClearGoals(c); }
+
+void despawnChar(GameWorld* gw, Character* c) { guardedDespawn(gw, c); }
+
+} // namespace coop
+
 // RE_Kenshi calls this once when the plugin loads. RE_Kenshi resolves the entry
 // point by its C++-mangled name (?startPlugin@@YAXXZ), exactly as the HelloWorld
 // example does - so this must NOT be extern "C" (that would export plain
@@ -1571,6 +2381,28 @@ __declspec(dllexport) void startPlugin() {
     std::string mode = envOr("KENSHICOOP_MODE", "host");
     g_saveName       = envOr("KENSHICOOP_SAVE", "");
     g_testSeconds    = std::atoi(envOr("KENSHICOOP_TEST_SECONDS", "0").c_str());
+    g_autoSpawnCount = std::atoi(envOr("KENSHICOOP_AUTOSPAWN", "0").c_str());
+    {
+        // Parse the ownership partition: optional leading '~' = exclusion set,
+        // then a comma-separated index list. Empty => own all (default).
+        std::string own = envOr("KENSHICOOP_OWN_INDICES", "");
+        if (!own.empty()) {
+            g_ownAll = false;
+            const char* p = own.c_str();
+            if (*p == '~') { g_ownExcept = true; ++p; }
+            unsigned int v = 0; bool have = false;
+            for (;; ++p) {
+                if (*p >= '0' && *p <= '9') { v = v * 10 + (unsigned)(*p - '0'); have = true; }
+                else {
+                    if (have) { g_ownIndices.insert(v); v = 0; have = false; }
+                    if (*p == '\0') break;
+                }
+            }
+        }
+    }
+    g_suppressAI     = std::atoi(envOr("KENSHICOOP_SUPPRESS_AI", "0").c_str()) != 0;
+    g_walkDrive      = std::atoi(envOr("KENSHICOOP_WALK_DRIVE", "1").c_str()) != 0;
+    g_scenarioName   = envOr("KENSHICOOP_SCENARIO", "");
     {
         int d = std::atoi(envOr("KENSHICOOP_AUTOLOAD_DELAY_MS", "5000").c_str());
         if (d > 0) g_autoLoadDelayMs = (DWORD)d; // settle before auto-load
@@ -1582,6 +2414,33 @@ __declspec(dllexport) void startPlugin() {
     coop::logInit(logPath.c_str(), isJoin ? "JOIN" : "HOST");
 
     coopLog("KenshiCoop loaded!"); // Milestone 1
+
+    // Always surface the ownership + drive-authority config (the runner watches
+    // for "inhabit ownership" to prove a fresh build is actually deployed; see
+    // manual_session.ps1 / the -SkipDeploy fix). Logged unconditionally so the
+    // marker is present even in own-all (non-partitioned) runs.
+    {
+        std::string idx;
+        for (std::set<unsigned int>::iterator it = g_ownIndices.begin();
+             it != g_ownIndices.end(); ++it) {
+            char nb[16]; _snprintf(nb, sizeof(nb) - 1, "%u", *it); nb[15] = '\0';
+            if (!idx.empty()) idx += ",";
+            idx += nb;
+        }
+        char b[160];
+        if (g_ownAll) {
+            _snprintf(b, sizeof(b) - 1,
+                "KenshiCoop: inhabit ownership = ALL (own entire squad); suppressAI=%d walkDrive=%d",
+                g_suppressAI ? 1 : 0, g_walkDrive ? 1 : 0);
+        } else {
+            _snprintf(b, sizeof(b) - 1,
+                "KenshiCoop: inhabit ownership = %s indices [%s]; suppressAI=%d walkDrive=%d",
+                g_ownExcept ? "ALL EXCEPT" : "ONLY", idx.c_str(),
+                g_suppressAI ? 1 : 0, g_walkDrive ? 1 : 0);
+        }
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+    }
 
     // Milestone 2/4/5: hook the main-thread tick. Verified in GameWorld.h: the
     // class exposes both virtual mainLoop_GPUSensitiveStuff and a non-virtual
@@ -1627,6 +2486,20 @@ __declspec(dllexport) void startPlugin() {
                   g_testSeconds);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
+    }
+
+    // Scenario harness: build the selected scenario object (host & join both
+    // run it; it branches on host/join internally). Unknown names are logged
+    // and ignored (normal co-op tick continues).
+    if (!g_scenarioName.empty()) {
+        g_scenario = coop::makeScenario(g_scenarioName);
+        if (g_scenario) {
+            std::string m = "KenshiCoop: scenario armed '" + g_scenarioName + "'";
+            coopLog(m.c_str());
+        } else {
+            std::string m = "KenshiCoop: unknown scenario '" + g_scenarioName + "'";
+            coopErr(m.c_str());
+        }
     }
 
     startNetworking();
