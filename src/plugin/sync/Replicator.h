@@ -24,6 +24,7 @@
 #include "../net/NetLink.h"
 
 class GameWorld;
+class Character;
 
 namespace coop {
 
@@ -33,6 +34,9 @@ public:
 
     // Stage 1/2 stream only the squad leader; later stages stream the whole squad.
     void setLeaderOnly(bool v) { leaderOnly_ = v; }
+
+    // Stage 4: also stream nearby host-authoritative world NPCs (host side).
+    void setStreamNpcs(bool v) { streamNpcs_ = v; }
 
     // BEFORE engine: drain received entities into their interpolation buffers.
     void ingest(Inbound& in);
@@ -73,13 +77,17 @@ private:
         bool         parked;         // settled at rest (avoid re-halting the clip)
         bool         haveDest;       // dx/dy/dz hold a previously issued destination
         float        dx, dy, dz;     // last issued walk destination
+        bool         suppressed;     // NPC pulled off the local AI update list
+        Character*    body;          // resolved local Character (for restore on release)
         Driven() : haveActual(false), lx(0), ly(0), lz(0), parked(false),
-                   haveDest(false), dx(0), dy(0), dz(0) {}
+                   haveDest(false), dx(0), dy(0), dz(0),
+                   suppressed(false), body(0) {}
     };
 
     std::map<Key, Driven> targets_;
     InterpConfig          cfg_;
     bool                  leaderOnly_;
+    bool                  streamNpcs_;
 
     // Smoothness accumulators (measured from the body's actual motion while its
     // source is moving): how often did the rendered body advance per frame?

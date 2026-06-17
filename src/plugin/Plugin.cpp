@@ -246,6 +246,10 @@ __declspec(dllexport) void startPlugin() {
 
     coop::engine::resolve();
 
+    // Stage 4: the host streams nearby world NPCs (host-authoritative) in addition
+    // to its squad; the join resolves each by hand and drives it like a squad body.
+    if (g_cfg.isHost) g_repl.setStreamNpcs(true);
+
     // Auto-load: only hook the title screen when a save name was provided.
     if (!g_cfg.save.empty()) {
         if (KenshiLib::SUCCESS !=

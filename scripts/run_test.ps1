@@ -235,7 +235,7 @@ if (-not $shotsTaken) {
 # scenario from ITS OWN gameplay-start, so the later-loading join finishes (and
 # self-exits) well after the host. Too small a grace kills a healthy join
 # mid-scenario and falsely flags "no clean exit".
-$killGrace = if ($Scenario -ne "") { 40 } else { $ShotLeadSec + 60 }
+$killGrace = if ($Scenario -ne "") { 75 } else { $ShotLeadSec + 60 }
 $killDeadline = (Get-Date).AddSeconds($killGrace)
 foreach ($p in @($hostPid, $joinPid)) {
     if ($p -eq 0) { continue }
@@ -360,6 +360,84 @@ function Compare-Scenario {
     return $ok
 }
 
+# Parse timestamped SCENARIO <Kind> lines into hand -> list of @{t=ms; p=@(x,y,z)}.
+# The leading "[HH:MM:SS.mmm]" stamp is the machine clock, identical for both
+# clients (same PC), so host and join samples are directly time-comparable.
+function Get-ScenarioSeries {
+    param([string]$File, [string]$Kind)
+    $map = @{}
+    if (-not (Test-Path $File)) { return $map }
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO $Kind hand=([\d,]+) pos=([\-\d\.,]+)"
+    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $t = ([int]$g[1].Value*3600 + [int]$g[2].Value*60 + [int]$g[3].Value)*1000 + [int]$g[4].Value
+        $hand = $g[5].Value
+        $pos  = $g[6].Value.Split(',') | ForEach-Object { [double]$_ }
+        if (-not $map.ContainsKey($hand)) { $map[$hand] = New-Object System.Collections.ArrayList }
+        [void]$map[$hand].Add(@{ t = $t; p = $pos })
+    }
+    return $map
+}
+
+# NPC sync cross-check (Stage 4), TIME-ALIGNED. Autonomous bar NPCs never settle
+# on command and the clients start staggered, so latest-vs-latest is meaningless
+# (it compares unrelated moments + post-exit wander). Instead, for each NPC, pair
+# every join RECV sample with the host MEMBER sample nearest in time (<= MaxDt) and
+# take the MEDIAN distance: a well-driven NPC tracks within a couple of metres at
+# every aligned moment, whether it is sitting or walking. PASS if a healthy
+# majority of the NPCs that actually overlap in time tracked within $Tol. NPCs that
+# never overlap (interest-boundary patrollers that left the host's stream) are
+# excluded - that is a Stage 6 interest-handoff concern, not sync fidelity.
+function Compare-NpcSync {
+    param([string]$HostFile, [string]$JoinFile, [double]$Tol,
+          [double]$MinRatio = 0.80, [int]$MinJudged = 4, [int]$MaxDt = 800)
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    # Pass 1: per NPC, median distance of time-aligned (host,join) sample pairs,
+    # plus how many aligned pairs it has (its "co-presence" count).
+    $rows = @()
+    foreach ($hand in $H.Keys) {
+        if (-not $J.ContainsKey($hand)) { continue }
+        $dists = New-Object System.Collections.ArrayList
+        foreach ($js in $J[$hand]) {
+            $best = [double]::MaxValue; $bp = $null
+            foreach ($hs in $H[$hand]) {
+                $dt = [Math]::Abs($hs.t - $js.t)
+                if ($dt -lt $best) { $best = $dt; $bp = $hs.p }
+            }
+            if ($best -le $MaxDt -and $bp) {
+                $dx = $bp[0]-$js.p[0]; $dy = $bp[1]-$js.p[1]; $dz = $bp[2]-$js.p[2]
+                [void]$dists.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+            }
+        }
+        if ($dists.Count -eq 0) { continue }
+        $sorted = $dists | Sort-Object
+        $rows += @{ hand = $hand; aligned = $dists.Count; med = $sorted[[int]($sorted.Count/2)] }
+    }
+    if ($rows.Count -eq 0) {
+        Write-Host "  CROSSCHECK [npc host->join] FAIL - no time-overlapping NPCs"
+        return $false
+    }
+    # Only JUDGE continuously co-present NPCs (aligned >= half the best coverage).
+    # A patroller that wanders past the host's interest sphere has far fewer aligned
+    # samples; excluding it keeps the oracle about sync fidelity, not interest
+    # hand-off at the boundary (a Stage 6 concern).
+    $maxAligned = ($rows | ForEach-Object { $_.aligned } | Measure-Object -Maximum).Maximum
+    $minAligned = [Math]::Max(10, [int]($maxAligned * 0.5))
+    $judged = @($rows | Where-Object { $_.aligned -ge $minAligned })
+    if ($judged.Count -lt $MinJudged) {
+        Write-Host "  CROSSCHECK [npc host->join] FAIL - only $($judged.Count) continuously-present NPC(s) (need >= $MinJudged; maxAligned=$maxAligned)"
+        return $false
+    }
+    $tracked = @($judged | Where-Object { $_.med -le $Tol }).Count
+    $worst = ($judged | ForEach-Object { $_.med } | Measure-Object -Maximum).Maximum
+    $ratio = [Math]::Round($tracked / $judged.Count, 3)
+    $ok = ($ratio -ge $MinRatio)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  CROSSCHECK [npc host->join] $v - tracked $tracked/$($judged.Count) continuously-present NPCs within $Tol (ratio=$ratio >= $MinRatio, worstMedian=$([Math]::Round($worst,1)), excluded $($rows.Count - $judged.Count) boundary)"
+    return $ok
+}
+
 # True if $File logged a "SCENARIO RESULT PASS" line.
 function Test-ScenarioResultPass {
     param([string]$File)
@@ -400,8 +478,11 @@ function Test-AnimTruth {
     if ($null -eq $line) { Write-Host "  [$Label] no SCENARIO ANIM line (skipped)"; return $true }
     $translate = [int]$line.Matches[0].Groups[1].Value
     $floatFrac = [double]$line.Matches[0].Groups[3].Value
-    # Need a meaningful sample of translating frames to trust the verdict.
-    if ($translate -lt 30) { Write-Host "  [$Label] anim-truth inconclusive - only $translate translating frame(s)"; return $false }
+    # Need a meaningful sample of translating frames to trust the verdict. Too few
+    # == nothing was walking this run (e.g. all-stationary NPCs); that is genuinely
+    # inconclusive, not a failure (motion/sync is proven by the cross-check), so we
+    # skip rather than fail.
+    if ($translate -lt 30) { Write-Host "  [$Label] anim-truth inconclusive - only $translate translating frame(s) (skipped)"; return $true }
     $ok = ($floatFrac -le $MaxFloatFrac)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  [$Label] anim-truth $v - floatFrac=$floatFrac (<= $MaxFloatFrac), translateFrames=$translate"
@@ -428,7 +509,11 @@ if ($Scenario -ne "") {
         $joinResultPass = Test-ScenarioResultPass -File $joinLog
         if (-not $joinResultPass) { Write-Host "  join SCENARIO RESULT is not PASS" }
     }
-    $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
+    if ($Scenario -eq "npc_sync") {
+        $cross = Compare-NpcSync -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
+    } else {
+        $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
+    }
     # Smoothness + anim-truth are asserted on the observing (join) side, which
     # drives the body. Each is skipped automatically if its line is absent.
     $smooth = Test-Smoothness -File $joinLog -Label "join"

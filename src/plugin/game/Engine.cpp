@@ -19,8 +19,9 @@
 #include <kenshi/Character.h>       // Character (handle/getPosition/getOrientation/movement)
 #include <kenshi/CharMovement.h>    // CharMovement::_setPositionDirectionAndTeleport/setDestination
 #include <kenshi/Enums.h>           // itemType, MoveSpeed { RUN }
+#include <kenshi/RootObject.h>      // RootObject base (getCharactersWithinSphere out type)
 #include <kenshi/util/hand.h>       // hand (5-field identity)
-#include <kenshi/util/lektor.h>     // lektor<Character*> (playerCharacters)
+#include <kenshi/util/lektor.h>     // lektor<T> (playerCharacters, interest query)
 #include <ogre/OgreVector3.h>
 #include <ogre/OgreQuaternion.h>
 
@@ -56,6 +57,24 @@ HandCtorFn    g_handCtorFn    = 0;
 typedef void (__fastcall* CharSetDestFn)(Character* self, const Ogre::Vector3* pos, bool shift);
 CharSetDestFn g_charSetDestFn = 0;
 
+// Stage 4 NPC replication: nearby-character interest query + AI quieting.
+// getCharactersWithinSphere fills a lektor with nearby characters (as RootObject*
+// base pointers); clearAllAIGoals stops a character pathing autonomously.
+typedef void (__fastcall* GetCharsInSphereFn)(
+    GameWorld* self, lektor<RootObject*>* results, const Ogre::Vector3* pos,
+    float farRadius, float nearRadius, float always, int maxFar, int maxNear,
+    RootObject* skip);
+typedef void (__fastcall* ClearGoalsFn)(Character* self);
+typedef void (__fastcall* UpdateListFn)(GameWorld* self, Character* c);
+
+GetCharsInSphereFn g_getCharsFn    = 0;
+ClearGoalsFn       g_clearGoalsFn  = 0;
+UpdateListFn       g_removeUpdateFn = 0;
+UpdateListFn       g_addUpdateFn    = 0;
+
+// One reused scratch buffer for the interest query (main thread only).
+lektor<RootObject*> g_npcQuery;
+
 } // namespace
 
 void resolve() {
@@ -78,6 +97,16 @@ void resolve() {
     g_charSetDestFn = (CharSetDestFn)KenshiLib::GetRealAddress(
         static_cast<void (Character::*)(const Ogre::Vector3&, bool)>(
             &Character::setDestination));
+
+    // Stage 4 NPC replication. Non-fatal: if unresolved, NPC streaming/quieting
+    // is simply skipped (squad sync still works).
+    g_getCharsFn = (GetCharsInSphereFn)KenshiLib::GetRealAddress(
+        &GameWorld::getCharactersWithinSphere);
+    g_clearGoalsFn = (ClearGoalsFn)KenshiLib::GetRealAddress(&Character::clearAllAIGoals);
+    g_removeUpdateFn = (UpdateListFn)KenshiLib::GetRealAddress(&GameWorld::removeFromUpdateListMain);
+    g_addUpdateFn    = (UpdateListFn)KenshiLib::GetRealAddress(&GameWorld::addToUpdateListMain);
+    if (!g_getCharsFn)
+        coop::logErrLine("engine: could not resolve getCharactersWithinSphere (NPC stream off)");
 }
 
 bool gameplayLive(GameWorld* gw) {
@@ -247,14 +276,17 @@ bool walkTo(Character* c, float x, float y, float z, float speed) {
     if (!c) return false;
     __try {
         Ogre::Vector3 dest(x, y, z);
-        // Player move-order path first (a player-controlled leader ignores a bare
-        // CharMovement::setDestination, but obeys this - same path click-to-move
-        // uses, which we proved drives the leader in Stage 1).
+        // Dual-path so ONE call drives both kinds of body:
+        //   * player-controlled (squad): the player move-order path; a player char
+        //     ignores a bare CharMovement::setDestination (proved in Stage 1).
+        //   * AI-controlled (NPC): a CharMovement HIGH_PRIORITY destination, which
+        //     overrides the NPC's autonomous movement goals (proved in the monolith).
+        // Issuing both is safe: each body obeys the one that applies to it.
         if (g_charSetDestFn) g_charSetDestFn(c, &dest, false);
 
         CharMovement* mv = c->movement;
         if (mv) {
-            if (!g_charSetDestFn) mv->setDestination(dest, HIGH_PRIORITY, false);
+            mv->setDestination(dest, HIGH_PRIORITY, false);
             float s = speed;
             if (s < 1.0f) s = (float)RUN; // unknown/tiny: default to a run pace
             mv->setDesiredSpeed(s);        // override the order's default speed (catch-up)
@@ -315,6 +347,83 @@ Character* leader(GameWorld* gw) {
         return gw->player->playerCharacters[0];
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
+    }
+}
+
+namespace {
+// True if 'obj' is one of the local player's squad members (we never stream our
+// own controllable squad as a host NPC). Caller holds the SEH frame.
+bool isPlayerSquad(GameWorld* gw, RootObject* obj) {
+    PlayerInterface* pl = gw->player;
+    if (!pl) return false;
+    unsigned int pc = (unsigned int)pl->playerCharacters.size();
+    for (unsigned int j = 0; j < pc; ++j) {
+        if (static_cast<RootObject*>(pl->playerCharacters[j]) == obj) return true;
+    }
+    return false;
+}
+} // namespace
+
+unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
+    if (!g_getCharsFn || !gw || !out || maxOut == 0) return 0;
+    unsigned int n = 0;
+    __try {
+        PlayerInterface* pl = gw->player;
+        if (!pl || pl->playerCharacters.size() == 0) return 0;
+
+        // Interest center: the local player's leader. The query radii approximate
+        // a town-block footprint (~200u far) so the bar's NPCs are all captured.
+        Ogre::Vector3 center = pl->playerCharacters[0]->getPosition();
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &center, 200.0f, 120.0f, 30.0f, 96, 96, 0);
+
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            RootObject* obj = g_npcQuery[i];
+            if (!obj) continue;
+            if (isPlayerSquad(gw, obj)) continue; // never stream our own squad here
+            // getCharactersWithinSphere returns Characters as RootObject* bases.
+            if (captureOne(static_cast<Character*>(obj), &out[n])) ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
+void clearGoals(Character* c) {
+    if (!c || !g_clearGoalsFn) return;
+    __try {
+        g_clearGoalsFn(c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+bool isLocalPlayerChar(GameWorld* gw, Character* c) {
+    if (!gw || !c) return false;
+    __try {
+        return isPlayerSquad(gw, static_cast<RootObject*>(c));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool suppressNpc(GameWorld* gw, Character* c) {
+    if (!gw || !c || !g_removeUpdateFn) return false;
+    __try {
+        g_removeUpdateFn(gw, c);
+        if (g_clearGoalsFn) g_clearGoalsFn(c);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void restoreNpc(GameWorld* gw, Character* c) {
+    if (!gw || !c || !g_addUpdateFn) return;
+    __try {
+        g_addUpdateFn(gw, c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
 

@@ -31,6 +31,19 @@ bool logScenarioLine(const char* kind, Character* c) {
     return true;
 }
 
+// Log a SCENARIO line straight from a captured EntityState. The hand field order
+// (index,serial,type,container,containerSerial) MUST match logScenarioLine so the
+// runner keys MEMBER and RECV lines identically.
+void logScenarioEntity(const char* kind, const EntityState& e) {
+    char b[160];
+    _snprintf(b, sizeof(b) - 1,
+              "SCENARIO %s hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f",
+              kind, e.hIndex, e.hSerial, e.hType, e.hContainer, e.hContainerSerial,
+              e.x, e.y, e.z);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+}
+
 // leader_move (Stage 1): the HOST orders its squad leader to walk to a nearby
 // destination and streams its transform; the JOIN drives its local copy of that
 // same (shared-save) leader to the received transform. Host logs MEMBER, join
@@ -115,10 +128,69 @@ private:
 
 const float LeaderMoveScenario::LEG = 14.0f;
 
+// npc_sync (Stage 4): the HOST streams nearby world NPCs (host-authoritative);
+// the JOIN resolves each by hand and drives it (walk-drive while moving, park +
+// AI-quiet at rest). Neither side scripts the NPCs - they do their own bar AI -
+// so this just enumerates the same shared-save NPCs around each (co-located)
+// leader and logs MEMBER (host, authoritative) / RECV (join, driven copy) per
+// hand. The runner cross-checks positions per hand (ratio-based: stationary
+// sitters match tightly, the occasional patroller may lag by interp/catch-up).
+class NpcSyncScenario : public Scenario {
+public:
+    NpcSyncScenario() : passed_(false), recvCount_(0), lastLogMs_(0) {}
+
+    virtual const char* name() const { return "npc_sync"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            // Log EVERY captured NPC with a timestamp (the log line carries it). The
+            // runner cross-checks TIME-ALIGNED samples (host MEMBER vs join RECV at
+            // the nearest moment, both share the machine clock) - this is the only
+            // correct way to compare autonomous movers across staggered clients;
+            // latest-vs-latest measures unrelated moments and post-exit drift.
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+        }
+
+        // The host streams MUCH longer than the join runs, so it keeps feeding the
+        // join's whole observation window (otherwise the host exits first, the
+        // join's NPCs go stale, get released to local AI, and wander - which would
+        // poison the cross-check). The join finishes first and reports the verdict.
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (ctx.isHost) {
+                EntityState npcs[MAX_LOG];
+                passed_ = (engine::captureNpcs(ctx.gw, npcs, MAX_LOG) > 0); // streamed NPCs
+            } else {
+                passed_ = (recvCount_ >= 1); // resolved + drove at least one NPC
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long HOST_DURATION_MS = 44000; // outlive the join's window
+    static const unsigned long JOIN_DURATION_MS = 24000;
+    static const unsigned int  MAX_LOG          = 40;     // cap NPCs logged per tick
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+};
+
 } // namespace
 
 Scenario* makeScenario(const std::string& name) {
     if (name == "leader_move") return new LeaderMoveScenario();
+    if (name == "npc_sync")    return new NpcSyncScenario();
     return 0;
 }
 

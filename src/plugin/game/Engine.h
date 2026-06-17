@@ -83,6 +83,38 @@ bool readMotion(Character* c, bool* moving, float* speed);
 // SEH-guarded: fetch the local player's squad leader (playerCharacters[0]) or 0.
 Character* leader(GameWorld* gw);
 
+// ---- Stage 4 NPC replication primitives ------------------------------------
+
+// SEH-guarded: enumerate characters near the local player and capture every one
+// that is NOT a member of the local player squad (i.e. host-authoritative world
+// NPCs) into 'out' (up to maxOut), filling hand + transform + locomotion. Returns
+// the number written. The same EntityState shape used for squad members, so the
+// receiver drives them through the identical resolve/walk-drive path.
+unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut);
+
+// SEH-guarded: clear a character's autonomous AI goals so it stops wandering /
+// re-pathing on its own. The body is kept IN the engine update list (removing it
+// freezes the movement controller and makes our walk-drive/teleport no-op), so
+// we quiet it here and let the network transform drive it instead.
+void clearGoals(Character* c);
+
+// SEH-guarded: is 'c' a member of the LOCAL player squad (shared-save squad)?
+// The join drives a squad member through the player move-order walk-drive (the
+// body is inert when uncontrolled), but a world NPC is fully AI-simulated locally
+// and must instead be driven kinematically (teleport wins over the local AI).
+bool isLocalPlayerChar(GameWorld* gw, Character* c);
+
+// SEH-guarded: pull an NPC OUT of the engine's main AI update list (and clear its
+// goals) so the engine stops simulating it autonomously - its local AI would
+// otherwise run its own schedule (sit/patrol/jobs) and diverge from the host.
+// We then own its transform via kinematic teleport. Returns true on success.
+bool suppressNpc(GameWorld* gw, Character* c);
+
+// SEH-guarded: hand a previously-suppressed NPC back to the engine's local AI
+// (when the host stops streaming it), so the world keeps living rather than
+// leaving a frozen body behind.
+void restoreNpc(GameWorld* gw, Character* c);
+
 } // namespace engine
 } // namespace coop
 
