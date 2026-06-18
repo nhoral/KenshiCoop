@@ -57,6 +57,10 @@ unsigned int    g_scenarioTick    = 0;
 DWORD           g_scenarioDoneTick = 0; // !=0 once RESULT logged; begins capture hold
 const DWORD     SCENARIO_HOLD_MS  = 4000; // hold synced state on screen for capture
 
+// Test-scene setup (host-only): one-shot world spawn the user then saves.
+bool            g_setupDone     = false;
+const DWORD     SETUP_DELAY_MS  = 4000; // let the world settle before spawning
+
 // Original function pointers, filled by KenshiLib::AddHook.
 void (*g_mainLoop_orig)(GameWorld*, float) = 0;
 void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
@@ -113,6 +117,32 @@ void mainLoop_hook(GameWorld* gw, float dt) {
 
     processNetEvents();
 
+    // Test-scene setup: host spawns the controlled scene ONCE, a few seconds after
+    // gameplay starts, then leaves the game running so the user can arrange the
+    // pose (e.g. seat the character) and SAVE. Baking it into a save gives the
+    // chair/NPC save-stable hands that resolve on both clients.
+    if (!g_setupDone && !g_cfg.setupScene.empty() && g_cfg.isHost && gw &&
+        g_gameStarted && (GetTickCount() - g_gameStartTick) >= SETUP_DELAY_MS) {
+        g_setupDone = true;
+        RootObject* seat = 0;
+        bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);
+        if (ok && seat) {
+            unsigned int h[5];
+            if (coop::engine::readObjectHand(seat, h))
+                { char b[160]; _snprintf(b, sizeof(b)-1,
+                    "SETUP: spawned seat hand=%u,%u,%u,%u,%u",
+                    h[3], h[4], h[0], h[1], h[2]); b[sizeof(b)-1]='\0'; coopLog(b); }
+            else coopLog("SETUP: spawned seat (hand unread)");
+        } else {
+            coopLog("SETUP: seat spawn FAILED (no seat template or createBuilding faulted)");
+        }
+        if (g_cfg.setupScene == "npc") {
+            Character* npc = coop::engine::spawnNpcInFront(gw, 2.5f, 1.0f);
+            coopLog(npc ? "SETUP: spawned world NPC" : "SETUP: NPC spawn FAILED");
+        }
+        coopLog("SETUP: scene ready - arrange the pose and SAVE the game now");
+    }
+
     // Scenario completion hold: once a verdict is logged, keep driving the synced
     // bodies on screen for the capture window, then self-exit cleanly.
     if (g_scenario && g_scenarioDoneTick != 0) {
@@ -147,8 +177,12 @@ void mainLoop_hook(GameWorld* gw, float dt) {
 
     // Receiver applies AFTER the engine so our transform is the last word the
     // renderer samples (the local AI re-decides at the start of the next tick).
-    if (!g_cfg.isHost && g_gameStarted)
+    if (!g_cfg.isHost && g_gameStarted) {
         g_repl.applyTargets(gw);
+        // Host-authoritative world: hide/freeze any local NPC the host isn't
+        // streaming so the join can't run a divergent copy of it.
+        g_repl.enforceHostAuthority(gw);
+    }
 
     // Scenario onTick AFTER apply, so a join's RECV line reflects the applied pos.
     if (g_scenario && g_gameStarted && gw && g_scenarioStarted && g_scenarioDoneTick == 0) {
@@ -249,6 +283,22 @@ __declspec(dllexport) void startPlugin() {
     // Stage 4: the host streams nearby world NPCs (host-authoritative) in addition
     // to its squad; the join resolves each by hand and drives it like a squad body.
     if (g_cfg.isHost) g_repl.setStreamNpcs(true);
+
+    // AI-gating probe (join side): recruit diverged NPCs to test the inhabit lever.
+    if (!g_cfg.isHost && g_cfg.probeRecruit) g_repl.setProbeRecruit(true);
+
+    // AI-suspend probe (join side): detour Character::periodicUpdate so host-driven
+    // NPCs stop self-tasking (decision layer off) while still animating. Faction is
+    // untouched - we just hold the body's current action instead of letting the AI
+    // re-decide and wander/thrash.
+    if (!g_cfg.isHost && g_cfg.probeAiSuspend) {
+        if (coop::engine::installAiSuspendHook()) {
+            g_repl.setProbeAiSuspend(true);
+            coopLog("[ai] periodicUpdate detour installed; AI-suspend probe ON");
+        } else {
+            coopLog("[ai] FAILED to install periodicUpdate detour; probe disabled");
+        }
+    }
 
     // Auto-load: only hook the title screen when a save name was provided.
     if (!g_cfg.save.empty()) {

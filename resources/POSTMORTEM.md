@@ -156,6 +156,10 @@ transform problem" earlier would have saved several iterations.
 
 ## Doctrine (reusable design rules)
 
+> Forward pointer: these rules are generalized into the project's go-forward
+> design in `INTENT_REPLICATION.md` (the "replicate causes, not effects" framework
+> and the per-class lever-set + conformance-oracle model that Phase 3+ builds on).
+
 1. **Identity via `hand`** for every replicated entity. It is the stable key that
    makes "drive the real local object" possible across processes.
 2. **Reproduce intent (task) for resting/interacting entities; drive transforms
@@ -269,3 +273,116 @@ via task + settle once + no-halt). The old teleport-kinematic mover remains behi
    skip *deploy* too, so tests ran the old DLL. Build and deploy are now separate
    (`-SkipDeploy` is explicit) and the plugin logs `inhabit ownership = ...;
    suppressAI=N` at load, which the runner watches for before trusting a result.
+
+## Addendum: Seated & standing task-pose sync (the sit/stand breakthrough)
+
+Written after the bar-scene sit/stand sync reached a user-confirmed "really good"
+state on the `sync` save. This closes the largest remaining open gap from the
+Phase 2 retrospective: NPCs that the host has *sitting on a specific stool* or
+*standing at a specific node* now reproduce that pose at the right place on the
+guest, instead of standing/marching-in-place. Grounded in `Replicator.cpp`
+(`applyRest`), `Engine.cpp` (`applyTaskOrder` / `detachFromTownAI` / `endAction`)
+and the iteration log in `tools/test-runs/POSE_IDEAS.md` (I0-I11).
+
+### The two sub-problems (they are NOT the same fix)
+
+The "interacting NPC" pose splits into two distinct cases that needed *opposite*
+handling, and conflating them is what cost the most iterations:
+
+- **Sitters** (`SIT_AROUND`, task 87) - need a *persistent, location-bound order*.
+- **Standers** (`STAND_AT_NODE`, task 51) - need their *residual action ended*, and
+  must be left attached to their squad/town-AI.
+
+### What worked - sitters: detach from town-AI + a player-style ORDER
+
+The winning path (I9) is, on first rest for a sitter:
+
+1. **Detach the NPC from its town-AI platoon** via
+   `Character::separateIntoMyOwnSquad` (`engine::detachFromTownAI`). This stops the
+   town package from continuously re-assigning it a *new* seat search.
+2. **Issue a player-style order**, not an AI goal: `Character::addOrder`
+   (fallback `addJob`) with an explicit **destination building + location**
+   (`engine::applyTaskOrder`). A player order *honors the specific fixture*; the
+   body walks to and sits on the host's exact stool.
+
+Result: every seated NPC sits on the correct stool, **0 drift-abandons**
+(user-confirmed visually, then reconfirmed on `sync`).
+
+**Why it worked:** the seat target was always available - the failure was that the
+*goal* layer refused to use it (see "wander goal" below). Detaching removes the
+competing town-AI intent; the player order is the one intent left, and it is the
+one kind of intent that respects an explicit location.
+
+### What worked - standers: end the residual action, do NOT detach
+
+Standers are AI-suspended but keep *executing* a half-finished "walk-to-node"
+action, so pinned in place they march. The fix (I10b + I11):
+
+1. **`CharBody::endAction`** (`engine::endAction`) once on park - drops the
+   suspended body from "walking to node" to idle.
+2. **Re-quiet on relapse (I11).** `endAction` once is not enough for every stander:
+   some *re-acquire* a walk action after settling and march again. So each tick, if
+   a parked body actually reports a walk motion while we hold it stationary (the
+   precise march signature, via `engine::readMotion`), re-issue `endAction`. A
+   genuinely idle body is never touched, so its idle clip is never reset to frame 0.
+3. **Crucially, do NOT detach standers.** (See the I10 failure below.)
+
+Result: standers idle at the correct spot; the residual marchers are gone.
+
+### What did NOT work (and the precise reason)
+
+- **`addGoal(SIT_AROUND, seat)` - a "wander goal", not a seat assignment.**
+  Empirically `SIT_AROUND` ignores the target fixture and re-searches for *a*
+  nearby seat. On the guest it resolved to a *far* stool, the body walked 50+ m,
+  and the drift guard abandoned it standing (the `753417984` holdout, I0-I6). This
+  is why we moved off goals to player **orders** for sitters.
+- **`_NV_setCurrentAction(SIT_AROUND)` (I7).** Same wander behaviour as `addGoal` -
+  the action layer also re-searches for a seat and ignores the target. Made things
+  *worse* (more wanderers). Reverted.
+- **Snap-then-pose (I8).** Teleport the body onto the seat *before* committing the
+  task. **Crashed the client.** Reverted.
+- **Detaching STANDERS (I10).** Applying the sitter recipe (detach) to standers
+  made them go **ABSENT** on the guest. Two compounding reasons: (a)
+  `separateIntoMyOwnSquad` changes the NPC's **container**, and the cross-client
+  identity key (`keyOf`) includes `container`/`containerSerial` - so the detached
+  NPC no longer matches the host's streamed `hand`, and `enforceHostAuthority`
+  suppresses it; (b) a stander gets no replacement intent (unlike a sitter's
+  persistent order), so once in its own squad it just wanders off. Sitters survive
+  detach *only because* the immediately-following persistent sit order re-anchors
+  them. Fix: `endAction`-only for standers, no detach.
+- **Releasing node-anchored NPCs to local AI (I4).** Freed AI wandered them off the
+  host position (CROSSCHECK regression). Reverted.
+
+### Doctrine added
+
+10. **"Interacting" pose is two problems: seat-bound and node-bound. Treat them
+    separately.** A persistent, location-honoring *order* fixes the first; *ending
+    the residual action* fixes the second. The same lever applied to both
+    backfires.
+11. **Use player ORDERS (location-bound), not AI GOALS, when a specific fixture
+    matters.** `addGoal(SIT_AROUND)` / `setCurrentAction(SIT_AROUND)` are
+    *wander* intents that re-search for any nearby seat and ignore the target;
+    `addOrder`/`addJob` with an explicit destination+location honor the exact one.
+12. **Detaching from town-AI (`separateIntoMyOwnSquad`) changes the entity's
+    container, which changes its cross-client `hand` identity.** Only detach an
+    entity you immediately re-anchor with a persistent intent (a sitter's order),
+    and only when its identity break is acceptable. Never detach an entity you
+    still need to match host-side by `hand` (a stander), or it goes ABSENT
+    (identity mismatch -> host-authority suppression) and/or wanders (no
+    replacement intent).
+13. **Quieting the AI is not the same as stopping the current action.** An
+    AI-suspended body still *executes* a half-finished action (walk-to-node), so it
+    marches in place when pinned. End the action explicitly, and re-end it when the
+    body relapses into a walk motion (`readMotion` is the relapse detector); never
+    blanket-`endAction` every frame or you reset the idle clip phase.
+
+### Where this leads
+
+The sit/stand result is the second proof (after the v4 locomotion mirror) of a
+single principle - **replicate the causes of an animation, let the local engine
+produce it, quiet the AI per-class, and guard drift**. That principle is the spine
+of the go-forward plan: `INTENT_REPLICATION.md` generalizes it into a layered model
+(L0 identity -> L5 combat), a `(behavior class -> lever-set)` taxonomy, the wire
+implications (a body-state field + a reliable `PKT_EVENT` channel), and a reusable
+per-class conformance oracle - with crafting/gathering as the next proof case. The
+re-prioritized roadmap lives in `MASTER_PLAN.md` (Phase 3a/3b/3c).

@@ -49,7 +49,18 @@ param(
     [switch]$SkipDeploy,
     [switch]$NoJoin,
     [int]$JoinDelaySec = 8,
-    [int]$StartTimeoutSec = 90
+    [int]$StartTimeoutSec = 90,
+    # Host-only deterministic test-scene setup (KENSHICOOP_SETUP). "chair" spawns a
+    # seat in front of the player; "npc" also spawns a loose world NPC. The host
+    # then stays up (no self-exit) so you can arrange the pose and SAVE the game.
+    [string]$SetupScene = "",
+    # AI-gating probe (join only, KENSHICOOP_PROBE_RECRUIT=1): recruit diverged
+    # NPCs into the player squad to validate the "inhabit" lever.
+    [switch]$ProbeRecruit,
+    # AI-suspend probe (join only, KENSHICOOP_PROBE_AISUSPEND=1): detour
+    # Character::periodicUpdate so host-driven NPCs stop self-tasking (decision
+    # layer off) while still animating. Faction is untouched.
+    [switch]$ProbeAiSuspend
 )
 
 $ErrorActionPreference = "Stop"
@@ -157,6 +168,10 @@ function Set-CoopEnv {
     $env:KENSHICOOP_SCENARIO     = ""      # manual: no scenario
     $env:KENSHICOOP_AUTOSPAWN    = "$Spawn"
     $env:KENSHICOOP_OWN_INDICES  = $Own    # inhabit partition ("" = own all)
+    # Host-only one-shot world spawn for baking a deterministic test scene.
+    $env:KENSHICOOP_SETUP        = if ($Mode -eq "join") { "" } else { $SetupScene }
+    $env:KENSHICOOP_PROBE_RECRUIT = if ($Mode -eq "join" -and $ProbeRecruit) { "1" } else { "" }
+    $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
     # Per-mode log next to the install so host/join don't clobber each other.
     $env:KENSHICOOP_LOG          = if ($Mode -eq "join") { "KenshiCoop_join.log" } else { "KenshiCoop_host.log" }
 }

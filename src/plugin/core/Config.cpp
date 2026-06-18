@@ -27,6 +27,10 @@ void loadConfig(Config& c) {
 
     int d = std::atoi(envOr("KENSHICOOP_AUTOLOAD_DELAY_MS", "5000").c_str());
     c.autoLoadDelayMs = (d > 0) ? (unsigned long)d : 5000ul;
+
+    c.setupScene = envOr("KENSHICOOP_SETUP", "");
+    c.probeRecruit = envOr("KENSHICOOP_PROBE_RECRUIT", "") == "1";
+    c.probeAiSuspend = envOr("KENSHICOOP_PROBE_AISUSPEND", "") == "1";
 }
 
 } // namespace coop

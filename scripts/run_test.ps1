@@ -47,6 +47,11 @@ param(
     # its first SCENARIO RECV, so the join screenshot is captured in-game and
     # mid-action rather than on a loading screen.
     [int]$JoinAnchorTimeoutSec = 45,
+    # AI-suspend probe (join only, KENSHICOOP_PROBE_AISUSPEND=1): detour
+    # Character::periodicUpdate so host-driven NPCs stop self-tasking (decision
+    # layer off) while still animating. Faction untouched. Lets us self-validate
+    # that suspended NPCs hold the host's pose without the sit->stand->walk thrash.
+    [switch]$ProbeAiSuspend,
     # Backstop cap (seconds, measured from host gameplay) for the scenario
     # pre-screenshot wait. The wait normally ends much sooner via early-out (a
     # SCENARIO MEMBER line to anchor the shot, or SCENARIO RESULT / both clients
@@ -121,6 +126,9 @@ function Set-CoopEnv {
     # KENSHICOOP_SCENARIO: empty string = normal co-op tick (no scenario). When
     # set, KENSHICOOP_TEST_SECONDS still applies as a hard backstop.
     $env:KENSHICOOP_SCENARIO     = $Scenario
+    # Join-only AI-suspend probe. Host ignores it (plugin guards on !isHost), but
+    # we still only set it for the join so the env is unambiguous.
+    $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
 }
 
 # Wait until a regex appears in a (growing) file, or timeout. Returns $true/$false.
@@ -367,14 +375,17 @@ function Get-ScenarioSeries {
     param([string]$File, [string]$Kind)
     $map = @{}
     if (-not (Test-Path $File)) { return $map }
-    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO $Kind hand=([\d,]+) pos=([\-\d\.,]+)"
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO $Kind hand=([\d,]+) pos=([\-\d\.,]+)(?: task=(\d+))?(?: pelvis=(-?[\d\.]+))?(?: crouch=(-?\d+))?"
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
         $t = ([int]$g[1].Value*3600 + [int]$g[2].Value*60 + [int]$g[3].Value)*1000 + [int]$g[4].Value
         $hand = $g[5].Value
         $pos  = $g[6].Value.Split(',') | ForEach-Object { [double]$_ }
+        $task = if ($g[7].Success) { [int]$g[7].Value } else { 65535 }
+        $pelvis = if ($g[8].Success) { [double]$g[8].Value } else { -1.0 }
+        $crouch = if ($g[9].Success) { [int]$g[9].Value } else { -1 }
         if (-not $map.ContainsKey($hand)) { $map[$hand] = New-Object System.Collections.ArrayList }
-        [void]$map[$hand].Add(@{ t = $t; p = $pos })
+        [void]$map[$hand].Add(@{ t = $t; p = $pos; task = $task; pelvis = $pelvis; crouch = $crouch })
     }
     return $map
 }
@@ -438,6 +449,116 @@ function Compare-NpcSync {
     return $ok
 }
 
+# Stage 5 pose oracle. For each STATIONARY host NPC (a sitter/idler: its host
+# position barely moves across the run) that carries a reproducible task, check
+# the join reproduced the SAME task on its local copy. captureNpcs reads the
+# join body's CURRENT action AFTER applyTargets, so a successfully reseated NPC
+# reports the host's task value; a join that only stood (old behaviour) reports a
+# different/idle task. Movers are excluded (their task is a transient goal we drive
+# kinematically, not a pose). Inconclusive (no seated tasked NPCs) -> skip, since
+# motion sync is already proven by the cross-check and the manual gate is final.
+function Compare-NpcPose {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$StillRadius = 3.0, [double]$MinRatio = 0.60, [int]$MinJudged = 2)
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    # Dominant (most frequent) reproducible task among a sample list, or $null.
+    $modeTask = {
+        param($samples)
+        $counts = @{}
+        foreach ($s in $samples) { if ($s.task -ne 65535) { $counts[$s.task] = 1 + ($counts[$s.task]) } }
+        if ($counts.Count -eq 0) { return $null }
+        ($counts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+    }
+    $judged = 0; $matched = 0; $mism = @()
+    foreach ($hand in $H.Keys) {
+        if (-not $J.ContainsKey($hand)) { continue }
+        $hs = $H[$hand]
+        if ($hs.Count -lt 4) { continue }
+        # Stationary? max displacement of any host sample from the first one.
+        $p0 = $hs[0].p; $spread = 0.0
+        foreach ($s in $hs) {
+            $dx = $s.p[0]-$p0[0]; $dy = $s.p[1]-$p0[1]; $dz = $s.p[2]-$p0[2]
+            $d = [Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz)
+            if ($d -gt $spread) { $spread = $d }
+        }
+        if ($spread -gt $StillRadius) { continue }       # a mover, not a pose
+        $ht = & $modeTask $hs
+        if ($null -eq $ht) { continue }                  # host had no reproducible task
+        $jt = & $modeTask $J[$hand]
+        $judged++
+        if ($null -ne $jt -and [int]$jt -eq [int]$ht) { $matched++ }
+        else { $mism += "$hand(host=$ht join=$jt)" }
+    }
+    if ($judged -lt $MinJudged) {
+        Write-Host "  POSE [npc] inconclusive - only $judged seated tasked NPC(s) (need >= $MinJudged); manual gate is authoritative (skipped)"
+        return $true
+    }
+    $ratio = [Math]::Round($matched / $judged, 3)
+    $ok = ($ratio -ge $MinRatio)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $detail = if ($mism.Count -gt 0) { " mismatches: $($mism -join ', ')" } else { "" }
+    Write-Host "  POSE [npc] $v - join reproduced host task for $matched/$judged seated NPCs (ratio=$ratio >= $MinRatio)$detail"
+    return $ok
+}
+
+# AUTHORITATIVE pose oracle (standing vs sitting), read off the ANIMATED skeleton.
+# Each SCENARIO line carries pelvis=<Bip01 Pelvis world-Y minus root-Y, in Kenshi
+# units>. That magnitude varies a LOT by race (Greenlander/Shek/Hiver/Skeleton are
+# different heights), so an absolute "seat line" is meaningless. Instead we compare
+# the SAME NPC host-vs-join, time-aligned: for each host MEMBER sample with a valid
+# pelvis, find the nearest-in-time join RECV sample (same machine clock, <= $MaxDt)
+# with a valid pelvis and take |Δpelvis|. If the join reproduces the host pose the
+# pelvis tracks within ~$PelvisTol; if the host sits (~3 units lower) while the join
+# stands, |Δ| blows past it. We only judge NPCs with enough valid aligned pairs.
+# PASS if a healthy majority of pairs match. Immune to camera/lighting/load-stagger.
+function Compare-NpcPoseState {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$PelvisTol = 1.5, [double]$MinRatio = 0.80,
+          [int]$MinJudged = 20, [int]$MinPerNpc = 4, [int]$MaxDt = 800)
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $valid = { param($s) ($s.pelvis -gt 0.5) }
+    $judged = 0; $matched = 0; $npcJudged = 0; $mism = @()
+    foreach ($hand in $H.Keys) {
+        if (-not $J.ContainsKey($hand)) { continue }
+        $hv = @($H[$hand] | Where-Object { (& $valid $_) })
+        $jv = @($J[$hand] | Where-Object { (& $valid $_) })
+        if ($hv.Count -eq 0 -or $jv.Count -eq 0) { continue }
+        $nJudged = 0; $nMatched = 0; $worst = 0.0
+        foreach ($hs in $hv) {
+            $best = [double]::MaxValue; $bj = $null
+            foreach ($js in $jv) {
+                $dt = [Math]::Abs($js.t - $hs.t)
+                if ($dt -lt $best) { $best = $dt; $bj = $js }
+            }
+            if ($best -le $MaxDt -and $null -ne $bj) {
+                $d = [Math]::Abs($hs.pelvis - $bj.pelvis)
+                $nJudged++; $judged++
+                if ($d -le $PelvisTol) { $nMatched++; $matched++ }
+                if ($d -gt $worst) { $worst = $d }
+            }
+        }
+        if ($nJudged -lt $MinPerNpc) { continue }
+        $npcJudged++
+        if ($nMatched -lt $nJudged) {
+            $pct = [Math]::Round(100.0 * $nMatched / $nJudged, 0)
+            $w = [Math]::Round($worst, 1)
+            $mism += "$hand($nMatched/$nJudged ok $pct%, worstD=$w)"
+        }
+    }
+    if ($npcJudged -eq 0 -or $judged -lt $MinJudged) {
+        Write-Host "  POSE-STATE [npc] inconclusive - only $judged valid aligned pelvis pair(s) across $npcJudged NPC(s) (need >= $MinJudged; pelvis read may be failing)"
+        return $true
+    }
+    $ratio = [Math]::Round($matched / $judged, 3)
+    $ok = ($ratio -ge $MinRatio)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $detail = if ($mism.Count -gt 0) { " pose-mismatch: $($mism -join ', ')" } else { "" }
+    Write-Host "  POSE-STATE [npc] $v - join pelvis tracked host within ${PelvisTol}u for $matched/$judged pairs across $npcJudged NPC(s) (ratio=$ratio >= $MinRatio)$detail"
+    return $ok
+}
+
 # True if $File logged a "SCENARIO RESULT PASS" line.
 function Test-ScenarioResultPass {
     param([string]$File)
@@ -489,6 +610,26 @@ function Test-AnimTruth {
     return $ok
 }
 
+# March-in-place oracle (the inverse of anim-truth). The receiver logs a
+# "SCENARIO MARCH ... marchFrac=.." line: the fraction of AT-REST frames where the
+# driven body played a walk clip while NOT translating - i.e. it marched on the
+# spot (e.g. a host-seated NPC stuck walking in place on the join). Engine walk +
+# correct rest poses keep this low. Skipped (returns $true) if no MARCH line or too
+# few rest samples to judge.
+function Test-MarchInPlace {
+    param([string]$File, [string]$Label, [double]$MaxMarchFrac = 0.20)
+    if (-not (Test-Path $File)) { return $true }
+    $line = Select-String -Path $File -Pattern "SCENARIO MARCH restSamples=(\d+) march=(\d+) marchFrac=([\d\.]+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $line) { Write-Host "  [$Label] no SCENARIO MARCH line (skipped)"; return $true }
+    $rest  = [int]$line.Matches[0].Groups[1].Value
+    $marchFrac = [double]$line.Matches[0].Groups[3].Value
+    if ($rest -lt 30) { Write-Host "  [$Label] march-in-place inconclusive - only $rest at-rest frame(s) (skipped)"; return $true }
+    $ok = ($marchFrac -le $MaxMarchFrac)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  [$Label] march-in-place $v - marchFrac=$marchFrac (<= $MaxMarchFrac), restSamples=$rest"
+    return $ok
+}
+
 $cleanPattern = if ($Scenario -ne "") { "SCENARIO RESULT" } else { "test duration elapsed; exiting" }
 $hostOk = Evaluate -File $hostLog -Label "host" -Required $true -CleanPattern $cleanPattern
 $joinOk = Evaluate -File $joinLog -Label "join" -Required ($joinPid -ne 0) -CleanPattern $cleanPattern
@@ -509,8 +650,12 @@ if ($Scenario -ne "") {
         $joinResultPass = Test-ScenarioResultPass -File $joinLog
         if (-not $joinResultPass) { Write-Host "  join SCENARIO RESULT is not PASS" }
     }
+    $pose = $true; $poseState = $true
     if ($Scenario -eq "npc_sync") {
         $cross = Compare-NpcSync -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
+        $pose  = Compare-NpcPose -HostFile $hostLog -JoinFile $joinLog
+        # Authoritative standing-vs-sitting gate (rendered-skeleton pelvis/crouch).
+        $poseState = Compare-NpcPoseState -HostFile $hostLog -JoinFile $joinLog
     } else {
         $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
     }
@@ -518,7 +663,8 @@ if ($Scenario -ne "") {
     # drives the body. Each is skipped automatically if its line is absent.
     $smooth = Test-Smoothness -File $joinLog -Label "join"
     $anim   = Test-AnimTruth  -File $joinLog -Label "join"
-    $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $smooth -and $anim)
+    $march  = Test-MarchInPlace -File $joinLog -Label "join"
+    $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $smooth -and $anim -and $march -and $pose -and $poseState)
 }
 
 Write-Host ""

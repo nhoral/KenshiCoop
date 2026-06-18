@@ -35,11 +35,28 @@ bool logScenarioLine(const char* kind, Character* c) {
 // (index,serial,type,container,containerSerial) MUST match logScenarioLine so the
 // runner keys MEMBER and RECV lines identically.
 void logScenarioEntity(const char* kind, const EntityState& e) {
-    char b[160];
+    // task=<TaskType|65535> lets the runner's pose oracle compare the host's
+    // current action against the join's reproduced one for seated NPCs.
+    //
+    // pelvis/crouch/idle are the AUTHORITATIVE pose oracle: read straight off the
+    // rendered skeleton (pelvis = Bip01 height above ground; seated ~0.4-0.6 m,
+    // standing ~0.9-1.1 m). We read them HERE (not in captureNpcs) by resolving the
+    // hand back to the local Character* and calling readPoseState - this keeps pose
+    // reading OFF the streaming-capture path (which broke host capture before). On
+    // fault / unresolved, pelvis=-1 and the runner skips that sample.
+    float pelvis = -1.0f; int crouch = -1, idle = -1, ptask = (int)e.task;
+    Character* c = engine::resolve(e);
+    // crouch=-2 is a diagnostic marker meaning the hand did NOT resolve to a local
+    // Character here (so we never even called readPoseState) - distinct from -1
+    // (resolved but the pose read returned nothing).
+    if (c) engine::readPoseState(c, &pelvis, &idle, &crouch, &ptask);
+    else   crouch = -2;
+    char b[224];
     _snprintf(b, sizeof(b) - 1,
-              "SCENARIO %s hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f",
+              "SCENARIO %s hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f task=%u "
+              "pelvis=%.2f crouch=%d idle=%d",
               kind, e.hIndex, e.hSerial, e.hType, e.hContainer, e.hContainerSerial,
-              e.x, e.y, e.z);
+              e.x, e.y, e.z, (unsigned int)e.task, pelvis, crouch, idle);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
 }

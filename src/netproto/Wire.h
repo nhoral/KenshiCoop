@@ -77,6 +77,10 @@ struct EntityState {
     u32 sContainerSerial;
     u32 sIndex;
     u32 sSerial;
+    // diagnostic (AI-gating spike): the host's RAW top-level Tasker::key for this
+    // body regardless of reproducibility, so the join can compare it to its own
+    // local task and detect divergence. TASK_NONE if the body has no current task.
+    u16 rawTask;
 };
 
 // Sentinel task value meaning "no current task this tick".

@@ -123,16 +123,28 @@ Explicitly deferred / out of scope for v1:
   own, and drives the peer's. Validated on the `sync` save (no frozen leaders,
   NPCs at `gap 0-1 m`). Distinct saves are unsupported (break resolve-by-`hand`).
   Detailed design + resolved questions below; see `POSTMORTEM.md` addendum.
-- **Phase 3 - NPC fidelity:** fix the seated-teleport edge case (force-unseat
-  before reposition) and optionally stream a compact pose/anim state for cases the
-  task system cannot reproduce.
-- **Phase 4 - Combat:** server-authoritative combat resolution, hit reactions,
-  KO/death, and the new wire state it requires (health, combat target, stance).
-  Depends on solid NPC presence, which now exists.
-- **Phase 5 - World objects:** inventory, buildings, and items within the active
-  zone.
-- **Phase 6 - Hardening:** interpolation buffer for real latency/jitter,
-  packet-loss resilience, rate limiting, reconnect, and anti-crash guards.
+- **Phase 3 - Intent-replication framework (reframed from "NPC fidelity").** The
+  sit/stand task-pose win generalizes into a reusable framework: replicate the
+  *causes* of an animation (identity + transform + locomotion + AI intent + body
+  state) and let the join's engine produce it, with a class-specific quieting lever
+  and an authority guard. Each new behavior is a new `(class -> lever-set)` entry
+  validated by its own conformance oracle, ordered by ascending risk. See
+  `INTENT_REPLICATION.md` for the full design. Sub-phases:
+  - **3a Crafting/gathering** - reuse the fixture-task lever (`detachFromTownAI` +
+    `applyTaskOrder` at the work-station subject); lowest risk; proves framework
+    reuse. Main open risk: resource-node subjects may lack a stable cross-client
+    `hand`.
+  - **3b Body-state layer (L4)** - laying / unconscious / KO / death / ragdoll.
+    Adds a compact body-state field to `EntityState` (bump `PROTOCOL_VERSION`) and a
+    reliable death/KO event; no pathing for a downed body.
+  - **3c Combat (L5)** - target hand + stance + health + reliable hit/KO/death
+    events + host-authoritative resolution. Highest value and risk; depends on 3b's
+    body state and the reliable event channel.
+- **Phase 4 - World objects:** inventory, buildings, and items within the active
+  zone (including the production *results* of crafting from 3a).
+- **Phase 5 - Hardening:** interpolation buffer for real latency/jitter,
+  packet-loss resilience, event ack/resend, rate limiting, reconnect, and
+  anti-crash guards.
 
 ## Lessons that changed the design
 
@@ -152,6 +164,23 @@ These come out of the Phase 1/2 post-mortem and directly reshape the roadmap:
   load the same save, squad members are real characters with stable `hand`s on
   the peer - so player presence should ride the NPC pipeline rather than a
   separate spawn-ghost mechanism. This is what Phase 2.5 acts on.
+- **Replicate causes, not effects (the spine of Phase 3+).** Confirmed twice now
+  (the v4 locomotion mirror and the sit/stand task-pose sync): stream identity +
+  transform + locomotion + AI intent + body state, and let the join's engine
+  produce the animation - never stream clips/phases (idle/sit/stand are not slave
+  animations and `AnimationClass` is opaque). This keeps the per-entity wire cost
+  roughly constant as animation variety grows and makes state idempotent
+  (loss-tolerant). Two wire implications follow: a new body-state field for
+  no-subject poses (laying/KO/death) bumps `PROTOCOL_VERSION`, and one-shot
+  transitions (death, KO, hit reactions) need a reliable `PKT_EVENT` sub-channel
+  alongside the 20 Hz unreliable state batch (continuous state self-heals; a lost
+  death event does not). See `INTENT_REPLICATION.md`.
+- **A new behavior is a new `(class -> lever-set)` entry, not new netcode - and the
+  same lever applied to the wrong class backfires.** Sitters need detach + a
+  location-bound order; standers must NOT be detached (it changes the body's
+  container and thus its cross-client `hand`, so the host stops matching it and it
+  goes absent). Pick each class's apply lever, quieting lever, and guard
+  deliberately.
 
 ## Phase 2.5 design: unify remote-player squads onto the NPC pipeline
 

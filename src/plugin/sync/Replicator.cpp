@@ -6,6 +6,7 @@
 
 #include <windows.h> // GetTickCount
 #include <deque>
+#include <set>
 #include <cstdio>
 #include <cmath>
 
@@ -41,6 +42,8 @@ const float REISSUE_DIST = 1.0f;  // re-issue the walk order only when tgt moved
 const float LEAD_SECONDS = 0.6f;  // project the walk target this far along source velocity
 const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "walking"
                                   // (vs a fidget/turn in place -> treat as at rest)
+const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose
+const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
 const float TRANSLATE_EPS = 0.02f; // per-frame actual movement counted as "translating"
 
 float dist3(float ax, float ay, float az, float bx, float by, float bz) {
@@ -52,7 +55,11 @@ float dist3(float ax, float ay, float az, float bx, float by, float bz) {
 Replicator::Replicator()
     : leaderOnly_(true), streamNpcs_(false),
       activeFrames_(0), zeroWhileActive_(0), maxStep_(0.0f),
-      translateFrames_(0), walkTruthFrames_(0) {}
+      translateFrames_(0), walkTruthFrames_(0),
+      restSampleFrames_(0), marchFrames_(0),
+      gateSamples_(0), gateAgree_(0), gateLogTick_(0),
+      probeRecruit_(false), probedCount_(0),
+      probeAiSuspend_(false), aiLogTick_(0) {}
 
 void Replicator::ingest(Inbound& in) {
     std::deque<InboundEntity> got;
@@ -79,14 +86,20 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
 void Replicator::applyTargets(GameWorld* gw) {
     (void)gw;
     unsigned long now = nowMs();
+    // Rebuild the AI-suspend set from scratch each tick: only NPCs we drive this
+    // tick stay suspended; anything we stop driving (stale/suppressed) is dropped
+    // here so its AI resumes. Safe to rebuild now - the periodicUpdate detour only
+    // reads the set during the engine tick, which already ran this frame.
+    if (probeAiSuspend_) engine::clearAiSuspend();
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
         Driven& d = it->second;
         EntityState out;
         if (!d.interp.sample(now, cfg_, &out)) {
             // Stream stale: release the body back to local AI (stop driving).
-            d.haveActual = false; d.parked = false;
+            d.haveActual = false; d.parked = false; d.fresh = false;
             continue;
         }
+        d.fresh = true;
 
         Character* c = engine::resolve(out);
         if (!c) continue;
@@ -104,6 +117,49 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     sit/idle poses for NPCs arrive in Stage 5 (AI quiet-in-place).
         bool isSquad = engine::isLocalPlayerChar(gw, c);
 
+        // AI-suspend decision is made BELOW, once we know whether this NPC is
+        // genuinely moving and whether the host has it node-anchored - node-sitters
+        // must keep their local AI so they can execute the node behavior.
+
+        // AI-gating spike: compare the join's LOCAL task for this NPC to the host's
+        // raw task. High agreement means the local AI is mostly doing the same
+        // thing the host is, so we could gate it (freeze on match / release on
+        // divergence) rather than replicate animation data. Logged, not acted on.
+        if (!isSquad) {
+            int localKey = engine::readTaskKey(c);
+            ++gateSamples_;
+            bool agree = (localKey == (int)out.rawTask);
+            if (agree) ++gateAgree_;
+            if (!agree && (now - gateLogTick_) > 2000) {
+                gateLogTick_ = now;
+                unsigned long pct = gateSamples_ ? (gateAgree_ * 100 / gateSamples_) : 0;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[gate] hand=%u,%u host=%u local=%d  agree=%lu/%lu (%lu%%)",
+                    out.hIndex, out.hSerial, (unsigned)out.rawTask, localKey,
+                    gateAgree_, gateSamples_, pct);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+
+            // Probe the "inhabit" lever: the first time we see a diverged NPC,
+            // recruit it into the player squad ONCE (capped). If the lever works,
+            // it stops self-tasking and next tick resolves as isSquad => the proven
+            // squad drive path takes over (walkTo + addGoal), and [gate] for this
+            // hand should converge as its local AI goes idle.
+            if (probeRecruit_ && !agree && probedCount_ < 8) {
+                Key k = keyOf(out);
+                if (probed_.find(k) == probed_.end()) {
+                    probed_.insert(k);
+                    bool ok = engine::recruitNpc(gw, c);
+                    ++probedCount_;
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[probe] recruit hand=%u,%u host=%u local=%d ok=%d (#%u)",
+                        out.hIndex, out.hSerial, (unsigned)out.rawTask, localKey,
+                        ok ? 1 : 0, probedCount_);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+
         // Newest received pose is the position authority while moving; the interp
         // sample ('out') is the smoothed authority at rest. gapNewest measures how
         // far the body trails the true host position.
@@ -119,6 +175,22 @@ void Replicator::applyTargets(GameWorld* gw) {
         // so a correctly-held (parked) body is not counted as missed movement.
         float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
         bool npcMoving = haveNewest && (vlen > NPC_MOVE_VEL);
+
+        // AI-suspend probe: for a host-driven world NPC, suspend its AI decision
+        // layer (faction-safe) so it stops self-tasking but keeps animating. The
+        // host stream is the sole task authority; the body holds + animates its
+        // current/injected action instead of the AI re-deciding every tick.
+        // (Releasing node-anchored sitters to local AI was tried - Idea I4 - and
+        // regressed: the freed AI wandered them off-host, CROSSCHECK 0.5, and it
+        // still did not reliably sit them. So we suspend uniformly.)
+        if (probeAiSuspend_ && !isSquad) engine::addAiSuspend(c);
+
+        // Re-arm rest-pose reproduction whenever the body is genuinely moving, so
+        // the next time it stops we re-evaluate the host's (possibly new) task.
+        bool genuinelyMoving = isSquad ? hostMoving : npcMoving;
+        if (genuinelyMoving) {
+            d.taskApplied = false; d.taskBad = false; d.issuedTask = TASK_NONE;
+        }
 
         if (!isSquad) {
             // ---- NPC: velocity-gated drive (smooth walk OR quieted rest) -------
@@ -154,14 +226,18 @@ void Replicator::applyTargets(GameWorld* gw) {
                 }
                 d.parked = false;
             } else {
-                engine::clearGoals(c); // quiet the wander only when near-stationary
-                float gapOut = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
-                if (!d.parked) {
-                    if (engine::park(c, out.x, out.y, out.z, out.heading)) d.parked = true;
-                } else if (gapOut > REPARK_DIST) {
-                    engine::applyRaw(c, out);
-                }
-                engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
+                // At rest, task-authoritative: reproduce the host's sit/idle pose at
+                // the same fixture, else quiet + park.
+                //
+                // The earlier AI-suspend-only path just snapped position and trusted
+                // a "currently-held" pose - but bar patrons sit DYNAMICALLY (they
+                // walk in and SIT_AROUND a stool), so at the moment we suspend them
+                // they are still standing and freeze there. The host streams task 87
+                // (SIT_AROUND, reproducible, subject resolves), so we must actively
+                // INJECT the seat via applyRest->applyTask. AI-suspend (set above for
+                // this NPC) is what stops the local AI from standing it back up - the
+                // thrash that broke this on the non-suspend path.
+                applyRest(c, d, out, haveActual, ax, ay, az, now);
                 d.haveDest = false;
             }
         } else if (hostMoving && haveActual && haveNewest && gapNewest > SNAP_DIST) {
@@ -203,17 +279,10 @@ void Replicator::applyTargets(GameWorld* gw) {
             // No motion mirror while genuinely moving: the engine selects the
             // grounded walk clip itself from the locomotion it is performing.
         } else {
-            // Squad member at rest: settle once (clean halt+teleport), then only
-            // re-place on drift WITHOUT halting (halting every frame freezes the
-            // idle clip on frame 0). Mirror an idle locomotion state.
-            engine::clearGoals(c);
-            float gapOut = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
-            if (!d.parked) {
-                if (engine::park(c, out.x, out.y, out.z, out.heading)) d.parked = true;
-            } else if (gapOut > REPARK_DIST) {
-                engine::applyRaw(c, out);
-            }
-            engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
+            // Squad member at rest: reproduce the host's pose (e.g. seated on the
+            // same chair) at the same fixture, else quiet + park (Stage 5). This is
+            // what makes a join squad-mate sit instead of standing on the chair.
+            applyRest(c, d, out, haveActual, ax, ay, az, now);
             d.haveDest = false;
         }
 
@@ -237,9 +306,152 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (engine::readMotion(c, &m, &sp) && m && sp > 0.1f)
                     ++walkTruthFrames_;
             }
+        } else if (!oracleActive && haveActual && d.haveActual) {
+            // Host is AT REST. Is the driven body marching in place? (walk clip
+            // playing while the body does not translate). This is the bug the
+            // float oracle is blind to.
+            float step = dist3(ax, ay, az, d.lx, d.ly, d.lz);
+            ++restSampleFrames_;
+            bool m = false; float sp = 0.0f;
+            if (step < TRANSLATE_EPS && engine::readMotion(c, &m, &sp) && m && sp > 0.1f)
+                ++marchFrames_;
         }
         if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
     }
+    if (probeAiSuspend_ && (now - aiLogTick_) > 3000) {
+        aiLogTick_ = now;
+        char b[96];
+        _snprintf(b, sizeof(b), "[ai] suspended=%u driven=%u",
+                  engine::aiSuspendCount(), (unsigned)targets_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::enforceHostAuthority(GameWorld* gw) {
+    if (!gw) return;
+    // Hands the host streamed a fresh sample for this tick = the authoritative set.
+    std::set<Key> keep;
+    for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
+        if (it->second.fresh) keep.insert(it->first);
+    }
+
+    // Enumerate the join's local world NPCs (same interest query as the host).
+    const unsigned int MAX_NPCS = 256;
+    static Character*  chars[MAX_NPCS]; // main-thread only
+    static EntityState states[MAX_NPCS];
+    unsigned int n = engine::listNpcs(gw, chars, states, MAX_NPCS);
+
+    for (unsigned int i = 0; i < n; ++i) {
+        Key k = keyOf(states[i]);
+        bool streamed = keep.find(k) != keep.end();
+        std::map<Key, Character*>::iterator s = suppressed_.find(k);
+        if (streamed) {
+            // Host owns it now: hand it back to the engine so the drive can pose it.
+            if (s != suppressed_.end()) {
+                engine::restoreNpc(gw, chars[i]);
+                suppressed_.erase(s);
+                { char b[96]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] restore NPC hand=%u,%u (supp=%u)",
+                    states[i].hIndex, states[i].hSerial,
+                    (unsigned)suppressed_.size()); b[sizeof(b) - 1] = '\0';
+                  coop::logLine(b); }
+            }
+        } else {
+            // Host isn't streaming it: hide + freeze so the local AI can't run a
+            // divergent (standing) copy on top of the host-driven world.
+            if (s == suppressed_.end()) {
+                engine::suppressNpc(gw, chars[i]);
+                suppressed_[k] = chars[i];
+                { char b[96]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] suppress NPC hand=%u,%u (streamed=%u local=%u supp=%u)",
+                    states[i].hIndex, states[i].hSerial, (unsigned)keep.size(), n,
+                    (unsigned)suppressed_.size()); b[sizeof(b) - 1] = '\0';
+                  coop::logLine(b); }
+            }
+        }
+    }
+}
+
+void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
+                           bool haveActual, float ax, float ay, float az,
+                           unsigned long now) {
+    // Re-arm only when the host adopts a genuinely NEW non-NONE rest pose (stood up
+    // then sat somewhere else). Crucially we IGNORE transient host->NONE frames: the
+    // host capture intermittently reads currentAction==NONE for an otherwise-seated
+    // NPC (transition frames), and re-arming on those tore the committed sit back
+    // down to a standing park every few frames -> the body oscillated sit/stand and
+    // mostly rendered standing. Holding through NONE keeps the seated pose sticky;
+    // genuine stand-up is caught by the movement re-arm in applyTargets.
+    if (out.task != TASK_NONE && out.task != d.issuedTask) {
+        { char b[96]; _snprintf(b, sizeof(b) - 1,
+            "[pose] rest re-arm task %u -> %u", (unsigned)d.issuedTask,
+            (unsigned)out.task); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+        d.taskApplied = false; d.taskBad = false; d.issuedTask = out.task;
+    }
+    // Commit a reproducible pose (sit/operate) at the SAME fixture, once.
+    if (out.task != TASK_NONE && !d.taskBad && !d.taskApplied) {
+        // I9: detach from the town-AI FIRST (once) so nothing auto-tasks this NPC,
+        // then reproduce the pose via the PLAYER-ORDER path (explicit seat location)
+        // so it pins THIS stool instead of running SIT_AROUND's own seat search.
+        if (!d.detached) { d.detached = engine::detachFromTownAI(c); }
+        int r = engine::applyTaskOrder(c, out);
+        d.taskTick = now;
+        { char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[pose] applyOrder hand=%u,%u task=%u subj=%u,%u,%u det=%d r=%d",
+            out.hIndex, out.hSerial, (unsigned)out.task,
+            out.sIndex, out.sSerial, out.sType, d.detached ? 1 : 0, r);
+          b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+        if (r == 2)              d.taskApplied = true; // resolved at host xform + posed
+        else if (r == 1 || r == 3) d.taskBad   = true; // not loaded / WRONG far seat -> park
+        // r <= 0 / -1: leave unapplied this frame; fall through to park.
+    }
+    // Drift guard: a committed pose that wandered off the host transform (the
+    // engine re-pathed the body to the fixture) is abandoned for a held park.
+    if (d.taskApplied && haveActual && (now - d.taskTick) > TASK_GRACE_MS &&
+        dist3(ax, ay, az, out.x, out.y, out.z) > TASK_DRIFT_MAX) {
+        float dd = dist3(ax, ay, az, out.x, out.y, out.z);
+        { char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[pose] drift-abandon hand=%u,%u drift=%.2f > %.2f",
+            out.hIndex, out.hSerial, dd, (double)TASK_DRIFT_MAX);
+          b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+        d.taskApplied = false; d.taskBad = true;
+    }
+    if (d.taskApplied) {
+        d.parked = false; // the engine holds the seated/idle pose; don't fight it
+        return;
+    }
+    // Fallback (no task / fixture missing / drifted): quiet the AI and hold the
+    // host transform. Settle once (clean halt+teleport), then only re-place on
+    // drift WITHOUT halting (halting every frame freezes the idle clip on frame 0).
+    //
+    // I10: a node-anchored stander (STAND_AT_NODE, not reproducible) that we
+    // suspend mid-walk keeps EXECUTING its walk-to-node action, so held in place it
+    // marches. END its current action once so the (already AI-suspended) body drops
+    // to idle instead of marching, then hold the transform.
+    //
+    // NOTE: we deliberately do NOT detach standers from the town-AI here. Detaching
+    // a sitter is safe because it is immediately re-anchored by a persistent sit
+    // ORDER; a stander gets no replacement intent, so once detached into its own
+    // squad it wanders off the spot (observed: standers went ABSENT). endAction
+    // under the existing AI-suspend is enough to quiet the march without detaching.
+    engine::clearGoals(c);
+    float gapOut = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
+    if (!d.parked) {
+        engine::endAction(c); // stop the residual walk -> idle (not march in place)
+        if (engine::park(c, out.x, out.y, out.z, out.heading)) d.parked = true;
+    } else if (gapOut > REPARK_DIST) {
+        engine::applyRaw(c, out);
+    }
+    // I11: endAction once is not enough for every stander - some RE-ACQUIRE a
+    // walk action after settling and march again. Re-quiet only when the body
+    // actually reports a walk motion while we hold it stationary (the precise
+    // march signature), so a genuinely idle body's clip is never reset.
+    {
+        bool reMoving = false; float reSpeed = 0.0f;
+        if (engine::readMotion(c, &reMoving, &reSpeed) && reMoving && reSpeed > 0.1f)
+            engine::endAction(c);
+    }
+    engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
 }
 
 void Replicator::logSmoothSummary() {
@@ -267,6 +479,19 @@ void Replicator::logSmoothSummary() {
               translateFrames_, walkTruthFrames_, floatFrac);
     a[sizeof(a) - 1] = '\0';
     coop::logLine(a);
+
+    // March-in-place oracle: of the at-rest frames, fraction where the body played
+    // a walk clip while NOT moving. High == "walking on the spot" (the failure the
+    // float oracle cannot see, e.g. a host-seated NPC stuck walking on the join).
+    float marchFrac = (restSampleFrames_ > 0)
+                          ? (float)marchFrames_ / (float)restSampleFrames_
+                          : 0.0f;
+    char m[160];
+    _snprintf(m, sizeof(m) - 1,
+              "SCENARIO MARCH restSamples=%lu march=%lu marchFrac=%.3f",
+              restSampleFrames_, marchFrames_, marchFrac);
+    m[sizeof(m) - 1] = '\0';
+    coop::logLine(m);
 }
 
 } // namespace coop

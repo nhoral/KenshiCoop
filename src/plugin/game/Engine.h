@@ -16,6 +16,7 @@
 
 class GameWorld;
 class Character;
+class RootObject;
 
 namespace coop {
 namespace engine {
@@ -112,8 +113,107 @@ bool suppressNpc(GameWorld* gw, Character* c);
 
 // SEH-guarded: hand a previously-suppressed NPC back to the engine's local AI
 // (when the host stops streaming it), so the world keeps living rather than
-// leaving a frozen body behind.
+// leaving a frozen body behind. Also makes the body visible again.
 void restoreNpc(GameWorld* gw, Character* c);
+
+// SEH-guarded: enumerate nearby world NPCs (excluding the local player squad),
+// writing each live Character* into outChars and its hand-bearing snapshot into
+// outStates. Returns the count. Used by the join to find NPCs the host is NOT
+// streaming so it can suppress them (host-authoritative world).
+unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outStates,
+                      unsigned int maxOut);
+
+// ---- Deterministic test-scene setup (host-side; baked into a save) ---------
+// These spawn objects into the live world so the user can SAVE the result. Once
+// saved, the spawned chair/NPC become ordinary save entities with save-stable
+// hands that resolve identically on both clients - the only way a controlled
+// actor can sync (a runtime spawn alone gets a host-only hand the join can't see).
+
+// SEH-guarded: place a seat (stool/chair/bench) furniture building 'fwd' metres in
+// front of the local leader (and 'side' metres to its right), facing the leader.
+// Returns true if a seat template was found and createBuilding did not fault.
+// 'spawned' (optional) receives the new object for hand logging.
+bool spawnSeatInFront(GameWorld* gw, float fwd, float side, RootObject** spawned);
+
+// SEH-guarded: spawn a loose world character (player faction, NOT enlisted in the
+// squad, so it travels the host-authoritative NPC path) at 'fwd'/'side' from the
+// leader. Returns the new Character* (or 0).
+Character* spawnNpcInFront(GameWorld* gw, float fwd, float side);
+
+// SEH-guarded: read a RootObject's save-stable hand into out[5] (type, container,
+// containerSerial, index, serial). Used to log spawned objects.
+bool readObjectHand(RootObject* obj, unsigned int out[5]);
+
+// ---- Honest pose oracle (downstream of the actual body, not the task flag) --
+// SEH-guarded: read pose signals that reflect the RENDERED body, so a pose check
+// cannot self-confirm off the task field we may have written:
+//   *pelvis  = pelvis (Bip01) height above the body's ground position, in metres
+//              (seated ~0.4-0.6, standing ~0.9-1.1; <0 = unavailable)
+//   *idle    = CharBody::isIdle()    (1/0/-1 unknown)
+//   *crouched= CharBody::isCrouched()(1/0/-1 unknown)
+//   *task    = current TaskType (TASK_NONE if none)
+// Returns true if at least the pelvis height was read.
+bool readPoseState(Character* c, float* pelvis, int* idle, int* crouched, int* task);
+
+// ---- Stage 5 rest-pose reproduction ----------------------------------------
+
+// SEH-guarded: force 'c' into the task carried by 'e' (e.task) targeting the
+// fixture named by e's subject hand, so the body adopts the SAME pose at the SAME
+// object as the host (e.g. SIT_AROUND on a specific stool). Resolves the subject
+// hand to a local RootObject; only commits if that fixture exists here.
+// Deliberately never issues a task with a NULL target (the engine would auto-pick
+// a nearby object and WALK the body to it). Returns:
+//   2 = applied (fixture resolved at the host transform, pose committed)
+//   3 = fixture resolved but it is the WRONG (far) one - a cross-client identity
+//       mismatch; NOT committed (issuing it would walk the body to the far seat).
+//       Caller should treat like a bad fixture and idle-park in place.
+//   1 = subject not loaded here (caller should fall back to a held idle-park)
+//   0 = no task in e / required fns unresolved
+//  -1 = fault
+int applyTask(Character* c, const EntityState& e);
+
+// I9: reproduce a rest pose via the PLAYER-ORDER path (addOrder/addJob with an
+// explicit location) instead of the autonomous SIT_AROUND goal. Pins the body to
+// THIS fixture at THIS spot (no local seat re-search). Same return codes as
+// applyTask (2 applied / 3 wrong-far fixture / 1 not loaded / 0 none / -1 fault).
+int applyTaskOrder(Character* c, const EntityState& e);
+
+// I9: detach an NPC from its town/faction (separateIntoMyOwnSquad) so the town-AI
+// stops auto-assigning it tasks - an inert, squad-like puppet driven only by the
+// host order. Call once per driven NPC. Returns true if the detach was issued.
+bool detachFromTownAI(Character* c);
+
+// I10: end the body's current action (CharBody::endAction) so a suspended
+// node-stander stops executing its residual walk-to-node and drops to idle
+// instead of marching in place. Returns true if the call was made.
+bool endAction(Character* c);
+
+// Read a body's RAW top-level Tasker::key (engine TaskType) - the same value the
+// host streams as EntityState::rawTask. TASK_NONE if the body has no current
+// task; -1 on fault / unresolved fn. Used by the AI-gating divergence check.
+int readTaskKey(Character* c);
+
+// True if 'taskKey' is a NODE-anchored rest pose (STAND_AT_NODE /
+// STAND_AT_SHOPKEEPER_NODE). These sit/idle the body at an AI node whose subject
+// is NOT a resolvable RootObject (applyTask cannot reproduce it), so the only way
+// to reproduce the pose on the join is to let the body's OWN local AI execute the
+// node behavior - i.e. do NOT suspend its AI and do NOT park it at rest.
+bool isNodeAnchoredPose(int taskKey);
+
+// AI-gating probe lever: recruit a world NPC into the local player's squad (the
+// "inhabit" path) so it stops self-assigning town tasks and obeys our drive.
+// Join-side only. Returns the engine's recruit() result (false if unresolved).
+bool recruitNpc(GameWorld* gw, Character* c);
+
+// AI decision-layer suspension (the faction-safe alternative to recruit): detour
+// Character::periodicUpdate so that, for NPCs in the suspended set, the AI "think"
+// tick is skipped (no autonomous re-tasking) while the body keeps animating and
+// executing its current/injected action. installAiSuspendHook() wires the detour
+// once; the set is rebuilt each tick via clearAiSuspend()/addAiSuspend().
+bool         installAiSuspendHook();
+void         clearAiSuspend();
+void         addAiSuspend(Character* c);
+unsigned int aiSuspendCount();
 
 } // namespace engine
 } // namespace coop

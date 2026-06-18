@@ -27,7 +27,9 @@ param(
     [int]$Port = 27800,
     # Optional compiled scenario to run (KENSHICOOP_SCENARIO); passthrough to run_test.ps1.
     [string]$Scenario = "",
-    [double]$Tolerance = 3.0
+    [double]$Tolerance = 3.0,
+    # Passthrough: join-only AI-suspend probe (see run_test.ps1 -ProbeAiSuspend).
+    [switch]$ProbeAiSuspend
 )
 
 $ErrorActionPreference = "Stop"
@@ -92,5 +94,6 @@ $testArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $s
               "-Save", $Save, "-Seconds", "$Seconds", "-Port", "$Port")
 if ($Sync) { $testArgs += "-Sync" }
 if ($Scenario -ne "") { $testArgs += @("-Scenario", $Scenario, "-Tolerance", "$Tolerance") }
+if ($ProbeAiSuspend) { $testArgs += "-ProbeAiSuspend" }
 & powershell @testArgs
 exit $LASTEXITCODE
