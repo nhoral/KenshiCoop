@@ -17,6 +17,7 @@
 class GameWorld;
 class Character;
 class RootObject;
+class Faction;
 
 namespace coop {
 namespace engine {
@@ -46,6 +47,10 @@ unsigned int captureSquad(GameWorld* gw, bool leaderOnly,
 // SEH-guarded: resolve a received entity's hand to this machine's local
 // Character*, or 0 if it isn't loaded here / doesn't resolve.
 Character* resolve(const EntityState& e);
+
+// SEH-guarded: resolve a Character* from raw hand fields (same path as resolve()).
+Character* resolveCharByHand(unsigned int idx, unsigned int ser, unsigned int type,
+                             unsigned int cont, unsigned int contSer);
 
 // SEH-guarded RAW apply: teleport the body to the entity transform via the
 // movement controller (no interpolation). Stage 1 apply path.
@@ -139,6 +144,45 @@ bool spawnSeatInFront(GameWorld* gw, float fwd, float side, RootObject** spawned
 // squad, so it travels the host-authoritative NPC path) at 'fwd'/'side' from the
 // leader. Returns the new Character* (or 0).
 Character* spawnNpcInFront(GameWorld* gw, float fwd, float side);
+
+// SEH-guarded: place an OPERABLE work-fixture building (research bench, training
+// dummy, machine...) 'fwd'/'side' from the leader, facing the leader, owned by
+// 'owner' (pass a non-player faction so the fixture is a world-owned station, or 0
+// for unowned). Used by the 'craft' setup scene to bake a save-stable work station
+// both clients resolve. 'spawned' (optional) receives the new object for hand
+// logging. Returns true if a machine template was found and createBuilding did not
+// fault.
+bool spawnMachineInFront(GameWorld* gw, float fwd, float side, Faction* owner,
+                         RootObject** spawned);
+
+// SEH-guarded: issue 'c' a player-style work order/job to perform 'task' (e.g.
+// OPERATE_MACHINERY / USE_TRAINING_DUMMY) AT 'fixture', at the fixture's position.
+// Clears prior goals first. Used by the setup scene to force the host NPC into the
+// work pose so the captured task streams to the join. Returns true if issued.
+bool orderWorkAt(Character* c, RootObject* fixture, int task);
+
+// 'craft' setup scene (host-side): spawn a save-stable work fixture + a world NPC
+// and force the NPC into the matching work pose (OPERATE_MACHINERY / training), so
+// the host captures the work task and the join reproduces it once the save is
+// baked. All task-enum selection is internal. Returns true if a fixture spawned.
+bool setupCraftScene(GameWorld* gw);
+
+// Craft RE-ARM (host-side): a worker's addGoal intent does NOT serialise, so a baked
+// craft scene reloads with an idle worker. Re-find the baked fixture + nearest
+// non-squad worker by search and re-issue the work goal, so the host resumes
+// streaming the work task. Idempotent (no-ops when the worker is already on task);
+// safe to call once on load and then periodically. Returns true if a goal is active.
+bool rearmCraftScene(GameWorld* gw);
+
+// LIVE-order test support. pickCraftWorker identifies the worker to drive (non-squad
+// NPC nearest the baked fixture) and returns its hand so a scenario can PIN it for
+// the whole run; orderCraftWorker then hands THAT pinned worker a work goal mid-run.
+// workerHand is in readObjectHand layout: [type,container,containerSerial,index,serial].
+bool pickCraftWorker(GameWorld* gw, unsigned int workerHand[5], int* outTask);
+bool orderCraftWorker(GameWorld* gw, const unsigned int workerHand[5], int task);
+// Hold the pinned worker untasked + parked at the prop during the baseline (an idle
+// world NPC patrols out of capture range otherwise). Call each baseline tick.
+bool holdWorkerAtFixture(GameWorld* gw, const unsigned int workerHand[5]);
 
 // SEH-guarded: read a RootObject's save-stable hand into out[5] (type, container,
 // containerSerial, index, serial). Used to log spawned objects.

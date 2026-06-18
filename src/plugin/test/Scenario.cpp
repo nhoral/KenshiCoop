@@ -203,11 +203,115 @@ private:
     unsigned long lastLogMs_;
 };
 
+// craft_order (Stage 1, LIVE transition): unlike npc_sync (which validates boot-time
+// state matching), this proves the runtime EVENT path. The worker starts UNTASKED
+// (craft1 loaded WITHOUT host re-arm), the join observes it idle for a baseline
+// window, then at ORDER_AT_MS the HOST issues the work order (engine::rearmCraftScene
+// finds the baked fixture + nearest non-squad worker and goals it). The host then
+// streams the new task; the join must transition its driven copy idle -> operating.
+// Logs an "SCENARIO ORDER" marker (machine-timestamped) so the runner can split the
+// join's per-hand task series into before/after and assert the live transition.
+class CraftOrderScenario : public Scenario {
+public:
+    CraftOrderScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), orderLogged_(false),
+          haveWorker_(false), task_(0), lastOrderMs_(0) {}
+
+    virtual const char* name() const { return "craft_order"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        // PIN the worker NOW (scene start), while the baked worker is still parked at
+        // the prop and is unambiguously the nearest non-squad NPC. Picking "nearest
+        // now" at order-time drifts: other world NPCs wander past the prop over the
+        // baseline window, so the host would order the wrong body (observed). Pinning
+        // by hand keeps host + join driving the SAME identity across the transition.
+        if (ctx.isHost) {
+            haveWorker_ = engine::pickCraftWorker(ctx.gw, workerHand_, &task_);
+            if (haveWorker_) {
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO craft worker pinned hand=%u,%u,%u,%u,%u task=%d",
+                          workerHand_[3], workerHand_[4], workerHand_[0],
+                          workerHand_[1], workerHand_[2], task_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                coop::logLine("SCENARIO craft worker pin FAILED (no fixture/worker)");
+            }
+        }
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // HOST, baseline phase: keep the pinned worker genuinely UNTASKED at the prop.
+        // Its faction AI otherwise patrols it out of the host's capture range, so when
+        // ordered later it is too far to reach the work pose in the window. Holding it
+        // parked at the prop is the faithful "untasked NPC standing by a prop" start.
+        if (ctx.isHost && haveWorker_ && ctx.elapsedMs < ORDER_AT_MS) {
+            engine::holdWorkerAtFixture(ctx.gw, workerHand_);
+        }
+        // HOST, order phase: hand the PINNED worker a work goal. orderCraftWorker is
+        // GUARDED (no-ops once the worker is operating) so re-issuing on a throttle
+        // recovers if its AI tries to drift, without thrashing pathing (the periodic
+        // re-arm lesson). The marker is logged once, as the before/after split point.
+        if (ctx.isHost && haveWorker_ && ctx.elapsedMs >= ORDER_AT_MS) {
+            if (!orderLogged_ || ctx.elapsedMs - lastOrderMs_ >= 3000) {
+                lastOrderMs_ = ctx.elapsedMs;
+                bool ok = engine::orderCraftWorker(ctx.gw, workerHand_, task_);
+                if (!orderLogged_) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO ORDER issued task=%d ok=%d (craft live-order)",
+                              task_, ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    orderLogged_ = true;
+                }
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (ctx.isHost) {
+                EntityState npcs[MAX_LOG];
+                passed_ = (engine::captureNpcs(ctx.gw, npcs, MAX_LOG) > 0);
+            } else {
+                passed_ = (recvCount_ >= 1);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ORDER_AT_MS     = 18000; // issue after join logs idle baseline
+    static const unsigned long HOST_DURATION_MS = 52000; // outlive the join (cover post-order)
+    static const unsigned long JOIN_DURATION_MS = 34000; // baseline + post-order observation
+    static const unsigned int  MAX_LOG          = 40;
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          orderLogged_;
+    bool          haveWorker_;
+    unsigned int  workerHand_[5];
+    int           task_;
+    unsigned long lastOrderMs_;
+};
+
 } // namespace
 
 Scenario* makeScenario(const std::string& name) {
     if (name == "leader_move") return new LeaderMoveScenario();
     if (name == "npc_sync")    return new NpcSyncScenario();
+    if (name == "craft_order") return new CraftOrderScenario();
     return 0;
 }
 

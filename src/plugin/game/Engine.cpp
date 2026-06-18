@@ -72,10 +72,17 @@ typedef void (__fastcall* GetCharsInSphereFn)(
     GameWorld* self, lektor<RootObject*>* results, const Ogre::Vector3* pos,
     float farRadius, float nearRadius, float always, int maxFar, int maxNear,
     RootObject* skip);
+// getObjectsWithinSphere fills a lektor with nearby objects of a given itemType
+// (BUILDING etc.). Used by craft re-arm to find a baked work fixture by SEARCH,
+// so a reloaded scene needs no sidecar to relocate the dummy/machine.
+typedef void (__fastcall* GetObjsInSphereFn)(
+    GameWorld* self, lektor<RootObject*>* results, const Ogre::Vector3* pos,
+    float radius, itemType type, int maxNumber, RootObject* skip);
 typedef void (__fastcall* ClearGoalsFn)(Character* self);
 typedef void (__fastcall* UpdateListFn)(GameWorld* self, Character* c);
 
 GetCharsInSphereFn g_getCharsFn    = 0;
+GetObjsInSphereFn  g_getObjsFn     = 0;
 ClearGoalsFn       g_clearGoalsFn  = 0;
 UpdateListFn       g_removeUpdateFn = 0;
 UpdateListFn       g_addUpdateFn    = 0;
@@ -84,6 +91,10 @@ UpdateListFn       g_addUpdateFn    = 0;
 // hand::getRootObject resolves a task's subject hand to its world fixture;
 // CharBody::_NV_setCurrentAction(TaskType,target) commits the body to that task.
 typedef int         (__fastcall* TaskerKeyFn)(const void* self);
+// Tasker::getDescription() -> const std::string&. A member returning a reference
+// puts `this` in RCX and returns the referent's address in RAX, so model it as a
+// pointer-returning fn. Used purely as a diagnostic to self-document task keys.
+typedef const std::string* (__fastcall* TaskerDescFn)(const void* self);
 typedef RootObject* (__fastcall* HandGetRootFn)(const hand* self);
 typedef bool        (__fastcall* SetActionFn)(void* charBody, int taskType, RootObject* target);
 // Character::addGoal(TaskType, RootObjectBase*): adds a PERSISTENT AI goal to
@@ -111,6 +122,7 @@ typedef Platoon*  (__fastcall* SeparateSquadFn)(Character* self, bool permanent)
 typedef void      (__fastcall* EndActionFn)(void* charBody);
 
 TaskerKeyFn   g_taskerKeyFn   = 0;
+TaskerDescFn  g_taskerDescFn  = 0;
 HandGetRootFn g_handGetRootFn = 0;
 SetActionFn   g_setActionFn   = 0;
 AddGoalFn     g_addGoalFn     = 0;
@@ -222,6 +234,8 @@ void resolve() {
     // is simply skipped (squad sync still works).
     g_getCharsFn = (GetCharsInSphereFn)KenshiLib::GetRealAddress(
         &GameWorld::getCharactersWithinSphere);
+    g_getObjsFn = (GetObjsInSphereFn)KenshiLib::GetRealAddress(
+        &GameWorld::getObjectsWithinSphere);
     g_clearGoalsFn = (ClearGoalsFn)KenshiLib::GetRealAddress(&Character::clearAllAIGoals);
     g_removeUpdateFn = (UpdateListFn)KenshiLib::GetRealAddress(&GameWorld::removeFromUpdateListMain);
     g_addUpdateFn    = (UpdateListFn)KenshiLib::GetRealAddress(&GameWorld::addToUpdateListMain);
@@ -230,6 +244,7 @@ void resolve() {
 
     // Stage 5 pose reproduction. Non-fatal: if unresolved, rest NPCs idle-park.
     g_taskerKeyFn = (TaskerKeyFn)KenshiLib::GetRealAddress(&Tasker::key);
+    g_taskerDescFn = (TaskerDescFn)KenshiLib::GetRealAddress(&Tasker::getDescription);
     g_handGetRootFn = (HandGetRootFn)KenshiLib::GetRealAddress(&hand::getRootObject);
     g_setActionFn = (SetActionFn)KenshiLib::GetRealAddress(
         static_cast<bool (CharBody::*)(TaskType, RootObject*)>(
@@ -308,7 +323,16 @@ bool isReproduciblePose(int t) {
         case USE_BED:
         case USE_BED_ORDER:
         case SLEEP_ON_FLOOR:
+        // Crafting / gathering / work poses (Stage 3a). All of these pin the body
+        // AT a work fixture whose subject hand resolves cross-client, exactly like
+        // sitting, so the player-order path (applyTaskOrder) reproduces them in
+        // place. Mining drills, farm plots, research benches and smithies all run
+        // through OPERATE_MACHINERY; the others cover automatic machines, training
+        // dummies and the ambient "pretend to work" town pose.
         case OPERATE_MACHINERY:
+        case OPERATE_AUTOMATIC_MACHINERY:
+        case USE_TRAINING_DUMMY:
+        case PRETEND_TO_OPERATE_MACHINERY:
             return true;
         default:
             return false;
@@ -332,12 +356,13 @@ bool isNodeAnchoredPoseImpl(int t) {
 // with whether we treat it as a reproducible rest pose. Reveals exactly which
 // tasks the bar's seated NPCs use so the allowlist can be widened. Lives outside
 // any __try so the std::set's allocations don't violate MSVC's SEH/unwind rule.
-void logTaskKeyOnce(int k, bool hasSubject) {
+void logTaskKeyOnce(int k, bool hasSubject, const char* desc) {
     static std::set<int> seen;
     if (seen.insert(k).second) {
-        char b[96];
-        _snprintf(b, sizeof(b) - 1, "[taskkey] key=%d repro=%d subject=%d",
-                  k, isReproduciblePose(k) ? 1 : 0, hasSubject ? 1 : 0);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "[taskkey] key=%d desc='%s' repro=%d subject=%d",
+                  k, (desc && desc[0]) ? desc : "?",
+                  isReproduciblePose(k) ? 1 : 0, hasSubject ? 1 : 0);
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
     }
@@ -363,11 +388,14 @@ bool resolveSubjectPos(u32 idx, u32 ser, u32 type, u32 cont, u32 contSer,
     }
 }
 
-// DIAGNOSTIC (host-side): once per (npc,seat) pair, log where THIS client resolves
-// the seat handle vs where the NPC actually is. Comparing the host's and join's
-// "[seatres]" lines for the same seat handle answers whether furniture identity
-// correlates across clients (same seatpos) or not (different seatpos).
-void logSeatResolveOnce(const char* side, u32 npcIdx, u32 npcSer,
+// DIAGNOSTIC (host-side): once per (npc,fixture) pair, log where THIS client
+// resolves the subject handle (seat, machine, dummy, bed...) vs where the NPC
+// actually is. Comparing the host's and join's "[seatres]" lines for the same
+// handle answers whether the fixture identity correlates across clients (same
+// pos) or not. The task= field distinguishes seated poses from crafting/gathering
+// work stations (OPERATE_MACHINERY etc.), so the same line doubles as the
+// craft-subject ([craftres]) diagnostic for Stage 3a.
+void logSeatResolveOnce(const char* side, int task, u32 npcIdx, u32 npcSer,
                         u32 sIdx, u32 sSer, u32 sType, u32 sCont, u32 sContSer,
                         float npx, float npy, float npz) {
     static std::set<std::pair<u32, u32> > seen;
@@ -376,10 +404,10 @@ void logSeatResolveOnce(const char* side, u32 npcIdx, u32 npcSer,
     bool ok = resolveSubjectPos(sIdx, sSer, sType, sCont, sContSer, &sx, &sy, &sz);
     float dx = sx - npx, dz = sz - npz;
     float d = ok ? (float)sqrt((double)(dx * dx + dz * dz)) : -1.0f;
-    char b[224];
+    char b[240];
     _snprintf(b, sizeof(b) - 1,
-              "[seatres] %s npc=%u,%u seat=%u,%u ok=%d npcpos=%.1f,%.1f seatpos=%.1f,%.1f d=%.1f",
-              side, npcIdx, npcSer, sIdx, sSer, ok ? 1 : 0, npx, npz, sx, sz, d);
+              "[seatres] %s task=%d npc=%u,%u subj=%u,%u ok=%d npcpos=%.1f,%.1f subjpos=%.1f,%.1f d=%.1f",
+              side, task, npcIdx, npcSer, sIdx, sSer, ok ? 1 : 0, npx, npz, sx, sz, d);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
 }
@@ -421,7 +449,12 @@ bool captureOne(Character* c, EntityState* e) {
             if (t) {
                 int k = g_taskerKeyFn(t);
                 e->rawTask = (u16)k; // diagnostic: stream the raw key for divergence checks
-                logTaskKeyOnce(k, t->subject.index != 0 || t->subject.serial != 0);
+                const char* desc = 0;
+                if (g_taskerDescFn) {
+                    const std::string* ds = g_taskerDescFn(t);
+                    if (ds) desc = ds->c_str();
+                }
+                logTaskKeyOnce(k, t->subject.index != 0 || t->subject.serial != 0, desc);
                 // Only stream anchored rest poses; everything else stays TASK_NONE
                 // so the receiver parks instead of reproducing a moving task.
                 if (isReproduciblePose(k)) {
@@ -432,8 +465,8 @@ bool captureOne(Character* c, EntityState* e) {
                     e->sContainerSerial = s.containerSerial;
                     e->sIndex           = s.index;
                     e->sSerial          = s.serial;
-                    // DIAGNOSTIC: where does THIS (host) client resolve the seat?
-                    logSeatResolveOnce("HOST", e->hIndex, e->hSerial,
+                    // DIAGNOSTIC: where does THIS (host) client resolve the fixture?
+                    logSeatResolveOnce("HOST", k, e->hIndex, e->hSerial,
                                        e->sIndex, e->sSerial, e->sType,
                                        e->sContainer, e->sContainerSerial,
                                        e->x, e->y, e->z);
@@ -475,6 +508,21 @@ Character* resolve(const EntityState& e) {
         hand* h = reinterpret_cast<hand*>(buf);
         g_handCtorFn(h, e.hIndex, e.hSerial, (itemType)e.hType,
                      e.hContainer, e.hContainerSerial);
+        return g_handGetCharFn(h);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Resolve a Character* from raw hand fields (same path as resolve(EntityState)).
+Character* resolveCharByHand(unsigned int idx, unsigned int ser, unsigned int type,
+                             unsigned int cont, unsigned int contSer) {
+    if (!g_handGetCharFn || !g_handCtorFn) return 0;
+    __try {
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, idx, ser, (itemType)type, cont, contSer);
         return g_handGetCharFn(h);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
@@ -666,6 +714,37 @@ bool isPlayerSquad(GameWorld* gw, RootObject* obj) {
     }
     return false;
 }
+
+// Read a live NON-player Faction* off a nearby world NPC (the first non-squad
+// character within the interest radius whose faction differs from the player's).
+// This avoids FactionManager (no header): spawning into this faction yields a true
+// world NPC that is NOT in the player squad, and owning the work fixture with the
+// same faction gives that NPC a legitimate reason to operate it. Caller holds SEH.
+// Returns 0 if no non-player NPC is nearby (e.g. an empty/blank save).
+Faction* findNearbyNonPlayerFaction(GameWorld* gw) {
+    if (!gw || !g_getCharsFn || !gw->player) return 0;
+    if (gw->player->playerCharacters.size() == 0) return 0;
+    Faction* playerFac = gw->player->getFaction();
+    Ogre::Vector3 center = gw->player->playerCharacters[0]->getPosition();
+    // Wide radius: we only need ANY loaded world NPC to read a faction pointer off,
+    // not a close one. A blank-start save can sit just outside a town, so the bar
+    // crowd is well beyond the 200u capture radius - reach the whole loaded block.
+    g_npcQuery.clear();
+    g_getCharsFn(gw, &g_npcQuery, &center, 6000.0f, 6000.0f, 6000.0f, 512, 512, 0);
+    unsigned int total = g_npcQuery.size();
+    {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SETUP: faction scan found %u loaded NPC(s) within 6000u", total);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    for (unsigned int i = 0; i < total; ++i) {
+        RootObject* obj = g_npcQuery[i];
+        if (!obj || isPlayerSquad(gw, obj)) continue;
+        Faction* f = static_cast<Character*>(obj)->getFaction();
+        if (f && f != playerFac) return f;
+    }
+    return 0;
+}
 } // namespace
 
 unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
@@ -801,6 +880,30 @@ GameData* findSeatTemplate(GameWorld* gw) {
     return 0;
 }
 
+// Find a furniture BUILDING template that is an OPERABLE work fixture an NPC can
+// stand at and work (crafting/gathering class). Caller holds SEH. Ordered keyword
+// preference: a training dummy is the most deterministic (no inputs/power/recipe -
+// the user can just order "train" and the work pose plays), then common crafting
+// machines. Mining/farming need terrain resources, so they're not spawned here.
+GameData* findMachineTemplate(GameWorld* gw) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    const char* prefs[] = {
+        "training dummy", "combat dummy", "punching bag", "research bench",
+        "engineering bench", "weapon smithy", "spinning wheel", "loom"
+    };
+    const unsigned int nprefs = sizeof(prefs) / sizeof(prefs[0]);
+    for (unsigned int k = 0; k < nprefs; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
 // Compute a world point 'fwd' metres ahead of the leader's facing and 'side' to
 // its right, plus the leader's yaw. Caller holds SEH.
 bool leaderAnchor(GameWorld* gw, float fwd, float side,
@@ -819,6 +922,81 @@ bool leaderAnchor(GameWorld* gw, float fwd, float side,
     outPos->z = p.z + fz * fwd + rz * side;
     if (outYaw) *outYaw = yaw;
     return true;
+}
+
+// Read a character's CURRENT task key (TASK_NONE if idle / unreadable). Mirrors the
+// capture path; used by re-arm to avoid re-issuing a goal a worker is already doing
+// (clearAllAIGoals + addGoal every tick would thrash pathing and never animate).
+int readCharTaskKey(Character* c) {
+    if (!c || !g_taskerKeyFn) return TASK_NONE;
+    __try {
+        CharBody* b = c->body;
+        Tasker* t = b ? b->currentAction : 0;
+        if (!t) return TASK_NONE;
+        return g_taskerKeyFn(t);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return TASK_NONE;
+    }
+}
+
+// Find a BAKED work fixture (training dummy / crafting machine) near the leader by
+// scanning loaded BUILDING objects (NOT templates). Returns the live fixture and the
+// task to issue at it. This is how craft re-arm relocates the dummy after a reload
+// without any sidecar - the save-stable building is simply searched for by name.
+RootObject* findWorkFixtureNear(GameWorld* gw, int* outTask) {
+    if (!gw || !g_getObjsFn || !gw->player) return 0;
+    if (gw->player->playerCharacters.size() == 0) return 0;
+    __try {
+        Ogre::Vector3 center = gw->player->playerCharacters[0]->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, 60.0f, BUILDING, 256, 0);
+        unsigned int total = g_npcQuery.size();
+        const char* prefs[] = {
+            "training dummy", "combat dummy", "punching bag", "research bench",
+            "engineering bench", "weapon smithy", "spinning wheel", "loom"
+        };
+        const unsigned int nprefs = sizeof(prefs) / sizeof(prefs[0]);
+        for (unsigned int k = 0; k < nprefs; ++k) {
+            for (unsigned int i = 0; i < total; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                GameData* gd = o->getGameData();
+                if (gd && ciContains(gd->name.c_str(), prefs[k])) {
+                    if (outTask)
+                        *outTask = (ciContains(gd->name.c_str(), "dummy") ||
+                                    ciContains(gd->name.c_str(), "bag"))
+                                       ? USE_TRAINING_DUMMY : OPERATE_MACHINERY;
+                    return o;
+                }
+            }
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Nearest NON-squad character to a fixture (the worker that should operate it).
+Character* findWorkerNear(GameWorld* gw, RootObject* fixture) {
+    if (!gw || !g_getCharsFn || !fixture || !gw->player) return 0;
+    __try {
+        Ogre::Vector3 at = fixture->getPosition();
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &at, 40.0f, 30.0f, 10.0f, 64, 64, 0);
+        unsigned int total = g_npcQuery.size();
+        Character* best = 0; float bestD2 = 1e18f;
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o || isPlayerSquad(gw, o)) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - at.x, dz = p.z - at.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) { bestD2 = d2; best = static_cast<Character*>(o); }
+        }
+        return best;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
 }
 } // namespace
 
@@ -918,6 +1096,270 @@ Character* spawnNpcInFront(GameWorld* gw, float fwd, float side) {
     }
 }
 
+// Spawn a world character in a GIVEN faction (not the player's), so it is NOT a
+// squad member and flows through the host-authoritative world-NPC path. Body uses
+// the leader's race template (a valid mesh); only the faction differs. SEH-guarded.
+Character* spawnCharInFaction(GameWorld* gw, float fwd, float side, Faction* fac) {
+    if (!gw || !gw->theFactory || !g_createCharFn || !fac) return 0;
+    __try {
+        Character* ld = (gw->player && gw->player->playerCharacters.size())
+                            ? gw->player->playerCharacters[0] : 0;
+        if (!ld) return 0;
+        GameData* tmpl = ld->getGameData();
+        if (!tmpl) return 0;
+        Ogre::Vector3 pos; float yaw = 0.0f;
+        if (!leaderAnchor(gw, fwd, side, &pos, &yaw)) return 0;
+        RootObject* r = g_createCharFn(gw->theFactory, fac, pos, 0, tmpl, 0, 25.0f);
+        return r ? static_cast<Character*>(r) : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+bool spawnMachineInFront(GameWorld* gw, float fwd, float side, Faction* owner,
+                         RootObject** spawned) {
+    if (spawned) *spawned = 0;
+    if (!gw || !gw->theFactory || !g_createBldgFn) {
+        coop::logLine("SETUP: machine spawn skipped (no factory / createBuilding fn)");
+        return false;
+    }
+    __try {
+        GameData* tmpl = findMachineTemplate(gw);
+        {
+            char d[200];
+            _snprintf(d, sizeof(d) - 1, "SETUP: machineTemplate='%s'",
+                      tmpl ? tmpl->name.c_str() : "(none)");
+            d[sizeof(d) - 1] = '\0';
+            coop::logLine(d);
+        }
+        if (!tmpl) return false;
+        Ogre::Vector3 pos; float yaw = 0.0f;
+        if (!leaderAnchor(gw, fwd, side, &pos, &yaw)) return false;
+        // Face the work face toward the leader so the operating body is visible.
+        Ogre::Quaternion rot(Ogre::Radian(yaw + 3.14159265f), Ogre::Vector3::UNIT_Y);
+        Ogre::Vector3 placePos(pos.x, 0.0f, pos.z); // y=0: createBuilding re-grounds
+        Building* b = g_createBldgFn(
+            gw->theFactory, tmpl, placePos, /*town*/0, /*owner*/owner, rot, /*cb*/0,
+            /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
+            /*invisible*/false, /*completed*/true, /*isFoliage*/false,
+            /*floor*/0, /*isOutsideFurniture*/false);
+        if (!b) { coop::logLine("SETUP: machine createBuilding returned null"); return false; }
+        RootObject* ro = reinterpret_cast<RootObject*>(b); // Building's first base
+        Ogre::Vector3 ap = ro->getPosition();
+        {
+            char d[160];
+            _snprintf(d, sizeof(d) - 1, "SETUP: machine actualPos=%.2f,%.2f,%.2f visible=%d",
+                      ap.x, ap.y, ap.z, ro->getVisible() ? 1 : 0);
+            d[sizeof(d) - 1] = '\0';
+            coop::logLine(d);
+        }
+        if (spawned) *spawned = ro;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("SETUP: machine createBuilding FAULTED");
+        return false;
+    }
+}
+
+bool orderWorkAt(Character* c, RootObject* fixture, int task) {
+    if (!c || !fixture) return false;
+    if (!g_addOrderFn && !g_addJobFn) return false;
+    __try {
+        if (g_clearGoalsFn) g_clearGoalsFn(c);
+        Ogre::Vector3 loc = fixture->getPosition(); // virtual: safe direct call
+        if (g_addOrderFn) {
+            Building* dest = reinterpret_cast<Building*>(fixture);
+            g_addOrderFn(c, dest, task, fixture, /*shift*/false,
+                         /*clear*/true, &loc);
+        } else if (g_addJobFn) {
+            g_addJobFn(c, task, fixture, /*shift*/false,
+                       /*addDontClear*/false, &loc);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Give 'c' a PERSISTENT AI GOAL (not a player order) to work 'task' at 'fixture'.
+// addGoal hands the intent to the NPC's OWN AI - it is NOT a squad/player-order
+// mechanism, so it does not recruit the NPC into the player squad. The NPC then
+// walks to the fixture and operates it autonomously, exactly the natural-task path
+// the host captures (the way the bar NPCs naturally sat). Returns true if issued.
+bool goalWorkAt(Character* c, RootObject* fixture, int task) {
+    if (!c || !fixture || !g_addGoalFn) return false;
+    __try {
+        if (g_clearGoalsFn) g_clearGoalsFn(c);
+        g_addGoalFn(c, task, fixture);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Craft RE-ARM: a worker's addGoal intent does NOT serialise, so a baked craft
+// scene (craft1) reloads with an idle worker. Re-find the baked fixture + nearest
+// non-squad worker by SEARCH and re-issue the work goal, so the HOST resumes
+// streaming the work task each session. Cheap + idempotent: it no-ops when the
+// worker is already on task (re-issuing every tick would thrash pathing). Meant to
+// be called once on load and then periodically by the host tick. Returns true if a
+// goal is active/issued.
+bool rearmCraftScene(GameWorld* gw) {
+    int task = USE_TRAINING_DUMMY;
+    RootObject* fixture = findWorkFixtureNear(gw, &task);
+    if (!fixture) return false; // nothing baked nearby - silent (called on a timer)
+    Character* worker = findWorkerNear(gw, fixture);
+    if (!worker) return false;
+    int cur = readCharTaskKey(worker);
+    if (cur == task) return true; // already operating - leave it alone (no thrash)
+    bool issued = goalWorkAt(worker, fixture, task);
+    {
+        unsigned int h[5];
+        readObjectHand(static_cast<RootObject*>(worker), h);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "REARM: re-issued work goal task=%d worker=%u,%u curTask=%d ok=%d",
+                  task, h[3], h[4], cur, issued ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    return issued;
+}
+
+// Identify the craft worker to drive for a LIVE-order test: the non-squad NPC
+// nearest the baked work fixture, plus the task. Returns the worker's hand (in
+// readObjectHand layout: [type,container,containerSerial,index,serial]) so a
+// scenario can PIN this exact NPC for the whole run - vs re-picking "nearest now",
+// which drifts as other world NPCs wander past the prop and orders the wrong body.
+bool pickCraftWorker(GameWorld* gw, unsigned int workerHand[5], int* outTask) {
+    int task = USE_TRAINING_DUMMY;
+    RootObject* fixture = findWorkFixtureNear(gw, &task);
+    if (!fixture) return false;
+    Character* w = findWorkerNear(gw, fixture);
+    if (!w) return false;
+    if (!readObjectHand(static_cast<RootObject*>(w), workerHand)) return false;
+    if (outTask) *outTask = task;
+    return true;
+}
+
+// Hold the pinned worker UNTASKED at the prop during a craft_order baseline: clear
+// its faction patrol goal and PARK it at the fixture each tick. An idle world NPC
+// otherwise patrols out of the host's capture range (observed: only a handful of
+// MEMBER samples, then it is too far to reach the prop when ordered). Parking it at
+// the prop is the faithful "untasked NPC standing by a prop" staging. Returns true
+// if held.
+bool holdWorkerAtFixture(GameWorld* gw, const unsigned int workerHand[5]) {
+    Character* w = resolveCharByHand(workerHand[3], workerHand[4], workerHand[0],
+                                     workerHand[1], workerHand[2]);
+    if (!w) return false;
+    RootObject* fixture = findWorkFixtureNear(gw, 0);
+    if (!fixture) return false;
+    float fxx = 0, fxy = 0, fxz = 0;
+    __try {
+        Ogre::Vector3 p = fixture->getPosition();
+        fxx = p.x; fxy = p.y; fxz = p.z;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    clearGoals(w);
+    return park(w, fxx, fxy, fxz + 2.5f, 0.0f); // ~2.5u in front, not inside the prop
+}
+
+// Order a SPECIFIC worker (pinned by hand) to work the baked fixture (re-found by
+// search - there is only one). This is the runtime EVENT the craft_order scenario
+// fires: the host hands the pinned NPC a work goal mid-run so the join's driven copy
+// transitions idle -> operating. workerHand is in readObjectHand layout. Guarded:
+// if the worker is ALREADY operating, do nothing (re-issuing goalWorkAt every tick
+// clears + re-adds the goal, thrashing pathing so it never settles into the pose -
+// the same lesson the periodic re-arm encodes).
+bool orderCraftWorker(GameWorld* gw, const unsigned int workerHand[5], int task) {
+    Character* w = resolveCharByHand(workerHand[3], workerHand[4], workerHand[0],
+                                     workerHand[1], workerHand[2]);
+    if (!w) return false;
+    if (readCharTaskKey(w) == task) return true; // already operating - don't thrash
+    RootObject* fixture = findWorkFixtureNear(gw, 0);
+    if (!fixture) return false;
+    return goalWorkAt(w, fixture, task);
+}
+
+// 'craft' setup scene: spawn a save-stable work fixture + a NON-squad world NPC,
+// then give the NPC a persistent AI GOAL to work it (NOT a player order, which
+// would recruit it into the squad and bypass the host-authoritative world-NPC
+// path). Its own AI then operates the station, so the HOST captures the natural
+// work task and the join reproduces it once the save is baked. Task selection
+// lives here where the TaskType enum is in scope. Returns true if a fixture spawned.
+bool setupCraftScene(GameWorld* gw) {
+    // Reloading a baked scene (craft1): a work fixture already exists nearby. Don't
+    // spawn a duplicate - just re-arm the worker's goal (the goal didn't persist).
+    {
+        int rt = USE_TRAINING_DUMMY;
+        if (findWorkFixtureNear(gw, &rt)) {
+            coop::logLine("SETUP: existing work fixture found - re-arming (no spawn)");
+            return rearmCraftScene(gw);
+        }
+    }
+
+    // Pick the task from the chosen fixture name: a dummy is "used", everything
+    // else is "operated". (findMachineTemplate prioritises a training dummy.)
+    int task = OPERATE_MACHINERY;
+    {
+        GameData* tmpl = findMachineTemplate(gw);
+        if (tmpl && (ciContains(tmpl->name.c_str(), "dummy") ||
+                     ciContains(tmpl->name.c_str(), "bag")))
+            task = USE_TRAINING_DUMMY;
+    }
+    // Borrow a live non-player faction from a nearby NPC so the worker is NOT a
+    // squad member and the fixture has a legitimate owner (an ownerless fixture in
+    // the player faction enlists the worker into the squad - the bug we observed).
+    Faction* fac = findNearbyNonPlayerFaction(gw);
+    coop::logLine(fac ? "SETUP: using nearby non-player faction (world NPC owner)"
+                      : "SETUP: NO nearby non-player faction - falling back to player "
+                        "faction (worker WILL be a squad member; load near a town)");
+
+    RootObject* mach = 0;
+    bool ok = spawnMachineInFront(gw, 6.0f, 0.0f, fac, &mach);
+    if (ok && mach) {
+        unsigned int h[5];
+        if (readObjectHand(mach, h)) {
+            char b[160];
+            _snprintf(b, sizeof(b) - 1, "SETUP: spawned machine hand=%u,%u,%u,%u,%u task=%d owned=%d",
+                      h[3], h[4], h[0], h[1], h[2], task, fac ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else coop::logLine("SETUP: spawned machine (hand unread)");
+    } else {
+        coop::logLine("SETUP: machine spawn FAILED (no machine template or createBuilding faulted)");
+    }
+
+    // Spawn the worker in the borrowed faction (non-squad) when we have one; else
+    // fall back to the player-faction spawn so the scene still produces something.
+    Character* npc = fac ? spawnCharInFaction(gw, 4.0f, 1.0f, fac)
+                         : spawnNpcInFront(gw, 4.0f, 1.0f);
+    if (npc && mach) {
+        // Detach the worker into its OWN platoon BEFORE baking, so its hand is fixed
+        // by the save and is IDENTICAL on both clients. The join's runtime quieting
+        // also detaches reproducible-pose NPCs (separateIntoMyOwnSquad); a worker
+        // that SHARES a faction platoon gets re-containered there (hand 14->1,..),
+        // breaking the host<->join hand pairing the pose oracle relies on. Baking it
+        // pre-separated makes that runtime detach a no-op, so the hand stays stable.
+        bool det = detachFromTownAI(npc);
+        coop::logLine(det ? "SETUP: worker detached into own platoon (stable hand)"
+                          : "SETUP: worker detach skipped/failed");
+        // GOAL, not player order: addGoal hands intent to the NPC's own AI without
+        // recruiting it (a player order would pull it into the squad).
+        bool issued = goalWorkAt(npc, mach, task);
+        coop::logLine(issued ? "SETUP: gave NPC a work GOAL at machine"
+                             : "SETUP: work goal FAILED (no addGoal fn)");
+        // Diagnostic: confirm the worker is NOT in the player squad (the screenshot
+        // gate's machine-readable counterpart). Enlistment can be deferred a tick,
+        // so this is an early indicator; the host-log [taskkey] world-capture + the
+        // squad-bar screenshot are the authoritative checks.
+        coop::logLine(isPlayerSquad(gw, static_cast<RootObject*>(npc))
+                          ? "SETUP: WARN worker IS in player squad (enlisted)"
+                          : "SETUP: worker is NON-squad (good)");
+    } else {
+        coop::logLine(npc ? "SETUP: no machine to assign NPC onto"
+                          : "SETUP: NPC spawn FAILED");
+    }
+    return ok && mach != 0;
+}
+
 // SEH-guarded bone read. MUST live in its own function with only POD locals: a
 // __try cannot coexist with C++ objects that need unwinding (the std::string for
 // the bone name is therefore owned by the caller and passed by pointer). Returns
@@ -994,7 +1436,7 @@ int applyTask(Character* c, const EntityState& e) {
         // DIAGNOSTIC: where does THIS (join) client resolve the same seat handle?
         // Compare the "[seatres] JOIN" seatpos to the host's for the same seat to
         // see whether furniture identity correlates across clients.
-        logSeatResolveOnce("JOIN", e.hIndex, e.hSerial, e.sIndex, e.sSerial,
+        logSeatResolveOnce("JOIN", (int)e.task, e.hIndex, e.hSerial, e.sIndex, e.sSerial,
                            e.sType, e.sContainer, e.sContainerSerial, e.x, e.y, e.z);
         if (!target) return 1; // fixture not loaded here -> caller idle-parks
         // PROXIMITY GATE: cross-client furniture identity is NOT reliable - the same

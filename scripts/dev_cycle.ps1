@@ -28,6 +28,9 @@ param(
     # Optional compiled scenario to run (KENSHICOOP_SCENARIO); passthrough to run_test.ps1.
     [string]$Scenario = "",
     [double]$Tolerance = 3.0,
+    # Passthrough: host-only setup/re-arm scene (see run_test.ps1 -Setup). Use "craft"
+    # to re-arm a baked crafting worker each session during validation.
+    [string]$Setup = "",
     # Passthrough: join-only AI-suspend probe (see run_test.ps1 -ProbeAiSuspend).
     [switch]$ProbeAiSuspend
 )
@@ -94,6 +97,7 @@ $testArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $s
               "-Save", $Save, "-Seconds", "$Seconds", "-Port", "$Port")
 if ($Sync) { $testArgs += "-Sync" }
 if ($Scenario -ne "") { $testArgs += @("-Scenario", $Scenario, "-Tolerance", "$Tolerance") }
+if ($Setup -ne "") { $testArgs += @("-Setup", $Setup) }
 if ($ProbeAiSuspend) { $testArgs += "-ProbeAiSuspend" }
 & powershell @testArgs
 exit $LASTEXITCODE

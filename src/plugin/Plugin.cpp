@@ -60,6 +60,8 @@ const DWORD     SCENARIO_HOLD_MS  = 4000; // hold synced state on screen for cap
 // Test-scene setup (host-only): one-shot world spawn the user then saves.
 bool            g_setupDone     = false;
 const DWORD     SETUP_DELAY_MS  = 4000; // let the world settle before spawning
+DWORD           g_lastCraftRearmTick = 0; // throttle host craft re-arm
+const DWORD     CRAFT_REARM_MS  = 3000; // re-issue the work goal at most this often
 
 // Original function pointers, filled by KenshiLib::AddHook.
 void (*g_mainLoop_orig)(GameWorld*, float) = 0;
@@ -124,23 +126,41 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     if (!g_setupDone && !g_cfg.setupScene.empty() && g_cfg.isHost && gw &&
         g_gameStarted && (GetTickCount() - g_gameStartTick) >= SETUP_DELAY_MS) {
         g_setupDone = true;
-        RootObject* seat = 0;
-        bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);
-        if (ok && seat) {
-            unsigned int h[5];
-            if (coop::engine::readObjectHand(seat, h))
-                { char b[160]; _snprintf(b, sizeof(b)-1,
-                    "SETUP: spawned seat hand=%u,%u,%u,%u,%u",
-                    h[3], h[4], h[0], h[1], h[2]); b[sizeof(b)-1]='\0'; coopLog(b); }
-            else coopLog("SETUP: spawned seat (hand unread)");
+        if (g_cfg.setupScene == "craft") {
+            // Crafting/gathering (Stage 3a): spawn a work fixture + an NPC and force
+            // the NPC to work it, so the host streams the work task. Both clients
+            // load the baked save, so the fixture has save-stable hands on both.
+            coop::engine::setupCraftScene(gw);
         } else {
-            coopLog("SETUP: seat spawn FAILED (no seat template or createBuilding faulted)");
-        }
-        if (g_cfg.setupScene == "npc") {
-            Character* npc = coop::engine::spawnNpcInFront(gw, 2.5f, 1.0f);
-            coopLog(npc ? "SETUP: spawned world NPC" : "SETUP: NPC spawn FAILED");
+            RootObject* seat = 0;
+            bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);
+            if (ok && seat) {
+                unsigned int h[5];
+                if (coop::engine::readObjectHand(seat, h))
+                    { char b[160]; _snprintf(b, sizeof(b)-1,
+                        "SETUP: spawned seat hand=%u,%u,%u,%u,%u",
+                        h[3], h[4], h[0], h[1], h[2]); b[sizeof(b)-1]='\0'; coopLog(b); }
+                else coopLog("SETUP: spawned seat (hand unread)");
+            } else {
+                coopLog("SETUP: seat spawn FAILED (no seat template or createBuilding faulted)");
+            }
+            if (g_cfg.setupScene == "npc") {
+                Character* npc = coop::engine::spawnNpcInFront(gw, 2.5f, 1.0f);
+                coopLog(npc ? "SETUP: spawned world NPC" : "SETUP: NPC spawn FAILED");
+            }
         }
         coopLog("SETUP: scene ready - arrange the pose and SAVE the game now");
+    }
+
+    // Craft re-arm (host): a baked work goal does not persist across save/load, and a
+    // world worker's own AI can drift off-station. Re-issue the work goal on an
+    // interval so the host keeps streaming the work task throughout the scene. The
+    // call is throttled and no-ops when the worker is already on task, so it never
+    // thrashes the worker's pathing. Only the 'craft' scene arms this.
+    if (g_cfg.setupScene == "craft" && g_cfg.isHost && gw && g_gameStarted &&
+        (GetTickCount() - g_lastCraftRearmTick) >= CRAFT_REARM_MS) {
+        g_lastCraftRearmTick = GetTickCount();
+        coop::engine::rearmCraftScene(gw);
     }
 
     // Scenario completion hold: once a verdict is logged, keep driving the synced
