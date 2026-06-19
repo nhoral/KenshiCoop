@@ -17,9 +17,10 @@ typedef unsigned short u16;
 typedef unsigned int   u32;
 typedef float          f32;
 
-// Protocol version, reset to 1 for the clean rebuild. Checked during handshake;
-// a mismatch is rejected (no attempt at backward compatibility across versions).
-const u16 PROTOCOL_VERSION = 1;
+// Protocol version. Bumped to 2 when EntityState gained the bodyState field
+// (Stage 2 down/dead/ragdoll replication). Checked during handshake; a mismatch is
+// rejected (no attempt at backward compatibility across versions).
+const u16 PROTOCOL_VERSION = 2;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -81,10 +82,27 @@ struct EntityState {
     // body regardless of reproducibility, so the join can compare it to its own
     // local task and detect divergence. TASK_NONE if the body has no current task.
     u16 rawTask;
+    // body state (Stage 2): bit-flags (BODY_*) read off the host's rendered Character
+    // - down/KO, ragdoll, dead, crawling. 0 = upright/normal. The join reproduces the
+    // down/dead posture from these (locomotion/task sync alone can't express a body
+    // lying on the ground), and a body that is down must NOT be walk-driven/parked.
+    u16 bodyState;
 };
 
 // Sentinel task value meaning "no current task this tick".
 const u16 TASK_NONE = 0xFFFFu;
+
+// bodyState bit-flags. A body is "down" (on the ground, not upright) when any of
+// BODY_DOWN / BODY_RAGDOLL / BODY_DEAD is set; BODY_CRAWL is an upright-ish stealth/
+// crawl posture kept separate. Read from Character::isDown/isRagdoll/isDead/
+// isStealthModeOrCrawling on the host.
+const u16 BODY_DOWN    = 1 << 0; // Character::isDown()  (KO'd / unconscious / collapsed)
+const u16 BODY_RAGDOLL = 1 << 1; // Character::isRagdoll()
+const u16 BODY_DEAD    = 1 << 2; // Character::isDead()
+const u16 BODY_CRAWL   = 1 << 3; // Character::isStealthModeOrCrawling()
+
+// True if the body should be treated as lying down (suppress walk-drive / parking).
+inline bool bodyIsDown(u16 s) { return (s & (BODY_DOWN | BODY_RAGDOLL | BODY_DEAD)) != 0; }
 
 // An entity batch is: [EntityBatchHeader][EntityState * count]. ownerId tags the
 // streaming peer; the receiver attributes every contained hand to that owner so

@@ -51,12 +51,13 @@ void logScenarioEntity(const char* kind, const EntityState& e) {
     // (resolved but the pose read returned nothing).
     if (c) engine::readPoseState(c, &pelvis, &idle, &crouch, &ptask);
     else   crouch = -2;
-    char b[224];
+    char b[256];
     _snprintf(b, sizeof(b) - 1,
               "SCENARIO %s hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f task=%u "
-              "pelvis=%.2f crouch=%d idle=%d",
+              "pelvis=%.2f crouch=%d idle=%d bs=%u",
               kind, e.hIndex, e.hSerial, e.hType, e.hContainer, e.hContainerSerial,
-              e.x, e.y, e.z, (unsigned int)e.task, pelvis, crouch, idle);
+              e.x, e.y, e.z, (unsigned int)e.task, pelvis, crouch, idle,
+              (unsigned int)e.bodyState);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
 }
@@ -306,12 +307,107 @@ private:
     unsigned long lastOrderMs_;
 };
 
+// down_order (Stage 2, LIVE transition): the body-state analog of craft_order. The
+// subject starts UPRIGHT (down1 loaded WITHOUT host re-arm, so nothing downs it), the
+// join observes it standing for a baseline window, then at ORDER_AT_MS the HOST knocks
+// it out (engine::orderDownSubject -> real knockout). The host then streams bodyState
+// down; the join must transition its driven copy upright -> down. Logs a "SCENARIO
+// DOWN" marker so the runner can split the join's per-hand bodyState series and assert
+// the live transition (vs npc_sync, which only validates boot-time down state).
+class DownOrderScenario : public Scenario {
+public:
+    DownOrderScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), downLogged_(false),
+          haveSubject_(false), lastDownMs_(0) {}
+
+    virtual const char* name() const { return "down_order"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        // PIN the subject now (upright), so the host knocks out the SAME baked NPC the
+        // join is already driving - re-picking "nearest now" at order-time could pick a
+        // different body that the join has no upright baseline for.
+        if (ctx.isHost) {
+            haveSubject_ = engine::pickDownSubject(ctx.gw, subjHand_);
+            if (haveSubject_) {
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO down subject pinned hand=%u,%u,%u,%u,%u",
+                          subjHand_[3], subjHand_[4], subjHand_[0],
+                          subjHand_[1], subjHand_[2]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                coop::logLine("SCENARIO down subject pin FAILED (no nearby NPC)");
+            }
+        }
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // HOST, baseline: keep the pinned subject UPRIGHT and in range (idle in place).
+        if (ctx.isHost && haveSubject_ && ctx.elapsedMs < ORDER_AT_MS) {
+            engine::holdSubjectUpright(ctx.gw, subjHand_);
+        }
+        // HOST, order phase: knock the PINNED subject out, re-issued on a throttle to
+        // top up the KO timer so it stays down. The marker is the before/after split.
+        if (ctx.isHost && haveSubject_ && ctx.elapsedMs >= ORDER_AT_MS) {
+            if (!downLogged_ || ctx.elapsedMs - lastDownMs_ >= 3000) {
+                lastDownMs_ = ctx.elapsedMs;
+                bool ok = engine::orderDownSubject(ctx.gw, subjHand_);
+                if (!downLogged_) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO DOWN issued ok=%d (knockout live-order)",
+                              ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    downLogged_ = true;
+                }
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (ctx.isHost) {
+                EntityState npcs[MAX_LOG];
+                passed_ = (engine::captureNpcs(ctx.gw, npcs, MAX_LOG) > 0);
+            } else {
+                passed_ = (recvCount_ >= 1);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ORDER_AT_MS      = 18000;
+    static const unsigned long HOST_DURATION_MS = 52000;
+    static const unsigned long JOIN_DURATION_MS = 34000;
+    static const unsigned int  MAX_LOG          = 40;
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          downLogged_;
+    bool          haveSubject_;
+    unsigned int  subjHand_[5];
+    unsigned long lastDownMs_;
+};
+
 } // namespace
 
 Scenario* makeScenario(const std::string& name) {
     if (name == "leader_move") return new LeaderMoveScenario();
     if (name == "npc_sync")    return new NpcSyncScenario();
     if (name == "craft_order") return new CraftOrderScenario();
+    if (name == "down_order")  return new DownOrderScenario();
     return 0;
 }
 

@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <deque>
 #include <enet/enet.h>
 
 #include "../../netproto/Wire.h"
@@ -39,6 +40,12 @@ public:
     // publish nothing.
     void setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int count);
 
+    // Debug WAN simulation. When delayMs > 0, received entity batches are held in a
+    // net-thread queue and delivered to the game thread only after delayMs +/- jitter
+    // has elapsed (lossPct of them are dropped outright). Must be called before
+    // startHost/startClient. All-zero = disabled (immediate delivery). See Config.
+    void setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct);
+
     bool isRunning() const { return running_ != 0; }
     u32  localId()   const { return myId_; } // host = 0; client = id from WELCOME
 
@@ -46,6 +53,11 @@ private:
     static DWORD WINAPI threadEntry(LPVOID self);
     void threadLoop();
     bool launchThread();
+
+    // Net-thread-only: route a received entity through the WAN sim (delay/drop) when
+    // enabled, else deliver immediately. flushDelayed() releases matured entries.
+    void deliverEntity(u32 ownerId, const EntityState& e);
+    void flushDelayed();
 
     bool        isHost_;
     std::string ip_;
@@ -64,6 +76,15 @@ private:
     volatile LONG running_;
     volatile LONG stopFlag_;
     u32           myId_;
+
+    // WAN sim config (set before launch; read-only on the net thread thereafter).
+    unsigned int  simDelayMs_;
+    unsigned int  simJitterMs_;
+    unsigned int  simLossPct_;
+    // Held-back inbound entities awaiting their simulated arrival time. Net-thread
+    // only (received and flushed on the same thread), so it needs no lock.
+    struct Delayed { DWORD releaseTick; u32 ownerId; EntityState e; };
+    std::deque<Delayed> delayed_;
 
     NetLink(const NetLink&);
     NetLink& operator=(const NetLink&);

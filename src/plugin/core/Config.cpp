@@ -31,6 +31,13 @@ void loadConfig(Config& c) {
     c.setupScene = envOr("KENSHICOOP_SETUP", "");
     c.probeRecruit = envOr("KENSHICOOP_PROBE_RECRUIT", "") == "1";
     c.probeAiSuspend = envOr("KENSHICOOP_PROBE_AISUSPEND", "") == "1";
+
+    int delay  = std::atoi(envOr("KENSHICOOP_NETSIM_DELAY_MS", "0").c_str());
+    int jitter = std::atoi(envOr("KENSHICOOP_NETSIM_JITTER_MS", "0").c_str());
+    int loss   = std::atoi(envOr("KENSHICOOP_NETSIM_LOSS_PCT", "0").c_str());
+    c.netSimDelayMs  = (delay  > 0) ? (unsigned int)delay  : 0u;
+    c.netSimJitterMs = (jitter > 0) ? (unsigned int)jitter : 0u;
+    c.netSimLossPct  = (loss   > 0) ? (unsigned int)(loss > 100 ? 100 : loss) : 0u;
 }
 
 } // namespace coop

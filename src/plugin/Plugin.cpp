@@ -131,6 +131,14 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             // the NPC to work it, so the host streams the work task. Both clients
             // load the baked save, so the fixture has save-stable hands on both.
             coop::engine::setupCraftScene(gw);
+        } else if (g_cfg.setupScene == "down") {
+            // Body-state (Stage 2) BAKE: spawn a non-squad world NPC and ragdoll it,
+            // so the user can SAVE a 'down1' that both clients then load.
+            coop::engine::setupDownScene(gw);
+        } else if (g_cfg.setupScene == "downhold") {
+            // Body-state VALIDATION: the subject is already baked into the save - do
+            // NOT spawn a duplicate. The periodic re-arm below keeps it down.
+            coopLog("SETUP(downhold): no spawn - re-arm keeps baked down bodies down");
         } else {
             RootObject* seat = 0;
             bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);
@@ -161,6 +169,17 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         (GetTickCount() - g_lastCraftRearmTick) >= CRAFT_REARM_MS) {
         g_lastCraftRearmTick = GetTickCount();
         coop::engine::rearmCraftScene(gw);
+    }
+
+    // Down re-arm (host): a healthy ragdolled body recovers and stands back up, and
+    // ragdoll state does not survive save/load. Re-knock the nearby non-squad bodies
+    // on an interval so they stay on the ground throughout the scene. Both the bake
+    // ('down') and the spawn-free validation ('downhold') arm this.
+    if ((g_cfg.setupScene == "down" || g_cfg.setupScene == "downhold") &&
+        g_cfg.isHost && gw && g_gameStarted &&
+        (GetTickCount() - g_lastCraftRearmTick) >= CRAFT_REARM_MS) {
+        g_lastCraftRearmTick = GetTickCount();
+        coop::engine::rearmDownScene(gw);
     }
 
     // Scenario completion hold: once a verdict is logged, keep driving the synced
@@ -249,6 +268,19 @@ void titleUpdate_hook(TitleScreen* self) {
 }
 
 void startNetworking() {
+    // Debug WAN simulation: when configured, hold/drop inbound entity batches so the
+    // loopback harness exercises the real-latency path (interp + local enforcement)
+    // instead of the ~0 ms same-frame delivery we'd otherwise validate against.
+    if (g_cfg.netSimDelayMs || g_cfg.netSimJitterMs || g_cfg.netSimLossPct) {
+        g_net.setNetSim(g_cfg.netSimDelayMs, g_cfg.netSimJitterMs, g_cfg.netSimLossPct);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1,
+                  "KenshiCoop: NET SIM on - delay=%ums jitter=+/-%ums loss=%u%%",
+                  g_cfg.netSimDelayMs, g_cfg.netSimJitterMs, g_cfg.netSimLossPct);
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+    }
+
     bool ok;
     if (g_cfg.isHost) {
         coopLog("KenshiCoop: starting as HOST");

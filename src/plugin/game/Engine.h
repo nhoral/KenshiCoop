@@ -174,6 +174,27 @@ bool setupCraftScene(GameWorld* gw);
 // safe to call once on load and then periodically. Returns true if a goal is active.
 bool rearmCraftScene(GameWorld* gw);
 
+// Stage 2 body-state. knockDown drops a Character into (on=true) / out of (on=false)
+// full-body ragdoll. setupDownScene spawns a non-squad world NPC and ragdolls it (a
+// controllable "down" subject); rearmDownScene re-applies ragdoll to that subject on
+// an interval (a healthy body recovers and stands). Host-only.
+bool knockDown(Character* c, bool on);
+// Maintain an already-down body each tick by topping the KO timer (no re-collapse).
+// Prevents the get-up/flop flicker without re-triggering the ragdoll fall. Join-side.
+bool holdDown(Character* c);
+bool setupDownScene(GameWorld* gw);
+// Re-knock every non-squad NPC near the leader so down bodies stay down (a healthy
+// ragdoll recovers; ragdoll does not persist across save/load). Returns count, or -1.
+int  rearmDownScene(GameWorld* gw);
+
+// down_order LIVE-transition helpers (Stage 2). pickDownSubject pins the non-squad
+// NPC nearest the leader (its hand, readObjectHand layout); holdSubjectUpright keeps
+// it idle/in-range during the baseline; orderDownSubject knocks THAT subject out at
+// the order point so the join must transition upright -> down.
+bool pickDownSubject(GameWorld* gw, unsigned int subjHand[5]);
+bool holdSubjectUpright(GameWorld* gw, const unsigned int subjHand[5]);
+bool orderDownSubject(GameWorld* gw, const unsigned int subjHand[5]);
+
 // LIVE-order test support. pickCraftWorker identifies the worker to drive (non-squad
 // NPC nearest the baked fixture) and returns its hand so a scenario can PIN it for
 // the whole run; orderCraftWorker then hands THAT pinned worker a work goal mid-run.
@@ -198,6 +219,10 @@ bool readObjectHand(RootObject* obj, unsigned int out[5]);
 //   *task    = current TaskType (TASK_NONE if none)
 // Returns true if at least the pelvis height was read.
 bool readPoseState(Character* c, float* pelvis, int* idle, int* crouched, int* task);
+
+// SEH-guarded: read the body-state bit-flags (BODY_* in Wire.h) off a rendered
+// Character - down/KO, ragdoll, dead, crawl. 0 = upright/normal (also on fault).
+unsigned short readBodyState(Character* c);
 
 // ---- Stage 5 rest-pose reproduction ----------------------------------------
 

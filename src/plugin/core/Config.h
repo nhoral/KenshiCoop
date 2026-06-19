@@ -19,7 +19,7 @@ struct Config {
     std::string   logPath;         // KENSHICOOP_LOG
     std::string   scenario;        // KENSHICOOP_SCENARIO (empty = normal tick)
     unsigned long autoLoadDelayMs; // KENSHICOOP_AUTOLOAD_DELAY_MS
-    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft")
+    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft"/"down"/"downhold")
                                    // host-only one-shot world spawn to bake a
                                    // deterministic test scene into a save.
     bool          probeRecruit;    // KENSHICOOP_PROBE_RECRUIT == "1" (join only):
@@ -29,6 +29,14 @@ struct Config {
                                    // detour Character::periodicUpdate to suspend the
                                    // AI decision layer for host-driven NPCs (keeps
                                    // animation; stops self-tasking) - faction-safe.
+
+    // Debug WAN simulation: artificially delay (and optionally drop) inbound entity
+    // batches so the same loopback harness exercises the latency path - render
+    // interpolation, dead reckoning, stale-state enforcement - that a real internet
+    // link would impose. All zero (default) = no simulation, immediate delivery.
+    unsigned int  netSimDelayMs;   // KENSHICOOP_NETSIM_DELAY_MS  (base one-way delay)
+    unsigned int  netSimJitterMs;  // KENSHICOOP_NETSIM_JITTER_MS (+/- uniform variance)
+    unsigned int  netSimLossPct;   // KENSHICOOP_NETSIM_LOSS_PCT  (0-100 drop chance)
 };
 
 // Read every KENSHICOOP_* var into 'out', applying host/join defaults.

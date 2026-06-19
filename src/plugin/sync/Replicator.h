@@ -103,11 +103,12 @@ private:
         bool         taskBad;        // task not reproducible here (fixture missing/drift)
         unsigned long taskTick;      // when the task was issued (drift grace timer)
         bool         detached;       // I9: detached from town-AI (separateIntoMyOwnSquad) once
+        bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), body(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
-                   taskTick(0), detached(false) {}
+                   taskTick(0), detached(false), downApplied(false) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose

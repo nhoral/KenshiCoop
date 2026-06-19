@@ -67,9 +67,24 @@ param(
     # moment both are launched, so a run can be watched without one window hiding the
     # other. Launched in the BACKGROUND and re-applied through the load screen, so it
     # positions early and sticks (Kenshi re-centers its window on gameplay entry).
+    # ON BY DEFAULT (every run is watchable); pass -NoArrange to skip, or -Arrange as
+    # a harmless explicit opt-in (kept for backward-compatible call sites).
     [switch]$Arrange,
+    [switch]$NoArrange,
     [ValidateSet("widest", "primary")]
-    [string]$ArrangeMonitor = "primary"
+    [string]$ArrangeMonitor = "primary",
+    # How long (s) to keep re-pinning the windows. Covers host launch + JoinDelay +
+    # both load screens; Kenshi re-centers on gameplay entry so this must outlast the
+    # slower client's load. Bumped from 45 -> 75 so a slow join still gets pinned.
+    [int]$ArrangeRepeatSec = 75,
+    # Debug WAN simulation. Inbound entity batches are held base +/- jitter ms (and
+    # NetSimLossPct% dropped) on BOTH clients, so the loopback run exercises the
+    # real-latency path - render interpolation, dead reckoning, stale-state local
+    # enforcement - rather than the ~0 ms same-frame delivery of pure loopback. All
+    # zero (default) = no simulation. e.g. -NetSimDelayMs 120 -NetSimJitterMs 40.
+    [int]$NetSimDelayMs = 0,
+    [int]$NetSimJitterMs = 0,
+    [int]$NetSimLossPct = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -106,6 +121,9 @@ Write-Host "== KenshiCoop test run =="
 Write-Host "  save:     $Save"
 Write-Host "  seconds:  $Seconds"
 if ($Scenario -ne "") { Write-Host "  scenario: $Scenario (tolerance $Tolerance u)" }
+if ($NetSimDelayMs -or $NetSimJitterMs -or $NetSimLossPct) {
+    Write-Host "  net sim:  delay ${NetSimDelayMs}ms +/-${NetSimJitterMs}ms, loss ${NetSimLossPct}%"
+}
 Write-Host "  out dir:  $OutDir"
 
 # Clear any leftover Kenshi instances from a previous (possibly crashed) run.
@@ -144,6 +162,11 @@ function Set-CoopEnv {
     # Host-only setup/re-arm scene. The join must stay clean (it reproduces via
     # replication), so we only set KENSHICOOP_SETUP for the host.
     $env:KENSHICOOP_SETUP = if ($Mode -eq "host") { $Setup } else { "" }
+    # Debug WAN sim (both clients): delay/jitter/drop inbound entity batches so the
+    # loopback run stresses the latency path. Zero = disabled (immediate delivery).
+    $env:KENSHICOOP_NETSIM_DELAY_MS  = "$NetSimDelayMs"
+    $env:KENSHICOOP_NETSIM_JITTER_MS = "$NetSimJitterMs"
+    $env:KENSHICOOP_NETSIM_LOSS_PCT  = "$NetSimLossPct"
 }
 
 # Wait until a regex appears in a (growing) file, or timeout. Returns $true/$false.
@@ -201,13 +224,13 @@ Write-Host "Host game PID=$hostPid  Join game PID=$joinPid"
 
 # Auto-arrange the windows side by side as EARLY as possible (background, re-pinned
 # through the load screen) so the run is watchable from the start.
-if ($Arrange -and $hostPid -ne 0) {
+if (-not $NoArrange -and $hostPid -ne 0) {
     $arrangeScript = Join-Path $scriptDir "arrange_windows.ps1"
-    Write-Host "Arranging windows side by side ($ArrangeMonitor monitor, host left / join right) ..."
+    Write-Host "Arranging windows side by side ($ArrangeMonitor monitor, host left / join right; re-pinning ${ArrangeRepeatSec}s) ..."
     Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$arrangeScript`"",
         "-HostPid", "$hostPid", "-JoinPid", "$joinPid",
-        "-Monitor", $ArrangeMonitor, "-TimeoutSec", "60", "-RepeatSec", "45"
+        "-Monitor", $ArrangeMonitor, "-TimeoutSec", "90", "-RepeatSec", "$ArrangeRepeatSec"
     ) | Out-Null
 }
 
@@ -402,7 +425,7 @@ function Get-ScenarioSeries {
     param([string]$File, [string]$Kind)
     $map = @{}
     if (-not (Test-Path $File)) { return $map }
-    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO $Kind hand=([\d,]+) pos=([\-\d\.,]+)(?: task=(\d+))?(?: pelvis=(-?[\d\.]+))?(?: crouch=(-?\d+))?"
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO $Kind hand=([\d,]+) pos=([\-\d\.,]+)(?: task=(\d+))?(?: pelvis=(-?[\d\.]+))?(?: crouch=(-?\d+))?(?: idle=(-?\d+))?(?: bs=(\d+))?"
     foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
         $g = $m.Matches[0].Groups
         $t = ([int]$g[1].Value*3600 + [int]$g[2].Value*60 + [int]$g[3].Value)*1000 + [int]$g[4].Value
@@ -411,8 +434,9 @@ function Get-ScenarioSeries {
         $task = if ($g[7].Success) { [int]$g[7].Value } else { 65535 }
         $pelvis = if ($g[8].Success) { [double]$g[8].Value } else { -1.0 }
         $crouch = if ($g[9].Success) { [int]$g[9].Value } else { -1 }
+        $bs   = if ($g[11].Success) { [int]$g[11].Value } else { 0 }
         if (-not $map.ContainsKey($hand)) { $map[$hand] = New-Object System.Collections.ArrayList }
-        [void]$map[$hand].Add(@{ t = $t; p = $pos; task = $task; pelvis = $pelvis; crouch = $crouch })
+        [void]$map[$hand].Add(@{ t = $t; p = $pos; task = $task; pelvis = $pelvis; crouch = $crouch; bs = $bs })
     }
     return $map
 }
@@ -598,6 +622,55 @@ function Compare-NpcPoseState {
     return $ok
 }
 
+# Stage 2 body-state oracle. For each NPC the HOST reports as DOWN (bs has any of
+# BODY_DOWN|BODY_RAGDOLL|BODY_DEAD = bits 1|2|4 => bs & 7), the JOIN's time-aligned
+# sample must ALSO be down: the body lies on the ground on both clients. We pair
+# each host-down MEMBER sample with the nearest-in-time join RECV sample (<= MaxDt)
+# and assert the join is down too. Inconclusive (no host-down samples) -> skip, like
+# the pose oracle, since the manual gate is then authoritative. BODY_CRAWL (bit 8)
+# is intentionally NOT counted as down (it is an upright stealth posture).
+function Compare-NpcBodyState {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$MinRatio = 0.80, [int]$MinJudged = 8, [int]$MaxDt = 800)
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $down = { param($bs) (($bs -band 7) -ne 0) }   # BODY_DOWN|RAGDOLL|DEAD
+    $judged = 0; $matched = 0; $npcJudged = 0; $mism = @()
+    foreach ($hand in $H.Keys) {
+        if (-not $J.ContainsKey($hand)) { continue }
+        $hd = @($H[$hand] | Where-Object { (& $down $_.bs) })
+        if ($hd.Count -eq 0) { continue }
+        $nJudged = 0; $nMatched = 0
+        foreach ($hs in $hd) {
+            $best = [double]::MaxValue; $bj = $null
+            foreach ($js in $J[$hand]) {
+                $dt = [Math]::Abs($js.t - $hs.t)
+                if ($dt -lt $best) { $best = $dt; $bj = $js }
+            }
+            if ($best -le $MaxDt -and $null -ne $bj) {
+                $nJudged++; $judged++
+                if (& $down $bj.bs) { $nMatched++; $matched++ }
+            }
+        }
+        if ($nJudged -lt 1) { continue }
+        $npcJudged++
+        if ($nMatched -lt $nJudged) {
+            $pct = [Math]::Round(100.0 * $nMatched / $nJudged, 0)
+            $mism += "$hand($nMatched/$nJudged down $pct%)"
+        }
+    }
+    if ($npcJudged -eq 0 -or $judged -lt $MinJudged) {
+        Write-Host "  BODY-STATE [npc] inconclusive - only $judged host-down aligned pair(s) across $npcJudged NPC(s) (need >= $MinJudged); manual gate is authoritative (skipped)"
+        return $true
+    }
+    $ratio = [Math]::Round($matched / $judged, 3)
+    $ok = ($ratio -ge $MinRatio)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $detail = if ($mism.Count -gt 0) { " not-down-on-join: $($mism -join ', ')" } else { "" }
+    Write-Host "  BODY-STATE [npc] $v - join body was down for $matched/$judged host-down pairs across $npcJudged NPC(s) (ratio=$ratio >= $MinRatio)$detail"
+    return $ok
+}
+
 # craft_order LIVE-transition oracle. Proves the runtime EVENT path (not just
 # boot-time state): the host issues a work order mid-run (logging a machine-stamped
 # "SCENARIO ORDER" marker), and the JOIN's driven worker must transition from idle
@@ -632,6 +705,47 @@ function Test-CraftOrder {
     $ok = ($preRatio -ge $MinRatio -and $postRatio -ge $MinRatio)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  CRAFT-ORDER [join] $v - worker=$worker idle-before $preIdle/$($pre.Count) (ratio=$preRatio), operating-after $postWork/$($post.Count) (ratio=$postRatio), task=$WorkTask"
+    return $ok
+}
+
+# down_order LIVE-transition oracle (Stage 2 body-state analog of Test-CraftOrder).
+# The host knocks a pinned subject out mid-run (logging a machine-stamped "SCENARIO
+# DOWN" marker); the JOIN's driven copy must transition from UPRIGHT (bs not down)
+# BEFORE the order to DOWN (bs & 7) AFTER it. We split the join's per-hand bodyState
+# series at the marker timestamp and assert both halves.
+function Test-DownOrder {
+    param([string]$HostFile, [string]$JoinFile, [int]$GraceMs = 4000, [double]$MinRatio = 0.70)
+    # Match the ORDER marker specifically ("SCENARIO DOWN issued"). NB: Select-String
+    # is case-insensitive, so a bare "SCENARIO DOWN" also matches the earlier
+    # lowercase "SCENARIO down subject pinned" line and sets T ~18s too early - making
+    # every join sample land "after" the order (the spurious pre=0). Anchor on "issued".
+    $om = Select-String -Path $HostFile -Pattern "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO DOWN issued" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $om) { Write-Host "  DOWN-ORDER FAIL - no 'SCENARIO DOWN issued' marker on host"; return $false }
+    $g = $om.Matches[0].Groups
+    $T = ([int]$g[1].Value*3600 + [int]$g[2].Value*60 + [int]$g[3].Value)*1000 + [int]$g[4].Value
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $down = { param($bs) (($bs -band 7) -ne 0) }
+    # Subject = the hand the HOST streams as DOWN after the knockout order.
+    $subject = $null
+    foreach ($hand in $H.Keys) {
+        if (@($H[$hand] | Where-Object { $_.t -ge $T -and (& $down $_.bs) }).Count -gt 0) { $subject = $hand; break }
+    }
+    if ($null -eq $subject) { Write-Host "  DOWN-ORDER FAIL - host never streamed a down body after the order"; return $false }
+    if (-not $J.ContainsKey($subject)) { Write-Host "  DOWN-ORDER FAIL - join never received subject hand=$subject"; return $false }
+    $pre  = @($J[$subject] | Where-Object { $_.t -lt $T })
+    $post = @($J[$subject] | Where-Object { $_.t -ge ($T + $GraceMs) })
+    if ($pre.Count -lt 1 -or $post.Count -lt 1) {
+        Write-Host "  DOWN-ORDER FAIL - insufficient join samples (pre=$($pre.Count) post=$($post.Count))"
+        return $false
+    }
+    $preUp   = @($pre  | Where-Object { -not (& $down $_.bs) }).Count
+    $postDn  = @($post | Where-Object {      (& $down $_.bs) }).Count
+    $preRatio  = [Math]::Round($preUp  / $pre.Count, 3)
+    $postRatio = [Math]::Round($postDn / $post.Count, 3)
+    $ok = ($preRatio -ge $MinRatio -and $postRatio -ge $MinRatio)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  DOWN-ORDER [join] $v - subject=$subject upright-before $preUp/$($pre.Count) (ratio=$preRatio), down-after $postDn/$($post.Count) (ratio=$postRatio)"
     return $ok
 }
 
@@ -726,18 +840,25 @@ if ($Scenario -ne "") {
         $joinResultPass = Test-ScenarioResultPass -File $joinLog
         if (-not $joinResultPass) { Write-Host "  join SCENARIO RESULT is not PASS" }
     }
-    $pose = $true; $poseState = $true
+    $pose = $true; $poseState = $true; $bodyState = $true
     if ($Scenario -eq "npc_sync") {
         $cross = Compare-NpcSync -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
         $pose  = Compare-NpcPose -HostFile $hostLog -JoinFile $joinLog
         # Authoritative standing-vs-sitting gate (rendered-skeleton pelvis/crouch).
         $poseState = Compare-NpcPoseState -HostFile $hostLog -JoinFile $joinLog
+        # Stage 2: down/KO/ragdoll/dead bodies must be down on the join too. Skips
+        # (advisory) when the host streamed no down bodies (e.g. an upright scene).
+        $bodyState = Compare-NpcBodyState -HostFile $hostLog -JoinFile $joinLog
     } elseif ($Scenario -eq "craft_order") {
         # LIVE transition: the join's worker must go idle -> operating AFTER the
         # host's runtime order. POSE-STATE still co-gates pelvis tracking (the worker
         # is pinned at the prop the whole time, idle or operating).
         $cross     = Test-CraftOrder -HostFile $hostLog -JoinFile $joinLog
         $poseState = Compare-NpcPoseState -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "down_order") {
+        # LIVE transition: the join's subject must go upright -> down AFTER the host
+        # knocks it out mid-run. Body-state analog of craft_order.
+        $cross = Test-DownOrder -HostFile $hostLog -JoinFile $joinLog
     } else {
         $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
     }
@@ -750,9 +871,14 @@ if ($Scenario -ne "") {
     # into the work pose, which legitimately spikes the locomotion-tuned smoothness /
     # anim-truth metrics. They're printed as advisory but don't gate here; CRAFT-ORDER
     # + POSE-STATE + MARCH are the authoritative gates.
-    $gateSmooth = if ($Scenario -eq "craft_order") { $true } else { $smooth }
-    $gateAnim   = if ($Scenario -eq "craft_order") { $true } else { $anim }
-    $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $gateSmooth -and $gateAnim -and $march -and $pose -and $poseState)
+    # A down-body scene (Setup down/downhold) intentionally does NOT walk-drive the
+    # subject - it is KO'd on the ground - so the locomotion-tuned smoothness/anim
+    # metrics are not meaningful here (a held body trivially "fails" zeroFrac). They
+    # print as advisory; BODY-STATE + MARCH are the authoritative gates.
+    $isDownScene = ($Setup -like "down*") -or ($Scenario -eq "down_order")
+    $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene) { $true } else { $smooth }
+    $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene) { $true } else { $anim }
+    $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $gateSmooth -and $gateAnim -and $march -and $pose -and $poseState -and $bodyState)
 }
 
 Write-Host ""

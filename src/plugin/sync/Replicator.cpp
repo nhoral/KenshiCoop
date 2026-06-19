@@ -117,6 +117,38 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     sit/idle poses for NPCs arrive in Stage 5 (AI quiet-in-place).
         bool isSquad = engine::isLocalPlayerChar(gw, c);
 
+        // ---- Stage 2: body-state override (down / KO / ragdoll / dead) --------
+        // A body the host reports as down (on the ground) must NOT be walk-driven or
+        // parked upright - reproducing locomotion on a corpse/KO is exactly the
+        // "marching/sliding while down" artifact. Instead drop the local copy into
+        // ragdoll and skip ALL locomotion + oracle work for it this tick. The local
+        // medical/AI tries to wake the body when its KO timer lapses, so:
+        //   - if the local body has actually stood back up, re-collapse it (knockDown
+        //     re-triggers the ragdoll fall), else
+        //   - top the KO timer EVERY tick (holdDown) so the timer never reaches 0 and
+        //     the wake AI never fires - this kills the get-up/flop/ragdoll-spike
+        //     flicker proactively instead of re-collapsing after the body stood.
+        // When the host reports the body upright again, release the KO once.
+        if (coop::bodyIsDown(out.bodyState)) {
+            unsigned short localBs = engine::readBodyState(c);
+            if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
+            else                            engine::holdDown(c);
+            // A ragdoll/KO falls independently on each client (and the join's local
+            // AI may have walked the body elsewhere before the down state arrived),
+            // so co-locate it with the host's down position when it has drifted.
+            // Teleport (not walk) - a limp body has no gait to preserve.
+            if (haveActual && dist3(ax, ay, az, out.x, out.y, out.z) > 2.0f)
+                engine::applyRaw(c, out);
+            d.downApplied = true;
+            d.parked = false; d.haveDest = false;
+            if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+            continue;
+        }
+        if (d.downApplied) {
+            engine::knockDown(c, false); // host says upright again -> stand back up
+            d.downApplied = false;
+        }
+
         // AI-suspend decision is made BELOW, once we know whether this NPC is
         // genuinely moving and whether the host has it node-anchored - node-sitters
         // must keep their local AI so they can execute the node behavior.

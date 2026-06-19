@@ -120,6 +120,13 @@ typedef Platoon*  (__fastcall* SeparateSquadFn)(Character* self, bool permanent)
 // held in place it marches; ending the action drops it to idle (the standing
 // analog of pinning a seat).
 typedef void      (__fastcall* EndActionFn)(void* charBody);
+// Character::ragdollMode(bool on, RagdollPart::Enum part): drop the body into (or
+// out of) ragdoll. Used to manufacture/reproduce a "down" body for Stage 2.
+typedef void      (__fastcall* RagdollModeFn)(Character* self, bool on, int part);
+// MedicalSystem::knockout(skill01) / knockoutForceTimer(seconds): a REAL knockout.
+// Unlike a bare ragdoll (which a healthy loaded NPC instantly fights out of), the KO
+// timer collapses the body AND holds it down, so it stays cleanly on the ground.
+typedef void      (__fastcall* MedFloatFn)(MedicalSystem* self, float v);
 
 TaskerKeyFn   g_taskerKeyFn   = 0;
 TaskerDescFn  g_taskerDescFn  = 0;
@@ -130,6 +137,9 @@ AddOrderFn      g_addOrderFn      = 0;
 AddJobFn        g_addJobFn        = 0;
 SeparateSquadFn g_separateSquadFn = 0;
 EndActionFn     g_endActionFn     = 0;
+RagdollModeFn   g_ragdollModeFn   = 0;
+MedFloatFn      g_knockoutFn      = 0;
+MedFloatFn      g_knockoutForceFn = 0;
 
 // AI-gating probe lever: PlayerInterface::recruit(Character*, bool) adds an NPC
 // to the local player's squad (the "inhabit" path). A recruited body stops
@@ -201,6 +211,13 @@ GetBip01Fn       g_getBip01Fn      = 0;
 GetBoneWorldPosFn g_getBoneWorldFn = 0;
 CharBodyBoolFn   g_isIdleFn        = 0;
 CharBodyBoolFn   g_isCrouchedFn    = 0;
+// Body-state reads (Stage 2): direct non-virtual bool getters on Character, same
+// thiscall ABI as the CharBody getters (this=RCX, returns bool), so we reuse the
+// CharBodyBoolFn type and pass the Character* as self.
+CharBodyBoolFn   g_isDownFn        = 0;
+CharBodyBoolFn   g_isRagdollFn     = 0;
+CharBodyBoolFn   g_isDeadCharFn    = 0;
+CharBodyBoolFn   g_isCrawlFn       = 0;
 
 lektor<GameData*> g_dataScratch; // reused seat-template scan buffer (main thread)
 
@@ -255,6 +272,9 @@ void resolve() {
     g_separateSquadFn = (SeparateSquadFn)KenshiLib::GetRealAddress(
         &Character::separateIntoMyOwnSquad);
     g_endActionFn = (EndActionFn)KenshiLib::GetRealAddress(&CharBody::endAction);
+    g_ragdollModeFn = (RagdollModeFn)KenshiLib::GetRealAddress(&Character::ragdollMode);
+    g_knockoutFn      = (MedFloatFn)KenshiLib::GetRealAddress(&MedicalSystem::knockout);
+    g_knockoutForceFn = (MedFloatFn)KenshiLib::GetRealAddress(&MedicalSystem::knockoutForceTimer);
 
     // AI-gating probe lever (non-fatal: only used when the probe is enabled).
     g_recruitFn = (RecruitFn)KenshiLib::GetRealAddress(
@@ -273,6 +293,14 @@ void resolve() {
     g_getBoneWorldFn = (GetBoneWorldPosFn)KenshiLib::GetRealAddress(&Character::getBoneWorldPosition);
     g_isIdleFn     = (CharBodyBoolFn)KenshiLib::GetRealAddress(&CharBody::isIdle);
     g_isCrouchedFn = (CharBodyBoolFn)KenshiLib::GetRealAddress(&CharBody::isCrouched);
+
+    // Body-state reads (non-fatal: unresolved -> bodyState stays 0 = upright).
+    g_isDownFn     = (CharBodyBoolFn)KenshiLib::GetRealAddress(&Character::isDown);
+    g_isRagdollFn  = (CharBodyBoolFn)KenshiLib::GetRealAddress(&Character::isRagdoll);
+    g_isDeadCharFn = (CharBodyBoolFn)KenshiLib::GetRealAddress(
+        static_cast<bool (Character::*)() const>(&Character::isDead));
+    g_isCrawlFn    = (CharBodyBoolFn)KenshiLib::GetRealAddress(
+        &Character::isStealthModeOrCrawling);
 }
 
 bool gameplayLive(GameWorld* gw) {
@@ -473,6 +501,9 @@ bool captureOne(Character* c, EntityState* e) {
                 }
             }
         }
+        // Stage 2: body-state flags (down/KO/ragdoll/dead/crawl). 0 = upright. Read
+        // last so a fault here can't lose the transform we already captured.
+        e->bodyState = readBodyState(c);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1279,6 +1310,81 @@ bool orderCraftWorker(GameWorld* gw, const unsigned int workerHand[5], int task)
     return goalWorkAt(w, fixture, task);
 }
 
+// --- down_order (Stage 2, LIVE knockout transition) ------------------------------
+// A FIXED world anchor captured once at pin time. The baseline hold parks the subject
+// here every tick. It must NOT be recomputed from the live leader each tick: a parked
+// body that collides with the leader shoves it, the leader-relative anchor then chases
+// the shoved leader, and the feedback flings the leader across the map (observed).
+static float g_downAnchor[4]   = { 0, 0, 0, 0 }; // x,y,z,yaw
+static bool  g_haveDownAnchor  = false;
+
+// Identify the subject to knock out for a LIVE down-order test: the non-squad NPC
+// nearest the LOCAL leader (in down1 that is the baked subject standing in front).
+// Returns its hand in readObjectHand layout so the scenario PINS this exact NPC for
+// the whole run, so host + join drive the SAME identity across the upright->down
+// transition. Also latches a FIXED leader-front anchor (a few metres clear of the
+// leader) for the baseline hold. Mirrors pickCraftWorker but anchors on the leader.
+bool pickDownSubject(GameWorld* gw, unsigned int subjHand[5]) {
+    if (!g_getCharsFn || !gw || !gw->player ||
+        gw->player->playerCharacters.size() == 0) return false;
+    Character* best = 0;
+    __try {
+        Ogre::Vector3 center = gw->player->playerCharacters[0]->getPosition();
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &center, 30.0f, 30.0f, 30.0f, 64, 64, 0);
+        float bestD = 1e18f;
+        for (unsigned int i = 0; i < g_npcQuery.size(); ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o || isPlayerSquad(gw, o)) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - center.x, dz = p.z - center.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < bestD) { bestD = d2; best = static_cast<Character*>(o); }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!best) return false;
+    if (!readObjectHand(static_cast<RootObject*>(best), subjHand)) return false;
+    // Latch the hold anchor ONCE: 6 m in front of the leader (well clear of its body
+    // so the parked subject never collides with / pushes the leader).
+    Ogre::Vector3 pos; float yaw = 0.0f;
+    if (leaderAnchor(gw, 6.0f, 0.0f, &pos, &yaw)) {
+        g_downAnchor[0] = pos.x; g_downAnchor[1] = pos.y; g_downAnchor[2] = pos.z;
+        g_downAnchor[3] = yaw; g_haveDownAnchor = true;
+    }
+    return true;
+}
+
+// Keep the pinned subject UPRIGHT and in capture range during a down_order baseline.
+// A baked world NPC's AI paths it AWAY on reload (observed: ~89 u/s off-screen within
+// 2 s, so by order-time it is far outside capture and the host streams no down body),
+// and clearGoals alone does not hold it - so we PARK it at the FIXED anchor latched at
+// pin time (teleport wins over its AI), like holdWorkerAtFixture pins the craft worker.
+// The anchor is fixed (not leader-relative) to avoid the parked-body-pushes-leader
+// feedback loop. It stays upright (nothing downs it in the baseline) and in range, so
+// the join gets a clean upright "before" series. Returns true if held.
+bool holdSubjectUpright(GameWorld* gw, const unsigned int subjHand[5]) {
+    (void)gw;
+    if (!g_haveDownAnchor) return false;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    clearGoals(s);
+    return park(s, g_downAnchor[0], g_downAnchor[1], g_downAnchor[2], g_downAnchor[3]);
+}
+
+// The runtime EVENT the down_order scenario fires: knock the PINNED subject out so
+// the host streams bodyState down and the join's driven copy must transition
+// upright -> down. NOT guarded against re-issue: re-applying the forced KO timer on
+// a throttle just tops it up (the body is already collapsed, no re-collapse), which
+// is how it stays down for the rest of the run. subjHand is readObjectHand layout.
+bool orderDownSubject(GameWorld* gw, const unsigned int subjHand[5]) {
+    (void)gw;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    return knockDown(s, true);
+}
+
 // 'craft' setup scene: spawn a save-stable work fixture + a NON-squad world NPC,
 // then give the NPC a persistent AI GOAL to work it (NOT a player order, which
 // would recruit it into the squad and bypass the host-authoritative world-NPC
@@ -1360,6 +1466,114 @@ bool setupCraftScene(GameWorld* gw) {
     return ok && mach != 0;
 }
 
+// Drop a Character into (on=true) or out of (on=false) full-body ragdoll. The host
+// uses this to manufacture a "down" subject; the join uses it to reproduce one.
+// SEH-guarded; no-op if the engine fn didn't resolve.
+bool knockDown(Character* c, bool on) {
+    if (!c) return false;
+    __try {
+        if (on) {
+            // Prefer a real knockout: it collapses the body AND the medical KO timer
+            // suppresses the get-up AI, so a loaded world NPC stays cleanly down (a
+            // bare ragdoll it just fights out of - the twitch we saw). Top the timer
+            // well past the re-arm interval. Fall back to ragdoll if unresolved.
+            if (g_knockoutFn || g_knockoutForceFn) {
+                MedicalSystem* med = &c->medical;
+                if (g_knockoutFn)      g_knockoutFn(med, 1.0f);
+                if (g_knockoutForceFn) g_knockoutForceFn(med, 8.0f);
+                return true;
+            }
+            if (g_ragdollModeFn) { g_ragdollModeFn(c, true, RagdollPart::WHOLE); return true; }
+            return false;
+        }
+        // Wake/stand: clear the forced KO timer and release any ragdoll.
+        if (g_knockoutForceFn) g_knockoutForceFn(&c->medical, 0.0f);
+        if (g_ragdollModeFn)   g_ragdollModeFn(c, false, RagdollPart::WHOLE);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Maintain an already-down body WITHOUT re-triggering the collapse. knockDown()
+// calls knockout(1.0), which re-initiates the ragdoll fall every time - calling
+// that each tick produces the visible get-up/flop/ragdoll-spike flicker. The
+// real cause of the get-up is the medical KO timer lapsing: once it hits 0 the
+// wake AI stands the body, the replicator notices (too late), and re-collapses
+// it. So instead top the force timer EVERY tick: the timer never reaches 0, the
+// wake AI never fires, and the body stays cleanly down with no re-collapse.
+bool holdDown(Character* c) {
+    if (!c) return false;
+    __try {
+        if (g_knockoutForceFn) { g_knockoutForceFn(&c->medical, 8.0f); return true; }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The down subject pinned at bake time (readObjectHand layout), so the host can keep
+// re-applying ragdoll to THAT exact NPC (a healthy body fights to stand back up).
+static unsigned int g_downHand[5] = { 0, 0, 0, 0, 0 };
+static bool         g_haveDownHand = false;
+
+// 'down' setup scene: spawn a NON-squad world NPC and drop it into ragdoll, so the
+// host streams bodyState != 0 and (later) the join reproduces a body on the ground.
+// Mirrors the craft scene's faction borrow + pre-detach so the subject's hand is
+// stable across save/reload and identical on both clients. Returns true if spawned.
+bool setupDownScene(GameWorld* gw) {
+    Faction* fac = findNearbyNonPlayerFaction(gw);
+    coop::logLine(fac ? "SETUP(down): using nearby non-player faction (world NPC)"
+                      : "SETUP(down): NO nearby non-player faction - falling back to "
+                        "player faction (subject WILL be a squad member; load near a town)");
+    Character* npc = fac ? spawnCharInFaction(gw, 4.0f, 0.0f, fac)
+                         : spawnNpcInFront(gw, 4.0f, 0.0f);
+    if (!npc) { coop::logLine("SETUP(down): NPC spawn FAILED"); return false; }
+    bool det = detachFromTownAI(npc);
+    coop::logLine(det ? "SETUP(down): subject detached into own platoon (stable hand)"
+                      : "SETUP(down): subject detach skipped/failed");
+    g_haveDownHand = readObjectHand(static_cast<RootObject*>(npc), g_downHand);
+    if (g_haveDownHand) {
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "SETUP(down): subject hand=%u,%u,%u,%u,%u",
+                  g_downHand[3], g_downHand[4], g_downHand[0], g_downHand[1], g_downHand[2]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    bool kd = knockDown(npc, true);
+    coop::logLine(kd ? "SETUP(down): subject knocked into ragdoll"
+                     : "SETUP(down): knockDown FAILED (no ragdollMode fn)");
+    return true;
+}
+
+// Keep down bodies down. A healthy ragdolled body recovers and stands back up, and
+// ragdoll state does not survive save/load, so the host re-applies ragdoll on an
+// interval. Rather than guess WHICH nearby NPC is "the subject" (the pin is empty
+// after a reload, and the nearest-NPC heuristic mis-fired when the donor/a re-spawn
+// sat at the same spot), we simply re-knock EVERY non-squad NPC within a modest
+// radius of the leader. The baked subject is always covered, and any neighbour that
+// goes down is a world NPC present in the save on BOTH clients, so the join
+// reproduces it too. Re-applying to an already-ragdolled body is harmless. Returns
+// the number of bodies (re-)knocked, or -1 if the query is unavailable.
+int rearmDownScene(GameWorld* gw) {
+    if (!g_getCharsFn || !gw || !gw->player ||
+        gw->player->playerCharacters.size() == 0) return -1;
+    const float R = 30.0f; // horizontal reach for "down bodies in this scene"
+    int n = 0;
+    __try {
+        Ogre::Vector3 center = gw->player->playerCharacters[0]->getPosition();
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &center, R, R, R, 64, 64, 0);
+        for (unsigned int i = 0; i < g_npcQuery.size(); ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o || isPlayerSquad(gw, o)) continue;
+            if (knockDown(static_cast<Character*>(o), true)) ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
 // SEH-guarded bone read. MUST live in its own function with only POD locals: a
 // __try cannot coexist with C++ objects that need unwinding (the std::string for
 // the bone name is therefore owned by the caller and passed by pointer). Returns
@@ -1390,6 +1604,22 @@ static bool readCharBodyFlags(Character* c, int* idle, int* crouched, int* task)
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// Read the host's body-state bit-flags off a rendered Character (BODY_* in Wire.h).
+// SEH-guarded, POD-only: a fault returns 0 (treated as upright). 0 = normal/upright.
+unsigned short readBodyState(Character* c) {
+    if (!c) return 0;
+    unsigned short s = 0;
+    __try {
+        if (g_isDownFn    && g_isDownFn(c))    s |= BODY_DOWN;
+        if (g_isRagdollFn && g_isRagdollFn(c)) s |= BODY_RAGDOLL;
+        if (g_isDeadCharFn && g_isDeadCharFn(c)) s |= BODY_DEAD;
+        if (g_isCrawlFn   && g_isCrawlFn(c))   s |= BODY_CRAWL;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return s;
 }
 
 bool readPoseState(Character* c, float* pelvis, int* idle, int* crouched, int* task) {

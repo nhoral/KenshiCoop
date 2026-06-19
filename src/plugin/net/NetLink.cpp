@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 
 namespace coop {
 
@@ -39,7 +40,8 @@ NetLink::NetLink()
     : isHost_(false), port_(0),
       enetHost_(0), serverPeer_(0), inbound_(0),
       outOwner_(0), haveOut_(false),
-      thread_(0), running_(0), stopFlag_(0), myId_(0) {
+      thread_(0), running_(0), stopFlag_(0), myId_(0),
+      simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
     InitializeCriticalSection(&outCs_);
 }
 
@@ -83,6 +85,48 @@ void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int
     else                  out_.clear();
     haveOut_ = true;
     LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct) {
+    simDelayMs_  = delayMs;
+    simJitterMs_ = jitterMs;
+    simLossPct_  = (lossPct > 100) ? 100 : lossPct;
+}
+
+// Deliver one received entity to the game thread, applying the WAN sim if enabled.
+// Loopback has ~0 latency, so without this a received "down"/move lands the same
+// frame it was sent - exactly the regime we want to stop relying on. With it, the
+// entity is parked until base +/- jitter has elapsed (and dropped lossPct% of the
+// time), so the join must coast on interpolation/local enforcement between arrivals.
+void NetLink::deliverEntity(u32 ownerId, const EntityState& e) {
+    if (simDelayMs_ == 0 && simJitterMs_ == 0 && simLossPct_ == 0) {
+        if (inbound_) inbound_->pushEntity(ownerId, e);
+        return;
+    }
+    if (simLossPct_ > 0 && (unsigned)(rand() % 100) < simLossPct_) return; // dropped
+    int jitter = 0;
+    if (simJitterMs_ > 0) jitter = (rand() % (int)(2 * simJitterMs_ + 1)) - (int)simJitterMs_;
+    int delay = (int)simDelayMs_ + jitter;
+    if (delay < 0) delay = 0;
+    Delayed d;
+    d.releaseTick = GetTickCount() + (DWORD)delay;
+    d.ownerId     = ownerId;
+    d.e           = e;
+    delayed_.push_back(d);
+}
+
+// Release every held entity whose simulated arrival time has passed. Jitter can put
+// release times out of order; we scan the whole queue (small N) and keep the rest.
+// "Newest supersedes" on the receiver makes any reordering harmless (and realistic).
+void NetLink::flushDelayed() {
+    if (delayed_.empty()) return;
+    DWORD now = GetTickCount();
+    std::deque<Delayed> keep;
+    for (std::deque<Delayed>::iterator it = delayed_.begin(); it != delayed_.end(); ++it) {
+        if ((long)(now - it->releaseTick) >= 0) { if (inbound_) inbound_->pushEntity(it->ownerId, it->e); }
+        else                                     { keep.push_back(*it); }
+    }
+    delayed_.swap(keep);
 }
 
 DWORD WINAPI NetLink::threadEntry(LPVOID self) {
@@ -215,7 +259,7 @@ void NetLink::threadLoop() {
                                 for (unsigned i = 0; i < hdr.count; ++i) {
                                     EntityState e;
                                     std::memcpy(&e, p + i * sizeof(EntityState), sizeof(e));
-                                    inbound_->pushEntity(hdr.ownerId, e);
+                                    deliverEntity(hdr.ownerId, e);
                                 }
                             }
                         }
@@ -243,6 +287,10 @@ void NetLink::threadLoop() {
                     break;
             }
         }
+
+        // Release any WAN-sim-delayed inbound entities whose arrival time has come.
+        // No-op (and cheap) when the sim is disabled / nothing is pending.
+        flushDelayed();
 
         // Transmit this peer's owned entities (latest snapshot), chunked so each
         // batch fits one datagram. Unreliable: the newest batch supersedes loss.
