@@ -134,6 +134,13 @@ private:
     // Host side: last bodyState we published per owned entity, so we can emit a
     // reliable event on the rising/falling edge (KO/death/revive) exactly once.
     std::map<Key, u16>    hostBody_;
+    // Host side: who is attacking whom (victim key -> {attacker key, lastSeenMs}), built
+    // from the combat intents in the captured set (task==TASK_COMBAT_MELEE, subject =
+    // the target). STICKY with a recency window: the attacker drops its target the instant
+    // the victim falls, so the down/death edge would otherwise see no current attacker -
+    // we keep the last attacker for ATTR_WINDOW_MS and stamp it as the event's ACTOR
+    // (causality: "downed BY"), so combat KO/death events carry who-did-it.
+    std::map<Key, std::pair<Key, unsigned long> > attackerOf_;
     u32                   nextEventId_;
     // Stage 6: world NPCs we've hidden+frozen on the join because the host isn't
     // streaming them. Keyed by hand so we restore the exact body when it re-enters

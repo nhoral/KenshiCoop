@@ -197,6 +197,10 @@ bool orderDownSubject(GameWorld* gw, const unsigned int subjHand[5]);
 // death_order: KILL the pinned subject (scaffold) so Character::isDead() flips and
 // the host emits a reliable EVT_DEATH. Idempotent; re-assertable on a throttle.
 bool killSubject(GameWorld* gw, const unsigned int subjHand[5]);
+// combat_kill: WEAKEN the subject (lower blood only, never heal/collapse) so an
+// ongoing real melee downs it decisively within the window - the down edge comes from
+// genuine combat, not a scaffold. Returns true if applied. subjHand readObjectHand layout.
+bool woundSubject(GameWorld* gw, const unsigned int subjHand[5], float blood);
 
 // ---- Combat (Phase 3c, L5) -------------------------------------------------
 

@@ -7,6 +7,7 @@
 #include <windows.h> // GetTickCount
 #include <deque>
 #include <set>
+#include <utility> // std::pair, std::make_pair
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -52,6 +53,8 @@ const float TRANSLATE_EPS = 0.02f; // per-frame actual movement counted as "tran
 // order on a throttle if the local copy disengaged while the host still reports combat.
 const float COMBAT_SNAP_DIST = 6.0f;       // teleport-correct combat drift beyond this
 const unsigned long COMBAT_REISSUE_MS = 1500; // re-arm the attack at most this often
+const unsigned long ATTR_WINDOW_MS = 3000; // remember a combatant's victim this long, so a
+                                           // KO/death edge can still name the attacker
 
 float dist3(float ax, float ay, float az, float bx, float by, float bz) {
     float dx = ax - bx, dy = ay - by, dz = az - bz;
@@ -89,6 +92,26 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         n += engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
     net.setOwnedEntities(ownerId, buf, n);
 
+    // Refresh the (sticky) attacker map from this tick's combat intents: a captured
+    // entity with task==TASK_COMBAT_MELEE carries its target in the subject fields, so it
+    // is the ATTACKER of that subject. Stamp lastSeen=now; entries persist (recency
+    // window below) so a KO/death edge - where the attacker has already dropped its
+    // now-fallen target - can still recover who did it. Prune entries older than the
+    // window so stale pairings don't mis-attribute a later, unrelated death.
+    unsigned long nowPub = nowMs();
+    for (unsigned int i = 0; i < n; ++i) {
+        const EntityState& e = buf[i];
+        if (e.task != TASK_COMBAT_MELEE) continue;
+        Key victim; victim.t = e.sType; victim.c = e.sContainer;
+        victim.cs = e.sContainerSerial; victim.i = e.sIndex; victim.s = e.sSerial;
+        attackerOf_[victim] = std::make_pair(keyOf(e), nowPub);
+    }
+    for (std::map<Key, std::pair<Key, unsigned long> >::iterator pr = attackerOf_.begin();
+         pr != attackerOf_.end(); ) {
+        if (nowPub - pr->second.second > ATTR_WINDOW_MS) attackerOf_.erase(pr++);
+        else ++pr;
+    }
+
     // Emit reliable transition events on bodyState edges. Continuous bodyState
     // already self-heals the down/dead POSTURE over the unreliable channel; the
     // event guarantees the TRANSITION moment is delivered exactly once (a dropped
@@ -114,11 +137,22 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 ev.sType = e.hType; ev.sContainer = e.hContainer;
                 ev.sContainerSerial = e.hContainerSerial;
                 ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
+                // Causality: if this victim was being meleed within the recency window,
+                // stamp the attacker as the ACTOR (combat KO/death "downed BY X"). A
+                // KO/death from a non-combat cause (scaffold kill, fall) leaves it zeroed.
+                std::map<Key, std::pair<Key, unsigned long> >::iterator ait = attackerOf_.find(k);
+                bool haveActor = (ait != attackerOf_.end());
+                if (haveActor) {
+                    const Key& a = ait->second.first;
+                    ev.aType = a.t; ev.aContainer = a.c; ev.aContainerSerial = a.cs;
+                    ev.aIndex = a.i; ev.aSerial = a.s;
+                }
                 net.queueEvent(ev);
-                char b[160]; _snprintf(b, sizeof(b) - 1,
-                    "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u bs %u->%u",
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u actor=%u,%u bs %u->%u",
                     ev.eventId, (unsigned)evType, e.hType, e.hContainer,
                     e.hContainerSerial, e.hIndex, e.hSerial,
+                    haveActor ? ev.aIndex : 0u, haveActor ? ev.aSerial : 0u,
                     (unsigned)prev, (unsigned)cur);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
@@ -141,10 +175,11 @@ void Replicator::applyEvents(Inbound& in) {
             case EVT_REVIVE:   d.deathLatched = false; d.koLatched = false; break;
             default: break;
         }
-        char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[event] RECV id=%u ev=%u owner=%u hand=%u,%u,%u,%u,%u",
+        char b[200]; _snprintf(b, sizeof(b) - 1,
+            "[event] RECV id=%u ev=%u owner=%u hand=%u,%u,%u,%u,%u actor=%u,%u",
             ev.eventId, (unsigned)ev.event, ev.ownerId,
-            ev.sType, ev.sContainer, ev.sContainerSerial, ev.sIndex, ev.sSerial);
+            ev.sType, ev.sContainer, ev.sContainerSerial, ev.sIndex, ev.sSerial,
+            ev.aIndex, ev.aSerial);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }

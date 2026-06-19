@@ -1448,6 +1448,26 @@ bool killSubject(GameWorld* gw, const unsigned int subjHand[5]) {
     }
 }
 
+// combat_kill bias (NOT a kill): lower the subject's blood so an ongoing REAL melee
+// downs it decisively within the test window, without collapsing it ourselves (no
+// unconcious/dead set, no ragdoll) - the opponent's hits + bleeding do the takedown,
+// so the down edge comes from genuine combat. Idempotent-ish (clamps to >=0). Returns
+// true if applied. subjHand is readObjectHand layout.
+bool woundSubject(GameWorld* gw, const unsigned int subjHand[5], float blood) {
+    (void)gw;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    __try {
+        MedicalSystem* med = &s->medical;
+        if (blood < 0.0f) blood = 0.0f;
+        if (med->blood > blood) med->blood = blood; // only weaken, never heal
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // ---- Combat (Phase 3c, L5) -------------------------------------------------
 
 bool readCombat(Character* c, CombatRead* out) {

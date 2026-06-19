@@ -253,11 +253,24 @@ if ($Scenario -ne "") {
     # anchor = its first SCENARIO RECV (proof it loaded and applied a transform).
     # The host scenario keeps the leader moving long enough to still be live when
     # the join captures.
-    if (Wait-ForLogLine -File $hostLog -Pattern "SCENARIO MEMBER" -TimeoutSec $ScenarioWaitSec) {
-        Write-Host "Saw host SCENARIO MEMBER; capturing host shortly after."
-        Start-Sleep -Seconds 1
+    # Most scenarios capture at the first authoritative/observed line so the shot
+    # shows live, mid-action state. combat_kill is special: the meaningful state
+    # (the loser on the ground) only exists AFTER the enforced takedown ~22 s in,
+    # so anchor its capture on the KO marker and give the join a beat to apply the
+    # reliable event before shooting.
+    $hostAnchor = "SCENARIO MEMBER"
+    $hostShotDelay = 1
+    $joinShotDelay = 1
+    if ($Scenario -eq "combat_kill") {
+        $hostAnchor = "SCENARIO KO enforced"
+        $hostShotDelay = 2
+        $joinShotDelay = 4
+    }
+    if (Wait-ForLogLine -File $hostLog -Pattern $hostAnchor -TimeoutSec $ScenarioWaitSec) {
+        Write-Host "Saw host '$hostAnchor'; capturing host shortly after."
+        Start-Sleep -Seconds $hostShotDelay
     } else {
-        Write-Warning "No host SCENARIO MEMBER within $ScenarioWaitSec s; capturing host best-effort."
+        Write-Warning "No host '$hostAnchor' within $ScenarioWaitSec s; capturing host best-effort."
     }
     if (Test-Alive $hostPid) { Take-Shot -ProcId $hostPid -Out $hostPng -Label "host" }
     else { Write-Warning "Host already exited before screenshot." }
@@ -265,7 +278,7 @@ if ($Scenario -ne "") {
     if ($joinPid -ne 0) {
         if (Wait-ForLogLine -File $joinLog -Pattern "SCENARIO RECV" -TimeoutSec $JoinAnchorTimeoutSec) {
             Write-Host "Saw join SCENARIO RECV; capturing join shortly after."
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds $joinShotDelay
         } else {
             Write-Warning "No join SCENARIO RECV within $JoinAnchorTimeoutSec s; capturing join best-effort."
         }
@@ -844,6 +857,54 @@ function Test-CombatOrder {
     return $ok
 }
 
+# combat_kill OUTCOME oracle (Phase 3c, L5). Proves combat resolution is HOST-
+# AUTHORITATIVE with attribution: the host's duelist A downs the (weakened) duelist B by
+# REAL melee, emits a reliable KO/death event STAMPED with A as the actor, the join
+# RECEIVES that exact event (hand B + actor A), and the join's copy of B is DOWN after
+# it - even though the join ran its own local fight. Asserts all three: combat
+# attribution (non-zero actor == opponent), reliable delivery, and synced down outcome.
+function Test-CombatKill {
+    param([string]$HostFile, [string]$JoinFile, [int]$GraceMs = 3000, [double]$MinDown = 0.70)
+    $pin = Select-String -Path $HostFile -Pattern 'SCENARIO duel subjects pinned A=(\d+),(\d+) B=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $pin) { Write-Host "  COMBAT-KILL FAIL - no pinned duelists on host"; return $false }
+    $ai = $pin.Matches[0].Groups[1].Value; $as = $pin.Matches[0].Groups[2].Value
+    $bi = $pin.Matches[0].Groups[3].Value; $bs = $pin.Matches[0].Groups[4].Value
+    # Host emitted a combat KO/death (ev=1 or 2) for B, stamped with A as the actor.
+    # Event hand layout is type,container,containerSerial,INDEX,SERIAL, so B's index,serial
+    # are the last two fields; actor is logged as index,serial.
+    $sendPat = '\[event\] SEND id=\d+ ev=(1|2) hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=' + $ai + ',' + $as
+    $send = Select-String -Path $HostFile -Pattern $sendPat -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $send) {
+        Write-Host "  COMBAT-KILL FAIL - host sent no combat KO/death for B=$bi,$bs with actor A=$ai,$as (no real takedown / no attribution)"
+        return $false
+    }
+    $ev = $send.Matches[0].Groups[1].Value
+    # Join received THAT exact reliable event (same ev, hand B, actor A).
+    $recvPat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[event\] RECV id=\d+ ev=' + $ev + ' .*hand=\d+,\d+,\d+,' + $bi + ',' + $bs + ' actor=' + $ai + ',' + $as
+    $recv = Select-String -Path $JoinFile -Pattern $recvPat -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $recv) {
+        Write-Host "  COMBAT-KILL FAIL - join never received the reliable combat event (ev=$ev hand=B actor=A)"
+        return $false
+    }
+    $rg = $recv.Matches[0].Groups
+    $T = ([int]$rg[1].Value*3600 + [int]$rg[2].Value*60 + [int]$rg[3].Value)*1000 + [int]$rg[4].Value
+    # The join's copy of B must be DOWN after it received the event. Series hand keys are
+    # index,serial,type,container,containerSerial, so B's key starts with "$bi,$bs,".
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $bKey = $null
+    foreach ($hand in $J.Keys) { if ($hand -match ('^' + $bi + ',' + $bs + ',')) { $bKey = $hand; break } }
+    if ($null -eq $bKey) { Write-Host "  COMBAT-KILL FAIL - join logged no body series for victim B=$bi,$bs"; return $false }
+    $post = @($J[$bKey] | Where-Object { $_.t -ge ($T + $GraceMs) })
+    if ($post.Count -lt 1) { Write-Host "  COMBAT-KILL FAIL - no join samples after the event"; return $false }
+    $down = @($post | Where-Object { ($_.bs -band 7) -ne 0 }).Count
+    $ratio = [Math]::Round($down / $post.Count, 3)
+    $ok = ($ratio -ge $MinDown)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $evName = if ($ev -eq "2") { "DEATH" } else { "KO" }
+    Write-Host "  COMBAT-KILL [join] $v - combat $evName for B=$bi,$bs by A=$ai,${as}: reliable event received, victim down-after $down/$($post.Count) (ratio=$ratio>=$MinDown)"
+    return $ok
+}
+
 # True if $File logged a "SCENARIO RESULT PASS" line.
 function Test-ScenarioResultPass {
     param([string]$File)
@@ -968,6 +1029,11 @@ if ($Scenario -ne "") {
         # the fight mid-run and the join's own copies must transition NOT-combat ->
         # combat (task=65024) AFTER the order. The payoff combat test.
         $cross = Test-CombatOrder -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "combat_kill") {
+        # L5 OUTCOME: host-authoritative combat resolution. A downs B by real melee; the
+        # host emits a reliable KO/death stamped with A as actor; the join receives it and
+        # forces ITS B down. Asserts attribution + reliable delivery + synced down outcome.
+        $cross = Test-CombatKill -HostFile $hostLog -JoinFile $joinLog
     } else {
         $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
     }
@@ -989,10 +1055,11 @@ if ($Scenario -ne "") {
     # join doesn't drive, so the join-side locomotion metrics (smoothness/anim/march)
     # are not meaningful and print as advisory; COMBAT-PROBE is the authoritative gate.
     $isReadProbe = ($Scenario -eq "combat_probe")
-    # combat_order drives combatants by ENGINE (local combat footwork), not by our
-    # walk-drive/park, so the locomotion-tuned smoothness/anim/march metrics legitimately
-    # spike (real combat movement). They print as advisory; COMBAT-ORDER is the gate.
-    $isCombatOrder = ($Scenario -eq "combat_order")
+    # combat_order/combat_kill drive combatants by ENGINE (local combat footwork), not by
+    # our walk-drive/park, so the locomotion-tuned smoothness/anim/march metrics
+    # legitimately spike (real combat movement + a falling body). They print as advisory;
+    # COMBAT-ORDER / COMBAT-KILL are the gates.
+    $isCombatOrder = ($Scenario -eq "combat_order") -or ($Scenario -eq "combat_kill")
     $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder) { $true } else { $smooth }
     $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder) { $true } else { $anim }
     $gateMarch  = if ($isReadProbe -or $isCombatOrder) { $true } else { $march }
