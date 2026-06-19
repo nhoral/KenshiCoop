@@ -770,6 +770,80 @@ function Test-DeathOrder {
     return $true
 }
 
+# combat_probe READ oracle (Phase 3c, L5). Validates that the combat-state primitives
+# populate during a live host-spawned duel: the duel spawned + both were ordered, a
+# sustained number of COMBAT samples show inCombat=1 + hasTarget=1, and the two
+# duelists target EACH OTHER (A's attack target == B's hand and vice versa - proving
+# getAttackTarget returns a correct, resolvable hand). Host-side only (the duelists
+# are runtime spawns, not baked, so the join has nothing to render yet).
+function Test-CombatProbe {
+    param([string]$HostFile)
+    # setupDuelScene now spawns PEACEFUL (the scenario triggers the fight via startDuel);
+    # match the peaceful-spawn line to recover the duelist hands.
+    $setup = Select-String -Path $HostFile -Pattern 'SETUP\(duel\): spawned PEACEFUL A=([\d]+),([\d]+) B=([\d]+),([\d]+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $setup) { Write-Host "  COMBAT-PROBE FAIL - duel did not spawn"; return $false }
+    $aIdx = $setup.Matches[0].Groups[1].Value; $aSer = $setup.Matches[0].Groups[2].Value
+    $bIdx = $setup.Matches[0].Groups[3].Value; $bSer = $setup.Matches[0].Groups[4].Value
+    $fighting = @(Select-String -Path $HostFile -Pattern 'COMBAT [AB] .*inCombat=1.*hasTarget=1' -ErrorAction SilentlyContinue)
+    if ($fighting.Count -lt 10) {
+        Write-Host "  COMBAT-PROBE FAIL - only $($fighting.Count) in-combat+targeted sample(s) (need >= 10)"
+        return $false
+    }
+    # A must target B's hand, and B must target A's hand (mutual, resolvable target).
+    $aOnB = @(Select-String -Path $HostFile -Pattern ("COMBAT A .*hasTarget=1 target=" + [regex]::Escape("$bIdx,$bSer")) -ErrorAction SilentlyContinue)
+    $bOnA = @(Select-String -Path $HostFile -Pattern ("COMBAT B .*hasTarget=1 target=" + [regex]::Escape("$aIdx,$aSer")) -ErrorAction SilentlyContinue)
+    if ($aOnB.Count -lt 1 -or $bOnA.Count -lt 1) {
+        Write-Host "  COMBAT-PROBE FAIL - duelists not mutually targeting (A->B=$($aOnB.Count) B->A=$($bOnA.Count))"
+        return $false
+    }
+    Write-Host "  COMBAT-PROBE [host] PASS - live duel: $($fighting.Count) in-combat samples; mutual attack-target hands resolve (A->B, B->A)"
+    return $true
+}
+
+# combat_order LIVE-transition oracle (Phase 3c, L5 - the payoff). Both clients load
+# the baked 'duel1' (two peaceful co-located NPCs). The host pins them, holds them
+# peaceful, then at "SCENARIO COMBAT issued" orders the live fight. The combat intent
+# streams as task=65024 (TASK_COMBAT_MELEE); the join reproduces it so its OWN copies
+# enter combat, and the join's RECV series (its independent re-read of those copies)
+# must flip from NOT-combat BEFORE the order to combat AFTER it. We split the join's
+# per-hand task series on the marker and assert both halves for the duelist hands (the
+# hands the host streams as combat after the order). Combat flickers between swings, so
+# the post threshold is a sustained fraction, not 100%.
+function Test-CombatOrder {
+    param([string]$HostFile, [string]$JoinFile, [int]$GraceMs = 5000,
+          [double]$PostMin = 0.40, [double]$PreMax = 0.10)
+    $COMBAT = 65024 # TASK_COMBAT_MELEE (0xFE00)
+    $om = Select-String -Path $HostFile -Pattern "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO COMBAT issued" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $om) { Write-Host "  COMBAT-ORDER FAIL - no 'SCENARIO COMBAT issued' marker on host"; return $false }
+    $g = $om.Matches[0].Groups
+    $T = ([int]$g[1].Value*3600 + [int]$g[2].Value*60 + [int]$g[3].Value)*1000 + [int]$g[4].Value
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    # Duelists = hands the HOST streams in combat (task=65024) after the order.
+    $duelists = @()
+    foreach ($hand in $H.Keys) {
+        if (@($H[$hand] | Where-Object { $_.t -ge $T -and $_.task -eq $COMBAT }).Count -gt 0) { $duelists += $hand }
+    }
+    if ($duelists.Count -lt 1) { Write-Host "  COMBAT-ORDER FAIL - host never streamed a combat task after the order"; return $false }
+    $preCombat = 0; $preTotal = 0; $postCombat = 0; $postTotal = 0; $seen = 0
+    foreach ($hand in $duelists) {
+        if (-not $J.ContainsKey($hand)) { continue }
+        $seen++
+        $pre  = @($J[$hand] | Where-Object { $_.t -lt $T })
+        $post = @($J[$hand] | Where-Object { $_.t -ge ($T + $GraceMs) })
+        $preTotal  += $pre.Count;  $preCombat  += @($pre  | Where-Object { $_.task -eq $COMBAT }).Count
+        $postTotal += $post.Count; $postCombat += @($post | Where-Object { $_.task -eq $COMBAT }).Count
+    }
+    if ($seen -lt 1) { Write-Host "  COMBAT-ORDER FAIL - join never received any duelist hand (saw $($duelists.Count) on host)"; return $false }
+    if ($preTotal -lt 1 -or $postTotal -lt 1) { Write-Host "  COMBAT-ORDER FAIL - insufficient join samples (preTotal=$preTotal postTotal=$postTotal)"; return $false }
+    $preRatio  = [Math]::Round($preCombat  / $preTotal, 3)
+    $postRatio = [Math]::Round($postCombat / $postTotal, 3)
+    $ok = ($preRatio -le $PreMax -and $postRatio -ge $PostMin)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  COMBAT-ORDER [join] $v - duelists=$($duelists.Count) seen=$seen combat-before $preCombat/$preTotal (ratio=$preRatio<=$PreMax), combat-after $postCombat/$postTotal (ratio=$postRatio>=$PostMin)"
+    return $ok
+}
+
 # True if $File logged a "SCENARIO RESULT PASS" line.
 function Test-ScenarioResultPass {
     param([string]$File)
@@ -885,6 +959,15 @@ if ($Scenario -ne "") {
         # reliable EVT_DEATH; the join MUST receive it (even under packet loss, since
         # it rides the reliable channel while the unreliable bodyState batches drop).
         $cross = Test-DeathOrder -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "combat_probe") {
+        # L5 READ probe: host spawns a live duel; assert the combat-state primitives
+        # populate (inCombat + mutually-resolvable attack-target hands). Host-side only.
+        $cross = Test-CombatProbe -HostFile $hostLog
+    } elseif ($Scenario -eq "combat_order") {
+        # L5 LIVE transition: both clients load duel1 (peaceful pair); the host triggers
+        # the fight mid-run and the join's own copies must transition NOT-combat ->
+        # combat (task=65024) AFTER the order. The payoff combat test.
+        $cross = Test-CombatOrder -HostFile $hostLog -JoinFile $joinLog
     } else {
         $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
     }
@@ -902,9 +985,18 @@ if ($Scenario -ne "") {
     # metrics are not meaningful here (a held body trivially "fails" zeroFrac). They
     # print as advisory; BODY-STATE + MARCH are the authoritative gates.
     $isDownScene = ($Setup -like "down*") -or ($Scenario -eq "down_order") -or ($Scenario -eq "death_order")
-    $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene) { $true } else { $smooth }
-    $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene) { $true } else { $anim }
-    $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $gateSmooth -and $gateAnim -and $march -and $pose -and $poseState -and $bodyState)
+    # combat_probe is a host-side READ probe: the duelists are runtime host spawns the
+    # join doesn't drive, so the join-side locomotion metrics (smoothness/anim/march)
+    # are not meaningful and print as advisory; COMBAT-PROBE is the authoritative gate.
+    $isReadProbe = ($Scenario -eq "combat_probe")
+    # combat_order drives combatants by ENGINE (local combat footwork), not by our
+    # walk-drive/park, so the locomotion-tuned smoothness/anim/march metrics legitimately
+    # spike (real combat movement). They print as advisory; COMBAT-ORDER is the gate.
+    $isCombatOrder = ($Scenario -eq "combat_order")
+    $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder) { $true } else { $smooth }
+    $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder) { $true } else { $anim }
+    $gateMarch  = if ($isReadProbe -or $isCombatOrder) { $true } else { $march }
+    $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $gateSmooth -and $gateAnim -and $gateMarch -and $pose -and $poseState -and $bodyState)
 }
 
 Write-Host ""

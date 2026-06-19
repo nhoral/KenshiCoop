@@ -19,7 +19,7 @@ struct Config {
     std::string   logPath;         // KENSHICOOP_LOG
     std::string   scenario;        // KENSHICOOP_SCENARIO (empty = normal tick)
     unsigned long autoLoadDelayMs; // KENSHICOOP_AUTOLOAD_DELAY_MS
-    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft"/"down"/"downhold")
+    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft"/"down"/"downhold"/"duel")
                                    // host-only one-shot world spawn to bake a
                                    // deterministic test scene into a save.
     bool          probeRecruit;    // KENSHICOOP_PROBE_RECRUIT == "1" (join only):

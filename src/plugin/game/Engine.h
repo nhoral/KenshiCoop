@@ -198,6 +198,56 @@ bool orderDownSubject(GameWorld* gw, const unsigned int subjHand[5]);
 // the host emits a reliable EVT_DEATH. Idempotent; re-assertable on a throttle.
 bool killSubject(GameWorld* gw, const unsigned int subjHand[5]);
 
+// ---- Combat (Phase 3c, L5) -------------------------------------------------
+
+// Read-only snapshot of a Character's combat state (the L5 probe). POD so it can be
+// filled inside an SEH frame. target[] is the attack target's hand in readObjectHand
+// layout [type,container,containerSerial,index,serial]; all-zero if no target.
+struct CombatRead {
+    bool         valid;       // at least one field read succeeded
+    bool         inCombat;    // isInCombatMode(melee=true, ranged=true)
+    bool         ranged;      // isInRangedCombatMode()
+    bool         underMelee;  // isLiterallyUnderMeleeAttackRightNowForSure()
+    bool         fleeing;     // isFleeing()
+    bool         hasTarget;   // attack target is non-null
+    unsigned int target[5];   // attack target hand (or zeros)
+};
+// SEH-guarded read of c's combat state into *out. Returns out->valid.
+bool readCombat(Character* c, CombatRead* out);
+
+// Join-side combat apply: e.task == TASK_COMBAT_MELEE and the subject hand is the
+// attack target. Resolve it locally and order THIS body to focus-melee it, so the
+// join's own engine animates the fight (replicate the cause, not the animation).
+// Returns 2 ordered / 1 target not loaded / 0 no-op (not a combat intent) / -1 fault.
+int applyCombat(Character* c, const EntityState& e);
+
+// duel test scene: spawn two mutually-hostile non-squad NPCs in front of the leader
+// from the SAME nearby faction so they are PEACEFUL on spawn (no attack issued here).
+// Hands are stashed so startDuel/rearmDuelScene can trigger/re-issue the fight at
+// runtime. Used both to BAKE a neutral 'duel1' save and as the baseline for the live
+// combat_order transition test (peaceful->fighting after the join has loaded).
+bool setupDuelScene(GameWorld* gw);
+// combat_order LIVE-transition pin: after loading a baked 'duel1', re-find the two
+// baked duelists (the two non-squad NPCs nearest the leader) and stash their hands so
+// startDuel/rearmDuelScene/holdDuelistsPeaceful operate on them. Latches a fixed
+// per-duelist anchor for the baseline hold. Returns true if two distinct subjects pin.
+bool pickDuelSubjects(GameWorld* gw, unsigned int outA[5], unsigned int outB[5]);
+// Hold both pinned duelists peaceful + in range at their latched anchors (clearGoals +
+// park) during the combat_order baseline. Returns true if at least one was held.
+bool holdDuelistsPeaceful(GameWorld* gw);
+// Trigger the fight: order each pinned duelist to melee the other. Returns the number
+// of attack orders issued (0 if the duelists aren't known/resolvable).
+int  startDuel(GameWorld* gw);
+// Re-issue the attack goals on the two pinned duelists if they've disengaged. Returns
+// the number of (re-)issued orders, or -1 if the duelists aren't resolvable.
+int  rearmDuelScene(GameWorld* gw);
+// Fill outA/outB (each [5], readObjectHand layout) with the pinned duelists' hands.
+// Returns true if both are known (setupDuelScene ran this session).
+bool getDuelHands(unsigned int outA[5], unsigned int outB[5]);
+// Host diagnostic: resolve the two pinned duelists and log a "COMBAT ..." line for
+// each (inCombat/ranged/underMelee/fleeing/target). Returns the number logged.
+int  logDuelCombat(GameWorld* gw);
+
 // LIVE-order test support. pickCraftWorker identifies the worker to drive (non-squad
 // NPC nearest the baked fixture) and returns its hand so a scenario can PIN it for
 // the whole run; orderCraftWorker then hands THAT pinned worker a work goal mid-run.

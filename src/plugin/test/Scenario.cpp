@@ -490,14 +490,177 @@ private:
     unsigned long lastKillMs_;
 };
 
+// combat_probe (Phase 3c, L5 READ probe): the HOST spawns two mutually-hostile
+// non-squad NPCs in front of the leader and orders them to melee each other, then
+// logs a "COMBAT ..." line per duelist each tick (inCombat/ranged/underMelee/
+// fleeing/target). No wire, no apply - this validates that the combat-state
+// primitives populate during a live fight before we replicate them. The duelists are
+// runtime host spawns (not baked), so the join only logs whatever NPCs it has; the
+// host log is the deliverable. Periodically re-arms disengaged duelists.
+class CombatProbeScenario : public Scenario {
+public:
+    CombatProbeScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastRearmMs_(0),
+          haveDuel_(false) {}
+
+    virtual const char* name() const { return "combat_probe"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        if (ctx.isHost) {
+            haveDuel_ = engine::setupDuelScene(ctx.gw);
+            // setupDuelScene now spawns PEACEFUL; the probe wants a live fight, so
+            // trigger it immediately (the onTick re-arm keeps it going if they disengage).
+            if (haveDuel_) engine::startDuel(ctx.gw);
+            coop::logLine(haveDuel_ ? "SCENARIO duel spawned"
+                                    : "SCENARIO duel spawn FAILED");
+        }
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // HOST: keep disengaged duelists fighting, and log their combat state.
+        if (ctx.isHost && haveDuel_) {
+            if (ctx.elapsedMs - lastRearmMs_ >= 2500) {
+                lastRearmMs_ = ctx.elapsedMs;
+                engine::rearmDuelScene(ctx.gw);
+            }
+            if (ctx.elapsedMs - lastLogMs_ >= 700 || lastLogMs_ == 0) {
+                lastLogMs_ = ctx.elapsedMs;
+                engine::logDuelCombat(ctx.gw);
+            }
+        }
+
+        // Both: position log (anchors the screenshot + gives the join a RECV signal).
+        if (!ctx.isHost) {
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity("RECV", npcs[i]);
+            if (n > 0) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? haveDuel_ : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long HOST_DURATION_MS = 40000;
+    static const unsigned long JOIN_DURATION_MS = 28000;
+    static const unsigned int  MAX_LOG          = 40;
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastRearmMs_;
+    bool          haveDuel_;
+};
+
+// combat_order (Phase 3c, L5 LIVE transition): the payoff test. Both clients load the
+// baked 'duel1' (two PEACEFUL, co-located non-squad NPCs present on both). The host
+// pins them, HOLDS them peaceful for a baseline window, then at ORDER_AT_MS issues the
+// LIVE attack order (startDuel). The host captures task==TASK_COMBAT_MELEE for them and
+// streams it; the join reproduces the intent (orders its local copies to melee the same
+// target) so its OWN copies enter combat. Because the join independently re-reads its
+// copies via captureNpcs, the RECV series shows task flip NONE->65024 (combat) only
+// AFTER the order - proving a live peaceful->fighting transition, not a baked load
+// state. The runner splits the RECV series on "SCENARIO COMBAT issued".
+class CombatOrderScenario : public Scenario {
+public:
+    CombatOrderScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), combatLogged_(false),
+          havePins_(false), lastRearmMs_(0) {}
+
+    virtual const char* name() const { return "combat_order"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        if (ctx.isHost) {
+            havePins_ = engine::pickDuelSubjects(ctx.gw, handA_, handB_);
+            if (havePins_) {
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO duel subjects pinned A=%u,%u B=%u,%u",
+                          handA_[3], handA_[4], handB_[3], handB_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                coop::logLine("SCENARIO duel pin FAILED (need two nearby non-squad NPCs)");
+            }
+        }
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Baseline: hold both duelists peaceful + in range (clean "not fighting before").
+        if (ctx.isHost && havePins_ && ctx.elapsedMs < ORDER_AT_MS) {
+            engine::holdDuelistsPeaceful(ctx.gw);
+        }
+        // Order phase: trigger the live fight once, then re-arm disengaged duelists on a
+        // throttle so the fight is sustained for the whole post-order window.
+        if (ctx.isHost && havePins_ && ctx.elapsedMs >= ORDER_AT_MS) {
+            if (!combatLogged_) {
+                int n = engine::startDuel(ctx.gw);
+                char b[96];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO COMBAT issued orders=%d", n);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                combatLogged_ = true;
+                lastRearmMs_ = ctx.elapsedMs;
+            } else if (ctx.elapsedMs - lastRearmMs_ >= 2500) {
+                lastRearmMs_ = ctx.elapsedMs;
+                engine::rearmDuelScene(ctx.gw);
+                engine::logDuelCombat(ctx.gw); // host-side combat ground truth
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (ctx.isHost) {
+                EntityState npcs[MAX_LOG];
+                passed_ = havePins_ && (engine::captureNpcs(ctx.gw, npcs, MAX_LOG) > 0);
+            } else {
+                passed_ = (recvCount_ >= 1);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ORDER_AT_MS      = 18000;
+    static const unsigned long HOST_DURATION_MS = 52000;
+    static const unsigned long JOIN_DURATION_MS = 34000;
+    static const unsigned int  MAX_LOG          = 40;
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          combatLogged_;
+    bool          havePins_;
+    unsigned int  handA_[5];
+    unsigned int  handB_[5];
+    unsigned long lastRearmMs_;
+};
+
 } // namespace
 
 Scenario* makeScenario(const std::string& name) {
-    if (name == "leader_move") return new LeaderMoveScenario();
-    if (name == "npc_sync")    return new NpcSyncScenario();
-    if (name == "craft_order") return new CraftOrderScenario();
-    if (name == "down_order")  return new DownOrderScenario();
-    if (name == "death_order") return new DeathOrderScenario();
+    if (name == "leader_move")  return new LeaderMoveScenario();
+    if (name == "npc_sync")     return new NpcSyncScenario();
+    if (name == "craft_order")  return new CraftOrderScenario();
+    if (name == "down_order")   return new DownOrderScenario();
+    if (name == "death_order")  return new DeathOrderScenario();
+    if (name == "combat_probe") return new CombatProbeScenario();
+    if (name == "combat_order") return new CombatOrderScenario();
     return 0;
 }
 

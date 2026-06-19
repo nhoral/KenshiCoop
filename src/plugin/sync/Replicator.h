@@ -112,12 +112,15 @@ private:
         bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
         bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
         bool         deathLatched;    // a reliable EVT_DEATH pinned this body down PERMANENTLY
+        bool         combatArmed;     // Stage 3c: a melee-attack order is currently issued
+        unsigned long combatTick;     // when the attack order was (re-)issued (re-arm throttle)
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), body(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
                    taskTick(0), detached(false), downApplied(false),
-                   koLatched(false), deathLatched(false) {}
+                   koLatched(false), deathLatched(false),
+                   combatArmed(false), combatTick(0) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose

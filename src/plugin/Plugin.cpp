@@ -139,6 +139,13 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             // Body-state VALIDATION: the subject is already baked into the save - do
             // NOT spawn a duplicate. The periodic re-arm below keeps it down.
             coopLog("SETUP(downhold): no spawn - re-arm keeps baked down bodies down");
+        } else if (g_cfg.setupScene == "duel") {
+            // Combat (Stage 3c) BAKE: spawn two PEACEFUL non-squad NPCs (same faction)
+            // so the user can SAVE a neutral 'duel1' that both clients load. The fight
+            // is triggered live later (combat_order) so the join sees the transition.
+            bool ok = coop::engine::setupDuelScene(gw);
+            coopLog(ok ? "SETUP(duel): peaceful duelists spawned - SAVE 'duel1' now"
+                       : "SETUP(duel): duelist spawn FAILED");
         } else {
             RootObject* seat = 0;
             bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);

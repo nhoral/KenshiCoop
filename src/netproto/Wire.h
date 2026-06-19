@@ -19,9 +19,10 @@ typedef float          f32;
 
 // Protocol version. Bumped to 2 when EntityState gained the bodyState field
 // (Stage 2 down/dead/ragdoll replication); to 3 when the reliable event channel
-// (PKT_EVENT: KO/death/revive transitions) was added. Checked during handshake; a
-// mismatch is rejected (no attempt at backward compatibility across versions).
-const u16 PROTOCOL_VERSION = 3;
+// (PKT_EVENT: KO/death/revive transitions) was added; to 4 when the combat intent
+// (TASK_COMBAT_MELEE) began riding the existing task+subject fields (Stage 3c).
+// Checked during handshake; a mismatch is rejected (no backward compatibility).
+const u16 PROTOCOL_VERSION = 4;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -130,6 +131,16 @@ struct EntityState {
 
 // Sentinel task value meaning "no current task this tick".
 const u16 TASK_NONE = 0xFFFFu;
+
+// Synthetic task value (NOT a real engine Tasker key) meaning "this body is in melee
+// combat with the subject hand as its target" (Stage 3c, L5). Real engine task keys
+// are small ints, so 0xFE00 cannot collide with one or with TASK_NONE. The host sets
+// task=TASK_COMBAT_MELEE + the subject hand = the attack target when readCombat reports
+// in-combat-with-target; the join reproduces the CAUSE by ordering its local copy to
+// melee that same resolved target (let its own engine animate the fight). Combat takes
+// priority over rest poses, so it overrides any reproducible sit/work task that frame.
+const u16 TASK_COMBAT_MELEE = 0xFE00u;
+inline bool taskIsCombat(u16 t) { return t == TASK_COMBAT_MELEE; }
 
 // bodyState bit-flags. A body is "down" (on the ground, not upright) when any of
 // BODY_DOWN / BODY_RAGDOLL / BODY_DEAD is set; BODY_CRAWL is an upright-ish stealth/

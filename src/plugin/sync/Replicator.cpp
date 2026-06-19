@@ -46,6 +46,12 @@ const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose
 const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
 const float TRANSLATE_EPS = 0.02f; // per-frame actual movement counted as "translating"
+// Stage 3c combat. A combatant is engine-driven locally (its own footwork), so we do
+// NOT walk-drive/park it; we only soft-correct large positional drift (a wider gate
+// than rest, since the fight legitimately moves the body) and re-issue the attack
+// order on a throttle if the local copy disengaged while the host still reports combat.
+const float COMBAT_SNAP_DIST = 6.0f;       // teleport-correct combat drift beyond this
+const unsigned long COMBAT_REISSUE_MS = 1500; // re-arm the attack at most this often
 
 float dist3(float ax, float ay, float az, float bx, float by, float bz) {
     float dx = ax - bx, dy = ay - by, dz = az - bz;
@@ -212,6 +218,44 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (d.downApplied) {
             engine::knockDown(c, false); // host says upright again -> stand back up
             d.downApplied = false;
+        }
+
+        // ---- Stage 3c: combat override (melee) --------------------------------
+        // The host streams a combat INTENT (task == TASK_COMBAT_MELEE, subject = the
+        // attack target's hand). Reproduce the cause: order the local copy to melee the
+        // same resolved target and let the join's own engine run the fight (draw, swing,
+        // footwork) - the proven "replicate the intent" path (sit/work/down all do this).
+        // We deliberately do NOT walk-drive or park a combatant: that fights the local
+        // combat movement and would freeze/slide the body. Position is only soft-corrected
+        // on large drift (the fight legitimately moves the body around). The attack order
+        // is issued once and re-armed on a throttle if the local copy disengaged while the
+        // host still reports combat. Combatants skip the AI-suspend path below (their AI
+        // must run to animate), reached only via this early `continue`.
+        if (coop::taskIsCombat(out.task)) {
+            if (!d.detached) d.detached = engine::detachFromTownAI(c);
+            engine::CombatRead lc;
+            bool localFighting = engine::readCombat(c, &lc) && lc.inCombat;
+            if (!d.combatArmed || (!localFighting && (now - d.combatTick) >= COMBAT_REISSUE_MS)) {
+                int r = engine::applyCombat(c, out);
+                d.combatArmed = true; d.combatTick = now;
+                { char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[combat] order hand=%u,%u tgt=%u,%u localFight=%d r=%d",
+                    out.hIndex, out.hSerial, out.sIndex, out.sSerial,
+                    localFighting ? 1 : 0, r); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            }
+            // Soft position correction only (don't kill the gait): teleport-converge
+            // only when the bodies have drifted far apart.
+            if (haveActual && dist3(ax, ay, az, out.x, out.y, out.z) > COMBAT_SNAP_DIST)
+                engine::applyRaw(c, out);
+            d.parked = false; d.haveDest = false;
+            if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+            continue;
+        }
+        // Host no longer reports combat for this body -> disarm so the next fight re-arms
+        // and the body falls back to the normal locomotion/rest drive below.
+        if (d.combatArmed) {
+            d.combatArmed = false;
+            engine::clearGoals(c); // drop the stale attack goal before re-parking
         }
 
         // AI-suspend decision is made BELOW, once we know whether this NPC is

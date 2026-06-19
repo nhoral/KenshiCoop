@@ -219,6 +219,19 @@ CharBodyBoolFn   g_isRagdollFn     = 0;
 CharBodyBoolFn   g_isDeadCharFn    = 0;
 CharBodyBoolFn   g_isCrawlFn       = 0;
 
+// Combat reads (L5 probe, Phase 3c). getAttackTarget returns a `hand` BY VALUE, so
+// it uses the same member-struct-return ABI as getBoneWorldPosition: this=RCX,
+// hidden return-buffer pointer=RDX (model it as `hand* fn(Character*, hand*)`).
+// isInCombatMode(melee, ranged) takes two bools; the remaining flags are bare bool
+// getters that reuse CharBodyBoolFn (this=RCX, returns bool).
+typedef hand* (__fastcall* GetAttackTargetFn)(Character* self, hand* ret);
+typedef bool  (__fastcall* InCombatModeFn)(Character* self, bool melee, bool ranged);
+GetAttackTargetFn g_getAttackTargetFn = 0;
+InCombatModeFn    g_inCombatModeFn    = 0;
+CharBodyBoolFn    g_inRangedModeFn    = 0;
+CharBodyBoolFn    g_underMeleeFn      = 0;
+CharBodyBoolFn    g_fleeingFn         = 0;
+
 lektor<GameData*> g_dataScratch; // reused seat-template scan buffer (main thread)
 
 // One reused scratch buffer for the interest query (main thread only).
@@ -301,6 +314,16 @@ void resolve() {
         static_cast<bool (Character::*)() const>(&Character::isDead));
     g_isCrawlFn    = (CharBodyBoolFn)KenshiLib::GetRealAddress(
         &Character::isStealthModeOrCrawling);
+
+    // Combat reads (Phase 3c probe; non-fatal: unresolved -> zeros).
+    g_getAttackTargetFn = (GetAttackTargetFn)KenshiLib::GetRealAddress(
+        &Character::getAttackTarget);
+    g_inCombatModeFn = (InCombatModeFn)KenshiLib::GetRealAddress(&Character::isInCombatMode);
+    g_inRangedModeFn = (CharBodyBoolFn)KenshiLib::GetRealAddress(
+        &Character::isInRangedCombatMode);
+    g_underMeleeFn   = (CharBodyBoolFn)KenshiLib::GetRealAddress(
+        &Character::isLiterallyUnderMeleeAttackRightNowForSure);
+    g_fleeingFn      = (CharBodyBoolFn)KenshiLib::GetRealAddress(&Character::isFleeing);
 }
 
 bool gameplayLive(GameWorld* gw) {
@@ -504,6 +527,24 @@ bool captureOne(Character* c, EntityState* e) {
         // Stage 2: body-state flags (down/KO/ragdoll/dead/crawl). 0 = upright. Read
         // last so a fault here can't lose the transform we already captured.
         e->bodyState = readBodyState(c);
+        // Stage 3c combat: if the body is fighting a resolvable target, OVERRIDE the
+        // pose task with the synthetic combat intent and stash the target's hand in the
+        // subject fields. Combat outranks any rest pose (you can't sit and fight), so
+        // this clobbers a sit/work task set above. The join reproduces the cause by
+        // ordering its local copy to melee the same target. (Read inside this __try so
+        // a combat-read fault can't lose the transform/body-state already captured.)
+        {
+            CombatRead cr;
+            if (readCombat(c, &cr) && cr.inCombat && cr.hasTarget &&
+                (cr.target[3] != 0 || cr.target[4] != 0)) {
+                e->task = TASK_COMBAT_MELEE;
+                e->sType            = cr.target[0];
+                e->sContainer       = cr.target[1];
+                e->sContainerSerial = cr.target[2];
+                e->sIndex           = cr.target[3];
+                e->sSerial          = cr.target[4];
+            }
+        }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1407,6 +1448,217 @@ bool killSubject(GameWorld* gw, const unsigned int subjHand[5]) {
     }
 }
 
+// ---- Combat (Phase 3c, L5) -------------------------------------------------
+
+bool readCombat(Character* c, CombatRead* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!c) return false;
+    __try {
+        if (g_inCombatModeFn) out->inCombat   = g_inCombatModeFn(c, true, true);
+        if (g_inRangedModeFn) out->ranged     = g_inRangedModeFn(c) ? true : false;
+        if (g_underMeleeFn)   out->underMelee  = g_underMeleeFn(c) ? true : false;
+        if (g_fleeingFn)      out->fleeing     = g_fleeingFn(c) ? true : false;
+        if (g_getAttackTargetFn) {
+            // getAttackTarget returns a hand by value into our buffer (this=RCX,
+            // retbuf=RDX). Read its POD fields into readObjectHand layout.
+            char hbuf[sizeof(hand) + 16];
+            memset(hbuf, 0, sizeof(hbuf));
+            hand* th = reinterpret_cast<hand*>(hbuf);
+            g_getAttackTargetFn(c, th);
+            out->target[0] = (unsigned int)th->type;
+            out->target[1] = th->container;
+            out->target[2] = th->containerSerial;
+            out->target[3] = th->index;
+            out->target[4] = th->serial;
+            out->hasTarget = (th->index != 0 || th->serial != 0);
+        }
+        out->valid = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// --- duel scene (Phase 3c probe) ------------------------------------------------
+static unsigned int g_duelHandA[5] = { 0, 0, 0, 0, 0 };
+static unsigned int g_duelHandB[5] = { 0, 0, 0, 0, 0 };
+static bool         g_haveDuel     = false;
+// Fixed baseline anchors (x,y,z,yaw) for the two pinned duelists, latched once at pin
+// time so combat_order can hold them peaceful + in range before the live attack order
+// (same fixed-anchor reasoning as g_downAnchor: leader-relative parking causes a
+// parked-body-pushes-leader feedback loop).
+static float g_duelAnchorA[4] = { 0, 0, 0, 0 };
+static float g_duelAnchorB[4] = { 0, 0, 0, 0 };
+static bool  g_haveDuelAnchors = false;
+
+// Order 'attacker' to focus-melee 'target' (UNPROVOKED so it engages regardless of
+// faction relations). addGoal hands the intent to the NPC's own AI, like the work
+// goal, so it is NOT a squad/player-order recruit. SEH-guarded.
+static bool orderMeleeAttack(Character* attacker, Character* target) {
+    if (!attacker || !target || !g_addGoalFn) return false;
+    __try {
+        if (g_clearGoalsFn) g_clearGoalsFn(attacker);
+        g_addGoalFn(attacker, (int)UNPROVOKED_FOCUSED_MELEE_ATTACK,
+                    static_cast<RootObject*>(target));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Spawn two non-squad NPCs in front of the leader from the SAME nearby faction (so
+// they are PEACEFUL on spawn - mutually non-hostile) and detach each into its own
+// platoon for a stable, save-survivable hand. NO attack is issued here: this is the
+// neutral baseline both a bake ('duel1') and the live combat_order test start from.
+// startDuel()/rearmDuelScene() trigger the fight at runtime so the join sees a live
+// peaceful->fighting transition (not just a baked load state). Returns true if both
+// spawned and their hands were read.
+bool setupDuelScene(GameWorld* gw) {
+    Faction* fac = findNearbyNonPlayerFaction(gw);
+    coop::logLine(fac ? "SETUP(duel): using nearby non-player faction (peaceful world NPCs)"
+                      : "SETUP(duel): NO nearby non-player faction - falling back to "
+                        "player faction (duelists WILL be squad members; load near a town)");
+    Character* a = fac ? spawnCharInFaction(gw, 5.0f, -2.0f, fac)
+                       : spawnNpcInFront(gw, 5.0f, -2.0f);
+    Character* b = fac ? spawnCharInFaction(gw, 5.0f,  2.0f, fac)
+                       : spawnNpcInFront(gw, 5.0f,  2.0f);
+    if (!a || !b) { coop::logLine("SETUP(duel): duelist spawn FAILED"); return false; }
+    detachFromTownAI(a);
+    detachFromTownAI(b);
+    g_haveDuel = readObjectHand(static_cast<RootObject*>(a), g_duelHandA) &&
+                 readObjectHand(static_cast<RootObject*>(b), g_duelHandB);
+    {
+        char m[200];
+        _snprintf(m, sizeof(m) - 1,
+                  "SETUP(duel): spawned PEACEFUL A=%u,%u B=%u,%u (no attack issued)",
+                  g_duelHandA[3], g_duelHandA[4], g_duelHandB[3], g_duelHandB[4]);
+        m[sizeof(m) - 1] = '\0'; coop::logLine(m);
+    }
+    return g_haveDuel;
+}
+
+// combat_order LIVE-transition pin (Stage 3c): re-find the two baked duelists after a
+// reload (the spawn-time globals are gone in a fresh process) by picking the two
+// non-squad NPCs nearest the leader, and stash their hands into the duel globals so
+// startDuel/rearmDuelScene/holdDuelistsPeaceful all operate on them by hand. Also
+// latches a fixed front-left / front-right anchor for each so the baseline hold keeps
+// them peaceful + in capture range. Returns true if TWO distinct subjects were pinned.
+bool pickDuelSubjects(GameWorld* gw, unsigned int outA[5], unsigned int outB[5]) {
+    if (!g_getCharsFn || !gw || !gw->player ||
+        gw->player->playerCharacters.size() == 0) return false;
+    Character* best1 = 0; Character* best2 = 0;
+    __try {
+        Ogre::Vector3 center = gw->player->playerCharacters[0]->getPosition();
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &center, 30.0f, 30.0f, 30.0f, 64, 64, 0);
+        float d1 = 1e18f, d2 = 1e18f;
+        for (unsigned int i = 0; i < g_npcQuery.size(); ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o || isPlayerSquad(gw, o)) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - center.x, dz = p.z - center.z;
+            float dd = dx * dx + dz * dz;
+            if (dd < d1) { d2 = d1; best2 = best1; d1 = dd; best1 = static_cast<Character*>(o); }
+            else if (dd < d2) { d2 = dd; best2 = static_cast<Character*>(o); }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!best1 || !best2 || best1 == best2) return false;
+    if (!readObjectHand(static_cast<RootObject*>(best1), g_duelHandA)) return false;
+    if (!readObjectHand(static_cast<RootObject*>(best2), g_duelHandB)) return false;
+    for (int i = 0; i < 5; ++i) { outA[i] = g_duelHandA[i]; outB[i] = g_duelHandB[i]; }
+    g_haveDuel = true;
+    Ogre::Vector3 pa, pb; float ya = 0.0f, yb = 0.0f;
+    if (leaderAnchor(gw, 6.0f, -1.5f, &pa, &ya) &&
+        leaderAnchor(gw, 6.0f,  1.5f, &pb, &yb)) {
+        g_duelAnchorA[0] = pa.x; g_duelAnchorA[1] = pa.y; g_duelAnchorA[2] = pa.z; g_duelAnchorA[3] = ya;
+        g_duelAnchorB[0] = pb.x; g_duelAnchorB[1] = pb.y; g_duelAnchorB[2] = pb.z; g_duelAnchorB[3] = yb;
+        g_haveDuelAnchors = true;
+    }
+    return true;
+}
+
+// Hold both pinned duelists at their latched anchors + clear goals each baseline tick,
+// so they stay peaceful and in capture range until the live attack order. Returns true
+// if held. No-op (false) until pickDuelSubjects has latched the anchors.
+bool holdDuelistsPeaceful(GameWorld* gw) {
+    (void)gw;
+    if (!g_haveDuel || !g_haveDuelAnchors) return false;
+    Character* a = resolveCharByHand(g_duelHandA[3], g_duelHandA[4], g_duelHandA[0],
+                                     g_duelHandA[1], g_duelHandA[2]);
+    Character* b = resolveCharByHand(g_duelHandB[3], g_duelHandB[4], g_duelHandB[0],
+                                     g_duelHandB[1], g_duelHandB[2]);
+    bool any = false;
+    if (a) { clearGoals(a); park(a, g_duelAnchorA[0], g_duelAnchorA[1], g_duelAnchorA[2], g_duelAnchorA[3]); any = true; }
+    if (b) { clearGoals(b); park(b, g_duelAnchorB[0], g_duelAnchorB[1], g_duelAnchorB[2], g_duelAnchorB[3]); any = true; }
+    return any;
+}
+
+// Trigger the fight between the two pinned duelists (order each to melee the other).
+// Used by the live probe/test to start combat AFTER a peaceful baseline. Returns the
+// number of attack orders issued.
+int startDuel(GameWorld* gw) {
+    (void)gw;
+    if (!g_haveDuel) return 0;
+    Character* a = resolveCharByHand(g_duelHandA[3], g_duelHandA[4], g_duelHandA[0],
+                                     g_duelHandA[1], g_duelHandA[2]);
+    Character* b = resolveCharByHand(g_duelHandB[3], g_duelHandB[4], g_duelHandB[0],
+                                     g_duelHandB[1], g_duelHandB[2]);
+    if (!a || !b) return 0;
+    int n = 0;
+    if (orderMeleeAttack(a, b)) ++n;
+    if (orderMeleeAttack(b, a)) ++n;
+    return n;
+}
+
+int rearmDuelScene(GameWorld* gw) {
+    (void)gw;
+    if (!g_haveDuel) return -1;
+    Character* a = resolveCharByHand(g_duelHandA[3], g_duelHandA[4], g_duelHandA[0],
+                                     g_duelHandA[1], g_duelHandA[2]);
+    Character* b = resolveCharByHand(g_duelHandB[3], g_duelHandB[4], g_duelHandB[0],
+                                     g_duelHandB[1], g_duelHandB[2]);
+    if (!a || !b) return -1;
+    int n = 0;
+    // Only re-issue to a duelist that has DISENGAGED (no combat mode), so we don't
+    // thrash the AI of one that is already actively fighting.
+    CombatRead ca, cb;
+    if (readCombat(a, &ca) && !ca.inCombat) { if (orderMeleeAttack(a, b)) ++n; }
+    if (readCombat(b, &cb) && !cb.inCombat) { if (orderMeleeAttack(b, a)) ++n; }
+    return n;
+}
+
+bool getDuelHands(unsigned int outA[5], unsigned int outB[5]) {
+    if (!g_haveDuel) return false;
+    for (int i = 0; i < 5; ++i) { outA[i] = g_duelHandA[i]; outB[i] = g_duelHandB[i]; }
+    return true;
+}
+
+int logDuelCombat(GameWorld* gw) {
+    (void)gw;
+    if (!g_haveDuel) return 0;
+    const unsigned int* hands[2] = { g_duelHandA, g_duelHandB };
+    const char* names[2] = { "A", "B" };
+    int n = 0;
+    for (int k = 0; k < 2; ++k) {
+        Character* c = resolveCharByHand(hands[k][3], hands[k][4], hands[k][0],
+                                         hands[k][1], hands[k][2]);
+        if (!c) continue;
+        CombatRead cr;
+        if (!readCombat(c, &cr)) continue;
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+            "COMBAT %s hand=%u,%u inCombat=%d ranged=%d underMelee=%d fleeing=%d "
+            "hasTarget=%d target=%u,%u",
+            names[k], hands[k][3], hands[k][4],
+            cr.inCombat ? 1 : 0, cr.ranged ? 1 : 0, cr.underMelee ? 1 : 0,
+            cr.fleeing ? 1 : 0, cr.hasTarget ? 1 : 0, cr.target[3], cr.target[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        ++n;
+    }
+    return n;
+}
+
 // 'craft' setup scene: spawn a save-stable work fixture + a NON-squad world NPC,
 // then give the NPC a persistent AI GOAL to work it (NOT a player order, which
 // would recruit it into the squad and bypass the host-authoritative world-NPC
@@ -1788,6 +2040,20 @@ int applyTaskOrder(Character* c, const EntityState& e) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return -1;
     }
+}
+
+// Stage 3c (join-side): reproduce a streamed combat intent. e.task == TASK_COMBAT_MELEE
+// and the subject hand is the attack target; resolve it to a local Character and order
+// THIS body to focus-melee it (UNPROVOKED so it engages regardless of faction). The
+// join's own engine then animates the fight (draw/swing/footwork) - we replicate the
+// CAUSE, not the animation. Returns 2 ordered / 1 target not loaded here / 0 no-op /
+// -1 fault. orderMeleeAttack clears prior goals so a re-issue cleanly re-targets.
+int applyCombat(Character* c, const EntityState& e) {
+    if (!c || e.task != TASK_COMBAT_MELEE) return 0;
+    Character* target = resolveCharByHand(e.sIndex, e.sSerial, e.sType,
+                                          e.sContainer, e.sContainerSerial);
+    if (!target) return 1; // opponent not loaded on this client -> caller just holds
+    return orderMeleeAttack(c, target) ? 2 : -1;
 }
 
 } // namespace engine
