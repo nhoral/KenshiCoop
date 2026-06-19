@@ -767,10 +767,139 @@ private:
     bool          koLogged_;
 };
 
+// coop_presence (Phase 3.5, BIDIRECTIONAL presence - the keystone two-player test):
+// both clients MOVE their OWNED squad member (chosen by save-stable hand-rank, the
+// same ordering the Replicator partitions on: host owns rank 0, join owns rank 1 -
+// leader-first) and stream it, while driving + observing the PEER's owned member.
+// Each side logs MEMBER for its OWN member (authoritative truth it streams) and RECV
+// for the PEER's member (the local driven copy), so the runner cross-checks BOTH
+// directions by hand: host MEMBER(rank0) vs join RECV(rank0), and join MEMBER(rank1)
+// vs host RECV(rank1). Proves each player's character is present + correctly placed
+// on the other client. Requires a shared save with >=2 controllable squad members.
+class CoopPresenceScenario : public Scenario {
+public:
+    CoopPresenceScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          haveStart_(false), sx_(0), sy_(0), sz_(0) {}
+
+    virtual const char* name() const { return "coop_presence"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned int ownRank  = ctx.isHost ? 0u : 1u; // our squad-tab rank
+        const unsigned int peerRank = ctx.isHost ? 1u : 0u; // the peer's squad-tab rank
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, /*leaderOnly*/ false, sq, MAX_SQUAD);
+
+            // Classify every shared-squad member by its SQUAD-TAB rank (same key the
+            // Replicator partitions on: distinct hand-containers, sorted). Log MEMBER
+            // for ALL members in OUR tab(s) (authoritative truth we stream) and RECV
+            // for ALL members in the PEER's tab(s) (the bodies we drive). Pick the
+            // lowest-hand owned member as the MOVER so the peer sees sustained motion.
+            int leaderIdx = -1; bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int cr = containerRankOf(sq, n, i);
+                if (cr < 0) continue;
+                if ((unsigned int)cr == ownRank) {
+                    logScenarioEntity("MEMBER", sq[i]);
+                    if (leaderIdx < 0 || handLess(sq[i], sq[leaderIdx])) leaderIdx = (int)i;
+                } else if ((unsigned int)cr == peerRank) {
+                    logScenarioEntity("RECV", sq[i]); sawPeer = true;
+                }
+            }
+            if (sawPeer) ++recvCount_;
+
+            // Move our tab leader so the peer sees LIVE motion, then settle to the start
+            // so both clients converge for a clean stationary cross-check in the
+            // overlapping window (movement proves presence; the settle proves placement).
+            if (leaderIdx >= 0) {
+                Character* oc = engine::resolve(sq[leaderIdx]);
+                if (oc) {
+                    if (!haveStart_) {
+                        sx_ = sq[leaderIdx].x; sy_ = sq[leaderIdx].y; sz_ = sq[leaderIdx].z;
+                        haveStart_ = true;
+                    }
+                    if (ctx.elapsedMs < MOVE_MS) {
+                        bool legB = ((ctx.elapsedMs / LEG_MS) % 2) != 0;
+                        engine::orderMoveTo(oc, legB ? sx_ + LEG : sx_, sy_,
+                                                legB ? sz_ + LEG : sz_);
+                    } else {
+                        engine::orderMoveTo(oc, sx_, sy_, sz_); // settle back to start
+                    }
+                }
+            }
+        }
+
+        // The host outlives the join (keeps streaming through the join's whole window
+        // so the join's RECV never goes stale); the join reports the verdict.
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = haveStart_ && (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Full hand order (used only to pick a stable per-tab "leader" mover).
+    static bool handLess(const EntityState& a, const EntityState& b) {
+        if (a.hType != b.hType) return a.hType < b.hType;
+        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+        if (a.hContainerSerial != b.hContainerSerial) return a.hContainerSerial < b.hContainerSerial;
+        if (a.hIndex != b.hIndex) return a.hIndex < b.hIndex;
+        return a.hSerial < b.hSerial;
+    }
+    // Squad-tab identity = the hand CONTAINER (hContainer,hContainerSerial).
+    static bool ctnrLess(const EntityState& a, const EntityState& b) {
+        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+        return a.hContainerSerial < b.hContainerSerial;
+    }
+    static bool ctnrEq(const EntityState& a, const EntityState& b) {
+        return a.hContainer == b.hContainer && a.hContainerSerial == b.hContainerSerial;
+    }
+    // Rank of member i's SQUAD TAB among the distinct, sorted containers (O(n^2),
+    // squads are tiny). MUST match the Replicator's container-rank partition so the
+    // scenario's "owned" set is exactly the set the Replicator streams as owned.
+    static int containerRankOf(const EntityState* sq, unsigned int n, unsigned int i) {
+        EntityState distinct[MAX_SQUAD]; unsigned int dn = 0;
+        for (unsigned int a = 0; a < n; ++a) {
+            bool seen = false;
+            for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[a])) { seen = true; break; }
+            if (!seen && dn < MAX_SQUAD) distinct[dn++] = sq[a];
+        }
+        for (unsigned int a = 1; a < dn; ++a)
+            for (unsigned int b = a; b > 0 && ctnrLess(distinct[b], distinct[b-1]); --b) {
+                EntityState t = distinct[b]; distinct[b] = distinct[b-1]; distinct[b-1] = t;
+            }
+        for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[i])) return (int)b;
+        return -1;
+    }
+
+    static const unsigned long HOST_DURATION_MS = 44000; // outlive the join's window
+    static const unsigned long JOIN_DURATION_MS = 24000;
+    static const unsigned long MOVE_MS          = 12000; // oscillate, then settle
+    static const unsigned long LEG_MS           = 4000;  // oscillation half-period
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const float         LEG;
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveStart_;
+    float         sx_, sy_, sz_;
+};
+const float CoopPresenceScenario::LEG = 12.0f;
+
 } // namespace
 
 Scenario* makeScenario(const std::string& name) {
     if (name == "leader_move")  return new LeaderMoveScenario();
+    if (name == "coop_presence") return new CoopPresenceScenario();
     if (name == "npc_sync")     return new NpcSyncScenario();
     if (name == "craft_order")  return new CraftOrderScenario();
     if (name == "down_order")   return new DownOrderScenario();

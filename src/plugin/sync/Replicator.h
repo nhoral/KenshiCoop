@@ -39,6 +39,14 @@ public:
     // Stage 4: also stream nearby host-authoritative world NPCs (host side).
     void setStreamNpcs(bool v) { streamNpcs_ = v; }
 
+    // Bidirectional presence: the SQUAD-TAB ranks (distinct hand-containers, sorted)
+    // this client OWNS (controls locally + streams). The peer owns the other tabs and
+    // we drive those from its stream. Host defaults to {0}, join to {1}. Runs on BOTH
+    // clients now, so each streams a disjoint set of squad tabs from the one shared
+    // squad. On a single-tab save only rank 0 exists -> the join owns nothing and the
+    // prior one-directional behaviour is preserved.
+    void setOwnRanks(const std::set<unsigned int>& r) { ownRanks_ = r; }
+
     // AI-gating probe (join side): recruit diverged NPCs into the player squad to
     // validate the "inhabit" lever (stops self-tasking + becomes drivable).
     void setProbeRecruit(bool v) { probeRecruit_ = v; }
@@ -149,6 +157,13 @@ private:
     InterpConfig          cfg_;
     bool                  leaderOnly_;
     bool                  streamNpcs_;
+
+    // Bidirectional ownership partition. ownRanks_ = the squad-TAB ranks (distinct
+    // sorted hand-containers) we own; ownHands_ = the resolved owned hand keys,
+    // refreshed every publishOwned. applyTargets skips any tracked hand in ownHands_
+    // (never drive a body we own + simulate locally), defense-in-depth on the partition.
+    std::set<unsigned int> ownRanks_;
+    std::set<Key>          ownHands_;
 
     // Smoothness accumulators (measured from the body's actual motion while its
     // source is moving): how often did the rendered body advance per frame?

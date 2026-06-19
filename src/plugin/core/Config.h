@@ -7,6 +7,7 @@
 #define KENSHICOOP_CONFIG_H
 
 #include <string>
+#include <set>
 
 namespace coop {
 
@@ -19,7 +20,7 @@ struct Config {
     std::string   logPath;         // KENSHICOOP_LOG
     std::string   scenario;        // KENSHICOOP_SCENARIO (empty = normal tick)
     unsigned long autoLoadDelayMs; // KENSHICOOP_AUTOLOAD_DELAY_MS
-    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft"/"down"/"downhold"/"duel")
+    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft"/"down"/"downhold"/"duel"/"squad")
                                    // host-only one-shot world spawn to bake a
                                    // deterministic test scene into a save.
     bool          probeRecruit;    // KENSHICOOP_PROBE_RECRUIT == "1" (join only):
@@ -37,6 +38,15 @@ struct Config {
     unsigned int  netSimDelayMs;   // KENSHICOOP_NETSIM_DELAY_MS  (base one-way delay)
     unsigned int  netSimJitterMs;  // KENSHICOOP_NETSIM_JITTER_MS (+/- uniform variance)
     unsigned int  netSimLossPct;   // KENSHICOOP_NETSIM_LOSS_PCT  (0-100 drop chance)
+
+    // Bidirectional ownership partition (KENSHICOOP_OWN_SQUAD, CSV of unsigned ints;
+    // KENSHICOOP_OWN_RANK accepted as an alias). Both clients load the SAME save and
+    // thus the SAME player squad; each client OWNS a disjoint set of SQUAD TABS chosen
+    // by save-stable tab rank (distinct hand-containers, sorted; 0 = first tab). Every
+    // member of an owned tab is controlled locally + streamed; the peer's tabs are
+    // driven from its stream. Default: host owns {0}, join owns {1} - one squad tab
+    // each. On a single-tab save the join owns nothing (one-directional, as before).
+    std::set<unsigned int> ownRanks;
 };
 
 // Read every KENSHICOOP_* var into 'out', applying host/join defaults.

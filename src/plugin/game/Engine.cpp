@@ -1839,6 +1839,56 @@ bool setupDownScene(GameWorld* gw) {
     return true;
 }
 
+// 'squad' setup scene (Phase 3.5 bake): build a SECOND player squad tab so the
+// bidirectional ownership partition (host owns tab 0, join owns tab 1) has two tabs
+// to split. A Kenshi squad tab is a Platoon, and a player member's tab identity is
+// its hand CONTAINER. We recruit two world bodies into the player squad, then
+// separateIntoMyOwnSquad ONE of them into its OWN player platoon (a distinct
+// container = a distinct tab). The faction stays the player's, so the separated
+// body is still a controllable squad member - just in tab 2. The user then SAVEs
+// (e.g. 'squad1') and both clients load it. The member dump makes the bake
+// machine-verifiable: 2+ distinct containers == 2+ squad tabs. Returns true if at
+// least one recruit took.
+bool setupSquadScene(GameWorld* gw) {
+    if (!gw || !gw->player) { coop::logLine("SETUP(squad): no player interface"); return false; }
+    PlayerInterface* pl = gw->player;
+
+    Character* a = spawnNpcInFront(gw, 4.0f, -1.5f);
+    Character* b = spawnNpcInFront(gw, 4.0f,  1.5f);
+    bool ra = a && recruitNpc(gw, a);
+    bool rb = b && recruitNpc(gw, b);
+    coop::logLine(ra ? "SETUP(squad): recruited A into player squad"
+                     : "SETUP(squad): recruit A FAILED");
+    coop::logLine(rb ? "SETUP(squad): recruited B into player squad"
+                     : "SETUP(squad): recruit B FAILED");
+    // Separate B into its OWN player platoon -> a SECOND squad tab (distinct container).
+    bool sep = b && detachFromTownAI(b);
+    coop::logLine(sep ? "SETUP(squad): separated B into its own platoon (tab 2)"
+                      : "SETUP(squad): separate B FAILED");
+
+    // Dump the tab partition (distinct hand-containers across player chars) so the
+    // bake is verifiable from the host log: 2+ distinct containers == 2+ squad tabs.
+    __try {
+        unsigned int n = pl->playerCharacters.size();
+        char hdr[96]; _snprintf(hdr, sizeof(hdr) - 1, "SETUP(squad): playerChars=%u", n);
+        hdr[sizeof(hdr) - 1] = '\0'; coop::logLine(hdr);
+        for (unsigned int i = 0; i < n; ++i) {
+            Character* c = pl->playerCharacters[i]; if (!c) continue;
+            unsigned int h[5];
+            if (readObjectHand(static_cast<RootObject*>(c), h)) {
+                char b2[160];
+                _snprintf(b2, sizeof(b2) - 1,
+                    "SETUP(squad): member[%u] idx=%u,%u container(tab)=%u,%u",
+                    i, h[3], h[4], h[1], h[2]);
+                b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("SETUP(squad): member dump faulted");
+    }
+    return ra || rb;
+}
+
 // Keep down bodies down. A healthy ragdolled body recovers and stands back up, and
 // ragdoll state does not survive save/load, so the host re-applies ragdoll on an
 // interval. Rather than guess WHICH nearby NPC is "the subject" (the pin is empty

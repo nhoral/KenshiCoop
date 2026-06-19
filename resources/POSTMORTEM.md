@@ -386,3 +386,85 @@ of the go-forward plan: `INTENT_REPLICATION.md` generalizes it into a layered mo
 implications (a body-state field + a reliable `PKT_EVENT` channel), and a reusable
 per-class conformance oracle - with crafting/gathering as the next proof case. The
 re-prioritized roadmap lives in `MASTER_PLAN.md` (Phase 3a/3b/3c).
+
+## Addendum: Bidirectional per-tab ownership (the true-co-op keystone)
+
+Written after the bidirectional ownership partition reached a user-confirmed
+working state on the `squad1` save - validated by the automated `coop_presence`
+oracle (0 ms + WAN sim) AND by manual control (each player drives only their own
+squad tab; both sides mirror cleanly). This is the milestone that turns "host
+streams a world; guest watches" into "two players, each authoritative over their
+own squad."
+
+### The progression
+
+1. **Host-only authority** (Phase 2): the host streamed everything; the guest only
+   rendered. No guest agency.
+2. **Leader-only ownership partition** (Phase 2.5): each client OWNS a disjoint,
+   hand-ranked subset and DRIVES the peer's, but the partition was keyed on a single
+   hand-rank ("leader") - coarse, and not how Kenshi players actually organize.
+3. **Per-tab bidirectional ownership** (Phase 3.5, this addendum): ownership is
+   partitioned by **Kenshi squad tab**, which maps cleanly to how players think
+   about "my squad" vs "your squad".
+
+### What worked
+
+- **A squad tab IS the member's `hand` CONTAINER.** A Kenshi squad tab is a
+  `Platoon`; a player member's tab identity is its `hand` container/containerSerial.
+  So "partition by tab" = "partition by distinct container", and container is
+  already part of the save-stable `hand` - no new identity needed. `publishOwned`
+  captures the whole squad, extracts the unique `(hContainer, hContainerSerial)`
+  pairs, sorts them into a stable **container rank**, and keeps only members whose
+  container rank is in this client's `ownRanks_`. The ranks match cross-client
+  because both load the identical shared save.
+- **Run the partition on BOTH clients; keep only world-NPC suppression one-sided.**
+  `publishOwned` (capture+stream my tabs) and `applyTargets` (drive the peer's tabs)
+  now run on both host and join. Only `enforceHostAuthority` (suppress/restore
+  world NPCs the host is/ isn't streaming) stays join-only, because world NPCs
+  remain host-authoritative. This symmetry is what gives the guest real agency
+  without a second authority for the world.
+- **A drive-exclusion guard is mandatory.** `applyTargets` (and
+  `enforceHostAuthority`) skip any hand in `ownHands_` (the set this client just
+  published). Without it, a client would try to DRIVE its own locally-controlled
+  body from the peer's echo - fighting its own input. The own-guard is the same
+  idea that fixed the "frozen leader" gap, now applied per-tab on both sides.
+- **A programmatic bake makes the 2-tab setup repeatable.** `setupSquadScene`
+  recruits two world bodies into the player squad, then `separateIntoMyOwnSquad`s
+  ONE into its own platoon (a second tab), and dumps each member's container so the
+  bake is verifiable from the log (2+ distinct containers = 2+ tabs). The user SAVEs
+  it as `squad1`; both clients load it.
+
+### What we had to get right (and a gotcha)
+
+- **`squadMemberID` is still useless for ownership** (every player member reports
+  `0`); container rank is the working key, consistent with doctrine #8.
+- **`playerCharacters.size()` can lag a just-separated member.** Right after the
+  bake the host logged `playerChars=2` even with two recruits + a separation; the
+  authoritative signal is the **distinct-container count** in the member dump, not
+  the list size snapshot at that instant. Validate the partition from container
+  identity, not list cardinality.
+- **WAN micro-slide on near-static bodies is cosmetic, not a presence failure.**
+  Under the WAN sim the driven tab-leader advances in brief dead-reckoning snaps, so
+  the locomotion-tuned `smoothness`/`anim-truth` fractions spike on the tiny
+  translate sample of a mostly-stationary presence test. We made those **advisory**
+  for `coop_presence`; the authoritative gates are the bidirectional `COOP-PRESENCE`
+  cross-check + `MARCH`. (A future velocity-hysteresis pass can smooth the seam.)
+
+### Doctrine added
+
+19. **Co-op ownership is partitioned by squad TAB (container rank), bidirectionally.**
+    Both clients run capture+stream (`publishOwned`) and drive (`applyTargets`); each
+    owns a disjoint set of tabs (distinct `hand` containers, stably ranked). Only
+    world-NPC suppression stays host-authoritative. This is the v1 "true co-op"
+    presence model.
+20. **Always exclude your own published hands from your own drive/suppress paths.**
+    A bidirectional partition echoes your members back from the peer; without an
+    `ownHands_` exclusion guard a client drives its own body from that echo and
+    fights its own input.
+21. **Verify a squad/tab bake by distinct-container identity, not list size.**
+    `playerCharacters.size()` can momentarily lag a just-separated member; the count
+    of distinct `(container, containerSerial)` pairs is the trustworthy tab count.
+22. **Gate placement/state tests on placement metrics; make locomotion-quality
+    metrics advisory there.** A mostly-static presence test shows latency micro-slide
+    under WAN that a locomotion oracle reads as a failure - judge it on the
+    cross-check, not on smoothness.

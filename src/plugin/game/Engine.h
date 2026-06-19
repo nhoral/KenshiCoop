@@ -187,6 +187,11 @@ bool setupDownScene(GameWorld* gw);
 // ragdoll recovers; ragdoll does not persist across save/load). Returns count, or -1.
 int  rearmDownScene(GameWorld* gw);
 
+// Phase 3.5 bake: build a SECOND player squad tab (recruit two bodies, separate one
+// into its own player platoon). Gives the bidirectional ownership partition two tabs
+// to split (host owns tab 0, join owns tab 1). Host-only; user SAVEs the result.
+bool setupSquadScene(GameWorld* gw);
+
 // down_order LIVE-transition helpers (Stage 2). pickDownSubject pins the non-squad
 // NPC nearest the leader (its hand, readObjectHand layout); holdSubjectUpright keeps
 // it idle/in-range during the baseline; orderDownSubject knocks THAT subject out at

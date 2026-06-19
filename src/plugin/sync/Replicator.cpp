@@ -7,6 +7,8 @@
 #include <windows.h> // GetTickCount
 #include <deque>
 #include <set>
+#include <vector>    // rank/sort the shared squad for the ownership partition
+#include <algorithm> // std::sort
 #include <utility> // std::pair, std::make_pair
 #include <cstdio>
 #include <cstring>
@@ -82,12 +84,44 @@ void Replicator::ingest(Inbound& in) {
 }
 
 void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
-    // Capture the locally-owned squad first, then (Stage 4) the nearby world NPCs.
+    // Capture the OWNED squad subset first, then (Stage 4) the nearby world NPCs.
     // The net layer chunks the whole vector into datagram-sized batches, so the
     // count is only bounded by MAX_PUBLISH (a bar holds well under that).
     const unsigned int MAX_PUBLISH = 160;
-    static EntityState buf[MAX_PUBLISH]; // main-thread only; avoids a big stack frame
-    unsigned int n = engine::captureSquad(gw, leaderOnly_, buf, MAX_PUBLISH);
+    static EntityState raw[MAX_PUBLISH]; // all squad members (pre ownership filter)
+    static EntityState buf[MAX_PUBLISH]; // owned subset (+ NPCs) actually published
+    // Both clients load the SAME save, so the shared playerCharacters list is
+    // identical on each. Capture the WHOLE squad, then partition it by SQUAD TAB:
+    // a Kenshi squad tab is a Platoon, and a member's tab identity is carried in its
+    // hand's CONTAINER (hContainer,hContainerSerial). Rank the DISTINCT containers
+    // (sorted -> the same ordering on both machines, save-stable), and own a member
+    // iff its tab's rank is in ownRanks_. So each player owns WHOLE squad tabs (host
+    // tab 0, join tab 1 by default) and the streams are disjoint (Doctrine 8).
+    // On a single-tab save only rank 0 exists, so the join owns nothing and the prior
+    // one-directional behaviour is preserved exactly. ownHands_ records owned keys
+    // for the drive-exclusion guard.
+    unsigned int nSquad = engine::captureSquad(gw, /*leaderOnly*/ false, raw, MAX_PUBLISH);
+    std::vector<std::pair<u32, u32> > ctnrs; // distinct squad-tab containers, sorted
+    ctnrs.reserve(nSquad);
+    for (unsigned int i = 0; i < nSquad; ++i)
+        ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
+    std::sort(ctnrs.begin(), ctnrs.end());
+    ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
+    ownHands_.clear();
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < nSquad && n < MAX_PUBLISH; ++i) {
+        std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);
+        unsigned int rank = (unsigned int)(std::lower_bound(ctnrs.begin(), ctnrs.end(), key)
+                                           - ctnrs.begin());
+        // Empty ownRanks_ (never configured) is a safety fallback to the first tab,
+        // so a missing setOwnRanks never makes us stream every tab or nothing.
+        bool owned = ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
+        if (!owned) continue;
+        buf[n++] = raw[i];
+        ownHands_.insert(keyOf(raw[i]));
+    }
+    // Host also streams nearby world NPCs (host-authoritative world). The join leaves
+    // streamNpcs_ off, so on the join this publishes ONLY its owned squad subset.
     if (streamNpcs_ && n < MAX_PUBLISH)
         n += engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
     net.setOwnedEntities(ownerId, buf, n);
@@ -193,6 +227,11 @@ void Replicator::applyTargets(GameWorld* gw) {
     // reads the set during the engine tick, which already ran this frame.
     if (probeAiSuspend_) engine::clearAiSuspend();
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
+        // Never drive a body WE own: we control + stream it locally, the peer drives
+        // its copy from our stream. The disjoint partition + no local loopback means
+        // our own hand shouldn't appear in targets_, but guard regardless (a stray
+        // self-owned sample would otherwise fight our own control every frame).
+        if (ownHands_.find(it->first) != ownHands_.end()) continue;
         Driven& d = it->second;
         EntityState out;
         if (!d.interp.sample(now, cfg_, &out)) {

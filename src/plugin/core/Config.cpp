@@ -38,6 +38,22 @@ void loadConfig(Config& c) {
     c.netSimDelayMs  = (delay  > 0) ? (unsigned int)delay  : 0u;
     c.netSimJitterMs = (jitter > 0) ? (unsigned int)jitter : 0u;
     c.netSimLossPct  = (loss   > 0) ? (unsigned int)(loss > 100 ? 100 : loss) : 0u;
+
+    // Ownership squad-tab ranks: parse a CSV of unsigned ints (e.g. "0", "1", "1,2").
+    // KENSHICOOP_OWN_SQUAD is primary; KENSHICOOP_OWN_RANK is an accepted alias. Empty
+    // env -> default (host owns tab {0} / join owns tab {1}).
+    c.ownRanks.clear();
+    {
+        std::string ranks = envOr("KENSHICOOP_OWN_SQUAD", envOr("KENSHICOOP_OWN_RANK", "").c_str());
+        unsigned int v = 0; bool have = false;
+        for (size_t i = 0; i < ranks.size(); ++i) {
+            char ch = ranks[i];
+            if (ch >= '0' && ch <= '9') { v = v * 10u + (unsigned int)(ch - '0'); have = true; }
+            else if (have) { c.ownRanks.insert(v); v = 0; have = false; }
+        }
+        if (have) c.ownRanks.insert(v);
+        if (c.ownRanks.empty()) c.ownRanks.insert(c.isHost ? 0u : 1u);
+    }
 }
 
 } // namespace coop

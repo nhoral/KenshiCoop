@@ -272,11 +272,20 @@ new lever-set instance validated by its own conformance oracle:
     `death_order` (host kills subject -> join receives the reliable `EVT_DEATH`
     *even under 30% packet loss + latency*, because the event bypasses the
     unreliable-batch drop). No pathing.
-  - **3c Combat (L5)** [NEXT - now unblocked] - target / stance / health + reliable
-    hit/KO/death events + host-authoritative resolution; highest value and risk. Its
-    two stated dependencies are now in place: 3b's body state (KO/death) and the
-    reliable event channel. Combat hit/KO/death reuse `PKT_EVENT`; target/stance/
-    health ride an optional L5 sub-batch (present only for combatants).
+  - **3c Combat (L5)** [DONE] - target / combat intent + reliable hit/KO/death events
+    + host-authoritative outcome & attribution. Both stated dependencies (3b body
+    state + the reliable event channel) were in place. Validated via `combat_probe`
+    (host combat-state read), `combat_order` (live melee intent so a fight that
+    starts *after* the join loads renders), and `combat_kill` (deterministic KO with
+    sticky time-windowed attacker attribution). Hit/KO/death reuse `PKT_EVENT`;
+    intent rides `TASK_COMBAT_MELEE`.
+- **Phase 3.5 - Bidirectional per-tab ownership (presence keystone)** [DONE] -
+  ownership partitioned by Kenshi squad tab (= the member's `hand` CONTAINER rank),
+  with `publishOwned` + `applyTargets` running on BOTH clients and a drive-exclusion
+  guard on each side's own published hands. This is the layer that gives the guest
+  real agency over its own squad. Validated via `coop_presence` (bidirectional
+  cross-check, 0 ms + WAN) and manual control on `squad1`. See `POSTMORTEM.md`
+  addendum "Bidirectional per-tab ownership".
 - **Phase 4 - World objects** - inventory, buildings, items in the active zone
   (the production *results* of 3a, plus general object state).
 - **Phase 5 - Hardening** - interpolation buffer for real latency/jitter, event

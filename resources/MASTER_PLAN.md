@@ -123,6 +123,20 @@ Explicitly deferred / out of scope for v1:
   own, and drives the peer's. Validated on the `sync` save (no frozen leaders,
   NPCs at `gap 0-1 m`). Distinct saves are unsupported (break resolve-by-`hand`).
   Detailed design + resolved questions below; see `POSTMORTEM.md` addendum.
+- **Phase 3.5 - Bidirectional per-tab ownership: DONE (keystone co-op milestone).**
+  The ownership partition is now **bidirectional and partitioned by squad tab**:
+  each player owns the squad members in a disjoint set of *Kenshi squad tabs*
+  (a tab = a `Platoon` = the member's `hand` CONTAINER), streams its own tab(s),
+  and drives the peer's. `publishOwned` + `applyTargets` run on BOTH clients;
+  only `enforceHostAuthority` (world-NPC suppression) stays join-only. A
+  drive-exclusion guard prevents a side from ever driving/suppressing its own
+  owned hands. Selected by `KENSHICOOP_OWN_SQUAD` (tab ranks; host=`{0}`,
+  join=`{1}` default). Validated automatically (`coop_presence` bidirectional
+  cross-check at 0 ms + WAN sim) AND by manual control on the `squad1` save (host
+  drives tab-0's 2 units, join drives tab-1's 1 unit, both mirror cleanly, neither
+  can hijack the peer's tab). This is the "true co-op" presence model: two
+  independent players, each authoritative over their own squad tab. See
+  `POSTMORTEM.md` addendum "Bidirectional per-tab ownership".
 - **Phase 3 - Intent-replication framework (reframed from "NPC fidelity").** The
   sit/stand task-pose win generalizes into a reusable framework: replicate the
   *causes* of an animation (identity + transform + locomotion + AI intent + body
@@ -130,16 +144,22 @@ Explicitly deferred / out of scope for v1:
   and an authority guard. Each new behavior is a new `(class -> lever-set)` entry
   validated by its own conformance oracle, ordered by ascending risk. See
   `INTENT_REPLICATION.md` for the full design. Sub-phases:
-  - **3a Crafting/gathering** - reuse the fixture-task lever (`detachFromTownAI` +
-    `applyTaskOrder` at the work-station subject); lowest risk; proves framework
-    reuse. Main open risk: resource-node subjects may lack a stable cross-client
-    `hand`.
-  - **3b Body-state layer (L4)** - laying / unconscious / KO / death / ragdoll.
-    Adds a compact body-state field to `EntityState` (bump `PROTOCOL_VERSION`) and a
-    reliable death/KO event; no pathing for a downed body.
-  - **3c Combat (L5)** - target hand + stance + health + reliable hit/KO/death
-    events + host-authoritative resolution. Highest value and risk; depends on 3b's
-    body state and the reliable event channel.
+  - **3a Crafting/gathering: DONE.** Reuses the fixture-task lever
+    (`detachFromTownAI` + `applyTaskOrder` at the work-station subject); lowest
+    risk; proved framework reuse. Validated via `craft_order` (live idle->operating
+    order reflected on the join).
+  - **3b Body-state layer (L4): DONE.** Laying / unconscious / KO / death / ragdoll.
+    Added a compact `bodyState` field to `EntityState` (bumped `PROTOCOL_VERSION`)
+    AND the reliable `PKT_EVENT` channel for KO/death/revive transitions. Validated
+    via `down_order` (live upright->down) and `death_order` (reliable `EVT_DEATH`
+    survives 30% packet loss + latency). `holdDown` refreshes the KO timer so the
+    local AI cannot stand a downed body back up. No pathing for a downed body.
+  - **3c Combat (L5): DONE.** Target hand + combat intent + reliable hit/KO/death
+    events + host-authoritative outcome & attribution. Validated via `combat_probe`
+    (host-side combat-state read), `combat_order` (live melee intent replicated so
+    a fight that *starts after* the join loads renders correctly), and
+    `combat_kill` (deterministic KO with sticky time-windowed attacker
+    attribution). Reuses `PKT_EVENT` for transitions; intent rides `TASK_COMBAT_MELEE`.
 - **Phase 4 - World objects:** inventory, buildings, and items within the active
   zone (including the production *results* of crafting from 3a).
 - **Phase 5 - Hardening:** interpolation buffer for real latency/jitter,
@@ -236,6 +256,66 @@ Resolved during the Co-op Drive Refoundation (see `POSTMORTEM.md` addendum):
   freezes the movement controller (the body renders but stops moving). Driven
   bodies must stay on the update list so the controller flushes our teleport;
   quiet the AI via `clearGoals`/`neutralize` + the v4 locomotion mirror instead.
+
+## Testing strategy & validation stages
+
+Validation is the project's backbone: every behavior class is proven by a
+repeatable RED/GREEN check, not by eyeballing one screenshot. The strategy has
+four layers, applied in order, and a behavior is only "done" when it clears all
+four for its class.
+
+### The conformance triplet (per behavior class)
+
+Each new class (pose, body-state, combat, presence) ships three things (detailed
+in `INTENT_REPLICATION.md`):
+
+1. **Host ground-truth read** - the authoritative engine state on the host (task +
+   subject for poses; `isDown`/health for L4; a combat-state read for L5; member
+   `hand` + transform for presence).
+2. **Join rendered-body read** - read the *result on the animated body* (e.g. the
+   `Bip01 Pelvis` world height via `engine::readPoseState`), NOT the field we wrote,
+   so a written flag cannot fake a PASS.
+3. **Tolerance comparator + deterministic scenario** - a compiled `Scenario`
+   (`src/plugin/test/Scenario.cpp`, driven via `ScenarioApi.h`) sets up the state
+   on both clients; a comparator in `scripts/run_test.ps1` time-aligns the host and
+   join reads and emits a verdict.
+
+### The harness layers
+
+1. **Compiled scenario harness.** Deterministic, time-gated state machines that run
+   in the main loop on both clients, selected by `KENSHICOOP_SCENARIO`. They emit
+   structured log markers (`SCENARIO MEMBER/RECV/...`) the runner anchors on. All
+   game mutation goes through the SEH-guarded `ScenarioApi`.
+2. **Bake scenes.** Host-only one-shot world setup (`setupCraftScene`,
+   `setupDownScene`, `setupDuelScene`, `setupSquadScene`) that the user SAVEs to a
+   canonical save (`craft1`, `down1`, `duel1`, `squad1`); both clients then load
+   the identical save (shared-save is mandatory for resolve-by-`hand`). Bakes are
+   machine-verifiable from the host log (e.g. the squad bake dumps distinct
+   containers = distinct tabs).
+3. **Automated host+join runner** (`scripts/run_test.ps1`). Build -> deploy ->
+   launch both clients -> screenshot (incl. burst frames for animation) -> parse
+   logs -> per-class oracle -> RED/GREEN verdict. Per-scenario oracles:
+   `Compare-NpcSync`/`CROSSCHECK`, `Test-DownOrder`, `Test-CombatProbe`,
+   `Test-CoopPresence` (bidirectional). Locomotion-quality metrics (`smoothness`,
+   `anim-truth`) gate locomotion scenarios but are **advisory** for placement/state
+   scenarios (e.g. `coop_presence`), where latency micro-slide on a mostly-static
+   body is a known cosmetic seam, not a presence failure.
+4. **Manual visual gate.** After the automated oracle is green, a manual co-op
+   session (`scripts/manual_session.ps1` + side-by-side window arrange via
+   `scripts/arrange_windows.ps1`) confirms the result with a human in the loop
+   (e.g. driving each squad tab on its owning client).
+
+### Conditions we validate under
+
+- **0 ms (localhost)** for correctness, then a **WAN simulator** (`netSimDelayMs` /
+  `netSimJitterMs` / `netSimLossPct`) for latency/jitter/loss realism - a per-frame
+  correction that looks perfect on localhost must survive real RTT.
+- **Live transitions, not just loaded state.** A class is validated by making the
+  transition happen *after* the join has loaded (spawn-then-order, upright->down,
+  fight-starts-after-join), not only by loading a save already in the end state.
+- **Regression sweep.** After any partition/authority change, re-run prior green
+  scenarios (`npc_sync`, `combat_kill`, the bar multi-NPC scene) to confirm no
+  regression.
 
 ## Success criteria
 

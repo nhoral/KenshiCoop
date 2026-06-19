@@ -525,6 +525,28 @@ function Compare-NpcSync {
     return $ok
 }
 
+# coop_presence (Phase 3.5): BIDIRECTIONAL presence cross-check - the keystone
+# two-player test. Each client streams its OWNED member (host rank 0, join rank 1)
+# and drives the peer's, so BOTH directions must track:
+#   host->join : host MEMBER(rank0) vs join RECV(rank0)
+#   join->host : join MEMBER(rank1) vs host RECV(rank1)
+# Reuses the TIME-ALIGNED Compare-NpcSync (robust to the launch stagger and to the
+# peer body being released after a client exits) once per direction, judging the
+# single owned member (MinJudged=1, MinRatio=1.0 = that member must track). A small
+# walk catch-up lag is tolerated (the settle tail dominates the per-hand median).
+function Test-CoopPresence {
+    param([string]$HostFile, [string]$JoinFile, [double]$Tol)
+    $t = [Math]::Max($Tol, 6.0)
+    Write-Host "  COOP-PRESENCE host->join (host owns rank0):"
+    $h2j = Compare-NpcSync -HostFile $HostFile -JoinFile $JoinFile -Tol $t -MinRatio 1.0 -MinJudged 1
+    Write-Host "  COOP-PRESENCE join->host (join owns rank1):"
+    $j2h = Compare-NpcSync -HostFile $JoinFile -JoinFile $HostFile -Tol $t -MinRatio 1.0 -MinJudged 1
+    $ok = ($h2j -and $j2h)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  COOP-PRESENCE $v - bidirectional presence (host->join=$h2j, join->host=$j2h, tol=$t)"
+    return $ok
+}
+
 # Stage 5 pose oracle. For each STATIONARY host NPC (a sitter/idler: its host
 # position barely moves across the run) that carries a reproducible task, check
 # the join reproduced the SAME task on its local copy. captureNpcs reads the
@@ -1034,6 +1056,10 @@ if ($Scenario -ne "") {
         # host emits a reliable KO/death stamped with A as actor; the join receives it and
         # forces ITS B down. Asserts attribution + reliable delivery + synced down outcome.
         $cross = Test-CombatKill -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "coop_presence") {
+        # Phase 3.5 BIDIRECTIONAL presence: both players' owned characters must be
+        # present + tracking on the OTHER client. Time-aligned cross-check, both ways.
+        $cross = Test-CoopPresence -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
     } else {
         $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
     }
@@ -1060,8 +1086,16 @@ if ($Scenario -ne "") {
     # legitimately spike (real combat movement + a falling body). They print as advisory;
     # COMBAT-ORDER / COMBAT-KILL are the gates.
     $isCombatOrder = ($Scenario -eq "combat_order") -or ($Scenario -eq "combat_kill")
-    $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder) { $true } else { $smooth }
-    $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder) { $true } else { $anim }
+    # coop_presence is primarily a PRESENCE/PLACEMENT test: each side moves its tab
+    # leader briefly to prove live presence, then SETTLES for a clean cross-check, so
+    # the measured window is mostly stationary with a tiny translate sample. Under WAN
+    # the driven leader advances in brief snaps (the known latency micro-slide / dead-
+    # reckoning seam), which makes the locomotion-tuned smoothness/anim fractions spike
+    # on that small sample. They print as advisory; COOP-PRESENCE (bidirectional
+    # cross-check) + MARCH are the authoritative gates.
+    $isPresence = ($Scenario -eq "coop_presence")
+    $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder -or $isPresence) { $true } else { $smooth }
+    $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder -or $isPresence) { $true } else { $anim }
     $gateMarch  = if ($isReadProbe -or $isCombatOrder) { $true } else { $march }
     $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $gateSmooth -and $gateAnim -and $gateMarch -and $pose -and $poseState -and $bodyState)
 }

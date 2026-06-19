@@ -146,6 +146,12 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             bool ok = coop::engine::setupDuelScene(gw);
             coopLog(ok ? "SETUP(duel): peaceful duelists spawned - SAVE 'duel1' now"
                        : "SETUP(duel): duelist spawn FAILED");
+        } else if (g_cfg.setupScene == "squad") {
+            // Bidirectional presence (Phase 3.5) BAKE: build a SECOND player squad tab
+            // so host (tab 0) and join (tab 1) each own a tab. User SAVEs e.g. 'squad1'.
+            bool ok = coop::engine::setupSquadScene(gw);
+            coopLog(ok ? "SETUP(squad): second squad tab built - SAVE your two-tab save now"
+                       : "SETUP(squad): squad-tab build FAILED");
         } else {
             RootObject* seat = 0;
             bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);
@@ -198,12 +204,16 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         }
     }
 
-    // --- Replication (Stage 1): host streams its owned leader; receiver applies.
-    // Ingest received targets BEFORE the engine tick so apply targets are current.
+    // --- Replication: BIDIRECTIONAL presence. Both clients stream their OWNED squad
+    // subset (partitioned by hand-rank) and drive the peer's; the host additionally
+    // streams world NPCs. Ingest received targets BEFORE the engine tick so apply
+    // targets are current.
     g_repl.ingest(g_inbound);
-    // Join: latch any reliable transition events (KO/death/revive) before apply.
-    if (!g_cfg.isHost) g_repl.applyEvents(g_inbound);
-    if (g_cfg.isHost && g_gameStarted)
+    // Both clients latch reliable transition events (KO/death/revive) for the bodies
+    // they drive, before apply (a side can emit an event for its own owned body and
+    // the peer that drives that body must honour it).
+    g_repl.applyEvents(g_inbound);
+    if (g_gameStarted)
         g_repl.publishOwned(gw, g_net, g_net.localId());
 
     // Scenario onStart fires once, BEFORE the engine tick, so a host-issued move
@@ -223,13 +233,16 @@ void mainLoop_hook(GameWorld* gw, float dt) {
 
     g_mainLoop_orig(gw, dt); // run the engine (incl. local AI)
 
-    // Receiver applies AFTER the engine so our transform is the last word the
-    // renderer samples (the local AI re-decides at the start of the next tick).
-    if (!g_cfg.isHost && g_gameStarted) {
+    // Apply AFTER the engine so our transform is the last word the renderer samples
+    // (the local AI re-decides at the start of the next tick). Both clients drive the
+    // PEER's owned bodies: the host drives the join's squad, the join drives the
+    // host's squad + world NPCs. applyTargets skips our OWN owned hands.
+    if (g_gameStarted) {
         g_repl.applyTargets(gw);
-        // Host-authoritative world: hide/freeze any local NPC the host isn't
-        // streaming so the join can't run a divergent copy of it.
-        g_repl.enforceHostAuthority(gw);
+        // Host-authoritative world: only the JOIN hides/freezes any local NPC the
+        // host isn't streaming (so the join can't run a divergent copy). The host IS
+        // the world authority, so it never suppresses.
+        if (!g_cfg.isHost) g_repl.enforceHostAuthority(gw);
     }
 
     // Scenario onTick AFTER apply, so a join's RECV line reflects the applied pos.
@@ -344,6 +357,22 @@ __declspec(dllexport) void startPlugin() {
     // Stage 4: the host streams nearby world NPCs (host-authoritative) in addition
     // to its squad; the join resolves each by hand and drives it like a squad body.
     if (g_cfg.isHost) g_repl.setStreamNpcs(true);
+
+    // Bidirectional presence: this client owns (controls + streams) a disjoint set of
+    // the shared squad chosen by save-stable hand-rank; it drives the peer's owned
+    // members from their stream. Default leader-first: host {0}, join {1}.
+    g_repl.setOwnRanks(g_cfg.ownRanks);
+    {
+        std::string ranks;
+        for (std::set<unsigned int>::const_iterator it = g_cfg.ownRanks.begin();
+             it != g_cfg.ownRanks.end(); ++it) {
+            char num[16]; _snprintf(num, sizeof(num) - 1, "%u", *it); num[sizeof(num)-1] = '\0';
+            if (!ranks.empty()) ranks += ",";
+            ranks += num;
+        }
+        std::string m = "KenshiCoop: ownership ranks = {" + ranks + "} (bidirectional presence)";
+        coopLog(m.c_str());
+    }
 
     // AI-gating probe (join side): recruit diverged NPCs to test the inhabit lever.
     if (!g_cfg.isHost && g_cfg.probeRecruit) g_repl.setProbeRecruit(true);
