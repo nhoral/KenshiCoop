@@ -749,6 +749,27 @@ function Test-DownOrder {
     return $ok
 }
 
+# death_order RELIABLE-EVENT oracle. The host kills the pinned subject and emits a
+# reliable EVT_DEATH ("[event] SEND ... ev=2 hand=H"); the join MUST log a matching
+# "[event] RECV ... ev=2 ... hand=H". SEND and RECV print the hand in the SAME field
+# order, so we match exactly. The win condition is RELIABILITY: under packet loss the
+# unreliable bodyState batches drop, but this event still arrives on the reliable
+# channel. (ev=2 == EVT_DEATH.)
+function Test-DeathOrder {
+    param([string]$HostFile, [string]$JoinFile)
+    $send = Select-String -Path $HostFile -Pattern '\[event\] SEND id=\d+ ev=2 hand=([\d,]+?) bs' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $send) { Write-Host "  DEATH-ORDER FAIL - host emitted no death event (ev=2)"; return $false }
+    $hand = $send.Matches[0].Groups[1].Value
+    $pat  = '\[event\] RECV id=\d+ ev=2 owner=\d+ hand=' + [regex]::Escape($hand) + '\b'
+    $recv = @(Select-String -Path $JoinFile -Pattern $pat -ErrorAction SilentlyContinue)
+    if ($recv.Count -lt 1) {
+        Write-Host "  DEATH-ORDER FAIL - join never received the reliable death event for hand=$hand"
+        return $false
+    }
+    Write-Host "  DEATH-ORDER [join] PASS - reliable EVT_DEATH received for hand=$hand ($($recv.Count) delivery/deliveries)"
+    return $true
+}
+
 # True if $File logged a "SCENARIO RESULT PASS" line.
 function Test-ScenarioResultPass {
     param([string]$File)
@@ -859,6 +880,11 @@ if ($Scenario -ne "") {
         # LIVE transition: the join's subject must go upright -> down AFTER the host
         # knocks it out mid-run. Body-state analog of craft_order.
         $cross = Test-DownOrder -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "death_order") {
+        # RELIABLE-EVENT proof: the host kills the pinned subject mid-run and emits a
+        # reliable EVT_DEATH; the join MUST receive it (even under packet loss, since
+        # it rides the reliable channel while the unreliable bodyState batches drop).
+        $cross = Test-DeathOrder -HostFile $hostLog -JoinFile $joinLog
     } else {
         $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
     }
@@ -875,7 +901,7 @@ if ($Scenario -ne "") {
     # subject - it is KO'd on the ground - so the locomotion-tuned smoothness/anim
     # metrics are not meaningful here (a held body trivially "fails" zeroFrac). They
     # print as advisory; BODY-STATE + MARCH are the authoritative gates.
-    $isDownScene = ($Setup -like "down*") -or ($Scenario -eq "down_order")
+    $isDownScene = ($Setup -like "down*") -or ($Scenario -eq "down_order") -or ($Scenario -eq "death_order")
     $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene) { $true } else { $smooth }
     $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene) { $true } else { $anim }
     $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $gateSmooth -and $gateAnim -and $march -and $pose -and $poseState -and $bodyState)

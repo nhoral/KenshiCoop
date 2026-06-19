@@ -18,16 +18,30 @@ typedef unsigned int   u32;
 typedef float          f32;
 
 // Protocol version. Bumped to 2 when EntityState gained the bodyState field
-// (Stage 2 down/dead/ragdoll replication). Checked during handshake; a mismatch is
-// rejected (no attempt at backward compatibility across versions).
-const u16 PROTOCOL_VERSION = 2;
+// (Stage 2 down/dead/ragdoll replication); to 3 when the reliable event channel
+// (PKT_EVENT: KO/death/revive transitions) was added. Checked during handshake; a
+// mismatch is rejected (no attempt at backward compatibility across versions).
+const u16 PROTOCOL_VERSION = 3;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
     PKT_HELLO        = 1, // client -> host on connect: version + name
     PKT_WELCOME      = 2, // host -> client: version echo + assigned playerId
     PKT_LEAVE        = 3, // net thread -> game thread marker: a peer left
-    PKT_ENTITY_BATCH = 4  // either direction: owner-tagged EntityState batch (20 Hz)
+    PKT_ENTITY_BATCH = 4, // either direction: owner-tagged EntityState batch (20 Hz)
+    PKT_EVENT        = 5  // RELIABLE one-shot transition (KO/death/revive); see EventPacket
+};
+
+// One-shot transition events carried on the RELIABLE channel. Continuous state
+// (EntityState.bodyState) self-heals at 20 Hz over the unreliable channel, but a
+// transition that MUST be observed exactly once - a death, a KO landing, later a
+// combat hit - cannot tolerate a dropped datagram. These ride the reliable channel
+// so they are never lost or reordered. Doctrine 16: state unreliable, events reliable.
+enum EventType {
+    EVT_NONE     = 0,
+    EVT_KNOCKOUT = 1, // subject went down / unconscious (BODY_DOWN edge)
+    EVT_DEATH    = 2, // subject died (BODY_DEAD edge) - permanent, latched on the join
+    EVT_REVIVE   = 3  // subject stood back up (down -> upright edge)
 };
 
 // Sentinel ownerId meaning "all remote peers" (used on local disconnect to sweep
@@ -47,6 +61,31 @@ struct WelcomePacket {
     u8  type;     // = PKT_WELCOME
     u16 version;  // host's PROTOCOL_VERSION (client re-checks)
     u32 playerId; // id the host assigned to this client
+};
+
+// A reliable one-shot transition. 'subject' is the hand the event happened TO; the
+// 'actor' hand is the cause (attacker) and is all-zero until combat (L5). 'arg' is
+// event-specific (e.g. damage) and 0 for KO/death. eventId is a per-sender monotonic
+// counter for idempotent apply + log correlation. Subject/actor use the same five
+// u32 hand fields as EntityState so the receiver resolves them identically.
+struct EventPacket {
+    u8  type;    // = PKT_EVENT
+    u8  event;   // EventType
+    u32 ownerId; // network player id of the sender
+    u32 eventId; // monotonic per-sender
+    // subject hand (whom it happened to)
+    u32 sType;
+    u32 sContainer;
+    u32 sContainerSerial;
+    u32 sIndex;
+    u32 sSerial;
+    // actor hand (the cause; zeroed until combat)
+    u32 aType;
+    u32 aContainer;
+    u32 aContainerSerial;
+    u32 aIndex;
+    u32 aSerial;
+    f32 arg;     // event-specific payload (damage, etc.); 0 for KO/death
 };
 
 // One replicated entity: save-stable hand identity + transform + locomotion +

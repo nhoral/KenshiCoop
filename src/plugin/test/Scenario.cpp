@@ -401,6 +401,95 @@ private:
     unsigned long lastDownMs_;
 };
 
+// death_order (Stage 3 reliable-event proof): like down_order, but at ORDER_AT_MS the
+// HOST KILLS the pinned subject (engine::killSubject -> Character::isDead()). The host
+// detects the bodyState DEAD edge and emits a RELIABLE EVT_DEATH; the join must log a
+// matching "[event] RECV ev=2" for that hand. The point is reliability: run this under
+// -NetSimLossPct and the unreliable bodyState batches drop, but the death event still
+// arrives (it rides the reliable channel). Reuses the down_order pin/hold baseline.
+class DeathOrderScenario : public Scenario {
+public:
+    DeathOrderScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), deathLogged_(false),
+          haveSubject_(false), lastKillMs_(0) {}
+
+    virtual const char* name() const { return "death_order"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        if (ctx.isHost) {
+            haveSubject_ = engine::pickDownSubject(ctx.gw, subjHand_);
+            if (haveSubject_) {
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO death subject pinned hand=%u,%u,%u,%u,%u",
+                          subjHand_[3], subjHand_[4], subjHand_[0],
+                          subjHand_[1], subjHand_[2]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                coop::logLine("SCENARIO death subject pin FAILED (no nearby NPC)");
+            }
+        }
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Baseline: hold the pinned subject upright + in range (clean "alive before").
+        if (ctx.isHost && haveSubject_ && ctx.elapsedMs < ORDER_AT_MS) {
+            engine::holdSubjectUpright(ctx.gw, subjHand_);
+        }
+        // Order phase: KILL the pinned subject, re-asserted on a throttle so it stays
+        // dead. The first kill is the marker the runner splits the series on.
+        if (ctx.isHost && haveSubject_ && ctx.elapsedMs >= ORDER_AT_MS) {
+            if (!deathLogged_ || ctx.elapsedMs - lastKillMs_ >= 3000) {
+                lastKillMs_ = ctx.elapsedMs;
+                bool ok = engine::killSubject(ctx.gw, subjHand_);
+                if (!deathLogged_) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO DEATH issued ok=%d (kill live-order)", ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    deathLogged_ = true;
+                }
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (ctx.isHost) {
+                EntityState npcs[MAX_LOG];
+                passed_ = (engine::captureNpcs(ctx.gw, npcs, MAX_LOG) > 0);
+            } else {
+                passed_ = (recvCount_ >= 1);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ORDER_AT_MS      = 18000;
+    static const unsigned long HOST_DURATION_MS = 52000;
+    static const unsigned long JOIN_DURATION_MS = 34000;
+    static const unsigned int  MAX_LOG          = 40;
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          deathLogged_;
+    bool          haveSubject_;
+    unsigned int  subjHand_[5];
+    unsigned long lastKillMs_;
+};
+
 } // namespace
 
 Scenario* makeScenario(const std::string& name) {
@@ -408,6 +497,7 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "npc_sync")    return new NpcSyncScenario();
     if (name == "craft_order") return new CraftOrderScenario();
     if (name == "down_order")  return new DownOrderScenario();
+    if (name == "death_order") return new DeathOrderScenario();
     return 0;
 }
 

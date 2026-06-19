@@ -263,13 +263,20 @@ combat" into a sequence of behavior classes ordered by ascending risk, each one 
 new lever-set instance validated by its own conformance oracle:
 
 - **Phase 3 - Intent-replication framework** (supersedes the old "NPC fidelity"):
-  - **3a Crafting/gathering** - reuse the fixture-task lever; lowest risk; proves
-    framework reuse.
-  - **3b Body-state layer (L4)** - laying / unconscious / KO / death / ragdoll;
-    adds the body-state field + a reliable death/KO event; no pathing.
-  - **3c Combat (L5)** - target / stance / health + reliable hit/KO/death events +
-    host-authoritative resolution; highest value and risk; depends on 3b's body
-    state (KO/death) and the reliable event channel.
+  - **3a Crafting/gathering** [DONE] - reuse the fixture-task lever; lowest risk;
+    proves framework reuse. Validated via `craft_order` (live idle->operating order).
+  - **3b Body-state layer (L4)** [DONE] - laying / unconscious / KO / death /
+    ragdoll. Added the `bodyState` field (continuous, unreliable, self-healing) AND
+    the reliable event channel (`PKT_EVENT`: KO/death/revive transitions on ENet's
+    reliable channel). Validated via `down_order` (live upright->down) and
+    `death_order` (host kills subject -> join receives the reliable `EVT_DEATH`
+    *even under 30% packet loss + latency*, because the event bypasses the
+    unreliable-batch drop). No pathing.
+  - **3c Combat (L5)** [NEXT - now unblocked] - target / stance / health + reliable
+    hit/KO/death events + host-authoritative resolution; highest value and risk. Its
+    two stated dependencies are now in place: 3b's body state (KO/death) and the
+    reliable event channel. Combat hit/KO/death reuse `PKT_EVENT`; target/stance/
+    health ride an optional L5 sub-batch (present only for combatants).
 - **Phase 4 - World objects** - inventory, buildings, items in the active zone
   (the production *results* of 3a, plus general object state).
 - **Phase 5 - Hardening** - interpolation buffer for real latency/jitter, event

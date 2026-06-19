@@ -194,6 +194,9 @@ int  rearmDownScene(GameWorld* gw);
 bool pickDownSubject(GameWorld* gw, unsigned int subjHand[5]);
 bool holdSubjectUpright(GameWorld* gw, const unsigned int subjHand[5]);
 bool orderDownSubject(GameWorld* gw, const unsigned int subjHand[5]);
+// death_order: KILL the pinned subject (scaffold) so Character::isDead() flips and
+// the host emits a reliable EVT_DEATH. Idempotent; re-assertable on a throttle.
+bool killSubject(GameWorld* gw, const unsigned int subjHand[5]);
 
 // LIVE-order test support. pickCraftWorker identifies the worker to drive (non-squad
 // NPC nearest the baked fixture) and returns its hand so a scenario can PIN it for

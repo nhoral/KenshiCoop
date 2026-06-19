@@ -51,7 +51,13 @@ public:
     // BEFORE engine: drain received entities into their interpolation buffers.
     void ingest(Inbound& in);
 
+    // BEFORE engine (join side): drain reliable transition events and latch them
+    // onto the matching tracked body (death = held down permanently; revive clears).
+    void applyEvents(Inbound& in);
+
     // BEFORE engine: capture the locally-owned squad and publish it (host side).
+    // Also detects per-entity bodyState transitions (KO/death/revive) and queues the
+    // matching reliable event on 'net'.
     void publishOwned(GameWorld* gw, NetLink& net, u32 ownerId);
 
     // AFTER engine: sample + apply the interpolated pose for every tracked entity.
@@ -104,11 +110,14 @@ private:
         unsigned long taskTick;      // when the task was issued (drift grace timer)
         bool         detached;       // I9: detached from town-AI (separateIntoMyOwnSquad) once
         bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
+        bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
+        bool         deathLatched;    // a reliable EVT_DEATH pinned this body down PERMANENTLY
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), body(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
-                   taskTick(0), detached(false), downApplied(false) {}
+                   taskTick(0), detached(false), downApplied(false),
+                   koLatched(false), deathLatched(false) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
@@ -119,6 +128,10 @@ private:
                    bool haveActual, float ax, float ay, float az, unsigned long now);
 
     std::map<Key, Driven> targets_;
+    // Host side: last bodyState we published per owned entity, so we can emit a
+    // reliable event on the rising/falling edge (KO/death/revive) exactly once.
+    std::map<Key, u16>    hostBody_;
+    u32                   nextEventId_;
     // Stage 6: world NPCs we've hidden+frozen on the join because the host isn't
     // streaming them. Keyed by hand so we restore the exact body when it re-enters
     // the host's streamed set.

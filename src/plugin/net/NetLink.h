@@ -40,6 +40,11 @@ public:
     // publish nothing.
     void setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int count);
 
+    // MAIN thread: queue a reliable one-shot event (KO/death/revive). The net thread
+    // drains and sends it on the RELIABLE channel next tick (host broadcasts to all
+    // peers; client sends to the host). Thread-safe; copied under lock.
+    void queueEvent(const EventPacket& ev);
+
     // Debug WAN simulation. When delayMs > 0, received entity batches are held in a
     // net-thread queue and delivered to the game thread only after delayMs +/- jitter
     // has elapsed (lossPct of them are dropped outright). Must be called before
@@ -71,6 +76,9 @@ private:
     std::vector<EntityState> out_;
     u32                      outOwner_;
     bool                     haveOut_;
+    // Reliable events queued by the main thread, drained + sent by the net thread.
+    // Guarded by outCs_ (same publish lock as out_).
+    std::vector<EventPacket> outEvents_;
 
     HANDLE        thread_;
     volatile LONG running_;

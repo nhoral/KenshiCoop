@@ -87,6 +87,12 @@ void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int
     LeaveCriticalSection(&outCs_);
 }
 
+void NetLink::queueEvent(const EventPacket& ev) {
+    EnterCriticalSection(&outCs_);
+    outEvents_.push_back(ev);
+    LeaveCriticalSection(&outCs_);
+}
+
 void NetLink::setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct) {
     simDelayMs_  = delayMs;
     simJitterMs_ = jitterMs;
@@ -263,6 +269,16 @@ void NetLink::threadLoop() {
                                 }
                             }
                         }
+                    } else if (type == PKT_EVENT) {
+                        // Reliable transition. Delivered immediately (NOT through the
+                        // WAN-sim delay buffer): the sim models unreliable-batch loss,
+                        // while the whole point of the reliable channel is that these
+                        // survive that loss - so we honour their guaranteed delivery.
+                        EventPacket evp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &evp)
+                            && inbound_) {
+                            inbound_->pushEvent(evp.ownerId, evp);
+                        }
                     }
                     enet_packet_destroy(ev.packet);
                     break;
@@ -291,6 +307,25 @@ void NetLink::threadLoop() {
         // Release any WAN-sim-delayed inbound entities whose arrival time has come.
         // No-op (and cheap) when the sim is disabled / nothing is pending.
         flushDelayed();
+
+        // Drain + send any queued reliable events on CH_RELIABLE. ENet guarantees
+        // delivery + ordering on that channel, so these survive the unreliable-batch
+        // loss the WAN sim injects (the reliability proof the death oracle checks).
+        std::vector<EventPacket> events;
+        EnterCriticalSection(&outCs_);
+        events.swap(outEvents_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < events.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&events[i], sizeof(EventPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
 
         // Transmit this peer's owned entities (latest snapshot), chunked so each
         // batch fits one datagram. Unreliable: the newest batch supersedes loss.

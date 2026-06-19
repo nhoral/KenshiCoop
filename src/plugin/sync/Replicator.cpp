@@ -8,6 +8,7 @@
 #include <deque>
 #include <set>
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 
 class Character;
@@ -59,7 +60,7 @@ Replicator::Replicator()
       restSampleFrames_(0), marchFrames_(0),
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
       probeRecruit_(false), probedCount_(0),
-      probeAiSuspend_(false), aiLogTick_(0) {}
+      probeAiSuspend_(false), aiLogTick_(0), nextEventId_(1) {}
 
 void Replicator::ingest(Inbound& in) {
     std::deque<InboundEntity> got;
@@ -81,6 +82,65 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     if (streamNpcs_ && n < MAX_PUBLISH)
         n += engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
     net.setOwnedEntities(ownerId, buf, n);
+
+    // Emit reliable transition events on bodyState edges. Continuous bodyState
+    // already self-heals the down/dead POSTURE over the unreliable channel; the
+    // event guarantees the TRANSITION moment is delivered exactly once (a dropped
+    // batch can't lose a death), which is what combat (L5) will build on.
+    for (unsigned int i = 0; i < n; ++i) {
+        const EntityState& e = buf[i];
+        Key k = keyOf(e);
+        std::map<Key, u16>::iterator pit = hostBody_.find(k);
+        u16 prev = (pit != hostBody_.end()) ? pit->second : 0;
+        u16 cur  = e.bodyState;
+        if (cur != prev) {
+            bool wasDown = bodyIsDown(prev), isDownNow = bodyIsDown(cur);
+            bool wasDead = (prev & BODY_DEAD) != 0, isDeadNow = (cur & BODY_DEAD) != 0;
+            u8 evType = EVT_NONE;
+            if (isDeadNow && !wasDead)       evType = EVT_DEATH;
+            else if (isDownNow && !wasDown)  evType = EVT_KNOCKOUT;
+            else if (!isDownNow && wasDown)  evType = EVT_REVIVE;
+            if (evType != EVT_NONE) {
+                EventPacket ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.type = (u8)PKT_EVENT; ev.event = evType;
+                ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+                ev.sType = e.hType; ev.sContainer = e.hContainer;
+                ev.sContainerSerial = e.hContainerSerial;
+                ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
+                net.queueEvent(ev);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[event] SEND id=%u ev=%u hand=%u,%u,%u,%u,%u bs %u->%u",
+                    ev.eventId, (unsigned)evType, e.hType, e.hContainer,
+                    e.hContainerSerial, e.hIndex, e.hSerial,
+                    (unsigned)prev, (unsigned)cur);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        hostBody_[k] = cur;
+    }
+}
+
+void Replicator::applyEvents(Inbound& in) {
+    std::deque<InboundEvent> got;
+    in.drainEvents(got);
+    for (std::deque<InboundEvent>::iterator it = got.begin(); it != got.end(); ++it) {
+        const EventPacket& ev = it->ev;
+        Key k; k.t = ev.sType; k.c = ev.sContainer; k.cs = ev.sContainerSerial;
+        k.i = ev.sIndex; k.s = ev.sSerial;
+        Driven& d = targets_[k]; // creates a placeholder if the body isn't streamed yet
+        switch (ev.event) {
+            case EVT_DEATH:    d.deathLatched = true;  d.koLatched = true;  break;
+            case EVT_KNOCKOUT: d.koLatched = true;                          break;
+            case EVT_REVIVE:   d.deathLatched = false; d.koLatched = false; break;
+            default: break;
+        }
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[event] RECV id=%u ev=%u owner=%u hand=%u,%u,%u,%u,%u",
+            ev.eventId, (unsigned)ev.event, ev.ownerId,
+            ev.sType, ev.sContainer, ev.sContainerSerial, ev.sIndex, ev.sSerial);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
 }
 
 void Replicator::applyTargets(GameWorld* gw) {
@@ -129,7 +189,12 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     the wake AI never fires - this kills the get-up/flop/ragdoll-spike
         //     flicker proactively instead of re-collapsing after the body stood.
         // When the host reports the body upright again, release the KO once.
-        if (coop::bodyIsDown(out.bodyState)) {
+        //
+        // A reliable EVT_DEATH/EVT_KNOCKOUT latch (d.deathLatched/koLatched) FORCES
+        // the down treatment even if this tick's (lossy) continuous sample momentarily
+        // reads upright - the whole point of the reliable event is that the down/dead
+        // transition is honoured regardless of a dropped batch. EVT_REVIVE clears it.
+        if (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched) {
             unsigned short localBs = engine::readBodyState(c);
             if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
             else                            engine::holdDown(c);

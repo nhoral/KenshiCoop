@@ -23,6 +23,13 @@ struct InboundEntity {
     EntityState e;
 };
 
+// One received reliable event (KO/death/revive transition), owner-tagged like an
+// entity so the receiver applies it to the right peer's body.
+struct InboundEvent {
+    u32         ownerId;
+    EventPacket ev;
+};
+
 class Inbound {
 public:
     Inbound()  { InitializeCriticalSection(&cs_); }
@@ -40,6 +47,11 @@ public:
         InboundEntity ie; ie.ownerId = ownerId; ie.e = e;
         EnterCriticalSection(&cs_); ent_.push_back(ie); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received reliable event, owner-tagged.
+    void pushEvent(u32 ownerId, const EventPacket& ev) {
+        InboundEvent ievt; ievt.ownerId = ownerId; ievt.ev = ev;
+        EnterCriticalSection(&cs_); evt_.push_back(ievt); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
     void drainConnects(std::deque<u32>& out) {
@@ -51,12 +63,16 @@ public:
     void drainEntities(std::deque<InboundEntity>& out) {
         EnterCriticalSection(&cs_); out.swap(ent_); LeaveCriticalSection(&cs_);
     }
+    void drainEvents(std::deque<InboundEvent>& out) {
+        EnterCriticalSection(&cs_); out.swap(evt_); LeaveCriticalSection(&cs_);
+    }
 
 private:
     CRITICAL_SECTION          cs_;
     std::deque<u32>           conn_;
     std::deque<u32>           leave_;
     std::deque<InboundEntity> ent_;
+    std::deque<InboundEvent>  evt_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);

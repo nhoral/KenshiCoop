@@ -1385,6 +1385,28 @@ bool orderDownSubject(GameWorld* gw, const unsigned int subjHand[5]) {
     return knockDown(s, true);
 }
 
+// death_order: the runtime EVENT that KILLS the pinned subject. Test scaffold (no
+// combat yet): collapse the body (ragdoll + KO) so it lies down, then mark the
+// medical system dead + drain blood so Character::isDead() flips true. That sets
+// BODY_DEAD in the host's bodyState capture, which publishOwned turns into a reliable
+// EVT_DEATH. Re-assertable on a throttle (idempotent: already-dead stays dead).
+bool killSubject(GameWorld* gw, const unsigned int subjHand[5]) {
+    (void)gw;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    __try {
+        knockDown(s, true); // collapse + hold the body on the ground
+        MedicalSystem* med = &s->medical;
+        med->blood     = 0.0f; // past the point of no return
+        med->unconcious = true;
+        med->dead      = true; // Character::isDead() reads this -> BODY_DEAD
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // 'craft' setup scene: spawn a save-stable work fixture + a NON-squad world NPC,
 // then give the NPC a persistent AI GOAL to work it (NOT a player order, which
 // would recruit it into the squad and bypass the host-authoritative world-NPC

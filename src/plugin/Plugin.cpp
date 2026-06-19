@@ -194,6 +194,8 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // --- Replication (Stage 1): host streams its owned leader; receiver applies.
     // Ingest received targets BEFORE the engine tick so apply targets are current.
     g_repl.ingest(g_inbound);
+    // Join: latch any reliable transition events (KO/death/revive) before apply.
+    if (!g_cfg.isHost) g_repl.applyEvents(g_inbound);
     if (g_cfg.isHost && g_gameStarted)
         g_repl.publishOwned(gw, g_net, g_net.localId());
 
