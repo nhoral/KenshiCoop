@@ -77,7 +77,7 @@ nameplates, follow-peer cam, GameData custom-save blob, etc.).
 
 | # | Title | Type |
 |---|-------|------|
-| 51 | spawnHostileBattle(perSide,red,blue) helper + 10v10 baseline sync | RUN |
+| 51 | spawnHostileBattle(perSide,red,blue) helper + 10v10 baseline sync | RUN | *(PARTIAL - see [51](51-spawnhostilebattle-10v10-baseline.md), README)* |
 | 52 | Combat-load FPS curve (host): 5v5/10v10/20v20/40v40 | RUN |
 | 53 | Combat-load FPS curve (join) while host fights | RUN |
 | 54 | Attribution correctness with 2 simultaneous fights | RUN |
