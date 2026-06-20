@@ -1,0 +1,117 @@
+[05:31:01.677] [HOST] INFO: log opened
+[05:31:01.677] [HOST] INFO: KenshiCoop loaded! (clean rebuild)
+[05:31:01.677] [HOST] INFO: KenshiCoop: build Jun 20 2026 05:28:31
+[05:31:01.677] [HOST] INFO: KenshiCoop: role=HOST proto=v11 port=27800 save='battle20'
+[05:31:01.721] [HOST] INFO: KenshiCoop: ownership ranks = {0} (bidirectional presence)
+[05:31:01.764] [HOST] INFO: KenshiCoop: auto-load armed for save 'battle20'
+[05:31:01.764] [HOST] INFO: KenshiCoop: test mode - self-exit 25 s after gameplay starts
+[05:31:01.764] [HOST] INFO: KenshiCoop: scenario armed 'spike'
+[05:31:01.764] [HOST] INFO: KenshiCoop: starting as HOST
+[05:31:01.765] [HOST] INFO: [net] hosting
+[05:31:02.773] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:03.781] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:04.793] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:05.802] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:06.812] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:07.821] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:08.027] [HOST] INFO: KenshiCoop: auto-load issued for save 'battle20' (after 5000 ms settle)
+[05:31:08.830] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:09.841] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:10.852] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:11.859] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:12.591] [HOST] INFO: [net] peer connecting (awaiting HELLO)
+[05:31:12.591] [HOST] INFO: [net] peer connected id=1 (proto v11)
+[05:31:12.592] [HOST] INFO: handshake: peer present id=1 (local id=0)
+[05:31:12.893] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:13.904] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:14.916] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:15.927] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:16.939] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:17.950] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:18.961] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:31:19.379] [HOST] INFO: KenshiCoop: gameplay started
+[05:31:19.379] [HOST] INFO: SCENARIO spike start
+[05:31:19.379] [HOST] INFO: SPIKE 12 start id=12 host=1
+[05:31:19.381] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51239.18,1549.37,2845.57
+[05:31:19.381] [HOST] INFO: SPIKE 12 smoke leader hand=1,2637329152,1,1,3079467776 pos=-51239.2,1549.4,2845.6
+[05:31:19.393] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51239.18,1549.37,2845.57
+[05:31:19.431] [HOST] INFO: [taskkey] key=1 desc='Moving' repro=0 subject=1
+[05:31:19.439] [HOST] INFO: [taskkey] key=36 desc='Patrolling town' repro=0 subject=0
+[05:31:19.741] [HOST] INFO: [taskkey] key=51 desc='Stand at node' repro=0 subject=1
+[05:31:19.898] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51237.48,1557.44,2840.57
+[05:31:19.973] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=23.6 appB/s=24402 wireB/s~=25157 batches/s=23.6 ents/s=307 ents/batch=13.0
+[05:31:20.396] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51237.54,1557.72,2837.20
+[05:31:20.895] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51237.29,1557.92,2834.86
+[05:31:20.984] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=40.0 appB/s=42189 wireB/s~=43469 batches/s=40.0 ents/s=531 ents/batch=13.3
+[05:31:21.397] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.78,1558.10,2833.99
+[05:31:21.899] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.78,1558.10,2833.99
+[05:31:21.992] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=39.4 appB/s=43823 wireB/s~=45084 batches/s=39.4 ents/s=552 ents/batch=14.0
+[05:31:22.394] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.99,1558.21,2833.07
+[05:31:22.896] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.35,1558.51,2830.27
+[05:31:23.003] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=39.4 appB/s=43780 wireB/s~=45039 batches/s=39.4 ents/s=551 ents/batch=14.0
+[05:31:23.402] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:23.900] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:24.012] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=40.0 appB/s=44480 wireB/s~=45760 batches/s=40.0 ents/s=560 ents/batch=14.0
+[05:31:24.396] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:24.898] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:25.023] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=39.4 appB/s=42302 wireB/s~=43562 batches/s=39.4 ents/s=532 ents/batch=13.5
+[05:31:25.396] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:25.902] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:26.033] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=39.4 appB/s=42266 wireB/s~=43527 batches/s=39.4 ents/s=532 ents/batch=13.5
+[05:31:26.393] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:26.896] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:27.044] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=40.0 appB/s=42900 wireB/s~=44180 batches/s=40.0 ents/s=540 ents/batch=13.5
+[05:31:27.400] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:27.896] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:28.055] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=39.4 appB/s=43469 wireB/s~=44728 batches/s=39.4 ents/s=547 ents/batch=13.9
+[05:31:28.397] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:28.892] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:29.067] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=39.4 appB/s=42811 wireB/s~=44072 batches/s=39.4 ents/s=539 ents/batch=13.7
+[05:31:29.399] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:29.894] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:30.078] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=40.0 appB/s=40767 wireB/s~=42047 batches/s=40.0 ents/s=513 ents/batch=12.8
+[05:31:30.399] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:30.895] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:31.089] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=39.4 appB/s=35071 wireB/s~=36331 batches/s=39.4 ents/s=441 ents/batch=11.2
+[05:31:31.394] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:31.900] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:32.100] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=24.6 appB/s=28295 wireB/s~=29083 batches/s=24.6 ents/s=356 ents/batch=14.5
+[05:31:32.396] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:32.896] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:33.111] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=19.7 appB/s=23624 wireB/s~=24254 batches/s=19.7 ents/s=298 ents/batch=15.1
+[05:31:33.400] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:33.893] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:34.120] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=20.0 appB/s=18527 wireB/s~=19167 batches/s=20.0 ents/s=233 ents/batch=11.7
+[05:31:34.395] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:34.896] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:35.129] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=19.7 appB/s=15669 wireB/s~=16299 batches/s=19.7 ents/s=197 ents/batch=10.0
+[05:31:35.394] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:35.897] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:36.138] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=20.0 appB/s=13392 wireB/s~=14032 batches/s=20.0 ents/s=168 ents/batch=8.4
+[05:31:36.396] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:36.899] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:37.147] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=19.7 appB/s=12559 wireB/s~=13189 batches/s=19.7 ents/s=157 ents/batch=8.0
+[05:31:37.394] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:37.898] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:38.157] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=20.0 appB/s=12760 wireB/s~=13400 batches/s=20.0 ents/s=160 ents/batch=8.0
+[05:31:38.396] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:38.896] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:39.168] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=19.7 appB/s=13661 wireB/s~=14292 batches/s=19.7 ents/s=171 ents/batch=8.7
+[05:31:39.397] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:39.892] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:40.179] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=19.7 appB/s=14114 wireB/s~=14744 batches/s=19.7 ents/s=177 ents/batch=9.0
+[05:31:40.398] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:40.894] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:41.190] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=19.7 appB/s=15296 wireB/s~=15926 batches/s=19.7 ents/s=192 ents/batch=9.8
+[05:31:41.400] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:41.893] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:42.201] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=20.0 appB/s=15920 wireB/s~=16560 batches/s=20.0 ents/s=200 ents/batch=10.0
+[05:31:42.393] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:42.894] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:43.212] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=19.7 appB/s=14114 wireB/s~=14744 batches/s=19.7 ents/s=177 ents/batch=9.0
+[05:31:43.400] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:43.900] [HOST] INFO: SCENARIO MEMBER hand=1,2637329152,1,1,3079467776 pos=-51238.07,1558.53,2829.98
+[05:31:44.082] [HOST] INFO: [taskkey] key=87 desc='Operating machine' repro=1 subject=1
+[05:31:44.082] [HOST] INFO: [seatres] HOST task=87 npc=1,3808471552 subj=514,2909912064 ok=1 npcpos=-51215.6,2660.6 subjpos=-51206.5,2659.7 d=9.1
+[05:31:44.223] [HOST] INFO: [net] [bw] role=H entsz=79 pkts/s=19.7 appB/s=12559 wireB/s~=13189 batches/s=19.7 ents/s=157 ents/batch=8.0
+[05:31:44.380] [HOST] INFO: KenshiCoop: test duration elapsed; exiting

@@ -61,6 +61,7 @@ is the record of completed (DONE/PARTIAL) spikes.
 | 9 | Battle sync fidelity vs combatant count | RUN | PARTIAL | Baked 5v5/10v10/20v20 melees; all combatants resolve+replicate to join, body-state agree 47/47 at 40-body; divergence flat (~18-20u) with count - bottleneck is interest-scatter, not load; absolute lag confounded by clock-skew (follow-up) |
 | 10 | Combat event storm (reliable channel) | RUN | DONE | Flooded KO/REVIVE at 84/s (peak 103/s): 2798/2798 delivered, contiguous ids, 0 loss/dup - reliable channel never drops; backpressure = latency tail (med 34ms, p95 753ms, max 2.3s). Real combat ~0.09/s (1000x headroom). Loopback only; NetSim follow-up |
 | 11 | Attribution correctness at scale | RUN | PARTIAL | Driven melee with 47 concurrent attacker->victim pairs (64 victims targeted); every emitted combat KO (4/4) attributed to a real attacker, 0 mis-attributions, 0 unattributed - recency map doesn't cross-contaminate. Death sample small (blood=12 not lethal); swarm/long-bleed + death-storm cases open |
+| 12 | Battle bandwidth profile | RUN | DONE | Stream = full 20 Hz snapshot, no delta; fixed 79 B/body/tick = 1.58 KB/s per streamed body per peer. Host upload linear in body count (battle40 ~30 KB/s); chunks at 18 bodies/datagram; join uploads only its own squad (~1 KB/s flat). Worst case (160-cap) ~253 KB/s/peer. Bandwidth not the battle bottleneck |
 | 14 | Interest cap overflow behavior | DUMP | DONE | Caps: 96 far+96 near per query, MAX_PUBLISH=160/tick; overflow truncates silently (no crash, no priority) |
 | 15 | Measure current host interest radius | DUMP | DONE | World NPCs stream within 200u far/120u near of HOST leader; ground items only 60u; single host-centered sphere |
 | 16 | Leader-separation: peer update cutoff distance | RUN | PARTIAL | Peer SQUAD always syncs (no cutoff); shared WORLD degrades past 200u from host leader; runtime walk-apart recipe noted |
@@ -81,6 +82,6 @@ is the record of completed (DONE/PARTIAL) spikes.
 | 31 | Purchase modeled as transfer + money delta | STATIC | DONE | Purchase = conserved item transfer + per-platoon money int delta; reuses inventory-conservation; host-authoritative |
 | 32 | Shared-economy conflict model | STATIC | DONE | Per-squad wallets (SDK-native) + host-auth vendors + conservation avoids double-spend/dup without locks |
 
-Carried-over originals 12-13 and 33-50 are still pending and live in
+Carried-over originals 13 and 33-50 are still pending and live in
 [BACKLOG.md](BACKLOG.md) along with new spikes 51-450. As each completes it is
 moved into this table.

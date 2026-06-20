@@ -1,0 +1,149 @@
+[05:30:13.733] [JOIN] INFO: log opened
+[05:30:13.734] [JOIN] INFO: KenshiCoop loaded! (clean rebuild)
+[05:30:13.734] [JOIN] INFO: KenshiCoop: build Jun 20 2026 05:28:31
+[05:30:13.734] [JOIN] INFO: KenshiCoop: role=JOIN proto=v11 port=27800 save='battle10'
+[05:30:13.790] [JOIN] INFO: KenshiCoop: ownership ranks = {1} (bidirectional presence)
+[05:30:13.828] [JOIN] INFO: KenshiCoop: auto-load armed for save 'battle10'
+[05:30:13.828] [JOIN] INFO: KenshiCoop: test mode - self-exit 25 s after gameplay starts
+[05:30:13.828] [JOIN] INFO: KenshiCoop: scenario armed 'spike'
+[05:30:13.828] [JOIN] INFO: KenshiCoop: starting as CLIENT
+[05:30:13.836] [JOIN] INFO: [net] connecting
+[05:30:13.836] [JOIN] INFO: [net] connected to host; sent HELLO
+[05:30:13.836] [JOIN] INFO: [net] peer connected id=1 (proto v11) - received WELCOME
+[05:30:14.847] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:15.855] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:16.867] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:17.877] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:18.889] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:19.901] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:20.440] [JOIN] INFO: KenshiCoop: auto-load issued for save 'battle10' (after 5000 ms settle)
+[05:30:20.910] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:21.917] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:22.924] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:23.319] [JOIN] INFO: handshake: peer present id=0 (local id=1)
+[05:30:23.929] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:24.939] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:25.950] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:26.959] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:27.967] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:28.979] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:29.989] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:30.998] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=0.0 appB/s=0 wireB/s~=0 batches/s=0.0 ents/s=0 ents/batch=0.0
+[05:30:31.016] [JOIN] INFO: KenshiCoop: gameplay started
+[05:30:31.016] [JOIN] INFO: SCENARIO spike start
+[05:30:31.016] [JOIN] INFO: SPIKE 12 start id=12 host=0
+[05:30:31.018] [JOIN] INFO: [gate] hand=1,524536128 host=1 local=65535  agree=0/1 (0%)
+[05:30:31.018] [JOIN] INFO: [authority] suppress NPC hand=3,3090698240 (streamed=17 local=14 supp=1)
+[05:30:31.018] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51235.20,1548.00,2849.72
+[05:30:31.018] [JOIN] INFO: SPIKE 12 smoke leader hand=1,2637329152,1,1,3079467776 pos=-51235.2,1548.0,2849.7
+[05:30:31.063] [JOIN] INFO: [taskkey] key=1 desc='Moving' repro=0 subject=1
+[05:30:31.090] [JOIN] INFO: [taskkey] key=36 desc='Patrolling town' repro=0 subject=0
+[05:30:31.158] [JOIN] INFO: [taskkey] key=51 desc='Stand at node' repro=0 subject=1
+[05:30:31.522] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:32.011] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:32.021] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:32.527] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:32.640] [JOIN] INFO: [authority] suppress NPC hand=1,1723144576 (streamed=17 local=18 supp=2)
+[05:30:33.022] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:33.025] [JOIN] INFO: [gate] hand=1,3823120128 host=1 local=65535  agree=730/3650 (20%)
+[05:30:33.025] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:33.521] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:34.018] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:34.031] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=20.0 appB/s=1700 wireB/s~=2340 batches/s=20.0 ents/s=20 ents/batch=1.0
+[05:30:34.523] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:34.977] [JOIN] INFO: [authority] suppress NPC hand=1,3701660160 (streamed=16 local=15 supp=3)
+[05:30:35.025] [JOIN] INFO: [gate] hand=1,3823120128 host=1 local=65535  agree=1960/7436 (26%)
+[05:30:35.025] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:35.040] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1675 wireB/s~=2305 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:35.518] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:35.735] [JOIN] INFO: [authority] suppress NPC hand=1,3229125888 (streamed=13 local=13 supp=4)
+[05:30:36.020] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:36.052] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:36.525] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:36.784] [JOIN] INFO: [authority] suppress NPC hand=1,469482432 (streamed=12 local=13 supp=5)
+[05:30:37.022] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:37.030] [JOIN] INFO: [gate] hand=1,3823120128 host=1 local=65535  agree=3333/10084 (33%)
+[05:30:37.061] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=20.0 appB/s=1700 wireB/s~=2340 batches/s=20.0 ents/s=20 ents/batch=1.0
+[05:30:37.246] [JOIN] INFO: [authority] suppress NPC hand=1,766113280 (streamed=11 local=14 supp=6)
+[05:30:37.524] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:37.972] [JOIN] INFO: [authority] suppress NPC hand=1,2878051840 (streamed=10 local=14 supp=7)
+[05:30:38.019] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:38.071] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1675 wireB/s~=2305 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:38.520] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:39.021] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:39.037] [JOIN] INFO: [gate] hand=1,3823120128 host=1 local=65535  agree=4429/12424 (35%)
+[05:30:39.083] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:39.523] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:39.728] [JOIN] INFO: [authority] suppress NPC hand=1,726928704 (streamed=9 local=14 supp=8)
+[05:30:40.021] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:40.092] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=20.0 appB/s=1700 wireB/s~=2340 batches/s=20.0 ents/s=20 ents/batch=1.0
+[05:30:40.521] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:41.023] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:41.038] [JOIN] INFO: [gate] hand=1,3823120128 host=1 local=65535  agree=5525/14422 (38%)
+[05:30:41.103] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:41.224] [JOIN] INFO: [authority] suppress NPC hand=5,1919189504 (streamed=9 local=15 supp=9)
+[05:30:41.520] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:42.023] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:42.113] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1675 wireB/s~=2305 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:42.517] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:43.023] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:43.041] [JOIN] INFO: [gate] hand=1,3823120128 host=1 local=65535  agree=6544/16408 (39%)
+[05:30:43.123] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=20.0 appB/s=1700 wireB/s~=2340 batches/s=20.0 ents/s=20 ents/batch=1.0
+[05:30:43.521] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:43.537] [JOIN] INFO: [authority] restore NPC hand=1,3229125888 (supp=8)
+[05:30:44.021] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:44.135] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:44.290] [JOIN] INFO: [pose] rest re-arm task 65535 -> 87
+[05:30:44.290] [JOIN] INFO: [pose] applyOrder hand=1,3808471552 task=87 subj=514,2909912064,0 det=1 r=3
+[05:30:44.447] [JOIN] INFO: [pose] rest re-arm task 65535 -> 87
+[05:30:44.448] [JOIN] INFO: [pose] applyOrder hand=1,3808471552 task=87 subj=514,2909912064,0 det=1 r=2
+[05:30:44.456] [JOIN] INFO: [taskkey] key=87 desc='Operating machine' repro=1 subject=1
+[05:30:44.456] [JOIN] INFO: [seatres] HOST task=87 npc=1,3808471552 subj=514,2909912064 ok=1 npcpos=-51206.5,2659.7 subjpos=-51206.5,2659.7 d=0.0
+[05:30:44.520] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:45.023] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:45.047] [JOIN] INFO: [gate] hand=4,1276245120 host=51 local=1  agree=7551/18365 (41%)
+[05:30:45.148] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:45.480] [JOIN] INFO: [authority] suppress NPC hand=1,1667968768 (streamed=8 local=14 supp=9)
+[05:30:45.522] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:46.024] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:46.159] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1675 wireB/s~=2305 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:46.244] [JOIN] INFO: [authority] suppress NPC hand=1,3823120128 (streamed=7 local=15 supp=10)
+[05:30:46.520] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:47.022] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:47.049] [JOIN] INFO: [gate] hand=4,1276245120 host=51 local=1  agree=8683/20162 (43%)
+[05:30:47.169] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=20.0 appB/s=1700 wireB/s~=2340 batches/s=20.0 ents/s=20 ents/batch=1.0
+[05:30:47.508] [JOIN] INFO: [authority] suppress NPC hand=4,1276245120 (streamed=0 local=15 supp=11)
+[05:30:47.508] [JOIN] INFO: [authority] suppress NPC hand=1,3808471552 (streamed=0 local=15 supp=12)
+[05:30:47.508] [JOIN] INFO: [authority] suppress NPC hand=1,2590331904 (streamed=0 local=15 supp=13)
+[05:30:47.508] [JOIN] INFO: [authority] suppress NPC hand=1,524536128 (streamed=0 local=15 supp=14)
+[05:30:47.508] [JOIN] INFO: [authority] suppress NPC hand=1,3229125888 (streamed=0 local=15 supp=15)
+[05:30:47.508] [JOIN] INFO: [authority] suppress NPC hand=1,3473144576 (streamed=0 local=15 supp=16)
+[05:30:47.521] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:48.022] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:48.179] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:48.520] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:49.021] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:49.190] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1675 wireB/s~=2305 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:49.521] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:50.021] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:50.200] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=20.0 appB/s=1700 wireB/s~=2340 batches/s=20.0 ents/s=20 ents/batch=1.0
+[05:30:50.521] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:51.021] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:51.060] [JOIN] INFO: [net] disconnected from host
+[05:30:51.064] [JOIN] INFO: handshake: peer left id=4294967295
+[05:30:51.110] [JOIN] INFO: [net] reconnecting
+[05:30:51.211] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:51.523] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:52.018] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:52.222] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:52.521] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:53.019] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:53.234] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=20.0 appB/s=1700 wireB/s~=2340 batches/s=20.0 ents/s=20 ents/batch=1.0
+[05:30:53.519] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:54.017] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:54.243] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1675 wireB/s~=2305 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:54.520] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:55.024] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:55.253] [JOIN] INFO: [net] [bw] role=J entsz=79 pkts/s=19.7 appB/s=1673 wireB/s~=2303 batches/s=19.7 ents/s=20 ents/batch=1.0
+[05:30:55.518] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51233.93,1557.07,2844.12
+[05:30:56.007] [JOIN] INFO: KenshiCoop: test duration elapsed; exiting
