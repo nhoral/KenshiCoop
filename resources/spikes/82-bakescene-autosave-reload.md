@@ -46,6 +46,14 @@ bodies PERSISTING as real save entities?
 4. **`savedExists("spikebake82")` returned 0** despite the save existing - confirming its
    `location` argument needs the real save path, not "". Use the on-disk folder / a
    time-delay instead of this probe to confirm a write.
+5. **CROSS-CLIENT CONFIRMED (sub-spike 82b).** A 2-client run on `-Save spikebake82`
+   (id `82b`, both roles census near-leader): the JOIN sees `near60=14` (vs vanilla save
+   'c' baseline of 2) and `fighting=9` - it loads and SEES the baked battle, and the
+   battle RESUMES combat (factions stayed hostile across the save). Host/join near-counts
+   agree (host 14/17, join 14/12 at t=6s/24s). `82b/raw/join_2.png` shows the join's
+   character amid the active melee with downed bodies + a blood pool. Note: fighting-count
+   differs host(11-12) vs join(6-9) - a combat-MODE-state cross-client divergence that
+   spikes 56-80 will now quantify properly.
 
 ## Validation
 
@@ -62,18 +70,18 @@ bodies PERSISTING as real save entities?
 
 ## Open questions / hypotheses (UNVALIDATED)
 
-- **Direct cross-client confirmation** (a JOIN loads `spikebake82` and sees the SAME 13
-  bodies with matching hands) was NOT run here - only host-local persistence + reload.
-  It is strongly implied (the bodies are now shared-save entities, and the mod's whole
-  model is that shared-save hands resolve identically on both clients), but it must be
-  confirmed by a 2-client run on `-Save spikebake82`.
-- **Hostility persistence**: whether the two factions stay mutually ENEMY after reload
-  (so the baked battle RESUMES fighting on load) is unconfirmed - faction relations are
-  saved, so likely yes, but unmeasured.
+- **Combat-mode cross-client divergence**: 82b showed host fighting=11-12 vs join
+  fighting=6-9 on the SAME baked battle. Whether this is sampling skew (~95ms apart +
+  bodies dropping) or a real combat-state desync is the FIRST thing 56-80 should pin down.
 - **Save cost / timing** under larger battles (40v40) and whether the SAVEGAME signal can
   stall a networked session were not measured (here it was host-only, 12 bodies).
 - One spawned body did not persist (14->13): wandered out of 60u, died, or the count
   includes the 2 natives - not pinned down.
+
+## Resolved by sub-spike 82b
+
+- Direct cross-client visibility: CONFIRMED (join near60=14 vs baseline 2; join_2.png).
+- Hostility persistence / battle resumes on load: CONFIRMED (join fighting=9 then 6).
 
 ## Implications for co-op (UNBLOCKS the cluster)
 
@@ -86,8 +94,9 @@ bodies PERSISTING as real save entities?
 
 ## Recommended follow-ups (now unblocked)
 
-- IMMEDIATE: 2-client run on `-Save spikebake82` to confirm the join sees the 13 bodies
-  (closes the only open item) and whether the battle resumes hostile.
-- Then drain 56-80 using baked battles instead of live runtime spawns.
-- Keeper primitives (reverted): `engine::bakeSave`, `savedExists`, `countCharsNear`,
-  plus the spike 51-55 battle helpers; `SpikeScenario` id 82.
+- DONE: 2-client confirmation (sub-spike 82b) - join sees + fights the baked battle.
+- Drain 56-80 using baked battles instead of live runtime spawns: phase A host-only bake
+  -> phase B 2-client `-Save <baked>` measuring the cross-client property.
+- FIRST target: the host-vs-join combat-mode count divergence 82b surfaced.
+- Keeper primitives (reverted): `engine::bakeSave`, `savedExists`, `countCharsNear`
+  (+fighting overload), plus the spike 51-55 battle helpers; `SpikeScenario` ids 82/82b.
