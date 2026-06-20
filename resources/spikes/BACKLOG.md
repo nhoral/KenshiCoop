@@ -60,7 +60,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 |---|-------|------|
 | 46 | Ogre overlay HUD proof | RUN | *(PARTIAL - see [46](46-ogre-overlay-hud-proof.md), README)* |
 | 47 | Peer-squad nameplates/markers | RUN | *(DONE - see [47](47-peer-squad-nameplates.md), README)* |
-| 48 | Connection/status + ping overlay | RUN |
+| 48 | Connection/status + ping overlay | RUN | *(DONE - see [48](48-connection-status-ping-overlay.md), README)* |
 | 49 | Minimap markers for peer squad | STATIC |
 | 50 | MyGUI native panel integration | STATIC |
 
