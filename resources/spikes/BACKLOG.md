@@ -58,7 +58,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 
 | # | Title | Type |
 |---|-------|------|
-| 46 | Ogre overlay HUD proof | RUN |
+| 46 | Ogre overlay HUD proof | RUN | *(PARTIAL - see [46](46-ogre-overlay-hud-proof.md), README)* |
 | 47 | Peer-squad nameplates/markers | RUN |
 | 48 | Connection/status + ping overlay | RUN |
 | 49 | Minimap markers for peer squad | STATIC |
