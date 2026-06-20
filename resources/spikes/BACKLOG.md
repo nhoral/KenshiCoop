@@ -113,7 +113,7 @@ nameplates, follow-peer cam, GameData custom-save blob, etc.).
 | # | Title | Type |
 |---|-------|------|
 | 81 | spawnHostileBattle engine helper primitive | DUMP |
-| 82 | bakeScene(name) auto-save + reload helper | DUMP |
+| 82 | bakeScene(name) auto-save + reload helper | DUMP | *(DONE - see [82](82-bakescene-autosave-reload.md), README - UNBLOCKS 56-80)* |
 | 83 | Deterministic spawnTemplateById exactness check | DUMP |
 | 84 | equipByStringId loadout helper | DUMP |
 | 85 | Squad spawn via createRandomSquad parameters | DUMP |
