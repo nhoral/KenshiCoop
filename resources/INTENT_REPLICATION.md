@@ -288,6 +288,80 @@ new lever-set instance validated by its own conformance oracle:
   addendum "Bidirectional per-tab ownership".
 - **Phase 4 - World objects** - inventory, buildings, items in the active zone
   (the production *results* of 3a, plus general object state).
+  - **4a Inventory / container-contents (content-snapshot/reconcile)** [DONE] -
+    runtime-minted items (craft output, loot) have HOST-ONLY hands that don't resolve
+    on the join, so item objects are NOT driven by `hand`. Instead the host streams a
+    container's CONTENTS as a description (template `stringID` + `itemType` + quantity
+    + quality) keyed by the CONTAINER's stable `hand`, and the join RECONSTRUCTS items
+    locally (`createItem`+`tryAddItem` for shortfalls, `removeItemAutoDestroy` for
+    excess) to match - idempotent + loss-tolerant. Rides the RELIABLE channel on a
+    content-hash change (+ periodic safety resend). v1 anchors on the leader's own
+    inventory (a save-stable container that accepts arbitrary items); host-authoritative
+    (`applyInventories` never reconciles a container the client authors). Validated via
+    `inv_order` (host live-add, host/join final-hash match, 0 ms + WAN 80/30/30% - the
+    add survives loss because the snapshot is reliable) plus the existing-scenario
+    regressions (`npc_sync`/`combat_kill`/`coop_presence`) staying green. **Now
+    BIDIRECTIONAL:** each client authors the inventory of every squad member it owns
+    (the `ownHands_` tab-rank partition - host tab 0, join tab 1) and reconciles the
+    peer's; `publishInventories` is gated behind `invSync`. Validated via `inv_bidir`
+    (host AND join each ADD-then-REMOVE their owned container; per-rank convergence both
+    ways with distinct net deltas) at 0 ms + WAN 120/40/30%. Doctrine 23. **Now covers
+    EQUIPPED gear (ALL slots):** worn gear lives in equipment SECTIONS, not the loose
+    `_allItems` list, so the snapshot walks `getAllSections()` and captures every section
+    flagged `isAnEquippedItemSection`, tagging each entry `equipped`+`slot` (protocol v6).
+    Walking all sections covers every armour piece, belt, and a worn backpack. WEAPONS need
+    more: worn weapons can live outside `getAllSections()` entirely - the sheathed weapon
+    sits in a `hip`/`back` section, but the HELD weapon is tracked only by
+    `getPrimaryWeapon()`/`getSecondaryWeapon()`. So the snapshot ALSO reads those two
+    accessors and appends any worn weapon, deduped by `(stringID,itemType)` against the
+    section-captured equipped entries (the sheathed weapon appears in both as two distinct
+    `Item*`, so pointer dedup double-counts - key on template). Without the accessors, a
+    re-equipped weapon (routed to the held slot) vanished from the snapshot and never
+    replicated. Reconcile keys on `(stringID,itemType,equipped)` so a worn item and a loose
+    copy converge independently (unequip/drop now removes the peer's worn copy - the case
+    loose-only sync silently missed). Validated via `inv_equip` (each side unequips a
+    real save-loaded worn item; per-rank worn-count drop + convergence both ways) at
+    0 ms + WAN 80/20/1%. **Up path (re-equip) now works too:** an equipped<->loose split
+    change on a template whose TOTAL count is unchanged reconciles as an in-place MOVE of
+    the REAL item - UP = `equipItem` on an existing loose copy; DOWN = detach +
+    re-home into a loose (non-equip) section's `addItem` (NOT `tryAddItem`, which
+    auto-re-equips). This sidesteps the fabricated-equip discard (d25): a genuinely-new
+    worn item with no loose copy is still best-effort `create+equip`. Validated via
+    `inv_reequip` (unequip a real worn item to loose, then re-equip it; per-rank
+    dip-then-restore + convergence both ways). Doctrine 25. **Publish settle-debounce
+    (removal-aware):** `publishInventories` only sends a changed fingerprint after it stays
+    STABLE for a settle window, and the window depends on the change: additions and
+    equip<->loose MOVES (entry count unchanged) use a fast `INV_SETTLE_MS` (350 ms), while a
+    count DECREASE (`n < lastSentN`) uses `INV_REMOVE_SETTLE_MS` (1800 ms). Mid-drag the UI
+    holds the dragged item on the CURSOR, so the inventory briefly reports it FULLY GONE - and
+    a *human* re-equip holds that for ~960 ms (measured), far past a flat 350 ms. Without the
+    long removal window the peer acts on that transient by DESTROYING the worn item, and it
+    cannot refabricate a worn weapon (createItemAndAdd fails for weapons; equipped fabrication
+    is non-persistent, d25), losing it permanently. Gating only DECREASES on the long window
+    swallows the cursor-hold (peer keeps + MOVES its real item) while keeping equip/unequip
+    snappy; the cost is a ~1.8 s lag before a genuine drop shows on the peer. Manually
+    validated (host removals/unequips, weapon included, reflected on the join; join trace
+    shows `MOVE-UP ok=1`, zero weapon REMOVE). Diagnosed with the
+    `KENSHICOOP_INV_DUMP` trace (per-SEND/APPLY inventory dump + `[recon]` branch log) and
+    the `inv_wpnseq` single-instance scenario that drives `applyContainerContents` through
+    the exact snapshot sequence with no UI. Doctrine 26. **Weapon-SLOT fidelity:** the two
+    weapon slots (`hip` = Weapon II, `back` = Weapon I) BOTH carry `limitedSlot=ATTACH_WEAPON`,
+    so the `slot` field can't distinguish them and `equipItem` auto-routes a re-equipped weapon
+    to the default slot. Each `InvItemEntry` now carries `section` = a 16-bit hash of the equip
+    section NAME (stable cross-client), folded into `invEntryHash` (else a Weapon I<->II move
+    has an unchanged fingerprint and never publishes), and `applyContainerContents` runs a
+    SLOT-FIDELITY pass that MOVES the real worn weapon between weapon sections
+    (`removeItemDontDestroy` + target `InventorySection::addItem`) to match the author's slot.
+    Armour is untouched (unique per-slot sections). Protocol 6 -> 7. Manually validated both
+    directions (one `SLOT-MOVE` per side, zero REMOVE). Doctrine 27.
+  - **4b Cross-squad TRADE via the world (drop -> pickup)** [PLANNED] - a direct
+    cross-squad drag is a non-atomic transfer across two authorities, so the
+    snapshot/reconcile model loses items moved INTO a peer-owned container and dupes
+    items moved OUT of one (doctrine 24). Route trades through host-authoritative world
+    state instead: DROP removes from the owner's inventory + spawns a ground item;
+    PICKUP removes the ground item + adds to the picker's inventory. Each leg is
+    single-owner, so there is no race. Prereq: world/ground item sync (verify dropped
+    items have stable cross-client hands, else content-snapshot a ground cell).
 - **Phase 5 - Hardening** - interpolation buffer for real latency/jitter, event
   ack/resend, reconnect, rate limiting, anti-crash guards.
 
@@ -310,3 +384,11 @@ These extend the numbered doctrine in `POSTMORTEM.md`:
 18. **Prefer divergence-gated authority where the local AI already agrees.** Use
     the `[gate]` signal to drive only what diverges; it scales the active driven
     set down and degrades gracefully.
+19. **For runtime-created content, replicate the CONTAINER's contents, not the item
+    objects.** Items minted at runtime (craft output, loot) have host-only `hand`s
+    that don't resolve on the peer, so stream a content DESCRIPTION (template
+    `stringID` + type + qty + quality) keyed by the container's stable `hand` and let
+    the peer reconstruct locally to match. Gate the (reliable) send on a content hash
+    so the channel stays quiet; reconcile is idempotent and loss-tolerant. (Mirrors
+    doctrine 14 "replicate causes" one layer up: the container is the cause, the item
+    instances are the effect.) See `POSTMORTEM.md` doctrine 23.

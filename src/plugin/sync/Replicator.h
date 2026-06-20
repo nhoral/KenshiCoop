@@ -17,8 +17,11 @@
 #ifndef KENSHICOOP_REPLICATOR_H
 #define KENSHICOOP_REPLICATOR_H
 
+#include <deque>
 #include <map>
 #include <set>
+#include <string>
+#include <vector>
 #include "Interp.h"
 #include "../../netproto/Wire.h"
 #include "../core/Inbound.h"
@@ -26,6 +29,7 @@
 
 class GameWorld;
 class Character;
+class RootObject;
 
 namespace coop {
 
@@ -56,8 +60,19 @@ public:
     // the host stream be the sole task authority.
     void setProbeAiSuspend(bool v) { probeAiSuspend_ = v; }
 
+    // Phase 4a: register a container (by hand) this client is AUTHORITATIVE for, so
+    // publishInventories streams its contents and applyInventories never reconciles
+    // it back onto us. hand layout = [type, container, containerSerial, index, serial].
+    // v1 registers a single host-owned baked storage container; clears prior set.
+    void setOwnedContainerHand(const unsigned int hand[5]);
+    void clearOwnedContainers() { ownedContainers_.clear(); }
+
     // BEFORE engine: drain received entities into their interpolation buffers.
     void ingest(Inbound& in);
+
+    // BEFORE engine: drain received container-contents snapshots (Phase 4a) into the
+    // per-container latest-snapshot cache (marks them dirty for applyInventories).
+    void ingestInv(Inbound& in);
 
     // BEFORE engine (join side): drain reliable transition events and latch them
     // onto the matching tracked body (death = held down permanently; revive clears).
@@ -68,8 +83,50 @@ public:
     // matching reliable event on 'net'.
     void publishOwned(GameWorld* gw, NetLink& net, u32 ownerId);
 
+    // BEFORE engine: for each owned container, capture its contents and queue a
+    // reliable snapshot when the content fingerprint changed (or a periodic safety
+    // resend elapsed). No-op when no owned container is registered / resolves.
+    void publishInventories(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (host only): scan the interest sphere for free ground items, assign/
+    // reuse a netId per item (keyed by its local engine hand), and queue a reliable
+    // snapshot for new/changed items + a reliable cull for items that vanished. A settled
+    // world produces no traffic (change-detected), with a slow periodic safety resend.
+    void publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // AFTER engine (join only): drain received world-item snapshots/culls and reconcile
+    // local proxies - spawn a proxy for a new netId, move it if it changed, destroy it on
+    // cull. The host skips this (it authors the world stream).
+    void applyWorldItems(GameWorld* gw, Inbound& in);
+
+    // BEFORE engine (Phase W2/W3, runs on EVERY client): diff each OWNED character's WEAPON
+    // census. A sustained count DECREASE is a DROP (the weapon left the bag; we never mutate
+    // owned inventories ourselves) - author a reliable DROP intent at the owner position (the
+    // engine's spatial item query can't find town drops, so we don't require it). A count
+    // INCREASE is a PICKUP - author a reliable PICKUP intent. Tracks the real dropped Item*
+    // handle per sid so the conservation channel can re-home the exact object on pickup.
+    void detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // AFTER engine (Phase W2): drain received DROP intents and relocate THIS client's own
+    // copy of the weapon to the ground (Inventory::dropItem, no fabrication). Idempotent by
+    // (ownerId,dropId); never acts on a character we own (we already dropped it locally).
+    // Runs BEFORE applyInventories so the relocation beats the debounced removal reconcile.
+    // Tracks the relocated Item* so a later pickup can re-home that exact object.
+    void applyWeaponDrops(GameWorld* gw, Inbound& in);
+
+    // AFTER engine (Phase W3): drain received PICKUP intents and re-home THIS client's tracked
+    // ground copy of the weapon back into the picking character's bag (no fabrication, no
+    // spatial re-query - uses the remembered Item* handle). Idempotent by (ownerId,pickupId);
+    // never acts on a character we own (we already picked it up locally). Runs BEFORE
+    // applyInventories so the re-home beats the inventory reconcile.
+    void applyWeaponPickups(GameWorld* gw, Inbound& in);
+
     // AFTER engine: sample + apply the interpolated pose for every tracked entity.
     void applyTargets(GameWorld* gw);
+
+    // AFTER engine: reconcile each peer-owned container we received a (dirty) snapshot
+    // for to its desired contents. Skips containers we own (we author those).
+    void applyInventories(GameWorld* gw);
 
     // AFTER applyTargets (join only): make the host authoritative for world NPCs.
     // Any nearby NPC the host is NOT streaming this tick is hidden + frozen so the
@@ -164,6 +221,69 @@ private:
     // (never drive a body we own + simulate locally), defense-in-depth on the partition.
     std::set<unsigned int> ownRanks_;
     std::set<Key>          ownHands_;
+
+    // Phase 4a inventory state. ownedContainers_ = containers we author (publish, never
+    // reconcile back onto us). invPub_ = last published content fingerprint + send time
+    // per owned container (resend only on change / periodic). invRecv_ = latest received
+    // snapshot per peer-owned container, applied (reconciled) when dirty.
+    // hash      = last fingerprint actually SENT to peers.
+    // lastSendMs = when we last sent (for the periodic safety resend).
+    // pendingHash/pendingSince = the most recent captured fingerprint and when it first
+    //   appeared; a change is only SENT once it has been STABLE for INV_SETTLE_MS. This
+    //   debounce suppresses sub-second mid-drag transients (e.g. a weapon held by the
+    //   cursor briefly leaves the inventory entirely) that would otherwise tell the peer
+    //   to DESTROY a worn item it cannot refabricate (createItemAndAdd fails for weapons),
+    //   losing it permanently. Settled states (the only ones a user actually rests at)
+    //   still replicate, just ~one settle-window later.
+    // lastSentN = entry count of the last SENT snapshot. A capture with FEWER entries is a
+    //   REMOVAL (something left the inventory) and must settle far longer than an addition
+    //   or an equip<->loose MOVE (same count): mid-drag the cursor holds the item OUT of the
+    //   inventory for up to ~1 s, a transient "gone" the peer would act on by DESTROYING a
+    //   worn item it cannot refabricate. Equip/unequip-to-bag keep the count, so they still
+    //   replicate fast; only genuine removals (and the cursor flicker) wait.
+    struct InvPub { u32 hash; unsigned long lastSendMs; u32 pendingHash; unsigned long pendingSince; unsigned int lastSentN; };
+    struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; };
+    std::set<Key>          ownedContainers_;
+    std::map<Key, InvPub>  invPub_;
+    std::map<Key, InvRecv> invRecv_;
+
+    // Phase W1 world-item state.
+    // HOST: worldTrack_ maps a ground item's LOCAL engine hand (Key) to its assigned
+    //   netId + last-sent content+pos hash + last send time. nextWorldNetId_ hands out
+    //   fresh ids. Items in the map but not seen this scan have left the world -> culled.
+    // JOIN: worldProxies_ maps a host netId to the LOCAL proxy object we spawned for it,
+    //   plus the last applied pos/hash so we only re-place it on real change.
+    struct WorldTrack { u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen; };
+    struct WorldProxy { RootObject* obj; float x, y, z; u32 hash; };
+    std::map<Key, WorldTrack> worldTrack_;
+    std::map<u32, WorldProxy>  worldProxies_;
+    u32                        nextWorldNetId_;
+
+    // Phase W2 conservation-drop state.
+    // weaponCensus_: per OWNED character hand, the last-tick set of WEAPON copies it held,
+    //   keyed by "sid|type" -> {provenance + count}. A count DECREASE that coincides with a
+    //   free ground weapon near the character is a drop. seeded=false on first sight (we
+    //   record the baseline without emitting a spurious drop). nextDropId_ hands out per-
+    //   sender monotonic ids. appliedDrops_ dedupes received intents by (ownerId,dropId).
+    struct WCensusItem { char manufacturer[48]; char material[48]; u16 quality; int count; unsigned int itemType; };
+    struct WCensus {
+        std::map<std::string, WCensusItem> items;
+        std::map<std::string, int>         retries; // per-sid ground-correlation retry budget
+        std::map<std::string, std::deque<void*> > ptrs;        // current weapon Item* per sid
+        bool seeded;
+    };
+    std::map<Key, WCensus>            weaponCensus_;
+    u32                               nextDropId_;
+    std::set<std::pair<u32, u32> >    appliedDrops_;
+
+    // Phase W3 conservation-pickup state.
+    // groundedWeapons_: the REAL ground Item* handles THIS client is tracking per sid (from
+    //   its own UI drop OR from relocating a peer's drop). A received PICKUP re-homes one of
+    //   these into the picking character's bag; a local pickup (census increase) consumes one.
+    // nextPickupId_ hands out per-sender monotonic ids; appliedPickups_ dedupes received ones.
+    std::map<std::string, std::deque<void*> > groundedWeapons_;
+    u32                               nextPickupId_;
+    std::set<std::pair<u32, u32> >    appliedPickups_;
 
     // Smoothness accumulators (measured from the body's actual motion while its
     // source is moving): how often did the rendered body advance per frame?

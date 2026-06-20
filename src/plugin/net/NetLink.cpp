@@ -93,6 +93,50 @@ void NetLink::queueEvent(const EventPacket& ev) {
     LeaveCriticalSection(&outCs_);
 }
 
+void NetLink::queueInvSnapshot(u32 ownerId, const u32 cHand[5],
+                               const InvItemEntry* items, unsigned int count) {
+    OutInv oi;
+    oi.ownerId = ownerId;
+    for (int k = 0; k < 5; ++k) oi.cHand[k] = cHand[k];
+    if (count > INV_ITEMS_MAX) count = INV_ITEMS_MAX;
+    if (items && count > 0) oi.items.assign(items, items + count);
+    EnterCriticalSection(&outCs_);
+    outInv_.push_back(oi);
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count) {
+    OutWorldItems ow;
+    ow.ownerId = ownerId;
+    if (count > WORLD_ITEMS_MAX) count = WORLD_ITEMS_MAX;
+    if (items && count > 0) ow.items.assign(items, items + count);
+    EnterCriticalSection(&outCs_);
+    outWorldItems_.push_back(ow);
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueWorldRemove(u32 ownerId, const u32* netIds, unsigned int count) {
+    OutWorldRemove ow;
+    ow.ownerId = ownerId;
+    if (count > 255) count = 255; // u8 count on the wire
+    if (netIds && count > 0) ow.netIds.assign(netIds, netIds + count);
+    EnterCriticalSection(&outCs_);
+    outWorldRemove_.push_back(ow);
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueWorldDrop(const WorldDropPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outWorldDrops_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outWorldPickups_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
 void NetLink::setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct) {
     simDelayMs_  = delayMs;
     simJitterMs_ = jitterMs;
@@ -279,6 +323,73 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushEvent(evp.ownerId, evp);
                         }
+                    } else if (type == PKT_INV_SNAPSHOT) {
+                        // Reliable container-contents snapshot (Phase 4a). Like
+                        // PKT_EVENT, delivered immediately (not through the WAN-sim
+                        // delay buffer): it rides the reliable channel precisely so a
+                        // content change survives unreliable-batch loss.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(InvSnapshotHeader) && inbound_) {
+                            InvSnapshotHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(InvSnapshotHeader)
+                                          + (unsigned)hdr.count * sizeof(InvItemEntry);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(InvSnapshotHeader);
+                                u32 cHand[5] = { hdr.cType, hdr.cContainer,
+                                                 hdr.cContainerSerial, hdr.cIndex, hdr.cSerial };
+                                const InvItemEntry* items =
+                                    (hdr.count > 0) ? reinterpret_cast<const InvItemEntry*>(p) : 0;
+                                inbound_->pushInv(hdr.ownerId, cHand, items, hdr.count);
+                            }
+                        }
+                    } else if (type == PKT_WORLD_ITEM) {
+                        // Reliable world-item snapshot (Phase W1). Delivered immediately
+                        // (not through the WAN-sim delay buffer), like the inventory
+                        // snapshot - it rides the reliable channel so a ground-item
+                        // change survives unreliable-batch loss.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(WorldItemSnapshotHeader) && inbound_) {
+                            WorldItemSnapshotHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(WorldItemSnapshotHeader)
+                                          + (unsigned)hdr.count * sizeof(WorldItemEntry);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(WorldItemSnapshotHeader);
+                                const WorldItemEntry* items =
+                                    (hdr.count > 0) ? reinterpret_cast<const WorldItemEntry*>(p) : 0;
+                                inbound_->pushWorldItems(hdr.ownerId, items, hdr.count);
+                            }
+                        }
+                    } else if (type == PKT_WORLD_ITEM_REMOVE) {
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(WorldItemRemoveHeader) && inbound_) {
+                            WorldItemRemoveHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(WorldItemRemoveHeader)
+                                          + (unsigned)hdr.count * sizeof(u32);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(WorldItemRemoveHeader);
+                                const u32* netIds =
+                                    (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
+                                inbound_->pushWorldRemove(hdr.ownerId, netIds, hdr.count);
+                            }
+                        }
+                    } else if (type == PKT_WORLD_DROP) {
+                        // Reliable conservation drop intent (Phase W2). Delivered immediately
+                        // (not via the WAN-sim buffer) like the other reliable packets.
+                        WorldDropPacket wdp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wdp)
+                            && inbound_) {
+                            inbound_->pushWorldDrop(wdp.ownerId, wdp);
+                        }
+                    } else if (type == PKT_WORLD_PICKUP) {
+                        // Reliable conservation pickup intent (Phase W3), mirror of the drop.
+                        WorldPickupPacket wpp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &wpp)
+                            && inbound_) {
+                            inbound_->pushWorldPickup(wpp.ownerId, wpp);
+                        }
                     }
                     enet_packet_destroy(ev.packet);
                     break;
@@ -317,6 +428,127 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < events.size(); ++i) {
             ENetPacket* out = enet_packet_create(&events[i], sizeof(EventPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued container-contents snapshots on CH_RELIABLE. Each
+        // is [InvSnapshotHeader][InvItemEntry*count]; only enqueued on content-change,
+        // so this channel stays quiet. Reliable so the change survives WAN loss.
+        std::vector<OutInv> invs;
+        EnterCriticalSection(&outCs_);
+        invs.swap(outInv_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < invs.size(); ++i) {
+            unsigned count = (unsigned)invs[i].items.size();
+            if (count > INV_ITEMS_MAX) count = INV_ITEMS_MAX;
+            unsigned bytes = sizeof(InvSnapshotHeader) + count * sizeof(InvItemEntry);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            InvSnapshotHeader hdr;
+            hdr.type             = (u8)PKT_INV_SNAPSHOT;
+            hdr.ownerId          = invs[i].ownerId;
+            hdr.cType            = invs[i].cHand[0];
+            hdr.cContainer       = invs[i].cHand[1];
+            hdr.cContainerSerial = invs[i].cHand[2];
+            hdr.cIndex           = invs[i].cHand[3];
+            hdr.cSerial          = invs[i].cHand[4];
+            hdr.count            = (u8)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0)
+                std::memcpy(out->data + sizeof(hdr), &invs[i].items[0],
+                            count * sizeof(InvItemEntry));
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued world-item snapshots on CH_RELIABLE (Phase W1). Each
+        // is [WorldItemSnapshotHeader][WorldItemEntry*count]; only enqueued for new/
+        // changed ground items, so a settled world produces no traffic. Host-authored.
+        std::vector<OutWorldItems> wis;
+        std::vector<OutWorldRemove> wrs;
+        EnterCriticalSection(&outCs_);
+        wis.swap(outWorldItems_);
+        wrs.swap(outWorldRemove_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < wis.size(); ++i) {
+            unsigned count = (unsigned)wis[i].items.size();
+            if (count > WORLD_ITEMS_MAX) count = WORLD_ITEMS_MAX;
+            unsigned bytes = sizeof(WorldItemSnapshotHeader) + count * sizeof(WorldItemEntry);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            WorldItemSnapshotHeader hdr;
+            hdr.type    = (u8)PKT_WORLD_ITEM;
+            hdr.ownerId = wis[i].ownerId;
+            hdr.count   = (u8)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0)
+                std::memcpy(out->data + sizeof(hdr), &wis[i].items[0],
+                            count * sizeof(WorldItemEntry));
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        // Drain + send any queued world-item culls on CH_RELIABLE (Phase W1).
+        for (size_t i = 0; i < wrs.size(); ++i) {
+            unsigned count = (unsigned)wrs[i].netIds.size();
+            if (count > 255) count = 255;
+            unsigned bytes = sizeof(WorldItemRemoveHeader) + count * sizeof(u32);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            WorldItemRemoveHeader hdr;
+            hdr.type    = (u8)PKT_WORLD_ITEM_REMOVE;
+            hdr.ownerId = wrs[i].ownerId;
+            hdr.count   = (u8)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0)
+                std::memcpy(out->data + sizeof(hdr), &wrs[i].netIds[0], count * sizeof(u32));
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued conservation DROP intents on CH_RELIABLE (Phase W2). A
+        // fixed-size POD per drop, like an event; reliable so a drop is never lost.
+        std::vector<WorldDropPacket> drops;
+        EnterCriticalSection(&outCs_);
+        drops.swap(outWorldDrops_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < drops.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&drops[i], sizeof(WorldDropPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued conservation PICKUP intents on CH_RELIABLE (Phase W3).
+        std::vector<WorldPickupPacket> pickups;
+        EnterCriticalSection(&outCs_);
+        pickups.swap(outWorldPickups_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < pickups.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&pickups[i], sizeof(WorldPickupPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

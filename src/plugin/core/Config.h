@@ -47,6 +47,19 @@ struct Config {
     // driven from its stream. Default: host owns {0}, join owns {1} - one squad tab
     // each. On a single-tab save the join owns nothing (one-directional, as before).
     std::set<unsigned int> ownRanks;
+
+    // Phase 4a inventory sync (KENSHICOOP_INV_SYNC == "1"). When on, the HOST registers
+    // the baked storage container nearest the leader (else the leader's own inventory)
+    // as an owned container and streams its contents; the JOIN reconciles its local
+    // copy. Default off so unrelated tests are unaffected; auto-enabled when the
+    // 'inventory' setup scene or the 'inv_order' scenario is active.
+    bool          invSync;
+
+    // Phase W1 world-item sync (KENSHICOOP_WORLD_SYNC == "1"). When on, the HOST streams
+    // free GROUND items inside the players' interest sphere (host-authoritative, netId-
+    // keyed) and the JOIN spawns/updates/culls local proxies to match. Default off;
+    // auto-enabled for the world_item_* scenarios.
+    bool          worldSync;
 };
 
 // Read every KENSHICOOP_* var into 'out', applying host/join defaults.

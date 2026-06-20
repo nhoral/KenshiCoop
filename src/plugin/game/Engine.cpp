@@ -21,8 +21,10 @@
 #include <kenshi/Enums.h>           // itemType, MoveSpeed { RUN }
 #include <kenshi/RootObject.h>      // RootObject base (getCharactersWithinSphere out type)
 #include <kenshi/RootObjectBase.h>  // getGameData/getFaction (spawn template + owner)
-#include <kenshi/RootObjectFactory.h> // createRandomCharacter / createBuilding
-#include <kenshi/GameData.h>        // GameData::name (seat-template scan)
+#include <kenshi/RootObjectFactory.h> // createRandomCharacter / createBuilding / createItem
+#include <kenshi/GameData.h>        // GameData::name / stringID / type (template scan + inv)
+#include <kenshi/Inventory.h>       // Inventory (Phase 4a container contents)
+#include <kenshi/Item.h>            // Item / InventoryItemBase (quantity/quality/equipped)
 #include <kenshi/CharBody.h>        // CharBody::currentAction / _NV_setCurrentAction
 #include <kenshi/Tasker.h>          // Tasker::key() -> TaskType, Tasker::subject (hand)
 #include <kenshi/util/hand.h>       // hand (5-field identity, getRootObject)
@@ -30,6 +32,7 @@
 #include <ogre/OgreVector3.h>
 #include <ogre/OgreQuaternion.h>
 #include <cmath>
+#include <cstdlib> // getenv (KENSHICOOP_INV_DUMP reconcile-trace gate)
 #include <set>
 #include <utility>
 
@@ -184,10 +187,53 @@ typedef Building* (__fastcall* CreateBuildingFn)(
     int floorNumber, bool isOutsideFurniture);
 typedef void (__fastcall* GetDataOfTypeFn)(
     GameDataContainer* self, lektor<GameData*>* list, itemType type);
+// RootObjectFactory::create - the GENERIC "spawn any RootObject into the world at a
+// position" path (createBuilding/createRandomCharacter are specialized wrappers). Used
+// (Phase W1) to spawn a JOIN-side ground-item proxy from an item template at a world
+// position. Same by-value Vector3/Quaternion ABI as createBuilding (large structs go by
+// hidden reference). Returns the spawned object as RootObjectBase* (== the Item address).
+typedef RootObjectBase* (__fastcall* CreateObjFn)(
+    RootObjectFactory* self, GameData* data, Ogre::Vector3 position,
+    bool isFromActiveLevelMod, Faction* owner, Ogre::Quaternion rotation,
+    FactoryCallbackInterface* cb, RootObjectContainer* certainContainer,
+    GameSaveState* state, bool invisible, Building* homeBuilding, float age);
+// GameWorld::destroy(RootObject*, justUnloaded, debugInfo) - engine removal of a dynamic
+// object (overloaded, so resolve via an explicit member-pointer cast). justUnloaded=false
+// = true destruction. Used to CULL a join-side world-item proxy on despawn. After this
+// the pointer is DEAD.
+typedef bool (__fastcall* DestroyObjFn)(
+    GameWorld* self, RootObject* obj, bool justUnloaded, const char* debugInfo);
+// RootObjectFactory::createItem (NON-virtual; resolve via GetRealAddress like
+// createBuilding). The `const hand&` argument is passed by reference == a pointer.
+typedef Item* (__fastcall* CreateItemFn)(
+    RootObjectFactory* self, GameData* gd, const hand* handle, GameData* weaponMesh,
+    GameData* matData, int levelOverride, Faction* flagUniform);
+// Inventory::equipItem (NON-virtual) - move a loose item into its equipment slot.
+typedef bool (__fastcall* EquipItemFn)(Inventory* self, Item* item);
+// Inventory::getAllSections (NON-virtual): the canonical list of EVERY inventory
+// section. Worn gear lives in the equip SECTIONS (one per slot: each weapon, each
+// armour piece, belt, backpack, ...), NOT in the loose _allItems list. Walking all
+// sections and keeping the ones flagged isAnEquippedItemSection captures every
+// equippable slot uniformly - the old per-getter approach (getEquippedArmour/
+// getEquippedWeapons) silently missed slots such as the weapon holster.
+typedef lektor<InventorySection*>* (__fastcall* GetAllSectionsFn)(Inventory* self);
+// Inventory::getPrimaryWeapon / getSecondaryWeapon (NON-virtual): worn weapons do NOT
+// live in any getAllSections() section - the engine keeps them in these dedicated
+// accessors. We must read them explicitly to capture equipped weapons. Weapon derives
+// from Item via a single-inheritance chain (InventoryItemBase->Item->Gear->Weapon), so
+// a Weapon* is numerically an Item* and can be used wherever an Item* is expected.
+typedef Item* (__fastcall* GetWeaponFn)(Inventory* self);
 
 CreateCharFn     g_createCharFn   = 0;
 CreateBuildingFn g_createBldgFn   = 0;
+CreateObjFn      g_createObjFn    = 0; // Phase W1 world-item proxy spawn
+DestroyObjFn     g_destroyObjFn   = 0; // Phase W1 world-item proxy cull
 GetDataOfTypeFn  g_getDataOfTypeFn = 0;
+CreateItemFn     g_createItemFn   = 0;
+EquipItemFn      g_equipItemFn    = 0;
+GetAllSectionsFn g_getSectionsFn  = 0;
+GetWeaponFn      g_getPrimaryWeaponFn   = 0;
+GetWeaponFn      g_getSecondaryWeaponFn = 0;
 
 // Honest pose oracle. getPositionBip01 is non-virtual (no vtable), so it must be
 // resolved + called through a pointer (returns Ogre::Vector3 BY VALUE). isIdle /
@@ -298,8 +344,25 @@ void resolve() {
         &RootObjectFactory::createRandomCharacter);
     g_createBldgFn = (CreateBuildingFn)KenshiLib::GetRealAddress(
         &RootObjectFactory::createBuilding);
+    // Phase W1 world-item proxy spawn/cull (non-fatal: unresolved -> world-item sync off).
+    g_createObjFn = (CreateObjFn)KenshiLib::GetRealAddress(&RootObjectFactory::create);
+    g_destroyObjFn = (DestroyObjFn)KenshiLib::GetRealAddress(
+        static_cast<bool (GameWorld::*)(RootObject*, bool, const char*)>(&GameWorld::destroy));
     g_getDataOfTypeFn = (GetDataOfTypeFn)KenshiLib::GetRealAddress(
         &GameDataContainer::getDataOfType);
+    // Phase 4a inventory: createItem is overloaded, so disambiguate the 6-arg form.
+    g_createItemFn = (CreateItemFn)KenshiLib::GetRealAddress(
+        static_cast<Item* (RootObjectFactory::*)(GameData*, const hand&, GameData*,
+                                                 GameData*, int, Faction*)>(
+            &RootObjectFactory::createItem));
+    // Equipped-gear sync: equipItem is non-virtual, single overload.
+    g_equipItemFn = (EquipItemFn)KenshiLib::GetRealAddress(&Inventory::equipItem);
+    // Worn gear lives in equip sections, not _allItems: enumerate ALL sections and
+    // keep the equipped ones (covers every slot, incl. weapons + worn backpack).
+    g_getSectionsFn = (GetAllSectionsFn)KenshiLib::GetRealAddress(&Inventory::getAllSections);
+    // Worn weapons are NOT in any section: read the dedicated weapon accessors directly.
+    g_getPrimaryWeaponFn   = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getPrimaryWeapon);
+    g_getSecondaryWeaponFn = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getSecondaryWeapon);
 
     // Honest pose oracle reads (non-fatal).
     g_getBip01Fn   = (GetBip01Fn)KenshiLib::GetRealAddress(&Character::getPositionBip01);
@@ -1085,6 +1148,1541 @@ bool readObjectHand(RootObject* obj, unsigned int out[5]) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// ---- Phase 4a: container-contents (inventory) capture / reconcile ----------
+
+RootObject* resolveObjectByHand(const unsigned int cHand[5]) {
+    if (!g_handGetRootFn || !g_handCtorFn || !cHand) return 0;
+    __try {
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        // cHand layout = [type, container, containerSerial, index, serial]; the
+        // 5-arg hand ctor takes (index, serial, type, container, containerSerial).
+        g_handCtorFn(h, cHand[3], cHand[4], (itemType)cHand[0], cHand[1], cHand[2]);
+        return g_handGetRootFn(h);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+namespace {
+
+// Order-independent per-entry hash (FNV-1a over stringID, mixed with type/qty/qual).
+// Summing these across a container's entries yields a content fingerprint that is
+// invariant to item ordering, so the host only re-sends a snapshot on real change.
+// FNV-1a over a section NAME, folded to 16 bits. The section set is built identically
+// from race/inventory data on both clients, so the same name yields the same hash -
+// a stable cross-client section identity that survives the wire (where STL strings
+// cannot). 0 is reserved for "no section" (loose), so a real section that hashes to 0
+// is nudged to 1 (collision with "loose" would be worse than a 1-in-65k name clash).
+unsigned short sectionNameHash(const char* name) {
+    if (!name || !name[0]) return 0;
+    unsigned int h = 2166136261u;
+    for (const char* p = name; *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
+    unsigned short s = (unsigned short)((h ^ (h >> 16)) & 0xFFFFu);
+    return s ? s : 1;
+}
+
+unsigned int invEntryHash(const InvItemEntry& e) {
+    unsigned int h = 2166136261u;
+    for (const char* p = e.stringID; *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
+    h ^= (unsigned int)e.itemType * 2654435761u;
+    h ^= (unsigned int)e.quantity * 40503u;
+    h ^= (unsigned int)e.quality  * 2246822519u;
+    // Equipped vs loose is a DISTINCT content state: an item worn in a slot must hash
+    // differently from the same item sitting loose, so equipping/unequipping registers
+    // as a content change (triggers a resend) and the peer reconciles the slot too.
+    h ^= (unsigned int)(e.equipped ? 0x9E3779B9u : 0u);
+    h ^= (unsigned int)e.slot * 2716044179u;
+    // The SECTION must be part of the fingerprint too: the two weapon slots ('hip' vs
+    // 'back') share AttachSlot ATTACH_WEAPON, so `slot` is identical for both - without
+    // hashing the section a Weapon I<->II move produces an UNCHANGED fingerprint and is
+    // never published, so the peer never learns the slot changed.
+    h ^= (unsigned int)e.section * 2475825337u;
+    // Manufacturer + material are part of a WEAPON's identity (mesh/company + grade): two
+    // otherwise-identical base weapons with different manufacturers are visually distinct,
+    // so they must hash differently (a swap registers as a content change + resend).
+    for (const char* p = e.manufacturer; *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
+    for (const char* p = e.material;     *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
+    return h;
+}
+
+// SEH-guarded helper: copy an item's manufacturer + material GameData stringIDs into the
+// snapshot entry. WEAPONS need them to be reconstructable on the peer (createItem requires
+// the manufacturer/mesh GameData); armour/items leave them empty (the pointers are null).
+void fillItemProvenance(Item* it, InvItemEntry& e) {
+    __try {
+        GameData* man = it->manufacturerData;
+        GameData* mat = it->materialData;
+        if (man) { const char* s = man->stringID.c_str(); strncpy(e.manufacturer, s ? s : "", sizeof(e.manufacturer) - 1); }
+        if (mat) { const char* s = mat->stringID.c_str(); strncpy(e.material,     s ? s : "", sizeof(e.material) - 1); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// SEH-guarded: read a container's contents - both LOOSE items and EQUIPPED gear
+// (each tagged with its equipped flag + slot) - into out[] and, when outItems != 0,
+// the matching Item* for each entry (used by the reconcile to remove excess stacks).
+// Reads template stringID + type + stack quantity + quality bucket off each Item.
+// Returns the count written.
+unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
+                          unsigned int maxOut) {
+    if (!inv || !out || maxOut == 0) return 0;
+    unsigned int n = 0;
+    __try {
+        lektor<Item*>& all = inv->_allItems;
+        unsigned int total = all.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            Item* it = all[i];
+            if (!it) continue;
+            GameData* gd = it->getGameData();
+            if (!gd) continue;
+            memset(&out[n], 0, sizeof(InvItemEntry));
+            const char* sid = gd->stringID.c_str();
+            strncpy(out[n].stringID, sid ? sid : "", sizeof(out[n].stringID) - 1);
+            out[n].itemType = (unsigned int)gd->type;
+            int q = it->quantity; if (q < 1) q = 1;
+            out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
+            float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
+            out[n].quality = (unsigned short)(ql * 100.0f);
+            if (it->isEquipped) continue; // worn gear is appended below, from equip sections
+            out[n].equipped = 0;
+            out[n].slot     = (unsigned char)((unsigned int)it->slotType & 0xFFu);
+            out[n].section  = 0; // loose: no equip section
+            fillItemProvenance(it, out[n]); // weapon manufacturer/material (empty otherwise)
+            if (outItems) outItems[n] = it;
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    // Append EQUIPPED gear (Phase 4a equipment sync). Worn items - EVERY equippable
+    // slot: weapons, all armour pieces, belt, worn backpack, ... - live in the
+    // inventory's equip SECTIONS, not the loose _allItems list. Walk every section and
+    // capture the ones flagged isAnEquippedItemSection, tagging each item equipped=1
+    // with the section's slot. This covers all slots uniformly (the prior armour/weapon
+    // getters silently missed the weapon holster, so weapon unequips never replicated).
+    if (g_getSectionsFn) {
+        __try {
+            lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+            unsigned int ns = secs ? secs->size() : 0;
+            for (unsigned int s = 0; s < ns && n < maxOut; ++s) {
+                InventorySection* sec = (*secs)[s];
+                if (!sec || !sec->isAnEquippedItemSection) continue;
+                const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
+                unsigned int ni = (unsigned int)its.size();
+                for (unsigned int i = 0; i < ni && n < maxOut; ++i) {
+                    Item* it = its[i].item;
+                    if (!it) continue;
+                    GameData* gd = it->getGameData();
+                    if (!gd) continue;
+                    memset(&out[n], 0, sizeof(InvItemEntry));
+                    const char* sid = gd->stringID.c_str();
+                    strncpy(out[n].stringID, sid ? sid : "", sizeof(out[n].stringID) - 1);
+                    out[n].itemType = (unsigned int)gd->type;
+                    int q = it->quantity; if (q < 1) q = 1;
+                    out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
+                    float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
+                    out[n].quality = (unsigned short)(ql * 100.0f);
+                    out[n].equipped = 1;
+                    out[n].slot     = (unsigned char)((unsigned int)sec->limitedSlot & 0xFFu);
+                    // Carry the SECTION identity so the two weapon slots ('hip' vs
+                    // 'back', both ATTACH_WEAPON) replicate to the SAME slot on the peer.
+                    out[n].section  = sectionNameHash(sec->name.c_str());
+                    fillItemProvenance(it, out[n]); // weapon manufacturer/material
+                    if (outItems) outItems[n] = it;
+                    ++n;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return n;
+        }
+    }
+    // Worn WEAPONS may not live in any section: a HELD/primary weapon is tracked only by
+    // getPrimaryWeapon()/getSecondaryWeapon(). A sheathed weapon often ALSO appears in a
+    // 'hip'/'back' equip section (captured above), so dedup by (stringID, itemType) below.
+    // Capturing both pointers guarantees equipping/unequipping ANY weapon replicates -
+    // without this a re-equipped weapon (routed to the held slot, which is in no section)
+    // disappears from the snapshot and the peer never sees it come back.
+    if (g_getPrimaryWeaponFn || g_getSecondaryWeaponFn) {
+        __try {
+            Item* wpns[2];
+            wpns[0] = g_getPrimaryWeaponFn ? g_getPrimaryWeaponFn(inv) : 0;
+            wpns[1] = g_getSecondaryWeaponFn ? g_getSecondaryWeaponFn(inv) : 0;
+            for (int w = 0; w < 2 && n < maxOut; ++w) {
+                Item* it = wpns[w];
+                if (!it) continue;
+                GameData* gd = it->getGameData();
+                if (!gd) continue;
+                const char* sid = gd->stringID.c_str();
+                unsigned int wtype = (unsigned int)gd->type;
+                // Dedup by (stringID, itemType) against already-captured EQUIPPED entries:
+                // a sheathed weapon is exposed BOTH as a section item and via this pointer,
+                // and the two are distinct Item* objects, so pointer identity won't catch
+                // it. Matching on template avoids double-counting the same worn weapon.
+                bool dup = false;
+                for (unsigned int j = 0; j < n; ++j)
+                    if (out[j].equipped && out[j].itemType == wtype &&
+                        strncmp(out[j].stringID, sid ? sid : "",
+                                sizeof(out[j].stringID)) == 0) { dup = true; break; }
+                if (dup) continue;
+                memset(&out[n], 0, sizeof(InvItemEntry));
+                strncpy(out[n].stringID, sid ? sid : "", sizeof(out[n].stringID) - 1);
+                out[n].itemType = (unsigned int)gd->type;
+                int q = it->quantity; if (q < 1) q = 1;
+                out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
+                float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
+                out[n].quality = (unsigned short)(ql * 100.0f);
+                out[n].equipped = 1;
+                out[n].slot     = (unsigned char)((unsigned int)it->slotType & 0xFFu);
+                // A pointer-only weapon isn't in a getAllSections() section, so there is
+                // no section name to hash - leave 0 (the peer equips it to the default
+                // weapon slot; sheathed weapons are captured WITH a section above).
+                out[n].section  = 0;
+                fillItemProvenance(it, out[n]); // weapon manufacturer/material (required to recreate)
+                if (outItems) outItems[n] = it;
+                ++n;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return n;
+        }
+    }
+    return n;
+}
+
+// SEH-guarded: find an item template by stringID within its itemType category.
+GameData* findItemTemplateImpl(GameWorld* gw, const char* sid, unsigned int typeCat) {
+    if (!gw || !g_getDataOfTypeFn || !sid || !sid[0]) return 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, (itemType)typeCat);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && strcmp(gd->stringID.c_str(), sid) == 0) return gd;
+        }
+        static int dbg = -1;
+        if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
+        if (dbg) {
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "[tmpl] MISS sid='%s' type=%u scanned=%u sample0='%s'",
+                sid, typeCat, n, (n > 0 && g_dataScratch[0]) ? g_dataScratch[0]->stringID.c_str() : "(none)");
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return 0;
+}
+
+// SEH-guarded: create `qty` of the template (sid, typeCat) and add it to inv. The
+// join reconstructs items locally (their hands are host-only / unresolvable), so a
+// fresh blank handle is fine - the host stays authoritative for the contents. When
+// `equip` is set, the created item is moved into its equipment slot (equipItem) so
+// the reconstructed item is WORN, matching the author's equipped state.
+bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
+                      unsigned int typeCat, int qty, int qualityBucket, bool equip,
+                      const char* manufacturer = 0, const char* material = 0) {
+    if (!gw || !gw->theFactory || !g_createItemFn || !inv || !sid || qty <= 0) return false;
+    static int dbg = -1;
+    if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
+    __try {
+        GameData* tmpl = findItemTemplateImpl(gw, sid, typeCat);
+        if (!tmpl) { if (dbg) coop::logLine("[mk] tmpl-null"); return false; }
+        // A WEAPON needs its manufacturer (mesh/company) GameData or createItem returns
+        // null; resolve it (and the material spec) by the replicated stringIDs. Armour and
+        // items pass null for both (their templates instantiate directly).
+        GameData* man = (manufacturer && manufacturer[0])
+                        ? findItemTemplateImpl(gw, manufacturer, (unsigned int)WEAPON_MANUFACTURER) : 0;
+        GameData* mat = (material && material[0])
+                        ? findItemTemplateImpl(gw, material, (unsigned int)MATERIAL_SPECS_WEAPON) : 0;
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, 0, 0, (itemType)typeCat, 0, 0); // blank handle (factory owns id)
+        Item* it = g_createItemFn(gw->theFactory, tmpl, h, man, mat, -1, 0);
+        // NOTE (weapon limitation): the 6-arg factory createItem returns null for WEAPONS in
+        // this context even with the correct manufacturer+material (confirmed: 0/24 base
+        // weapon templates instantiate), while armour/items create fine. Newly-ACQUIRED
+        // weapons (loot/pickup/trade) therefore cannot yet be reconstructed on a peer; save-
+        // shared weapons still sync (they MOVE, never CREATE). Needs the engine's real
+        // weapon-spawn path (TODO) - tracked as a follow-up.
+        if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; }
+        if (qualityBucket > 0) it->quality = (float)qualityBucket / 100.0f;
+        if (!inv->tryAddItem(it, qty)) { if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] tryAddItem-fail sid='%s' type=%u equip=%d",sid,typeCat,equip?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; } // virtual
+        // Equipment is non-stackable (qty 1); move the just-added item into its slot.
+        if (equip && g_equipItemFn) g_equipItemFn(inv, it);
+        if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] OK sid='%s' type=%u equip=%d qty=%d",sid,typeCat,equip?1:0,qty); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (dbg) coop::logLine("[mk] SEH-except");
+        return false;
+    }
+}
+
+// SEH-guarded: remove up to `qty` units of (sid, typeCat, equipped) by walking the
+// captured stacks. removeItemAutoDestroy frees the stack, so items[i] is never
+// touched again. `wantEquipped` keeps loose and worn copies of the same item distinct
+// (so unequipping/dropping a worn item doesn't accidentally remove the loose one).
+int removeByKey(Inventory* inv, Item** items, InvItemEntry* meta, unsigned int n,
+                const char* sid, unsigned int typeCat, int qty, int wantEquipped) {
+    if (!inv || !items || !meta || !sid || qty <= 0) return 0;
+    int removed = 0;
+    __try {
+        for (unsigned int i = 0; i < n && removed < qty; ++i) {
+            if (!items[i]) continue;
+            if (meta[i].itemType != typeCat) continue;
+            if ((int)meta[i].equipped != wantEquipped) continue;
+            if (strcmp(meta[i].stringID, sid) != 0) continue;
+            int have = meta[i].quantity; if (have < 1) have = 1;
+            int take = qty - removed; if (take > have) take = have;
+            inv->removeItemAutoDestroy(items[i], take); // virtual; destroys the stack
+            removed += take;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return removed;
+    }
+    return removed;
+}
+
+// SEH-guarded: EQUIP an item the container ALREADY holds loose (move loose -> slot).
+// Unlike createItemAndAdd(equip=true) - which fabricates a blank-handle item that the
+// engine discards within a tick (d25) - this equips a REAL, already-resolved item, so it
+// PERSISTS. This is what makes the re-equip (up) path replicate. Returns 1 on success.
+int equipExisting(Inventory* inv, Item* it) {
+    if (!inv || !it || !g_equipItemFn) return 0;
+    __try {
+        return g_equipItemFn(inv, it) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// SEH-guarded: UNEQUIP a worn item back to loose inventory (move slot -> loose) WITHOUT
+// destroying it, so its identity/quality survive for a later re-equip. removeItemDontDestroy
+// detaches it from its equip section; then we place it into a LOOSE (non-equip) storage
+// section DIRECTLY - the inventory-level add (tryAddItem) auto-routes an equippable item
+// straight back into its slot (re-equipping the thing we just took off), so we must target
+// a loose section's own addItem to keep it off. Returns 1 on success.
+int unequipToLoose(Inventory* inv, Item* it) {
+    if (!inv || !it) return 0;
+    __try {
+        Item* taken = inv->removeItemDontDestroy_returnsItem(it, 1, false); // virtual
+        if (!taken) return 0;
+        GameData* gd = taken->getGameData();
+        if (g_getSectionsFn) {
+            lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+            unsigned int ns = secs ? secs->size() : 0;
+            for (unsigned int s = 0; s < ns; ++s) {
+                InventorySection* sec = (*secs)[s];
+                if (!sec || sec->isAnEquippedItemSection || sec->containerSlot) continue;
+                if (gd && !sec->hasRoomForItem(gd, 1)) continue;  // virtual
+                if (sec->addItem(taken, 1)) return 1;             // virtual; loose placement
+            }
+        }
+        // Fallback: generic add (may re-equip, but never leak the item).
+        return inv->tryAddItem(taken, 1) ? 1 : 0;                 // virtual
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// SEH-guarded: ensure a WORN weapon of (sid,type) sits in the weapon section whose name
+// hashes to wantSection. The two weapon slots ('hip'=Weapon II, 'back'=Weapon I) share
+// AttachSlot ATTACH_WEAPON, so equipItem auto-routes to a default slot - it cannot honour
+// the author's slot choice. This moves the REAL worn item between the two weapon sections
+// (detach + section-level addItem, the same direct placement unequipToLoose uses) so the
+// peer mirrors Weapon I vs II. No-op unless wantSection names an EXISTING weapon section,
+// the item is worn in a DIFFERENT weapon section, and the target slot doesn't already hold
+// it. Armour is never touched (its sections are unique per slot, so they never mismatch).
+// Returns 1 if it moved an item, else 0.
+int correctWeaponSlot(Inventory* inv, const char* sid, unsigned int type,
+                      unsigned short wantSection) {
+    if (!inv || !sid || !sid[0] || wantSection == 0 || !g_getSectionsFn) return 0;
+    __try {
+        lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+        unsigned int ns = secs ? secs->size() : 0;
+        InventorySection* target = 0;
+        Item* srcItem = 0;
+        for (unsigned int s = 0; s < ns; ++s) {
+            InventorySection* sec = (*secs)[s];
+            if (!sec || !sec->isAnEquippedItemSection) continue;
+            if ((unsigned int)sec->limitedSlot != (unsigned int)ATTACH_WEAPON) continue;
+            unsigned short h = sectionNameHash(sec->name.c_str());
+            const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
+            unsigned int ni = (unsigned int)its.size();
+            Item* found = 0;
+            for (unsigned int i = 0; i < ni; ++i) {
+                Item* it = its[i].item; if (!it) continue;
+                GameData* gd = it->getGameData(); if (!gd) continue;
+                if ((unsigned int)gd->type != type) continue;
+                if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
+                found = it; break;
+            }
+            if (h == wantSection) {
+                target = sec;
+                if (found) return 0;            // already in the desired slot - nothing to do
+            } else if (found && !srcItem) {
+                srcItem = found;                // worn in the OTHER weapon slot - candidate to move
+            }
+        }
+        if (!target || !srcItem) return 0;       // target slot unknown, or item not worn elsewhere
+        Item* taken = inv->removeItemDontDestroy_returnsItem(srcItem, 1, false); // virtual
+        if (!taken) return 0;
+        if (target->addItem(taken, 1)) return 1;                  // virtual: direct slot placement
+        // Targeted placement failed - re-equip generically so the weapon is never leaked.
+        if (g_equipItemFn) g_equipItemFn(inv, taken);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+} // namespace
+
+unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
+                                      InvItemEntry* out, unsigned int maxOut,
+                                      unsigned int* outHash) {
+    if (outHash) *outHash = 0;
+    if (!gw || !out || maxOut == 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    unsigned int n = readInvItems(inv, out, 0, maxOut);
+    if (outHash) {
+        unsigned int h = 0;
+        for (unsigned int i = 0; i < n; ++i) h += invEntryHash(out[i]);
+        *outHash = h; // 0 == empty container (a meaningful, distinct fingerprint)
+    }
+    return n;
+}
+
+bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
+                            const InvItemEntry* items, unsigned int count) {
+    if (!gw) return false;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return false;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return false;
+
+    // Snapshot current contents (with parallel Item* for removal).
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    Item* curItems[64];
+    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+
+    // Group desired + current by TEMPLATE (stringID,itemType), tracking the EQUIPPED vs
+    // LOOSE split separately. A change in the split while the template's TOTAL count is
+    // unchanged is an in-place MOVE (equip/unequip an existing item): we transition the
+    // REAL item rather than destroy+recreate, so (a) identity/quality survive and (b) the
+    // equip PERSISTS - fabricated blank-handle equips are discarded by the engine (d25),
+    // which is why the re-equip (up) path used to vanish. Only a genuine total-count
+    // change creates (loose) or destroys items. Counts are tiny, so O(k^2) PODs is fine
+    // (SEH-safe: engine mutation is confined to the equip/unequip/create/remove helpers).
+    struct Grp {
+        char sid[48]; unsigned int type;
+        int desiredEq, desiredLoose, curEq, curLoose; int qualEq, qualLoose;
+        char manufacturer[48]; char material[48]; // weapon provenance (needed to recreate)
+    };
+    Grp g[128];
+    unsigned int ng = 0;
+    for (unsigned int i = 0; i < count; ++i) {
+        unsigned int j = 0;
+        for (; j < ng; ++j)
+            if (g[j].type == items[i].itemType && strcmp(g[j].sid, items[i].stringID) == 0) break;
+        if (j == ng && ng < 128) {
+            memset(&g[ng], 0, sizeof(Grp));
+            strncpy(g[ng].sid, items[i].stringID, sizeof(g[ng].sid) - 1);
+            g[ng].type = items[i].itemType; j = ng; ++ng;
+        }
+        if (j < ng) {
+            int q = (items[i].quantity < 1) ? 1 : items[i].quantity;
+            if (items[i].equipped) { g[j].desiredEq += q; g[j].qualEq = items[i].quality; }
+            else                   { g[j].desiredLoose += q; g[j].qualLoose = items[i].quality; }
+            // Carry the weapon's manufacturer/material (first desired entry of the group);
+            // empty for non-weapons. Needed when the create path fabricates the item.
+            if (!g[j].manufacturer[0] && items[i].manufacturer[0])
+                strncpy(g[j].manufacturer, items[i].manufacturer, sizeof(g[j].manufacturer) - 1);
+            if (!g[j].material[0] && items[i].material[0])
+                strncpy(g[j].material, items[i].material, sizeof(g[j].material) - 1);
+        }
+    }
+    for (unsigned int i = 0; i < ncur; ++i) {
+        unsigned int j = 0;
+        for (; j < ng; ++j)
+            if (g[j].type == cur[i].itemType && strcmp(g[j].sid, cur[i].stringID) == 0) break;
+        if (j == ng && ng < 128) {
+            memset(&g[ng], 0, sizeof(Grp));
+            strncpy(g[ng].sid, cur[i].stringID, sizeof(g[ng].sid) - 1);
+            g[ng].type = cur[i].itemType; j = ng; ++ng;
+        }
+        if (j < ng) {
+            int q = (cur[i].quantity < 1) ? 1 : cur[i].quantity;
+            if (cur[i].equipped) g[j].curEq += q; else g[j].curLoose += q;
+        }
+    }
+
+    static int dbg = -1;
+    if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
+
+    bool changed = false;
+    for (unsigned int k = 0; k < ng; ++k) {
+        if (dbg) {
+            char b[200];
+            _snprintf(b, sizeof(b) - 1,
+                "[recon] grp type=%u sid='%s' desire(eq=%d,loose=%d) cur(eq=%d,loose=%d)",
+                g[k].type, g[k].sid, g[k].desiredEq, g[k].desiredLoose, g[k].curEq, g[k].curLoose);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // 1) MOVE UP: equip an existing LOOSE copy when we need more worn AND have loose
+        //    to spare. Equipping a real item persists (unlike a fabricated one).
+        int upMoves;
+        { int needEq = g[k].desiredEq - g[k].curEq, surpLoose = g[k].curLoose - g[k].desiredLoose;
+          upMoves = (needEq < surpLoose) ? needEq : surpLoose; if (upMoves < 0) upMoves = 0; }
+        for (int m = 0; m < upMoves; ++m) {
+            int f = -1;
+            for (unsigned int i = 0; i < ncur; ++i) {
+                if (!curItems[i] || cur[i].equipped || cur[i].itemType != g[k].type) continue;
+                if (strcmp(cur[i].stringID, g[k].sid) != 0) continue;
+                f = (int)i; break;
+            }
+            int ok = (f < 0) ? -1 : equipExisting(inv, curItems[f]);
+            if (dbg) { char b[96]; _snprintf(b, sizeof(b)-1, "[recon]   MOVE-UP f=%d ok=%d", f, ok); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+            if (f < 0 || !ok) break;
+            curItems[f] = 0;                 // consumed: now worn, not loose
+            g[k].curLoose--; g[k].curEq++; changed = true;
+        }
+        // 2) MOVE DOWN: unequip an existing WORN copy to loose (preserve it) when we need
+        //    more loose AND have worn to spare.
+        int downMoves;
+        { int needLoose = g[k].desiredLoose - g[k].curLoose, surpEq = g[k].curEq - g[k].desiredEq;
+          downMoves = (needLoose < surpEq) ? needLoose : surpEq; if (downMoves < 0) downMoves = 0; }
+        for (int m = 0; m < downMoves; ++m) {
+            int f = -1;
+            for (unsigned int i = 0; i < ncur; ++i) {
+                if (!curItems[i] || !cur[i].equipped || cur[i].itemType != g[k].type) continue;
+                if (strcmp(cur[i].stringID, g[k].sid) != 0) continue;
+                f = (int)i; break;
+            }
+            int ok = (f < 0) ? -1 : unequipToLoose(inv, curItems[f]);
+            if (dbg) { char b[96]; _snprintf(b, sizeof(b)-1, "[recon]   MOVE-DOWN f=%d ok=%d", f, ok); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+            if (f < 0 || !ok) break;
+            curItems[f] = 0;                 // consumed: now loose, not worn
+            g[k].curEq--; g[k].curLoose++; changed = true;
+        }
+        // 3) RESIDUAL CREATE (genuine additions). ALWAYS create LOOSE - a fabricated loose
+        //    item persists, but a fabricated-AND-equipped one is discarded within a tick by
+        //    the engine's equipment validation (d25; this is the "picked-up weapon flickers
+        //    into slot 1 then vanishes" bug). So any EQUIP shortfall for which we have no
+        //    real copy to MOVE-UP is created loose here and equipped on a LATER reconcile
+        //    tick: by then the loose copy is a real, established factory item, and MOVE-UP's
+        //    equipExisting moves it into its slot persistently (the inv_reequip path). The
+        //    freshly-created loose items are NOT in curItems[], so step-4 REMOVE-LOOSE (which
+        //    only scans captured pre-existing items) can never strip them this tick.
+        int createLoose = 0;
+        if (g[k].desiredLoose > g[k].curLoose) createLoose += g[k].desiredLoose - g[k].curLoose;
+        if (g[k].desiredEq    > g[k].curEq)    createLoose += g[k].desiredEq    - g[k].curEq;
+        if (createLoose > 0) {
+            int qb = (g[k].desiredEq > g[k].curEq) ? g[k].qualEq : g[k].qualLoose;
+            bool ok = createItemAndAdd(gw, inv, g[k].sid, g[k].type, createLoose, qb, false,
+                                       g[k].manufacturer, g[k].material);
+            if (dbg) { char b[120]; _snprintf(b, sizeof(b)-1, "[recon]   CREATE-LOOSE n=%d (loose+eqDefer) ok=%d", createLoose, ok?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+            if (ok) changed = true;
+        }
+        // 4) RESIDUAL REMOVE (genuine removals; destroy surplus). Moved items were nulled
+        //    in curItems above, so removeByKey won't touch them.
+        if (g[k].curLoose > g[k].desiredLoose) {
+            int r = removeByKey(inv, curItems, cur, ncur, g[k].sid, g[k].type,
+                            g[k].curLoose - g[k].desiredLoose, 0);
+            if (dbg) { char b[96]; _snprintf(b, sizeof(b)-1, "[recon]   REMOVE-LOOSE n=%d got=%d", g[k].curLoose-g[k].desiredLoose, r); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+            if (r > 0) changed = true;
+        }
+        if (g[k].curEq > g[k].desiredEq) {
+            int r = removeByKey(inv, curItems, cur, ncur, g[k].sid, g[k].type,
+                            g[k].curEq - g[k].desiredEq, 1);
+            if (dbg) { char b[96]; _snprintf(b, sizeof(b)-1, "[recon]   REMOVE-EQ n=%d got=%d", g[k].curEq-g[k].desiredEq, r); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+            if (r > 0) changed = true;
+        }
+    }
+    // SLOT-FIDELITY pass (weapons). The count reconcile above equips the right NUMBER of
+    // each weapon, but equipItem auto-routes to a default weapon slot, so a weapon the
+    // author wears in Weapon I ('back') can land in Weapon II ('hip') on the peer. Both
+    // weapon sections share AttachSlot ATTACH_WEAPON (identical `slot`), so we steer by the
+    // replicated SECTION hash and move each worn weapon into the slot the author chose.
+    for (unsigned int i = 0; i < count; ++i) {
+        if (!items[i].equipped || items[i].section == 0) continue;
+        if (correctWeaponSlot(inv, items[i].stringID, items[i].itemType, items[i].section)) {
+            changed = true;
+            if (dbg) { char b[160]; _snprintf(b, sizeof(b)-1,
+                "[recon]   SLOT-MOVE sid='%s' -> section=%u", items[i].stringID, items[i].section);
+                b[sizeof(b)-1]='\0'; coop::logLine(b); }
+        }
+    }
+    return changed;
+}
+
+namespace {
+// Find a "common", general-inventory-friendly item template (stackable trade goods /
+// food the player squad's backpack always accepts). Falls back to the first ITEM
+// template. Caller holds SEH. Returns the template + writes its itemType category.
+GameData* findCommonItemTemplate(GameWorld* gw, unsigned int* outType) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    const char* prefs[] = {
+        "iron plate", "copper", "building materials", "raw meat", "dustwich",
+        "foodcube", "ration", "rock", "cotton", "fabric"
+    };
+    const unsigned int np = sizeof(prefs) / sizeof(prefs[0]);
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, ITEM);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int k = 0; k < np; ++k)
+            for (unsigned int i = 0; i < n; ++i) {
+                GameData* gd = g_dataScratch[i];
+                if (gd && ciContains(gd->name.c_str(), prefs[k])) {
+                    if (outType) *outType = (unsigned int)ITEM;
+                    return gd;
+                }
+            }
+        for (unsigned int i = 0; i < n; ++i)
+            if (g_dataScratch[i]) { if (outType) *outType = (unsigned int)ITEM; return g_dataScratch[i]; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return 0;
+}
+} // namespace
+
+bool pickInventoryContainer(GameWorld* gw, unsigned int out[5]) {
+    if (out) { for (int i = 0; i < 5; ++i) out[i] = 0; }
+    if (!gw || !gw->player) return false;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return false;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return false;
+        // v1 anchor: the leader's own inventory - a container that EXISTS in every save
+        // (stable character hand, resolves cross-client) and accepts arbitrary items
+        // (unlike resource-limited storage buildings). Both setup + resolve agree on it.
+        return readObjectHand(static_cast<RootObject*>(ld), out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+int addTestItemsToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
+                            char* outStringID, unsigned int outLen) {
+    if (outStringID && outLen) outStringID[0] = '\0';
+    if (!gw || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    unsigned int typeCat = 0;
+    GameData* gd = findCommonItemTemplate(gw, &typeCat);
+    if (!gd) return 0;
+    char sid[48]; sid[0] = '\0';
+    __try {
+        const char* s = gd->stringID.c_str();
+        strncpy(sid, s ? s : "", sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0';
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    if (!sid[0]) return 0;
+    if (outStringID && outLen) { strncpy(outStringID, sid, outLen - 1); outStringID[outLen - 1] = '\0'; }
+    // createItemAndAdd is SEH-guarded; it re-resolves the template by stringID+type.
+    bool ok = createItemAndAdd(gw, inv, sid, typeCat, qty, 0, /*equip=*/false);
+    return ok ? qty : 0;
+}
+
+int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int qty) {
+    if (!gw || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    unsigned int typeCat = 0;
+    GameData* gd = findCommonItemTemplate(gw, &typeCat);
+    if (!gd) return 0;
+    char sid[48]; sid[0] = '\0';
+    __try {
+        const char* s = gd->stringID.c_str();
+        strncpy(sid, s ? s : "", sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0';
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    if (!sid[0]) return 0;
+    // Snapshot current contents (with parallel Item* for removal), then remove by key.
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    Item* curItems[64];
+    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+    return removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty, /*wantEquipped=*/0);
+}
+
+// SEH-guarded DIAGNOSTIC: log the full inventory of the object at cHand - every loose
+// _allItems entry and every section (name/slot/equipFlag/containerFlag) with its items
+// (type/eqFlag/sid). Lets us see exactly where a worn WEAPON lives: a section flagged
+// isAnEquippedItemSection (the snapshot captures it) vs. a dedicated weapon pointer the
+// section walk misses (type 0 = WEAPON, 1 = ARMOUR, 2 = ITEM).
+void dumpInventory(GameWorld* gw, const unsigned int cHand[5]) {
+    if (!gw) return;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return;
+    __try {
+        lektor<Item*>& all = inv->_allItems;
+        unsigned int na = all.size();
+        char h[120]; _snprintf(h, sizeof(h) - 1, "DUMP _allItems n=%u", na); h[sizeof(h) - 1] = '\0';
+        coop::logLine(h);
+        for (unsigned int i = 0; i < na; ++i) {
+            Item* it = all[i]; if (!it) continue;
+            GameData* gd = it->getGameData(); if (!gd) continue;
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "DUMP   loose type=%u eq=%d slot=%u sid='%s'",
+                      (unsigned int)gd->type, it->isEquipped ? 1 : 0,
+                      (unsigned int)it->slotType, gd->stringID.c_str());
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __try {
+        Item* pw = g_getPrimaryWeaponFn ? g_getPrimaryWeaponFn(inv) : 0;
+        Item* sw = g_getSecondaryWeaponFn ? g_getSecondaryWeaponFn(inv) : 0;
+        GameData* pgd = pw ? pw->getGameData() : 0;
+        GameData* sgd = sw ? sw->getGameData() : 0;
+        char b[220];
+        _snprintf(b, sizeof(b) - 1, "DUMP weapons primary=%s sid='%s' secondary=%s sid='%s'",
+                  pw ? "Y" : "n", pgd ? pgd->stringID.c_str() : "",
+                  sw ? "Y" : "n", sgd ? sgd->stringID.c_str() : "");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (!g_getSectionsFn) return;
+    __try {
+        lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+        unsigned int ns = secs ? secs->size() : 0;
+        char h[120]; _snprintf(h, sizeof(h) - 1, "DUMP sections n=%u", ns); h[sizeof(h) - 1] = '\0';
+        coop::logLine(h);
+        for (unsigned int s = 0; s < ns; ++s) {
+            InventorySection* sec = (*secs)[s]; if (!sec) continue;
+            const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
+            unsigned int ni = (unsigned int)its.size();
+            char b[220];
+            _snprintf(b, sizeof(b) - 1, "DUMP sec='%s' slot=%u equip=%d ctnr=%d items=%u",
+                      sec->name.c_str(), (unsigned int)sec->limitedSlot,
+                      sec->isAnEquippedItemSection ? 1 : 0, sec->containerSlot ? 1 : 0, ni);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            for (unsigned int i = 0; i < ni; ++i) {
+                Item* it = its[i].item; if (!it) continue;
+                GameData* gd = it->getGameData(); if (!gd) continue;
+                char c[200];
+                _snprintf(c, sizeof(c) - 1, "DUMP     type=%u eq=%d sid='%s'",
+                          (unsigned int)gd->type, it->isEquipped ? 1 : 0, gd->stringID.c_str());
+                c[sizeof(c) - 1] = '\0'; coop::logLine(c);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// ---- Phase W0: world-item (ground drop) diagnostic hooks -------------------
+// These let a scenario drive a DROP and enumerate nearby world items WITHOUT any UI,
+// so we can characterize exactly what a Kenshi drop produces (object kind/itemType,
+// position, whether getObjectsWithinSphere enumerates it, hand value) before designing
+// the world-item replication channel. Mirrors addTestItemsToContainer / dumpInventory.
+
+// SEH-guarded: drop `qty` of the LOOSE (sid,type) the object at cHand holds onto the
+// ground. Finds the matching loose Item* and calls Inventory::dropItem (virtual), which
+// removes it from the bag and places it as a world object. Returns the number dropped.
+int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
+                          const char* sid, unsigned int typeCat, int qty,
+                          void** outLastDropped) {
+    if (outLastDropped) *outLastDropped = 0;
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    int dropped = 0;
+    __try {
+        // Re-snapshot each iteration: dropItem mutates _allItems, so a cached Item*
+        // could dangle. Find the first LOOSE entry matching (sid,type) and drop it.
+        for (int d = 0; d < qty; ++d) {
+            const unsigned int MAXC = 64;
+            InvItemEntry cur[64];
+            Item* curItems[64];
+            unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+            Item* victim = 0;
+            for (unsigned int i = 0; i < ncur; ++i) {
+                if (cur[i].equipped) continue;                 // loose only
+                if (cur[i].itemType != typeCat) continue;
+                if (strcmp(cur[i].stringID, sid) != 0) continue;
+                victim = curItems[i]; break;
+            }
+            if (!victim) break;
+            inv->dropItem(victim);                             // virtual: bag -> ground
+            if (outLastDropped) *outLastDropped = victim;      // the now-grounded object
+            ++dropped;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return dropped;
+}
+
+namespace {
+// Enumerate world objects of `type` within `radius` of `center` and log one line per
+// object (itemType / sid / hand / pos). Returns the count enumerated. Caller holds SEH.
+unsigned int dumpWorldItemsOfType(GameWorld* gw, const Ogre::Vector3& center,
+                                  float radius, itemType type, const char* label) {
+    if (!g_getObjsFn) return 0;
+    g_npcQuery.clear();
+    g_getObjsFn(gw, &g_npcQuery, &center, radius, type, 256, 0);
+    unsigned int n = g_npcQuery.size();
+    char h[120];
+    _snprintf(h, sizeof(h) - 1, "WORLDITEM scan type=%s(%d) n=%u r=%.1f",
+              label, (int)type, n, radius);
+    h[sizeof(h) - 1] = '\0'; coop::logLine(h);
+    for (unsigned int i = 0; i < n; ++i) {
+        RootObject* o = g_npcQuery[i]; if (!o) continue;
+        unsigned int hd[5] = {0,0,0,0,0};
+        readObjectHand(o, hd);
+        Ogre::Vector3 p(0,0,0);
+        __try { p = o->getPosition(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        GameData* gd = 0;
+        __try { gd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
+        char b[260];
+        _snprintf(b, sizeof(b) - 1,
+            "WORLDITEM   %s sid='%s' gdtype=%u hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f",
+            label, gd ? gd->stringID.c_str() : "(no gd)",
+            gd ? (unsigned int)gd->type : 0u,
+            hd[0], hd[1], hd[2], hd[3], hd[4], p.x, p.y, p.z);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    return n;
+}
+} // namespace
+
+// SEH-guarded DIAGNOSTIC: enumerate WEAPON/ARMOUR/ITEM/CONTAINER world objects near the
+// local leader and log each (so we can see what a dropped item became and whether the
+// interest query enumerates it). The log IS the deliverable for the W0 drop_probe.
+void dumpWorldItems(GameWorld* gw) {
+    if (!gw || !gw->player) return;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return;
+        Ogre::Vector3 center = ld->getPosition();
+        const float r = 30.0f;
+        dumpWorldItemsOfType(gw, center, r, WEAPON,    "WEAPON");
+        dumpWorldItemsOfType(gw, center, r, ARMOUR,    "ARMOUR");
+        dumpWorldItemsOfType(gw, center, r, ITEM,      "ITEM");
+        dumpWorldItemsOfType(gw, center, r, CONTAINER, "CONTAINER");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// SEH-guarded: count loose world items (WEAPON+ARMOUR+ITEM) within `radius` of the
+// leader. Oracle cross-check that a drop actually produced an enumerable ground item.
+int countWorldItemsNear(GameWorld* gw, float radius) {
+    if (!gw || !gw->player || !g_getObjsFn) return 0;
+    int total = 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return 0;
+        Ogre::Vector3 center = ld->getPosition();
+        const itemType kinds[] = { WEAPON, ARMOUR, ITEM };
+        for (int k = 0; k < 3; ++k) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &center, radius, kinds[k], 256, 0);
+            total += (int)g_npcQuery.size();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return total; }
+    return total;
+}
+
+// ---- Phase W1: world-item (ground drop) replication ------------------------
+namespace {
+// CONTENT fingerprint of one world item: stringID + type + qty + quality. Position is
+// DELIBERATELY excluded - the join may re-ground a spawned proxy's Y slightly, so a
+// pos-inclusive hash would never match host vs join. The caller tracks position
+// separately (the WorldItemEntry carries x/y/z; the oracle matches pos within tolerance).
+unsigned int worldItemHash(const char* sid, unsigned int type, unsigned short qty,
+                           unsigned short quality) {
+    unsigned int h = 2166136261u;
+    if (sid) for (const char* p = sid; *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
+    h ^= (unsigned int)type    * 2654435761u;
+    h ^= (unsigned int)qty     * 40503u;
+    h ^= (unsigned int)quality * 2246822519u;
+    return h ? h : 1u;
+}
+} // namespace
+
+unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int maxOut,
+                               float radius) {
+    if (!gw || !gw->player || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return 0;
+        Ogre::Vector3 center = ld->getPosition();
+        // A dropped item enumerates under multiple category queries (W0 finding), so
+        // scan WEAPON/ARMOUR/ITEM and DEDUPE by hand (index+serial) to avoid triples.
+        const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
+        for (int k = 0; k < 3 && n < maxOut; ++k) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &center, radius, kinds[k], 256, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* o = g_npcQuery[i]; if (!o) continue;
+                unsigned int hd[5] = {0,0,0,0,0};
+                if (!readObjectHand(o, hd)) continue;
+                // Dedupe by (index, serial) against what we've already collected.
+                bool dup = false;
+                for (unsigned int j = 0; j < n; ++j)
+                    if (out[j].hand[3] == hd[3] && out[j].hand[4] == hd[4]) { dup = true; break; }
+                if (dup) continue;
+                GameData* gd = 0;
+                __try { gd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
+                if (!gd) continue;
+                Ogre::Vector3 p(0,0,0);
+                __try { p = o->getPosition(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                Item* it = reinterpret_cast<Item*>(o);
+                int qty = 1; float ql = 0.0f;
+                __try { qty = it->quantity; ql = it->quality; } __except (EXCEPTION_EXECUTE_HANDLER) { qty = 1; ql = 0.0f; }
+                if (qty < 1) qty = 1;
+                WorldItemRaw& w = out[n];
+                for (int t = 0; t < 5; ++t) w.hand[t] = hd[t];
+                strncpy(w.stringID, gd->stringID.c_str(), sizeof(w.stringID) - 1);
+                w.stringID[sizeof(w.stringID) - 1] = '\0';
+                w.itemType = (unsigned int)gd->type;
+                w.quantity = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);
+                w.quality  = (unsigned short)(ql > 0.0f ? (int)(ql * 100.0f) : 0);
+                w.x = p.x; w.y = p.y; w.z = p.z;
+                w.hash = worldItemHash(w.stringID, w.itemType, w.quantity, w.quality);
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
+RootObject* spawnWorldItemProxy(GameWorld* gw, const char* sid, unsigned int typeCat,
+                                int qty, float x, float y, float z) {
+    if (!gw || !gw->theFactory || !g_createObjFn || !sid || !sid[0]) return 0;
+    __try {
+        GameData* tmpl = findItemTemplateImpl(gw, sid, typeCat);
+        if (!tmpl) return 0;
+        Ogre::Vector3 pos(x, y, z);
+        Ogre::Quaternion rot = Ogre::Quaternion::IDENTITY;
+        // owner=0 (unowned ground item), invisible=false (must render), no home building.
+        RootObjectBase* ro = g_createObjFn(gw->theFactory, tmpl, pos, /*fromMod*/false,
+                                           /*owner*/0, rot, /*cb*/0, /*container*/0,
+                                           /*state*/0, /*invisible*/false, /*home*/0,
+                                           /*age*/0.0f);
+        if (!ro) return 0;
+        // RootObjectBase is the topmost base (offset 0), so this is an address no-op
+        // (same pattern as createBuilding -> RootObject*).
+        RootObject* obj = reinterpret_cast<RootObject*>(ro);
+        // Stacks: the factory mints a single unit; set the visible stack quantity.
+        if (qty > 1) { __try { reinterpret_cast<Item*>(obj)->quantity = qty; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        return obj;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+void updateWorldItemProxy(RootObject* proxy, float x, float y, float z) {
+    if (!proxy) return;
+    __try {
+        Ogre::Vector3 pos(x, y, z);
+        Ogre::Quaternion rot = Ogre::Quaternion::IDENTITY;
+        // setPositionRotation is virtual on Item; the proxy IS an Item.
+        reinterpret_cast<Item*>(proxy)->setPositionRotation(pos, rot, /*fixedPosition*/true);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+bool removeWorldItemProxy(GameWorld* gw, RootObject* proxy) {
+    if (!gw || !proxy || !g_destroyObjFn) return false;
+    __try {
+        return g_destroyObjFn(gw, proxy, /*justUnloaded*/false, "coop-worlditem-cull");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+int destroyWorldItemsNear(GameWorld* gw, float radius) {
+    if (!gw || !gw->player || !g_getObjsFn || !g_destroyObjFn) return 0;
+    int destroyed = 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return 0;
+        Ogre::Vector3 center = ld->getPosition();
+        // Collect distinct ground items first (the query enumerates one object under
+        // multiple category filters), THEN destroy - destroying mutates the world, so we
+        // must not destroy mid-enumeration of the shared scratch buffer.
+        RootObject* victims[64]; unsigned int nv = 0;
+        const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
+        for (int k = 0; k < 3 && nv < 64; ++k) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &center, radius, kinds[k], 256, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && nv < 64; ++i) {
+                RootObject* o = g_npcQuery[i]; if (!o) continue;
+                bool dup = false;
+                for (unsigned int j = 0; j < nv; ++j) if (victims[j] == o) { dup = true; break; }
+                if (!dup) victims[nv++] = o;
+            }
+        }
+        for (unsigned int i = 0; i < nv; ++i) {
+            if (g_destroyObjFn(gw, victims[i], /*justUnloaded*/false, "coop-worlditem-test-despawn"))
+                ++destroyed;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return destroyed; }
+    return destroyed;
+}
+
+// SEH-guarded DIAGNOSTIC: dump every nearby item (across ITEM/WEAPON/ARMOUR queries) so we
+// can see what the engine actually reports for a UI-dropped weapon - its gd->type, its
+// isInInventory flag, and distance. Used once when a drop-decrease can't be correlated to a
+// ground copy, to learn WHY (not enumerated at all? enumerated but flagged in-inventory?).
+void diagGroundScan(GameWorld* gw, const unsigned int cHand[5], const char* sid, float radius) {
+    if (!gw || !g_getObjsFn) return;
+    RootObject* ro = resolveObjectByHand(cHand);
+    __try {
+        // Resolve both candidate query centers: the OWNED character (what the detector uses)
+        // and the player leader (what the working W1 captureWorldItems uses). Log both so we
+        // can tell whether the owned-hand position is the problem.
+        Ogre::Vector3 cpos(0,0,0); bool haveC = false;
+        if (ro) { cpos = ro->getPosition(); haveC = true; }
+        Ogre::Vector3 lpos(0,0,0); bool haveL = false;
+        if (gw->player && gw->player->playerCharacters.size() > 0 && gw->player->playerCharacters[0]) {
+            lpos = gw->player->playerCharacters[0]->getPosition(); haveL = true;
+        }
+        float dCL = (haveC && haveL)
+            ? (float)sqrt((cpos.x-lpos.x)*(cpos.x-lpos.x) + (cpos.y-lpos.y)*(cpos.y-lpos.y) + (cpos.z-lpos.z)*(cpos.z-lpos.z))
+            : -1.0f;
+        char hb[220]; _snprintf(hb, sizeof(hb) - 1,
+            "[wd] scan ownedPos=%.1f,%.1f,%.1f leaderPos=%.1f,%.1f,%.1f apart=%.1f wideR=%.0f",
+            cpos.x, cpos.y, cpos.z, lpos.x, lpos.y, lpos.z, dCL, radius * 4.0f);
+        hb[sizeof(hb) - 1] = '\0'; coop::logLine(hb);
+        // Scan a WIDE radius around the LEADER (the center that works for W1) so a far/cursor
+        // drop is still caught. Log every candidate with its distance from BOTH centers.
+        Ogre::Vector3 center = haveL ? lpos : cpos;
+        float wideR = radius * 4.0f;
+        const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
+        const char* knm[] = { "ITEM", "WEAPON", "ARMOUR" };
+        int logged = 0;
+        for (int k = 0; k < 3; ++k) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &center, wideR, kinds[k], 256, 0);
+            unsigned int n = g_npcQuery.size();
+            char qb[120]; _snprintf(qb, sizeof(qb) - 1, "[wd] scan query=%s found=%u (leader-centered, R=%.0f)", knm[k], n, wideR);
+            qb[sizeof(qb) - 1] = '\0'; coop::logLine(qb);
+            for (unsigned int i = 0; i < n && logged < 30; ++i) {
+                RootObject* o = g_npcQuery[i]; if (!o) continue;
+                Item* it = reinterpret_cast<Item*>(o);
+                GameData* gd = 0; __try { gd = it->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
+                if (!gd) continue;
+                int inInv = 0; __try { inInv = it->isInInventory ? 1 : 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                Ogre::Vector3 p(0,0,0); __try { p = it->getPosition(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                float dL = (float)sqrt((p.x-lpos.x)*(p.x-lpos.x)+(p.y-lpos.y)*(p.y-lpos.y)+(p.z-lpos.z)*(p.z-lpos.z));
+                float dC = (float)sqrt((p.x-cpos.x)*(p.x-cpos.x)+(p.y-cpos.y)*(p.y-cpos.y)+(p.z-cpos.z)*(p.z-cpos.z));
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "[wd]   cand sid='%s' type=%u inInv=%d dLeader=%.1f dOwned=%.1f%s",
+                    gd->stringID.c_str(), (unsigned)gd->type, inInv, dL, dC,
+                    (sid && sid[0] && strcmp(gd->stringID.c_str(), sid) == 0) ? " <== MATCH" : "");
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                ++logged;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// SEH-guarded: count FREE ground items (isInInventory==false) of (sid,type) within radius
+// of the object at cHand. "Free" excludes the character's own worn/held copies, which the
+// interest query also enumerates - so this isolates the item actually lying on the ground.
+int countFreeGroundItemsNear(GameWorld* gw, const unsigned int cHand[5],
+                             const char* sid, unsigned int typeCat, float radius) {
+    if (!gw || !sid || !sid[0] || !g_getObjsFn) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    int count = 0;
+    __try {
+        Ogre::Vector3 center = ro->getPosition();
+        // A dropped item enumerates under multiple category queries (W0 finding) - a
+        // UI-dropped weapon often shows up only under ITEM, not WEAPON. Scan all three
+        // and DEDUPE by object pointer so the same ground item isn't counted twice.
+        const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
+        RootObject* seen[64]; unsigned int ns = 0;
+        for (int k = 0; k < 3; ++k) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &center, radius, kinds[k], 256, 0);
+            unsigned int n = g_npcQuery.size();
+            for (unsigned int i = 0; i < n; ++i) {
+                RootObject* o = g_npcQuery[i]; if (!o) continue;
+                Item* it = reinterpret_cast<Item*>(o);   // WEAPON/ARMOUR/ITEM objects are Items
+                GameData* gd = it->getGameData(); if (!gd) continue;
+                if ((unsigned int)gd->type != typeCat) continue;
+                if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
+                if (it->isInInventory) continue;          // skip the char's own worn/held copies
+                bool dup = false;
+                for (unsigned int j = 0; j < ns; ++j) if (seen[j] == o) { dup = true; break; }
+                if (dup) continue;
+                if (ns < 64) seen[ns++] = o;
+                ++count;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return count;
+}
+
+// SEH-guarded SPIKE: pick up a FREE ground item of (sid,type) near cHand by RELOCATING the
+// REAL object into the character's inventory (tryAddItem) - NO createItem. This is the
+// conservation primitive that makes weapons work where fabrication fails: the dropped
+// weapon already exists as a real object, so we just re-home it. Returns 1 on success.
+int pickupWorldItemIntoInventory(GameWorld* gw, const unsigned int cHand[5],
+                                 const char* sid, unsigned int typeCat, float radius) {
+    if (!gw || !sid || !sid[0] || !g_getObjsFn) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    int picked = 0;
+    __try {
+        Ogre::Vector3 center = ro->getPosition();
+        // Scan all categories (a dropped weapon often enumerates under ITEM, not WEAPON).
+        const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
+        for (int k = 0; k < 3 && !picked; ++k) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &center, radius, kinds[k], 256, 0);
+            unsigned int n = g_npcQuery.size();
+            for (unsigned int i = 0; i < n; ++i) {
+                RootObject* o = g_npcQuery[i]; if (!o) continue;
+                Item* it = reinterpret_cast<Item*>(o);
+                GameData* gd = it->getGameData(); if (!gd) continue;
+                if ((unsigned int)gd->type != typeCat) continue;
+                if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
+                if (it->isInInventory) continue;          // only a free ground item
+                if (inv->tryAddItem(it, 1)) { picked = 1; break; } // relocate real object: bag <- ground
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return picked;
+}
+
+// SEH-guarded: position of the FIRST free ground item of (sid,type) within radius of cHand.
+// Fills out[3] and returns 1 if found, else 0. The drop detector uses this to put the
+// dropped weapon's world position on the wire so the peer mirrors it.
+int firstFreeGroundItemPos(GameWorld* gw, const unsigned int cHand[5],
+                           const char* sid, unsigned int typeCat, float radius, float out[3]) {
+    if (!gw || !sid || !sid[0] || !g_getObjsFn || !out) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    int found = 0;
+    __try {
+        Ogre::Vector3 center = ro->getPosition();
+        // A UI-dropped weapon often enumerates only under the ITEM category, not WEAPON
+        // (W0 finding) - scan all three and filter by gd->type so we still locate it.
+        const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
+        for (int k = 0; k < 3 && !found; ++k) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &center, radius, kinds[k], 256, 0);
+            unsigned int n = g_npcQuery.size();
+            for (unsigned int i = 0; i < n; ++i) {
+                RootObject* o = g_npcQuery[i]; if (!o) continue;
+                Item* it = reinterpret_cast<Item*>(o);
+                GameData* gd = it->getGameData(); if (!gd) continue;
+                if ((unsigned int)gd->type != typeCat) continue;
+                if (strcmp(gd->stringID.c_str(), sid) != 0) continue;
+                if (it->isInInventory) continue;
+                Ogre::Vector3 p = it->getPosition();
+                out[0] = p.x; out[1] = p.y; out[2] = p.z; found = 1; break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return found;
+}
+
+// SEH-guarded: world position of the object at hand. Fills out[3], returns 1 on success.
+// The drop detector uses this as the drop position when the engine's spatial item query
+// can't locate the dropped weapon on the ground (e.g. in towns) - the weapon was dropped at
+// the owner's feet anyway, so the owner's position is a faithful mirror target.
+int objectWorldPos(const unsigned int hand[5], float out[3]) {
+    if (!out) return 0;
+    RootObject* ro = resolveObjectByHand(hand);
+    if (!ro) return 0;
+    int ok = 0;
+    __try {
+        Ogre::Vector3 p = ro->getPosition();
+        out[0] = p.x; out[1] = p.y; out[2] = p.z; ok = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    return ok;
+}
+
+// SEH-guarded (Phase W3): world position of a tracked Item* (as void*). The drop detector
+// reads this off the REAL just-dropped object to author the exact cursor-drop location -
+// far more accurate than the owner's feet, and it never relies on the (town-unreliable)
+// spatial query. Fills out[3], returns 1 on success.
+int itemWorldPos(void* item, float out[3]) {
+    if (!out || !item) return 0;
+    int ok = 0;
+    __try {
+        Ogre::Vector3 p = reinterpret_cast<RootObject*>(item)->getPosition();
+        out[0] = p.x; out[1] = p.y; out[2] = p.z; ok = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    return ok;
+}
+
+// SEH-guarded CONSERVATION primitive (Phase W2): relocate the owner's OWN copy of a weapon
+// from its bag to the GROUND at (x,y,z) - the mirror of a drop performed on another client.
+// Never fabricates: it finds the real item the peer already owns (shared save) and moves it
+// (Inventory::dropItem). If only an EQUIPPED copy exists, it is unequipped to loose first
+// (dropItem acts on loose items). Returns the number relocated (0 if the peer had no copy).
+int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
+                           const char* sid, unsigned int typeCat,
+                           float x, float y, float z, void** outDropped) {
+    if (outDropped) *outDropped = 0;
+    if (!gw || !sid || !sid[0]) return 0;
+    RootObject* ro = resolveObjectByHand(ownerHand);
+    if (!ro) return 0;
+    // 1) Move a real copy to the ground. Try a loose copy first; if none, unequip a worn
+    //    one to loose and drop that. dropItemFromInventory drops loose items only. Capture
+    //    the dropped Item* so the conservation channel can re-home this exact object later
+    //    (the spatial query can't re-find it in towns).
+    void* droppedItem = 0;
+    int dropped = dropItemFromInventory(gw, ownerHand, sid, typeCat, 1, &droppedItem);
+    if (dropped == 0) {
+        int un = unequipItemToLoose(gw, ownerHand, sid, typeCat, 1);
+        if (un > 0) dropped = dropItemFromInventory(gw, ownerHand, sid, typeCat, 1, &droppedItem);
+    }
+    if (dropped == 0) return 0;
+    if (outDropped) *outDropped = droppedItem;
+    // 2) Reposition the just-dropped object to the mirrored world position so it lands in the
+    //    same spot the dropping client placed it. We move the EXACT dropped Item* by handle
+    //    (no spatial query - that fails in towns and would leave the item at the owner's feet).
+    __try {
+        if (droppedItem) {
+            Ogre::Vector3 pos(x, y, z);
+            Ogre::Quaternion rot = Ogre::Quaternion::IDENTITY;
+            reinterpret_cast<Item*>(droppedItem)->setPositionRotation(pos, rot, /*fixedPosition*/true);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return dropped;
+}
+
+// SEH-guarded (Phase W3): capture the WEAPON items the object at cHand currently holds, with
+// their REAL Item* handles. The drop detector remembers these per tick so that when a weapon
+// leaves the bag (drop), the prior tick's handle IS the now-grounded object - trackable for a
+// later pickup without re-querying the world (the spatial query fails in towns). Fills
+// sids[i] (NUL-terminated, <48) and items[i] (Item* as void*); returns the count.
+unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
+                               char (*sids)[48], void** items, unsigned int maxOut) {
+    if (!gw || !sids || !items || maxOut == 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry ent[64];
+    Item* its[64];
+    unsigned int ncur = readInvItems(inv, ent, its, MAXC);
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < ncur && n < maxOut; ++i) {
+        // Gear only (itemType 2 = WEAPON, 3 = ARMOUR/clothing): the conservation channel tracks
+        // these by real Item* handle. Stackable items stay on the W1 proxy stream.
+        if (ent[i].itemType != 2u && ent[i].itemType != 3u) continue;
+        strncpy(sids[n], ent[i].stringID, 47); sids[n][47] = '\0';
+        items[n] = its[i];
+        ++n;
+    }
+    return n;
+}
+
+// SEH-guarded (Phase W3): re-home a tracked ground Item* back into the inventory of the
+// object at targetHand (Inventory::tryAddItem of the EXISTING object - no fabrication). This
+// is the pickup mirror of relocateWeaponToGround. Returns 1 on success. The caller guarantees
+// `item` is a real, still-live object it dropped earlier (conservation); SEH guards a stale
+// handle from crashing, but a destroyed object should never be passed.
+int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void* item) {
+    if (!gw || !item) return 0;
+    RootObject* ro = resolveObjectByHand(targetHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    int ok = 0;
+    __try {
+        ok = inv->tryAddItem(reinterpret_cast<Item*>(item), 1) ? 1 : 0; // virtual: ground -> bag
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    return ok;
+}
+
+// SEH-guarded: report the first EQUIPPED item worn by the object at cHand. Writes its
+// template stringID + itemType + equipped count, returns 1 if any worn item exists.
+// The inv_equip scenario uses this to drive equip/unequip on a KNOWN, race-compatible
+// template (the gear the character already wears), so no template-hunting is needed.
+int findEquippedItemKey(GameWorld* gw, const unsigned int cHand[5],
+                        char* outSid, unsigned int outLen, unsigned int* outType,
+                        int* outEquippedCount) {
+    if (outEquippedCount) *outEquippedCount = 0;
+    if (!gw) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    unsigned int ncur = readInvItems(inv, cur, 0, MAXC);
+    int found = 0; int eqCount = 0;
+    for (unsigned int i = 0; i < ncur; ++i) {
+        if (!cur[i].equipped) continue;
+        ++eqCount;
+        if (!found) {
+            if (outSid && outLen) { strncpy(outSid, cur[i].stringID, outLen - 1); outSid[outLen - 1] = '\0'; }
+            if (outType) *outType = cur[i].itemType;
+            found = 1;
+        }
+    }
+    if (outEquippedCount) *outEquippedCount = eqCount;
+    return found;
+}
+
+// SEH-guarded: remove `qty` of the EQUIPPED (sid, type) worn by the object at cHand
+// (the "drop/unequip armour" action). Returns the number removed. Used by inv_equip
+// to prove that unequipping/removing worn gear propagates cross-client.
+int removeEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                       const char* sid, unsigned int typeCat, int qty) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    Item* curItems[64];
+    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+    return removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty, /*wantEquipped=*/1);
+}
+
+// SEH-guarded: create and EQUIP `qty` of (sid, type) onto the object at cHand (the
+// "equip armour" action). Returns the number equipped. Used by inv_equip to prove
+// that equipping worn gear propagates cross-client.
+int addEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                    const char* sid, unsigned int typeCat, int qty) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    return createItemAndAdd(gw, inv, sid, typeCat, qty, 0, /*equip=*/true) ? qty : 0;
+}
+
+// SEH-guarded: UNEQUIP `qty` of the worn (sid,type) on the object at cHand to LOOSE
+// inventory WITHOUT destroying it (move slot -> loose; the real "drag worn item into
+// the bag" action). Unlike removeEquippedItem (which destroys), this PRESERVES the item
+// so it can be re-equipped later. Returns how many moved. Used by inv_reequip.
+int unequipItemToLoose(GameWorld* gw, const unsigned int cHand[5],
+                       const char* sid, unsigned int typeCat, int qty) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64]; Item* curItems[64];
+    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+    int moved = 0;
+    for (unsigned int i = 0; i < ncur && moved < qty; ++i) {
+        if (!curItems[i] || !cur[i].equipped || cur[i].itemType != typeCat) continue;
+        if (strcmp(cur[i].stringID, sid) != 0) continue;
+        if (unequipToLoose(inv, curItems[i])) ++moved;
+    }
+    return moved;
+}
+
+// SEH-guarded: EQUIP `qty` of the LOOSE (sid,type) the object at cHand already holds
+// (move loose -> slot; the real "drag item from bag onto the paperdoll" action). Equips
+// a REAL item so it persists (fabricated equips are discarded, d25). Returns how many
+// equipped. Used by inv_reequip to drive the UP path on save-loaded gear.
+int reequipLooseItem(GameWorld* gw, const unsigned int cHand[5],
+                     const char* sid, unsigned int typeCat, int qty) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64]; Item* curItems[64];
+    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+    int moved = 0;
+    for (unsigned int i = 0; i < ncur && moved < qty; ++i) {
+        if (!curItems[i] || cur[i].equipped || cur[i].itemType != typeCat) continue;
+        if (strcmp(cur[i].stringID, sid) != 0) continue;
+        if (equipExisting(inv, curItems[i])) ++moved;
+    }
+    return moved;
+}
+
+// DIAGNOSTIC: classify why createItem returns null for WEAPONS. Walks the first `maxTry`
+// WEAPON base templates and tries to instantiate each with no manufacturer, with a
+// manufacturer, and with manufacturer+material, logging the success counts. Tells us
+// whether weapon creation via the 6-arg factory is broken in general (all fail) or only
+// for the specific save weapon (some base weapons succeed). Created trials are added to
+// `inv` and immediately destroyed so nothing leaks.
+void diagWeaponCreate(GameWorld* gw, const unsigned int cHand[5], int maxTry) {
+    (void)maxTry;
+    if (!gw || !gw->theFactory || !g_createItemFn || !g_handCtorFn) {
+        coop::logLine("[wpndiag] missing fns"); return;
+    }
+    RootObject* ro = resolveObjectByHand(cHand);
+    Inventory* inv = 0;
+    if (ro) { __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; } }
+    if (!inv) { coop::logLine("[wpndiag] no inv"); return; }
+    // Find a REAL worn/loose WEAPON already on this character and read its GENUINE
+    // manufacturer/material/colorise GameData POINTERS + its base gd. createItem with the
+    // exact pointers the live weapon uses is the cleanest possible recipe; if THAT fails we
+    // know the blocker is not stringID resolution but the call itself (hand/faction/mesh).
+    Item* w = 0; GameData *gd = 0, *man = 0, *mat = 0, *col = 0;
+    // Worn weapons live in equip SECTIONS / the primary-secondary getters, NOT _allItems.
+    __try {
+        if (g_getPrimaryWeaponFn) { Item* it = g_getPrimaryWeaponFn(inv); if (it && it->getGameData()) w = it; }
+        if (!w && g_getSecondaryWeaponFn) { Item* it = g_getSecondaryWeaponFn(inv); if (it && it->getGameData()) w = it; }
+        if (!w && g_getSectionsFn) {
+            lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+            unsigned int ns = secs ? secs->size() : 0;
+            for (unsigned int s = 0; s < ns && !w; ++s) {
+                InventorySection* sec = (*secs)[s]; if (!sec || !sec->isAnEquippedItemSection) continue;
+                const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
+                for (unsigned int i = 0; i < its.size(); ++i) {
+                    Item* it = its[i].item; if (!it) continue; GameData* g = it->getGameData(); if (!g) continue;
+                    if ((unsigned int)g->type == (unsigned int)WEAPON) { w = it; break; }
+                }
+            }
+        }
+        if (w) { gd = w->getGameData(); man = w->manufacturerData; mat = w->materialData; col = w->coloriseData; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (!w || !gd) { coop::logLine("[wpndiag] no live weapon on char"); return; }
+    char b[220];
+    __try {
+        _snprintf(b, sizeof(b)-1, "[wpndiag] live wpn sid='%s' gdType=%u manType=%d matType=%d colType=%d",
+            gd->stringID.c_str(), (unsigned int)gd->type,
+            man ? (int)man->type : -1, mat ? (int)mat->type : -1, col ? (int)col->type : -1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { b[0]='\0'; }
+    b[sizeof(b)-1]='\0'; coop::logLine(b);
+    // Recipe matrix with the REAL pointers: vary hand (blank vs non-blank) and grade.
+    struct R { const char* tag; int idx; int ser; GameData* mm; GameData* mt; int lvl; };
+    R recipes[] = {
+        { "real man,mat lvl-1 blankH", 0, 0, man, mat, -1 },
+        { "real man,mat lvl0  blankH", 0, 0, man, mat,  0 },
+        { "real man,mat lvl0  realH ", 1, 1, man, mat,  0 },
+        { "real man only lvl0 realH ", 1, 1, man, 0,    0 },
+        { "no man/mat   lvl0  realH ", 1, 1, 0,   0,    0 },
+        { "colorise asMesh   realH ", 1, 1, col, mat,  0 },
+    };
+    for (int r = 0; r < 6; ++r) {
+        Item* it = 0;
+        __try {
+            char buf[sizeof(hand) + 16]; memset(buf, 0, sizeof(buf));
+            hand* h = reinterpret_cast<hand*>(buf);
+            g_handCtorFn(h, recipes[r].idx, recipes[r].ser, WEAPON, 0, 0);
+            it = g_createItemFn(gw->theFactory, gd, h, recipes[r].mm, recipes[r].mt, recipes[r].lvl, 0);
+            if (it && inv) inv->removeItemAutoDestroy(it, 1);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { it = (Item*)0; }
+        char e[140]; _snprintf(e, sizeof(e)-1, "[wpndiag] recipe[%d] %s -> %s", r, recipes[r].tag, it ? "OK" : "null");
+        e[sizeof(e)-1]='\0'; coop::logLine(e);
+    }
+}
+
+// SEH-guarded: find a template the character at cHand can actually WEAR and equip it,
+// so the inv_equip scenario has a known worn item to cycle even on a save whose squad
+// members start naked. Walks ARMOUR then WEAPON templates, creating+equipping each and
+// keeping the first that actually lands in a slot (it->isEquipped); non-wearable trials
+// are destroyed so nothing leaks loose. Writes the winning stringID + itemType.
+int seedEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                     char* outSid, unsigned int outLen, unsigned int* outType) {
+    if (outSid && outLen) outSid[0] = '\0';
+    if (outType) *outType = 0;
+    if (!gw || !gw->theFactory || !g_createItemFn || !g_handCtorFn ||
+        !g_equipItemFn || !g_getDataOfTypeFn) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+
+    const itemType cats[2] = { ARMOUR, WEAPON };
+    for (int c = 0; c < 2; ++c) {
+        unsigned int n = 0;
+        __try {
+            g_dataScratch.clear();
+            g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, cats[c]);
+            n = g_dataScratch.size();
+        } __except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
+        unsigned int tried = 0;
+        for (unsigned int i = 0; i < n && tried < 120; ++i) {
+            GameData* tmpl = 0;
+            __try { tmpl = g_dataScratch[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { tmpl = 0; }
+            if (!tmpl) continue;
+            ++tried;
+            int ok = 0;
+            char sidbuf[48]; sidbuf[0] = '\0';
+            __try {
+                char buf[sizeof(hand) + 16];
+                memset(buf, 0, sizeof(buf));
+                hand* h = reinterpret_cast<hand*>(buf);
+                g_handCtorFn(h, 0, 0, cats[c], 0, 0);
+                Item* it = g_createItemFn(gw->theFactory, tmpl, h, 0, 0, -1, 0);
+                if (it) {
+                    if (inv->tryAddItem(it, 1)) {                  // virtual
+                        bool eq = g_equipItemFn(inv, it);
+                        if (eq && it->isEquipped) {
+                            const char* s = tmpl->stringID.c_str();
+                            strncpy(sidbuf, s ? s : "", sizeof(sidbuf) - 1);
+                            sidbuf[sizeof(sidbuf) - 1] = '\0';
+                            ok = sidbuf[0] ? 1 : 0;
+                        } else {
+                            inv->removeItemAutoDestroy(it, 1);     // not wearable here
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+            if (ok) {
+                if (outSid && outLen) { strncpy(outSid, sidbuf, outLen - 1); outSid[outLen - 1] = '\0'; }
+                if (outType) *outType = (unsigned int)cats[c];
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+bool setupInventoryScene(GameWorld* gw, unsigned int outHand[5]) {
+    if (outHand) { for (int i = 0; i < 5; ++i) outHand[i] = 0; }
+    if (!gw || !gw->player) { coop::logLine("SETUP(inventory): no player interface"); return false; }
+    unsigned int ch[5];
+    if (!pickInventoryContainer(gw, ch)) {
+        coop::logLine("SETUP(inventory): could not resolve leader container");
+        return false;
+    }
+    char sid[48]; sid[0] = '\0';
+    int added = addTestItemsToContainer(gw, ch, 2, sid, sizeof(sid));
+    char b[220];
+    _snprintf(b, sizeof(b) - 1,
+        "SETUP(inventory): anchor=leader hand=%u,%u,%u,%u,%u seeded=%d x '%s'",
+        ch[0], ch[1], ch[2], ch[3], ch[4], added, sid[0] ? sid : "(none)");
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    if (outHand) { for (int i = 0; i < 5; ++i) outHand[i] = ch[i]; }
+    return true;
 }
 
 bool spawnSeatInFront(GameWorld* gw, float fwd, float side, RootObject** spawned) {

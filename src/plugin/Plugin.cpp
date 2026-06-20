@@ -152,6 +152,16 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             bool ok = coop::engine::setupSquadScene(gw);
             coopLog(ok ? "SETUP(squad): second squad tab built - SAVE your two-tab save now"
                        : "SETUP(squad): squad-tab build FAILED");
+        } else if (g_cfg.setupScene == "inventory") {
+            // Inventory (Phase 4a) BAKE: spawn a save-stable storage container in front
+            // of the leader + seed it with items so both clients load an identical
+            // container with a resolvable hand. User SAVEs e.g. 'inv1'.
+            unsigned int ch[5] = { 0, 0, 0, 0, 0 };
+            bool ok = coop::engine::setupInventoryScene(gw, ch);
+            if (ok) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                "SETUP(inventory): container hand=%u,%u,%u,%u,%u - SAVE 'inv1' now",
+                ch[0], ch[1], ch[2], ch[3], ch[4]); b[sizeof(b) - 1] = '\0'; coopLog(b); }
+            else coopLog("SETUP(inventory): container prep FAILED");
         } else {
             RootObject* seat = 0;
             bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);
@@ -195,6 +205,21 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         coop::engine::rearmDownScene(gw);
     }
 
+    // Inventory owner registration (host, Phase 4a): when inventory sync is active,
+    // (re)resolve the baked storage container nearest the leader (else the leader's own
+    // inventory) and register it as the owned container so publishInventories streams
+    // its contents. Re-resolved on an interval because the container hand only resolves
+    // once the world block has loaded. The join never registers (it reconciles).
+    if (g_cfg.invSync && g_cfg.isHost && gw && g_gameStarted) {
+        static DWORD lastInvReg = 0;
+        if (GetTickCount() - lastInvReg >= (DWORD)CRAFT_REARM_MS) {
+            lastInvReg = GetTickCount();
+            unsigned int ch[5];
+            if (coop::engine::pickInventoryContainer(gw, ch))
+                g_repl.setOwnedContainerHand(ch);
+        }
+    }
+
     // Scenario completion hold: once a verdict is logged, keep driving the synced
     // bodies on screen for the capture window, then self-exit cleanly.
     if (g_scenario && g_scenarioDoneTick != 0) {
@@ -209,12 +234,32 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // streams world NPCs. Ingest received targets BEFORE the engine tick so apply
     // targets are current.
     g_repl.ingest(g_inbound);
+    // Phase 4a: drain received container-contents snapshots into the per-container
+    // cache (reconciled after the engine tick by applyInventories).
+    g_repl.ingestInv(g_inbound);
     // Both clients latch reliable transition events (KO/death/revive) for the bodies
     // they drive, before apply (a side can emit an event for its own owned body and
     // the peer that drives that body must honour it).
     g_repl.applyEvents(g_inbound);
-    if (g_gameStarted)
+    if (g_gameStarted) {
         g_repl.publishOwned(gw, g_net, g_net.localId());
+        // Both clients stream the contents of every squad member they OWN (host tab 0,
+        // join tab 1) on content-change - bidirectional, disjoint by the same tab
+        // partition as positional sync. Gated on invSync so ordinary co-op sessions add
+        // no inventory traffic; the peer reconciles via applyInventories (skips own).
+        if (g_cfg.invSync)
+            g_repl.publishInventories(gw, g_net, g_net.localId());
+        // Phase W1: the HOST streams free ground items in the interest sphere (host-
+        // authoritative world). The join never publishes world items (it sends intents
+        // later, W2); it reconciles proxies after the engine tick (applyWorldItems).
+        if (g_cfg.worldSync && g_cfg.isHost)
+            g_repl.publishWorldItems(gw, g_net, g_net.localId());
+        // Phase W2: BOTH clients watch their OWNED characters for a WEAPON drop and author a
+        // reliable conservation intent so the peer relocates its own copy of that weapon (a
+        // weapon can't be rebuilt via the W1 proxy path). Bidirectional; gated on worldSync.
+        if (g_cfg.worldSync)
+            g_repl.detectAndPublishWeaponDrops(gw, g_net, g_net.localId());
+    }
 
     // Scenario onStart fires once, BEFORE the engine tick, so a host-issued move
     // order takes effect this frame.
@@ -239,6 +284,22 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // host's squad + world NPCs. applyTargets skips our OWN owned hands.
     if (g_gameStarted) {
         g_repl.applyTargets(gw);
+        // Phase W2: relocate our own copy of any DROPPED weapon to the ground BEFORE the
+        // inventory reconcile runs, so the conservation move beats the (debounced) removal
+        // reconcile that would otherwise DESTROY the weapon we cannot refabricate.
+        if (g_cfg.worldSync) {
+            g_repl.applyWeaponDrops(gw, g_inbound);
+            // Phase W3: re-home tracked ground copies into the picking character's bag, also
+            // before the inventory reconcile (which can't refabricate a weapon into the proxy).
+            g_repl.applyWeaponPickups(gw, g_inbound);
+        }
+        // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
+        // for (the join applies the host's container; the host skips its own).
+        g_repl.applyInventories(gw);
+        // Phase W1: the JOIN spawns/updates/culls local proxies for the host's streamed
+        // ground items (the host authors them, so it skips this).
+        if (g_cfg.worldSync && !g_cfg.isHost)
+            g_repl.applyWorldItems(gw, g_inbound);
         // Host-authoritative world: only the JOIN hides/freezes any local NPC the
         // host isn't streaming (so the join can't run a divergent copy). The host IS
         // the world authority, so it never suppresses.

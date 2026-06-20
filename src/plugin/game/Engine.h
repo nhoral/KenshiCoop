@@ -271,6 +271,219 @@ bool holdWorkerAtFixture(GameWorld* gw, const unsigned int workerHand[5]);
 // containerSerial, index, serial). Used to log spawned objects.
 bool readObjectHand(RootObject* obj, unsigned int out[5]);
 
+// ---- Phase 4a: container-contents (inventory) replication ------------------
+// World objects carry the same save-stable hand as Characters, so a container that
+// EXISTS in the shared save resolves cross-client. But runtime-minted items (craft
+// output, loot) have host-only hands, so we do NOT drive item objects by hand:
+// instead the host streams a container's CONTENTS (template stringID + itemType +
+// quantity + quality) keyed by the CONTAINER's hand, and the join reconstructs items
+// locally to match (createItem/addItem, removeItemAutoDestroy). Host-authoritative,
+// idempotent, loss-tolerant; rides the reliable channel on content change.
+
+// SEH-guarded: resolve a save-stable object hand (cHand layout = type, container,
+// containerSerial, index, serial) to this machine's local RootObject*, or 0.
+RootObject* resolveObjectByHand(const unsigned int cHand[5]);
+
+// SEH-guarded: capture the LOOSE contents of the container identified by cHand into
+// out[] (up to maxOut), filling template stringID + itemType + quantity + quality
+// per item (equipped gear skipped in v1). *outHash receives an order-independent
+// content fingerprint (0 == empty) so the caller only re-sends on real change.
+// Returns the number of item entries written.
+unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
+                                      InvItemEntry* out, unsigned int maxOut,
+                                      unsigned int* outHash);
+
+// SEH-guarded: reconcile the local container (cHand) to the desired item multiset:
+// add any shortfall (createItem of the template + tryAddItem) and remove any excess
+// (removeItemAutoDestroy), per (stringID, itemType) key. count==0 empties it.
+// Returns true if anything changed.
+bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
+                            const InvItemEntry* items, unsigned int count);
+
+// 'inventory' setup scene (Phase 4a bake): spawn a save-stable storage container in
+// front of the leader and seed it with a couple of items, so both clients load an
+// identical container with a resolvable hand. Falls back to seeding the leader's own
+// inventory if no storage-building template is found. Host-only; user SAVEs (inv1).
+// On success, fills outHand[5] with the anchored container's hand. Returns true if a
+// container (or the leader fallback) was prepared.
+bool setupInventoryScene(GameWorld* gw, unsigned int outHand[5]);
+
+// Resolve the baked inventory container again after load (host + join): v1 anchors on
+// the leader's own inventory (a save-stable container that accepts arbitrary items).
+// Fills outHand[5]; returns true if found. Used by the scenario + the replicator.
+bool pickInventoryContainer(GameWorld* gw, unsigned int outHand[5]);
+
+// SEH-guarded (host-side): add `qty` of a common, general-inventory-friendly item
+// template to the container identified by cHand. Writes the chosen template stringID
+// to outStringID (so the scenario/oracle knows what to look for). Returns the number
+// added (0 on failure). Used both to seed the bake and to perform the live add.
+int addTestItemsToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
+                            char* outStringID, unsigned int outLen);
+
+// SEH-guarded: remove up to `qty` of the SAME common template addTestItemsToContainer
+// adds, from the container identified by cHand. Returns the number removed (0 on
+// failure). Used by the bidirectional inventory scenario to prove that REMOVALS (not
+// just adds) propagate cross-client without loss.
+int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int qty);
+
+// ---- Phase W0: world-item (ground drop) diagnostic hooks -------------------
+// SEH-guarded: drop `qty` of the LOOSE (sid,type) the object at cHand holds onto the
+// ground (Inventory::dropItem). Lets a scenario produce a real world item without UI.
+// Returns the number dropped.
+// outLastDropped (optional): receives the Item* of the last item dropped (the now-grounded
+// object), so the conservation channel can track that real handle for a later pickup.
+int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
+                          const char* sid, unsigned int typeCat, int qty,
+                          void** outLastDropped = 0);
+
+// SEH-guarded DIAGNOSTIC: enumerate WEAPON/ARMOUR/ITEM/CONTAINER world objects near the
+// local leader and log each (itemType / sid / hand / pos), so we can characterize what a
+// dropped item becomes and whether the interest query enumerates it. The log IS the
+// deliverable for the W0 drop_probe (no protocol changes).
+void dumpWorldItems(GameWorld* gw);
+
+// SEH-guarded: count loose world items (WEAPON+ARMOUR+ITEM) within `radius` of the
+// leader. Oracle cross-check that a drop produced an enumerable ground item.
+int countWorldItemsNear(GameWorld* gw, float radius);
+
+// ---- Phase W1: world-item (ground drop) replication ------------------------
+// A free ground item captured from the host's interest sphere. `hand` is the host's
+// LOCAL engine hand (index/serial) - a stable per-item identity the host's tracker maps
+// to a synthetic netId; it is NOT sent on the wire (the join can't resolve it). `hash`
+// is a content+position fingerprint so the tracker only re-streams on real change.
+struct WorldItemRaw {
+    unsigned int   hand[5];     // host-local hand [type,container,containerSerial,index,serial]
+    char           stringID[48];// template identity
+    unsigned int   itemType;    // GameData::type category
+    unsigned short quantity;
+    unsigned short quality;     // quality*100 (0 if n/a)
+    float          x, y, z;     // world position
+    unsigned int   hash;        // content+pos fingerprint
+};
+
+// SEH-guarded (host): enumerate free GROUND items within `radius` of the local leader
+// (interest scope) into out[] (up to maxOut), deduped by hand. Items inside inventories
+// are NOT enumerated by the engine's sphere query (confirmed by the W0 drop_probe), so
+// every result is a real world item. Returns the number written.
+unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int maxOut,
+                               float radius);
+
+// SEH-guarded (join): spawn a LOCAL proxy ground item from the template (sid, typeCat) at
+// world position (x,y,z), so the join renders a host-dropped item where the host sees it.
+// Returns the spawned object (cull/update it later) or 0. The join owns this proxy; it is
+// keyed to the host's netId by the caller (Replicator).
+RootObject* spawnWorldItemProxy(GameWorld* gw, const char* sid, unsigned int typeCat,
+                                int qty, float x, float y, float z);
+
+// SEH-guarded (join): move an existing proxy to (x,y,z) (a settled world item rarely
+// moves, but a re-drop/nudge must track). No-op on fault.
+void updateWorldItemProxy(RootObject* proxy, float x, float y, float z);
+
+// SEH-guarded (join): destroy a proxy ground item (engine removal). After this the
+// pointer is DEAD; the caller must drop its netId->proxy entry. Returns true if destroyed.
+bool removeWorldItemProxy(GameWorld* gw, RootObject* proxy);
+
+// SEH-guarded (host, TEST hook): destroy every free ground item within `radius` of the
+// leader (deduped). Used by the world_item_sync scenario to despawn a dropped item so the
+// host's tracker culls it and the join removes its proxy (the cull half of the oracle).
+// Returns the number destroyed.
+int destroyWorldItemsNear(GameWorld* gw, float radius);
+
+// SEH-guarded DIAGNOSTIC: dump every nearby item (ITEM/WEAPON/ARMOUR) with type/isInInventory/
+// distance, to learn why a dropped weapon isn't being correlated to a free ground copy.
+void diagGroundScan(GameWorld* gw, const unsigned int cHand[5], const char* sid, float radius);
+
+// SEH-guarded: count FREE ground items (not the char's own worn/held copies) of (sid,type)
+// within radius of cHand. Lets the relocation spike isolate the item lying on the ground.
+int countFreeGroundItemsNear(GameWorld* gw, const unsigned int cHand[5],
+                             const char* sid, unsigned int typeCat, float radius);
+
+// SEH-guarded SPIKE: pick up a free ground item of (sid,type) near cHand by RELOCATING the
+// real object into the character's inventory (no createItem) - the conservation primitive
+// proving weapons can move bag<->ground without fabrication. Returns 1 on success.
+int pickupWorldItemIntoInventory(GameWorld* gw, const unsigned int cHand[5],
+                                 const char* sid, unsigned int typeCat, float radius);
+
+// SEH-guarded: world position of the first free ground item of (sid,type) near cHand. Fills
+// out[3], returns 1 if found. Used by the W2 drop detector to mirror the drop position.
+int firstFreeGroundItemPos(GameWorld* gw, const unsigned int cHand[5],
+                           const char* sid, unsigned int typeCat, float radius, float out[3]);
+
+// SEH-guarded: world position of the object at hand. Fills out[3], returns 1 on success.
+// Fallback drop position when the spatial item query can't find the dropped weapon.
+int objectWorldPos(const unsigned int hand[5], float out[3]);
+
+// SEH-guarded: world position of a tracked Item* (as void*). The drop detector reads the
+// REAL dropped object's position to author the exact cursor-drop location. Returns 1 on ok.
+int itemWorldPos(void* item, float out[3]);
+
+// SEH-guarded CONSERVATION primitive (Phase W2): relocate the owner's OWN copy of a weapon
+// from its bag to the ground at (x,y,z) - the peer-side mirror of a drop. Unequips a worn
+// copy to loose first if needed. Never fabricates. Returns the number relocated.
+// outDropped (optional): receives the now-grounded Item* so it can be tracked for pickup.
+int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
+                           const char* sid, unsigned int typeCat,
+                           float x, float y, float z, void** outDropped = 0);
+
+// SEH-guarded (Phase W3): capture the WEAPON items the object at cHand holds, with their real
+// Item* handles, so the drop detector can track the exact dropped object for a later pickup.
+// Fills sids[i] (<48 chars) + items[i] (Item* as void*); returns the count.
+unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
+                               char (*sids)[48], void** items, unsigned int maxOut);
+
+// SEH-guarded (Phase W3): re-home a tracked ground Item* into the inventory at targetHand
+// (Inventory::tryAddItem of the existing object - no fabrication). The pickup mirror of
+// relocateWeaponToGround. Returns 1 on success. `item` must be a still-live tracked object.
+int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void* item);
+
+// ---- Equipped-gear (armour/weapon slot) test hooks (inv_equip scenario) ----
+// SEH-guarded: report the first EQUIPPED item worn by the object at cHand (its
+// template stringID + itemType) and the total count of worn items. Returns 1 if any
+// worn item exists. Lets the scenario drive equip/unequip on a KNOWN, race-compatible
+// template (gear the character already wears) without hunting for one.
+int findEquippedItemKey(GameWorld* gw, const unsigned int cHand[5],
+                        char* outSid, unsigned int outLen, unsigned int* outType,
+                        int* outEquippedCount);
+
+// SEH-guarded: remove `qty` of the EQUIPPED (sid, type) worn by the object at cHand
+// (the "drop/unequip armour" action). Returns the number removed.
+int removeEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                       const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded: create and EQUIP `qty` of (sid, type) onto the object at cHand (the
+// "equip armour" action). Returns the number equipped.
+int addEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                    const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded DIAGNOSTIC: log the full inventory (loose _allItems + every section with
+// its slot/equip flags + items) of the object at cHand, so we can see where a worn
+// weapon actually lives relative to the equip-section walk the snapshot uses.
+void dumpInventory(GameWorld* gw, const unsigned int cHand[5]);
+
+// SEH-guarded: UNEQUIP `qty` of the worn (sid,type) at cHand to LOOSE inventory WITHOUT
+// destroying it (move slot -> loose, preserving the item for a later re-equip). Returns
+// how many moved. The faithful "drag worn item into the bag" action for inv_reequip.
+int unequipItemToLoose(GameWorld* gw, const unsigned int cHand[5],
+                       const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded: EQUIP `qty` of the LOOSE (sid,type) the object at cHand already holds
+// (move loose -> slot). Equips a REAL item so it persists (fabricated equips are
+// discarded, d25). Returns how many equipped. Drives the UP path for inv_reequip.
+int reequipLooseItem(GameWorld* gw, const unsigned int cHand[5],
+                     const char* sid, unsigned int typeCat, int qty);
+
+// SEH-guarded: find a template the character at cHand can WEAR and equip it (so the
+// scenario has a known worn item to cycle even when squad members start naked). Writes
+// the winning stringID + itemType. Returns 1 on success, 0 if nothing could be worn.
+int seedEquippedItem(GameWorld* gw, const unsigned int cHand[5],
+                     char* outSid, unsigned int outLen, unsigned int* outType);
+
+// DIAGNOSTIC: probe whether the engine factory can instantiate WEAPON base templates at
+// all (createItem returns null for the save weapon even with manufacturer+material). Tries
+// the first `maxTry` weapon templates with no/man/man+mat and logs [wpndiag] success
+// counts. Trials are added to cHand's inventory and immediately destroyed.
+void diagWeaponCreate(GameWorld* gw, const unsigned int cHand[5], int maxTry);
+
 // ---- Honest pose oracle (downstream of the actual body, not the task flag) --
 // SEH-guarded: read pose signals that reflect the RENDERED body, so a pose check
 // cannot self-confirm off the task field we may have written:

@@ -10,8 +10,10 @@
 #include <vector>    // rank/sort the shared squad for the ownership partition
 #include <algorithm> // std::sort
 #include <utility> // std::pair, std::make_pair
+#include <string>  // weapon-census keys (Phase W2)
 #include <cstdio>
 #include <cstring>
+#include <cstdlib> // getenv (KENSHICOOP_INV_DUMP diagnostic gate)
 #include <cmath>
 
 class Character;
@@ -62,6 +64,15 @@ float dist3(float ax, float ay, float az, float bx, float by, float bz) {
     float dx = ax - bx, dy = ay - by, dz = az - bz;
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
+
+// Conservation channel item types. itemType 2 = WEAPON (createItem can't rebuild a proxy)
+// and 3 = ARMOUR/clothing. Both are non-stackable EQUIPPABLE gear, so each unit is a distinct
+// object the peer already mirrors (weapons via shared save; armour also reconstructed by inv
+// sync) - the real object can be relocated bag<->ground on every client and re-homed on pickup
+// WITHOUT fabrication. The W1 host-authored proxy stream handles everything else (stacks, loot)
+// and skips these. Routing gear through conservation also fixes a host-dropped item lingering
+// on the host ground after the JOIN picks it up (the W1 cull only removes the join's proxy).
+inline bool isGearType(unsigned int t) { return t == 2u || t == 3u; }
 } // namespace
 
 Replicator::Replicator()
@@ -71,7 +82,8 @@ Replicator::Replicator()
       restSampleFrames_(0), marchFrames_(0),
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
       probeRecruit_(false), probedCount_(0),
-      probeAiSuspend_(false), aiLogTick_(0), nextEventId_(1) {}
+      probeAiSuspend_(false), aiLogTick_(0), nextEventId_(1),
+      nextWorldNetId_(1), nextDropId_(1), nextPickupId_(1) {}
 
 void Replicator::ingest(Inbound& in) {
     std::deque<InboundEntity> got;
@@ -80,6 +92,25 @@ void Replicator::ingest(Inbound& in) {
     unsigned long now = nowMs();
     for (std::deque<InboundEntity>::iterator it = got.begin(); it != got.end(); ++it) {
         targets_[keyOf(it->e)].interp.push(it->e, now);
+    }
+}
+
+void Replicator::setOwnedContainerHand(const unsigned int hand[5]) {
+    ownedContainers_.clear();
+    Key k; k.t = hand[0]; k.c = hand[1]; k.cs = hand[2]; k.i = hand[3]; k.s = hand[4];
+    ownedContainers_.insert(k);
+}
+
+void Replicator::ingestInv(Inbound& in) {
+    std::deque<InboundInv> got;
+    in.drainInv(got);
+    for (std::deque<InboundInv>::iterator it = got.begin(); it != got.end(); ++it) {
+        Key k; k.t = it->cHand[0]; k.c = it->cHand[1]; k.cs = it->cHand[2];
+        k.i = it->cHand[3]; k.s = it->cHand[4];
+        InvRecv& r = invRecv_[k];
+        r.ownerId = it->ownerId;
+        r.items   = it->items; // latest snapshot supersedes
+        r.dirty   = true;
     }
 }
 
@@ -192,6 +223,450 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
         }
         hostBody_[k] = cur;
+    }
+}
+
+void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
+    // Author the inventory of every container we OWN. ownHands_ is the per-tick set of
+    // owned squad-member hands (a character's own hand IS its personal-inventory
+    // container hand), so streaming it makes inventory sync fully BIDIRECTIONAL and
+    // disjoint by the same tab-rank partition as positional sync (host streams tab-0
+    // members, join streams tab-1 members - Doctrine 8). ownedContainers_ adds any
+    // explicitly-registered non-squad container (e.g. a baked storage chest / the
+    // SETUP-seeded leader). applyInventories skips this same union, so no client ever
+    // reconciles a container it authors.
+    std::set<Key> owned = ownedContainers_;
+    owned.insert(ownHands_.begin(), ownHands_.end());
+    if (owned.empty()) return;
+    const unsigned long INV_RESEND_MS = 5000; // periodic safety resend (loss/late join)
+    // A changed snapshot must be STABLE this long before we publish it. A change that only
+    // REARRANGES or ADDS (entry count >= last sent) settles fast. A change that REMOVES an
+    // entry settles much longer: mid-drag the UI holds the dragged item on the CURSOR, out
+    // of the inventory entirely, for up to ~1 s - a transient "item gone" the peer would act
+    // on by DESTROYING a worn item it cannot refabricate (createItemAndAdd is unreliable for
+    // weapons; equipped fabrication is non-persistent, d25), losing it for good. Equip and
+    // unequip-to-bag keep the entry count (a MOVE), so they still replicate promptly; only
+    // genuine removals (and the in-cursor flicker) wait out the longer window.
+    const unsigned long INV_SETTLE_MS        = 350;
+    const unsigned long INV_REMOVE_SETTLE_MS = 1800;
+    InvItemEntry items[INV_ITEMS_MAX];
+    unsigned long now = nowMs();
+    for (std::set<Key>::iterator it = owned.begin();
+         it != owned.end(); ++it) {
+        unsigned int cHand[5] = { it->t, it->c, it->cs, it->i, it->s };
+        // Skip until the container actually resolves here (post-load it may not yet),
+        // so we never blast a spurious "empty" snapshot that would wipe baked contents.
+        if (engine::resolveObjectByHand(cHand) == 0) continue;
+        u32 hash = 0;
+        unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX, &hash);
+        std::map<Key, InvPub>::iterator pit = invPub_.find(*it);
+        bool first = (pit == invPub_.end());
+        if (first) {
+            // Track from now; let it settle before the initial publish (cheap, and avoids
+            // emitting a half-built inventory captured mid-load).
+            InvPub p; p.hash = 0; p.lastSendMs = 0; p.pendingHash = hash; p.pendingSince = now;
+            p.lastSentN = 0;
+            invPub_[*it] = p;
+            pit = invPub_.find(*it);
+        }
+        InvPub& pub = pit->second;
+        bool sent = (pub.lastSendMs != 0) || (pub.hash != 0);
+        bool differs = !sent || (pub.hash != hash);
+        // Maintain the settle timer: restart it whenever the captured fingerprint moves.
+        if (hash != pub.pendingHash) { pub.pendingHash = hash; pub.pendingSince = now; }
+        // A removal (fewer entries than last sent) waits out the long window; everything
+        // else (additions, equip<->loose moves) settles fast.
+        unsigned long settleMs = (sent && n < pub.lastSentN) ? INV_REMOVE_SETTLE_MS : INV_SETTLE_MS;
+        bool settled  = (now - pub.pendingSince >= settleMs);
+        bool changed  = differs && settled;
+        bool periodic = sent && !differs && (now - pub.lastSendMs >= INV_RESEND_MS);
+        if (!changed && !periodic) continue;
+        net.queueInvSnapshot(ownerId, cHand, items, n);
+        pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n;
+        if (changed) {
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                "[inv] SEND hand=%u,%u,%u,%u,%u items=%u hash=%u",
+                it->t, it->c, it->cs, it->i, it->s, n, hash);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            static int dumpInv = -1;
+            if (dumpInv < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpInv = (e && e[0] == '1') ? 1 : 0; }
+            if (dumpInv) { coop::logLine("[inv] SEND-state:"); engine::dumpInventory(gw, cHand); }
+        }
+    }
+}
+
+void Replicator::applyInventories(GameWorld* gw) {
+    if (invRecv_.empty()) return;
+    for (std::map<Key, InvRecv>::iterator it = invRecv_.begin(); it != invRecv_.end(); ++it) {
+        if (!it->second.dirty) continue;
+        it->second.dirty = false;
+        // Never reconcile a container we author (defense-in-depth on the partition):
+        // any explicitly-registered container OR any squad member we own this tick.
+        if (ownedContainers_.count(it->first) != 0) continue;
+        if (ownHands_.count(it->first) != 0) continue;
+        const Key& k = it->first;
+        unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        const InvItemEntry* items = it->second.items.empty() ? 0 : &it->second.items[0];
+        unsigned int n = (unsigned int)it->second.items.size();
+        engine::applyContainerContents(gw, cHand, items, n);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+            "[inv] APPLY hand=%u,%u,%u,%u,%u items=%u",
+            k.t, k.c, k.cs, k.i, k.s, n);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        static int dumpInvA = -1;
+        if (dumpInvA < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpInvA = (e && e[0] == '1') ? 1 : 0; }
+        if (dumpInvA) { coop::logLine("[inv] APPLY-result:"); engine::dumpInventory(gw, cHand); }
+    }
+}
+
+void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
+    // Host-authoritative world stream. Scan the interest sphere for free ground items,
+    // assign/reuse a netId per item (keyed by its local engine hand), and stream new/
+    // changed items + cull vanished ones. A settled world produces stable content+pos -
+    // so zero traffic - with a slow periodic safety resend.
+    const float         RADIUS       = 60.0f; // interest scope for ground items (v1)
+    const float         POS_EPS      = 0.5f;  // re-stream a moved item past this gap
+    const unsigned long WI_RESEND_MS = 5000;  // periodic safety resend (loss / late join)
+    static int dumpWi = -1;
+    if (dumpWi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWi = (e && e[0] == '1') ? 1 : 0; }
+
+    engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
+    unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
+    unsigned long now = nowMs();
+
+    for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ++it)
+        it->second.seen = false;
+
+    // Gear (itemType 2 WEAPON / 3 ARMOUR) is handled by the conservation drop/pickup channel
+    // (the real object is relocated bag<->ground on each client and re-homed on pickup), so the
+    // W1 template-proxy stream skips it - both to avoid a duplicate proxy AND because a W1 cull
+    // only removes the join's proxy, leaving a host-dropped real item orphaned on the ground.
+    WorldItemEntry send[WORLD_ITEMS_MAX]; unsigned int ns = 0;
+    for (unsigned int i = 0; i < n; ++i) {
+        if (isGearType(raw[i].itemType)) continue;
+        Key k; k.t = raw[i].hand[0]; k.c = raw[i].hand[1]; k.cs = raw[i].hand[2];
+        k.i = raw[i].hand[3]; k.s = raw[i].hand[4];
+        std::map<Key, WorldTrack>::iterator tit = worldTrack_.find(k);
+        bool isNew = (tit == worldTrack_.end());
+        if (isNew) {
+            WorldTrack t; t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
+            t.x = t.y = t.z = 0.0f; t.seen = true;
+            worldTrack_[k] = t;
+            tit = worldTrack_.find(k);
+        }
+        WorldTrack& tr = tit->second;
+        tr.seen = true;
+        bool sent = (tr.lastSendMs != 0);
+        float dx = raw[i].x - tr.x, dy = raw[i].y - tr.y, dz = raw[i].z - tr.z;
+        bool moved = (dx*dx + dy*dy + dz*dz) > (POS_EPS * POS_EPS);
+        bool changed = !sent || (tr.hash != raw[i].hash) || moved;
+        bool periodic = sent && !changed && (now - tr.lastSendMs >= WI_RESEND_MS);
+        if (!changed && !periodic) continue;
+        if (ns < WORLD_ITEMS_MAX) {
+            WorldItemEntry& e = send[ns++];
+            e.netId = tr.netId;
+            strncpy(e.stringID, raw[i].stringID, sizeof(e.stringID) - 1);
+            e.stringID[sizeof(e.stringID) - 1] = '\0';
+            e.itemType = raw[i].itemType;
+            e.quantity = raw[i].quantity;
+            e.quality  = raw[i].quality;
+            e.x = raw[i].x; e.y = raw[i].y; e.z = raw[i].z;
+            e.state = 0;
+        }
+        tr.hash = raw[i].hash; tr.lastSendMs = now;
+        tr.x = raw[i].x; tr.y = raw[i].y; tr.z = raw[i].z;
+        if (changed && dumpWi) {
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "[wi] SEND netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f hash=%u",
+                tr.netId, raw[i].stringID, raw[i].quantity, raw[i].x, raw[i].y, raw[i].z, raw[i].hash);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    u32 removed[256]; unsigned int nr = 0;
+    for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ) {
+        if (!it->second.seen) {
+            if (nr < 256) removed[nr++] = it->second.netId;
+            if (dumpWi) { char b[96]; _snprintf(b, sizeof(b) - 1, "[wi] CULL netId=%u", it->second.netId);
+                          b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            worldTrack_.erase(it++);
+        } else ++it;
+    }
+
+    if (ns > 0) net.queueWorldItems(ownerId, send, ns);
+    if (nr > 0) net.queueWorldRemove(ownerId, removed, nr);
+}
+
+void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
+    std::deque<InboundWorldItems>  items;
+    std::deque<InboundWorldRemove> rems;
+    in.drainWorldItems(items);
+    in.drainWorldRemove(rems);
+    if (items.empty() && rems.empty()) return;
+    static int dumpWi = -1;
+    if (dumpWi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWi = (e && e[0] == '1') ? 1 : 0; }
+    const float POS_EPS = 0.5f;
+
+    // Snapshots: spawn a proxy for a new netId, move it if it changed.
+    for (std::deque<InboundWorldItems>::iterator b = items.begin(); b != items.end(); ++b) {
+        for (std::vector<WorldItemEntry>::iterator e = b->items.begin(); e != b->items.end(); ++e) {
+            std::map<u32, WorldProxy>::iterator pit = worldProxies_.find(e->netId);
+            if (pit == worldProxies_.end()) {
+                RootObject* obj = engine::spawnWorldItemProxy(gw, e->stringID, e->itemType,
+                                                              (int)e->quantity, e->x, e->y, e->z);
+                if (obj) {
+                    WorldProxy wp; wp.obj = obj; wp.x = e->x; wp.y = e->y; wp.z = e->z; wp.hash = 0;
+                    worldProxies_[e->netId] = wp;
+                }
+                char b2[200]; _snprintf(b2, sizeof(b2) - 1,
+                    "[wi] SPAWN netId=%u ok=%d sid='%s' pos=%.2f,%.2f,%.2f",
+                    e->netId, obj ? 1 : 0, e->stringID, e->x, e->y, e->z);
+                b2[sizeof(b2) - 1] = '\0'; if (dumpWi || !obj) coop::logLine(b2);
+            } else {
+                WorldProxy& wp = pit->second;
+                float dx = e->x - wp.x, dy = e->y - wp.y, dz = e->z - wp.z;
+                if ((dx*dx + dy*dy + dz*dz) > (POS_EPS * POS_EPS)) {
+                    engine::updateWorldItemProxy(wp.obj, e->x, e->y, e->z);
+                    wp.x = e->x; wp.y = e->y; wp.z = e->z;
+                    if (dumpWi) { char b2[160]; _snprintf(b2, sizeof(b2) - 1,
+                        "[wi] MOVE netId=%u pos=%.2f,%.2f,%.2f", e->netId, e->x, e->y, e->z);
+                        b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
+                }
+            }
+        }
+    }
+    // Culls: destroy the proxy and drop the mapping.
+    for (std::deque<InboundWorldRemove>::iterator b = rems.begin(); b != rems.end(); ++b) {
+        for (std::vector<u32>::iterator id = b->netIds.begin(); id != b->netIds.end(); ++id) {
+            std::map<u32, WorldProxy>::iterator pit = worldProxies_.find(*id);
+            if (pit == worldProxies_.end()) continue;
+            engine::removeWorldItemProxy(gw, pit->second.obj);
+            worldProxies_.erase(pit);
+            if (dumpWi) { char b2[96]; _snprintf(b2, sizeof(b2) - 1, "[wi] CULL netId=%u", *id);
+                          b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
+        }
+    }
+}
+
+void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (ownHands_.empty()) return;
+    // Correlate the bag-loss with a FREE ground item anywhere in the interest sphere (not just
+    // at the feet): a UI drop lands at the cursor, which can be many metres away. A TRADE moves
+    // the item into another BAG (isInInventory=true), so it is never a free ground item - hence
+    // even a generous radius cannot mistake a trade for a drop.
+    const float        GROUND_R    = 60.0f;
+    const int          MAX_RETRY   = 30;    // ticks to keep looking for the ground copy
+    static int dumpWd = -1;
+    if (dumpWd < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWd = (e && e[0] == '1') ? 1 : 0; }
+    InvItemEntry items[INV_ITEMS_MAX];
+    for (std::set<Key>::iterator it = ownHands_.begin(); it != ownHands_.end(); ++it) {
+        unsigned int cHand[5] = { it->t, it->c, it->cs, it->i, it->s };
+        if (engine::resolveObjectByHand(cHand) == 0) continue;
+        unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX, 0);
+        // Build this character's CURRENT GEAR census (copies per "sid", with provenance + type).
+        std::map<std::string, WCensusItem> cur;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (!isGearType(items[i].itemType)) continue;
+            WCensusItem& wc = cur[std::string(items[i].stringID)];
+            int q = items[i].quantity; if (q < 1) q = 1;
+            if (wc.count == 0) {
+                strncpy(wc.manufacturer, items[i].manufacturer, sizeof(wc.manufacturer) - 1);
+                strncpy(wc.material,     items[i].material,     sizeof(wc.material) - 1);
+                wc.quality  = items[i].quality;
+                wc.itemType = items[i].itemType;
+            }
+            wc.count += q;
+        }
+        // Capture the REAL Item* of each weapon this tick (parallel to the census), so a
+        // DROP can remember the exact now-grounded object for a later pickup (the spatial
+        // query can't re-find it in towns).
+        char wsids[INV_ITEMS_MAX][48];
+        void* wptrs[INV_ITEMS_MAX];
+        unsigned int nwp = engine::captureWeaponPtrs(gw, cHand, wsids, wptrs, INV_ITEMS_MAX);
+        std::map<std::string, std::deque<void*> > curPtrs;
+        for (unsigned int i = 0; i < nwp; ++i) curPtrs[std::string(wsids[i])].push_back(wptrs[i]);
+
+        WCensus& prevC = weaponCensus_[*it];
+        if (!prevC.seeded) {
+            prevC.items = cur; prevC.ptrs = curPtrs; prevC.seeded = true; // baseline; never emit
+            if (dumpWd) { char b[140]; _snprintf(b, sizeof(b) - 1,
+                "[wd] census-seed hand=%u,%u,%u,%u,%u weaponKinds=%u",
+                it->t, it->c, it->cs, it->i, it->s, (unsigned)cur.size());
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            continue;
+        }
+        // INCREASE pass (PICKUP): a weapon kind whose count rose was picked up by this owned
+        // character. Author a reliable PICKUP intent so the peer re-homes its tracked ground
+        // copy into this character's bag; consume one of OUR tracked ground copies (the local
+        // UI pickup already moved the real object from ground to bag). Done before the drop
+        // pass mutates `cur` for debounce. (No tracked copy on the peer => no-op there, so a
+        // brand-new/looted weapon never spuriously appears.)
+        for (std::map<std::string, WCensusItem>::iterator ce = cur.begin(); ce != cur.end(); ++ce) {
+            std::map<std::string, WCensusItem>::iterator pp = prevC.items.find(ce->first);
+            int prevCount = (pp != prevC.items.end()) ? pp->second.count : 0;
+            int inc = ce->second.count - prevCount;
+            for (int k = 0; k < inc; ++k) {
+                WorldPickupPacket pkt; memset(&pkt, 0, sizeof(pkt));
+                pkt.type = (u8)PKT_WORLD_PICKUP; pkt.ownerId = ownerId;
+                pkt.pickupId = nextPickupId_++;
+                pkt.oType = it->t; pkt.oContainer = it->c; pkt.oContainerSerial = it->cs;
+                pkt.oIndex = it->i; pkt.oSerial = it->s;
+                strncpy(pkt.stringID, ce->first.c_str(), sizeof(pkt.stringID) - 1);
+                pkt.itemType = ce->second.itemType; pkt.quality = ce->second.quality;
+                net.queueWorldPickup(pkt);
+                std::deque<void*>& q = groundedWeapons_[ce->first];
+                if (!q.empty()) q.pop_front(); // our ground copy is now in the bag
+                if (dumpWd) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] PICKUP id=%u sid='%s' owner=%u,%u,%u,%u,%u prev=%d now=%d trackedLeft=%u",
+                    pkt.pickupId, pkt.stringID, it->t, it->c, it->cs, it->i, it->s,
+                    prevCount, ce->second.count, (unsigned)q.size());
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            }
+        }
+        // Walk every previously-held weapon kind; a count DECREASE is a candidate drop.
+        for (std::map<std::string, WCensusItem>::iterator pe = prevC.items.begin();
+             pe != prevC.items.end(); ++pe) {
+            std::map<std::string, WCensusItem>::iterator ce = cur.find(pe->first);
+            int now = (ce != cur.end()) ? ce->second.count : 0;
+            int delta = pe->second.count - now;
+            if (delta <= 0) { prevC.retries.erase(pe->first); continue; }
+            float pos[3] = { 0, 0, 0 };
+            unsigned int gtype = pe->second.itemType;
+            bool onGround = engine::firstFreeGroundItemPos(gw, cHand, pe->first.c_str(),
+                                                           gtype, GROUND_R, pos) != 0;
+            if (!onGround) {
+                // The engine's spatial item query couldn't locate a free ground copy. This is
+                // common in towns and for equipped-then-dropped weapons (the query returns
+                // nothing even at a wide radius - see diagGroundScan). Debounce a few ticks to
+                // shrug off a 1-frame equip/swap transient WITHOUT committing the lower count.
+                int& r = prevC.retries[pe->first];
+                if (r == 0) {
+                    r = MAX_RETRY;
+                    if (dumpWd) engine::diagGroundScan(gw, cHand, pe->first.c_str(), GROUND_R);
+                }
+                if (--r > 0) {
+                    if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[wd] decrease-pending hand=%u,%u,%u,%u,%u sid='%s' prev=%d now=%d retry=%d",
+                        it->t, it->c, it->cs, it->i, it->s, pe->first.c_str(),
+                        pe->second.count, now, r); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    cur[pe->first] = pe->second;        // hold the old count so we re-check next tick
+                    curPtrs[pe->first] = prevC.ptrs[pe->first]; // and keep the departed Item* handle(s)
+                    continue;
+                }
+                // Debounce expired: the weapon really LEFT this owned character (we never mutate
+                // owned inventories ourselves, so this is a genuine user action). Author the drop
+                // at the OWNER's position as the mirror target - the weapon was dropped at its
+                // feet, so the peer relocating its own copy there reproduces the drop. (A rare
+                // intra-squad trade would be mirrored as a drop here; reconcile then corrects it.)
+                prevC.retries.erase(pe->first);
+                if (!engine::objectWorldPos(cHand, pos)) {
+                    if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[wd] decrease-nopos hand=%u,%u,%u,%u,%u sid='%s' (owner pos unresolved; skip)",
+                        it->t, it->c, it->cs, it->i, it->s, pe->first.c_str());
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    continue;
+                }
+                if (dumpWd) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] drop-fallback hand=%u,%u,%u,%u,%u sid='%s' (no ground copy; owner pos=%.1f,%.1f,%.1f)",
+                    it->t, it->c, it->cs, it->i, it->s, pe->first.c_str(), pos[0], pos[1], pos[2]);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            } else {
+                prevC.retries.erase(pe->first);
+            }
+            // The departed weapon's REAL Item* is the prior tick's handle for this sid; after a
+            // UI drop it persists as the now-grounded object (conservation). Remember it so a
+            // later PICKUP intent re-homes this exact object without a spatial re-query.
+            std::deque<void*>& departed = prevC.ptrs[pe->first];
+            for (int d = 0; d < delta; ++d) {
+                void* di = departed.empty() ? 0 : departed.front();
+                // Prefer the REAL dropped object's position (the exact cursor-drop spot) over
+                // the owner-feet fallback - and it's query-free, so both clients agree.
+                float dpos[3] = { pos[0], pos[1], pos[2] };
+                if (di) { float ip[3]; if (engine::itemWorldPos(di, ip)) {
+                    dpos[0] = ip[0]; dpos[1] = ip[1]; dpos[2] = ip[2]; } }
+                WorldDropPacket pkt; memset(&pkt, 0, sizeof(pkt));
+                pkt.type = (u8)PKT_WORLD_DROP; pkt.ownerId = ownerId; pkt.dropId = nextDropId_++;
+                pkt.oType = it->t; pkt.oContainer = it->c; pkt.oContainerSerial = it->cs;
+                pkt.oIndex = it->i; pkt.oSerial = it->s;
+                strncpy(pkt.stringID, pe->first.c_str(), sizeof(pkt.stringID) - 1);
+                pkt.itemType = gtype; pkt.quality = pe->second.quality;
+                strncpy(pkt.manufacturer, pe->second.manufacturer, sizeof(pkt.manufacturer) - 1);
+                strncpy(pkt.material,     pe->second.material,     sizeof(pkt.material) - 1);
+                pkt.x = dpos[0]; pkt.y = dpos[1]; pkt.z = dpos[2];
+                net.queueWorldDrop(pkt);
+                if (di) {
+                    groundedWeapons_[pe->first].push_back(di);
+                    departed.pop_front();
+                }
+                char b[220]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] DROP id=%u sid='%s' owner=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f tracked=%u",
+                    pkt.dropId, pkt.stringID, it->t, it->c, it->cs, it->i, it->s,
+                    pkt.x, pkt.y, pkt.z, (unsigned)groundedWeapons_[pe->first].size());
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        prevC.items = cur;
+        prevC.ptrs  = curPtrs;
+    }
+}
+
+void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
+    std::deque<InboundWorldDrop> got;
+    in.drainWorldDrops(got);
+    if (got.empty()) return;
+    for (std::deque<InboundWorldDrop>::iterator it = got.begin(); it != got.end(); ++it) {
+        const WorldDropPacket& p = it->pkt;
+        std::pair<u32, u32> id(p.ownerId, p.dropId);
+        if (appliedDrops_.count(id) != 0) continue; // idempotent (reliable resend / replay)
+        appliedDrops_.insert(id);
+        Key ok; ok.t = p.oType; ok.c = p.oContainer; ok.cs = p.oContainerSerial;
+        ok.i = p.oIndex; ok.s = p.oSerial;
+        if (ownHands_.count(ok) != 0) continue;     // we own this char -> we dropped it locally
+        unsigned int ownerHand[5] = { p.oType, p.oContainer, p.oContainerSerial,
+                                      p.oIndex, p.oSerial };
+        void* dropped = 0;
+        int moved = engine::relocateWeaponToGround(gw, ownerHand, p.stringID, p.itemType,
+                                                   p.x, p.y, p.z, &dropped);
+        // Track the relocated REAL object so a later PICKUP intent re-homes this exact handle
+        // back into the owner's bag (no spatial re-query, which fails in towns).
+        if (moved > 0 && dropped) groundedWeapons_[std::string(p.stringID)].push_back(dropped);
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[wd] APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u moved=%d pos=%.2f,%.2f,%.2f tracked=%u",
+            p.dropId, p.stringID, p.oType, p.oContainer, p.oContainerSerial, p.oIndex,
+            p.oSerial, moved, p.x, p.y, p.z,
+            (unsigned)groundedWeapons_[std::string(p.stringID)].size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
+    std::deque<InboundWorldPickup> got;
+    in.drainWorldPickups(got);
+    if (got.empty()) return;
+    for (std::deque<InboundWorldPickup>::iterator it = got.begin(); it != got.end(); ++it) {
+        const WorldPickupPacket& p = it->pkt;
+        std::pair<u32, u32> id(p.ownerId, p.pickupId);
+        if (appliedPickups_.count(id) != 0) continue; // idempotent (reliable resend / replay)
+        appliedPickups_.insert(id);
+        Key ok; ok.t = p.oType; ok.c = p.oContainer; ok.cs = p.oContainerSerial;
+        ok.i = p.oIndex; ok.s = p.oSerial;
+        if (ownHands_.count(ok) != 0) continue;        // we own this char -> we picked it up locally
+        unsigned int targetHand[5] = { p.oType, p.oContainer, p.oContainerSerial,
+                                       p.oIndex, p.oSerial };
+        std::deque<void*>& q = groundedWeapons_[std::string(p.stringID)];
+        int moved = 0;
+        if (!q.empty()) {
+            void* item = q.front();
+            moved = engine::addItemPtrToInventory(gw, targetHand, item);
+            if (moved) q.pop_front(); // re-homed; stop tracking it on the ground
+        }
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u moved=%d trackedLeft=%u",
+            p.pickupId, p.stringID, p.oType, p.oContainer, p.oContainerSerial, p.oIndex,
+            p.oSerial, moved, (unsigned)q.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
 

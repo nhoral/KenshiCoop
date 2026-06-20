@@ -468,3 +468,327 @@ own squad."
     metrics advisory there.** A mostly-static presence test shows latency micro-slide
     under WAN that a locomotion oracle reads as a failure - judge it on the
     cross-check, not on smoothness.
+23. **Replicate runtime-created CONTENT by container snapshot + local reconstruction,
+    not by item `hand`.** Items minted at runtime (craft output, loot) get host-only
+    `hand`s that don't resolve on the peer - the same reason we bake saves. Stream the
+    container's contents as a description (template `stringID` + type + qty + quality)
+    keyed by the container's stable `hand`, gate the reliable send on a content hash,
+    and let the peer reconstruct to match (idempotent, loss-tolerant). The client never
+    reconciles a container it authors (host-authoritative). This is doctrine 14
+    ("replicate causes, not effects") one layer up: the container is the cause.
+24. **A move ACROSS an ownership boundary is a non-atomic two-authority transaction -
+    the snapshot model cannot make it safe; route trades through a shared authority.**
+    Per-container convergence is correct only when ONE client authors each container.
+    A cross-squad item drag touches two containers owned by two different clients: the
+    source removal (your owned container) propagates authoritatively, but the
+    destination ADD lands in a container the OTHER client authors - its next snapshot
+    lacks the item and DELETES it (net LOSS). The mirror case (dragging OUT of a
+    peer-owned container) DUPLICATES. There is no per-container fix; the transaction has
+    no single owner. The sanctioned design is to route transfers through a shared
+    authority - the host-authoritative WORLD: DROP (remove from my owned inventory ->
+    spawn a ground item, host-owned) then PICKUP (remove the ground item -> add to my
+    owned inventory). Each leg is single-owner end-to-end, so the race disappears. This
+    is the inventory analogue of doctrine 8 (disjoint ownership) and the
+    host-authoritative-world invariant. The supported (owned-container) path is proven
+    loss-free both ways by `inv_bidir`; cross-squad trade is deferred to 4b.
+
+## Addendum: Inventory / container-contents (Phase 4a)
+
+Written after `inv_order` reached a green automated state on `squad1` - host live-add,
+host/join FINAL content-hash match, at 0 ms and WAN (80 ms +/-30 ms, 30% loss), with
+`npc_sync`/`combat_kill`/`coop_presence` regressions still green.
+
+### What worked
+
+- **Content-snapshot/reconcile beats hand-driving for items.** Save-baked items carry
+  a stable `hand`, but crafting/loot mint NEW items whose hands are host-only and
+  unresolvable on the join. Driving item objects by hand was a dead end; streaming the
+  CONTAINER's contents (keyed by the container's stable hand) and reconstructing items
+  locally (`createItem`+`tryAddItem` for shortfalls, `removeItemAutoDestroy` for
+  excess) is idempotent, loss-tolerant, and host-authoritative.
+- **Reliable channel + hash gate keeps it cheap and correct.** `publishInventories`
+  only enqueues a snapshot when the container's order-independent content hash changes
+  (plus a 5 s safety resend); it rides the reliable channel, so a content change
+  survives the 30% loss the WAN sim injects (proven: the add lands on the join under
+  loss). `applyInventories` reconciles only on a freshly-received (dirty) snapshot.
+- **Anchor on the leader's inventory, not a spawned chest (v1).** Many Kenshi storage
+  buildings are resource-limited and would reject a seeded general item - a real bake
+  risk. The leader's own inventory exists in every save, resolves cross-client by its
+  character `hand`, and accepts arbitrary items, so `inv_order` validates against ANY
+  squad save (no dedicated bake needed). A general-purpose storage-building anchor is
+  the natural follow-up.
+
+### What we had to get right (and two gotchas)
+
+- **The verdict must be robust to the launch stagger.** The join loads ~10 s after the
+  host, so it can start sampling AFTER the host's add already propagated - it then
+  never witnesses the 0->1 edge itself. Gating on "join observed the change" or "join
+  count grew" falsely fails. The stagger-robust proof is: host performed a live add +
+  host content actually changed (first hash != last) + host/join FINAL hashes match +
+  join ends non-empty (the save's leader baseline is empty, so a matching non-empty
+  multiset proves cross-client reconstruction). "Join saw the transition" is advisory.
+- **Oracle regexes must not anchor at line start.** Log lines carry a
+  `[ts] [ROLE] INFO:` prefix; an `^SCENARIO ...` anchor silently matched zero lines.
+- **Identical equality via a shared hash.** Host and join compute the SAME
+  `invEntryHash` over `(stringID,type,qty,quality)`, summed order-independently, so
+  "equal hash == equal multiset" is a sound cross-client content check.
+
+## Addendum: Bidirectional inventory + the cross-squad-trade decision (Phase 4a -> 4b)
+
+Written after `inv_bidir` reached green at 0 ms and WAN (120 ms +/-40 ms, 30% loss),
+with `inv_order`/`coop_presence` regressions still green.
+
+### What worked
+
+- **Bidirectional fell out of the existing partition for free.** The replicator already
+  computes `ownHands_` (the squad members we own, by tab-rank) every tick for the
+  positional drive-exclusion guard. Publishing the inventory of every container in that
+  set - instead of a host-only single registration - makes inventory sync symmetric and
+  disjoint by construction (host authors tab 0, join authors tab 1). `applyInventories`
+  skipping that same set means no client reconciles a container it authors, both ways.
+  No new ownership concept, no new wire type.
+- **Gate the publish behind `invSync`.** Once publishing keys off `ownHands_` (always
+  populated), ordinary co-op would start streaming inventories for everyone; gating
+  `publishInventories` on `invSync` keeps non-inventory sessions silent.
+- **The bidirectional oracle needs DISTINCT net deltas per side.** `inv_bidir` has the
+  host end +2 and the join end +1 on their owned containers, and checks per-rank
+  convergence in BOTH directions. Distinct deltas make the cross-client match
+  unambiguous (the two streams can't be coincidentally equal), and the ADD-then-REMOVE
+  sequence forces the peer to converge DOWN as well as up - so a removal that failed to
+  propagate would leave the peer stuck above the author's count and fail the check.
+
+### The loss the user saw, explained
+
+Manual cross-squad drag lost items "a few times." Root cause is doctrine 24: dragging an
+item INTO a peer-owned container is a split transaction - the source removal is
+authoritative but the destination add is local-only and gets deleted by the destination
+owner's next snapshot. It is not a wire/reconcile bug; it is structural. Hence the 4b
+decision to route trades through the world (drop -> pickup) rather than allow direct
+cross-authority moves. The owned-container path itself is loss-free (proven by
+`inv_bidir`), which is exactly what drop/pickup is built on.
+
+## Addendum: Equipped gear (armour/weapon slots) - the loose-only blind spot (Phase 4a)
+
+Written after `inv_equip` reached green at 0 ms and WAN (80 ms +/-20 ms, 1% loss), with
+`inv_bidir`/`inv_order`/`coop_presence` regressions still green. Prompted by a user
+observation: dropping a loose item synced, but dropping/unequipping ARMOUR removed it on
+the acting client only - the other client kept wearing it.
+
+### What worked
+
+- **Read worn gear from the equipment SECTIONS, not `_allItems`.** The original snapshot
+  iterated `Inventory::_allItems` and even had an `if (it->isEquipped) continue;` guard -
+  but that guard was DEAD CODE: for a character, worn armour/weapons don't live in
+  `_allItems` at all. They live in equipment sections. The snapshot now appends those,
+  tagged `equipped=1` + `slot`. (How we found it: every geared character logged
+  `count=0 eq=0` - the loose list really is empty for save-loaded gear.)
+- **The up path is a MOVE, not a fabrication.** Re-equipping from inventory used to vanish
+  because the reconcile destroyed the worn surplus and `create+equipItem`'d a replacement -
+  and a fabricated blank-handle item is discarded the moment it enters a slot (d25). The
+  fix keys the reconcile by TEMPLATE (not by `(sid,type,equipped)`) and, when only the
+  worn/loose SPLIT changed at unchanged total, MOVES the real item: UP `equipItem`s an
+  existing loose copy (a real item persists); DOWN detaches it and re-homes it into a loose
+  section. The non-obvious trap: `Inventory::tryAddItem` auto-routes an equippable item
+  straight back into its slot, so a removed item must be placed via a loose section's own
+  `addItem` or it instantly re-equips (the first `inv_reequip` run showed `eq` never dipping
+  - the unequip was silently undone). With the section-targeted add, `inv_reequip` shows a
+  clean `peak2 dip1 ->2` on author AND observer, both directions.
+- **Walk EVERY equip section, don't enumerate slots by getter.** The first cut read worn
+  gear via `getEquippedArmour` + `getEquippedWeapons`. Armour replicated, but unequipping a
+  WEAPON did nothing on the peer - because the weapon holster is its own equip section that
+  `getEquippedWeapons` didn't report, so the weapon was never in the snapshot and unequipping
+  it changed nothing to resend. Fix: iterate `Inventory::getAllSections()` and capture every
+  section flagged `isAnEquippedItemSection` (tagging each item `equipped=1` + the section's
+  `limitedSlot`). One uniform loop now covers ALL equippable slots - every armour piece,
+  both weapon slots, belt, and a worn backpack - and any future slot for free, since the
+  reconcile already keys on `(stringID,itemType,equipped)`. `inv_equip` confirmed it: the
+  geared member's worn count rose from `eq1` to `eq2` (armour + weapon now both captured).
+- **`equipped` is part of the reconcile key.** Keying on `(stringID,itemType,equipped)`
+  (and folding the flag into the content hash) makes a worn item and a loose copy of the
+  same template reconcile INDEPENDENTLY, so unequipping converges the slot, not just a
+  count. The peer's down-reconcile (`removeItemAutoDestroy` on its real worn item) is what
+  finally removes the armour the user saw stuck on.
+- **Stagger-robust test from REAL gear.** Because both clients load the same save, the
+  observer's own copy starts wearing the same gear; when the author unequips one item, the
+  observer must actively remove its worn copy to converge to "one fewer." That holds no
+  matter when the join finishes loading - no need to witness intermediate states (unlike
+  the naked-baseline approach, which can't tell a synced-down observer from one that was
+  never geared).
+
+### Addendum 2: weapons aren't (only) in sections - the held-weapon blind spot
+
+Walking every `isAnEquippedItemSection` made armour, belt, worn backpack, and the SHEATHED
+weapon (it sits in a `hip`/`back` section) replicate. But the user reported that manually
+unequipping AND re-equipping a WEAPON still didn't sync either direction, while pants did -
+and the automated `inv_reequip` was passing the whole time. A per-member inventory dump
+(`engine::dumpInventory`) explained the contradiction:
+
+- The geared member's sections were `hip, back, boots, head, backpack_attach, shirt, armour,
+  legs, belt, main` - **there is no dedicated weapon section.** The SHEATHED (secondary)
+  weapon happened to live in `hip`, so the section walk captured it and `inv_reequip` was
+  actually exercising that weapon (and passing). The test gave false confidence.
+- A HELD (primary) weapon is tracked ONLY by `Inventory::getPrimaryWeapon()` /
+  `getSecondaryWeapon()`, which are NOT part of `getAllSections()`. Re-equipping a weapon
+  from inventory routes it to the held slot, so it left every section the snapshot reads -
+  it vanished from the wire and the peer never saw it return. That is the manual failure.
+
+Fix: after the section walk, also read `getPrimaryWeapon()`/`getSecondaryWeapon()` and append
+any worn weapon, deduped by `(stringID, itemType)` against the already-captured equipped
+entries (the sheathed weapon is exposed BOTH as a section item and via the pointer, and the
+two are DISTINCT `Item*` objects, so pointer-identity dedup double-counted it - `inv_reequip`
+jumped from `peak2` to `peak3` until the dedup keyed on template instead). With template
+dedup, peak returned to `2` and both clients converge.
+
+### Addendum 3: the mid-drag "weapon gone" transient + a publish settle-debounce
+
+Even after the held-weapon capture fix, manually unequipping/re-equipping a weapon STILL
+didn't sync, while the automated `inv_reequip` (which drives clean engine moves) kept
+passing. Rather than guess, the reconcile was made fully observable - `engine::dumpInventory`
+on every SEND/APPLY (env `KENSHICOOP_INV_DUMP=1`), a `[recon]` trace of each branch inside
+`applyContainerContents`, and a single-instance diagnostic scenario `inv_wpnseq` that drives
+`applyContainerContents` through a crafted snapshot sequence with NO UI. That nailed it:
+
+- The clean two-step (weapon EQ -> weapon LOOSE -> weapon EQ) reconciles perfectly:
+  `MOVE-DOWN ok=1` then `MOVE-UP ok=1`. The move logic is correct.
+- The real manual capture (`KENSHICOOP_INV_DUMP`) showed the host briefly publishing the
+  weapon as FULLY GONE (`_allItems n=0`, every section empty) for ~240 ms - the window where
+  the inventory UI holds the dragged weapon on the CURSOR, out of the inventory entirely.
+- Feeding THAT into the reconcile (`inv_wpnseq` S2 `[weapon GONE]`) shows the killer:
+  `REMOVE-LOOSE got=1` DESTROYS the (real) weapon, and the follow-up re-equip can only
+  `CREATE-EQ`, which returns `ok=0` for the weapon (createItemAndAdd fails for this weapon
+  template; equipped fabrication is non-persistent anyway - d25). So the weapon is gone for
+  good. Clothes survived because they are never reported "fully gone" mid-drag.
+
+First fix attempt (host side): a flat **settle-debounce** in `publishInventories` - a changed
+fingerprint had to stay STABLE for `INV_SETTLE_MS` (~350 ms) before being sent. This passed
+the automated suite but STILL failed the manual weapon test, and the `KENSHICOOP_INV_DUMP`
+trace from that run showed why: a *deliberate* human re-equip holds the weapon on the cursor
+for far longer than 350 ms - the captured "weapon FULLY GONE" state persisted **961 ms**
+(`12:35:46.571`). The flat window was below the human cursor-hold, so the transient settled
+and was published, the peer destroyed its real weapon, and re-equip's `CREATE-EQ` was
+unreliable. (Pants never hit this: cloth re-create succeeds, so even a destroy recovers.)
+
+Final fix (the right layer): make the debounce **removal-aware**. The killer transient is
+always a count DECREASE (the weapon leaves the inventory for the cursor), and so is a genuine
+drop; an equip<->loose move keeps the count. So `publishInventories` tracks `lastSentN` (entry
+count of the last SENT snapshot) and applies the long `INV_REMOVE_SETTLE_MS` (1800 ms) window
+ONLY when `n < lastSentN`; additions and equip/unequip MOVES keep the fast 350 ms window. A
+~1 s cursor-hold is now swallowed, so the peer keeps its real weapon and just MOVES it; only
+genuine removals wait out the longer settle (a real drop lags ~1.8 s on the peer - acceptable).
+Manually validated: host removals/unequips reflected on the join, weapon included, with the
+join trace showing `MOVE-UP ok=1` and **zero** weapon REMOVE ops (the real item was never
+destroyed). Automated `inv_reequip`/`inv_equip`/`inv_bidir` stay green.
+
+### Addendum 4: weapon-SLOT fidelity (Weapon I vs Weapon II)
+
+With unequip/re-equip finally syncing, the next manual finding: re-equipping a weapon into the
+OTHER weapon slot (unequip from slot 2, re-equip to slot 1) persisted on the acting client, but
+the peer put it back in slot 2. Two compounding causes, both rooted in how the engine models
+weapon slots:
+
+- A character has TWO weapon sections - `hip` (Weapon II) and `back` (Weapon I) - and BOTH
+  carry `limitedSlot = ATTACH_WEAPON (0)`. Armour sections each have a unique `AttachSlot`
+  (head=3, legs=6, ...), so `slot` identifies them; the two weapon slots are identical in
+  `slot`. The snapshot's `slot` field therefore could not tell Weapon I from Weapon II.
+- Consequently the content fingerprint (`invEntryHash`) was IDENTICAL for the same weapon in
+  `hip` vs `back` (same sid/type/equipped/slot), so a pure slot move produced NO fingerprint
+  change and was never published. The peer only ever saw the loose<->equipped transitions of
+  the drag and re-equipped via `equipItem`, which auto-routes to the default slot (`hip`).
+
+Fix (three coordinated parts): (1) repurpose the `InvItemEntry` pad as `section` = a 16-bit
+hash of the equip section's NAME (`sectionNameHash`), built identically on both clients, so the
+two weapon slots get distinct wire identities; (2) fold `section` into `invEntryHash` so a
+Weapon I<->II move now changes the fingerprint and publishes; (3) a SLOT-FIDELITY pass in
+`applyContainerContents` after the count reconcile: for each worn weapon, if it sits in a
+different weapon section than the author's `section` hash, MOVE the real item between the two
+weapon sections (`removeItemDontDestroy_returnsItem` + the target `InventorySection::addItem` -
+the same direct placement `unequipToLoose` uses). Armour is untouched (its per-slot sections
+never mismatch). Protocol bumped 6 -> 7. Manually validated both directions; the trace shows a
+single `SLOT-MOVE` per side and **zero** weapon REMOVE ops (the real item is relocated, not
+rebuilt). Doctrine 27.
+
+### What did NOT work
+
+- **Refabricating a removed worn weapon on the peer.** Once the transient destroyed the
+  join's real weapon, the re-equip had to `createItemAndAdd(..., equip=true)`, which returns
+  `ok=0` for the weapon template (and even when create succeeds for gear, equipped
+  fabrication is discarded - d25). The peer therefore cannot reconstruct a worn weapon from
+  scratch; it must PRESERVE and MOVE its own real copy. Hence the fix prevents the
+  destroying transient rather than trying to rebuild afterwards.
+- **Trusting "walk every equip section" as slot-complete for weapons.** It is NOT: worn
+  weapons can live outside `getAllSections()` entirely (the held slot is only in
+  `getPrimaryWeapon()`/`getSecondaryWeapon()`). The section walk caught the sheathed weapon
+  by luck (it sat in `hip`), which masked the gap and let `inv_reequip` pass on a weapon it
+  wasn't really testing end-to-end. Always read the weapon accessors in addition to sections.
+- **Pointer-identity dedup across the section list and the weapon accessors.** The same
+  logical weapon is two different `Item*` objects (one held by the section, one returned by
+  the accessor), so it was counted twice. Dedup by `(stringID, itemType)` among equipped
+  entries instead.
+- **Synthesizing worn gear for the test.** `seedEquippedItem` (create item -> `tryAddItem`
+  -> `equipItem`) reports success for one tick (`isEquipped` flips true), then the engine
+  DISCARDS the fabricated, blank-handle item within a tick or two (next sample: gone, or
+  fallen back to loose). So you cannot mint equipped gear from scratch; the test must use
+  gear the save already wears. This is also why the equip (UP) reconcile is out of scope -
+  a peer reconstructing "newly equipped" gear hits the same non-persistence. Only removal
+  of real, save-loaded worn gear is reliably authoritative today.
+- **Picking the tab's lowest-hand member blindly.** The lead isn't always the geared one;
+  `inv_equip` now scans the tab for the lowest-hand member with `eq>=1` (deterministic, so
+  both clients pick the same one) and caches it so sampling doesn't drift after the unequip
+  drops that member's worn count.
+
+### Doctrine added
+
+- **Doctrine 25 - Equipped gear is a separate store; walk EVERY equip section, and MOVE
+  real items between worn/loose instead of destroy+recreate.** Worn gear is NOT in
+  `Inventory::_allItems`; enumerate `getAllSections()` and capture each section flagged
+  `  isAnEquippedItemSection`, carrying an `equipped`+`slot` tag on the wire so worn vs loose
+  reconcile independently. Walking all sections (rather than per-slot getters like
+  `getEquippedArmour`/`getEquippedWeapons`) covers armour, belt, and a worn backpack - BUT
+  IT IS NOT ENOUGH FOR WEAPONS. Worn weapons can live outside `getAllSections()` entirely:
+  the SHEATHED weapon happens to sit in a `hip`/`back` section, but the HELD weapon is tracked
+  only by `getPrimaryWeapon()`/`getSecondaryWeapon()`. So ALSO read those two accessors and
+  append any worn weapon, deduped by `(stringID, itemType)` against the equipped entries
+  already captured (the sheathed weapon shows up in BOTH the section and the accessor as two
+  distinct `Item*`, so pointer-identity dedup double-counts - key on template). Without this,
+  re-equipping a weapon (routed to the held slot) vanishes from the snapshot and never
+  replicates. For an equipped<->loose split change on a template
+  whose TOTAL count is unchanged, the reconcile does an in-place MOVE of the REAL item:
+  UP = `equipItem` on an existing loose copy; DOWN = detach via `removeItemDontDestroy` then
+  add into a LOOSE (non-equip) section's own `addItem`. Two engine gotchas this encodes:
+  (a) fabricated blank-handle items still get discarded when equipped, so the up path MUST
+  equip a real item (a synced loose copy), never `create+equipItem`; (b) the inventory-level
+  `tryAddItem` AUTO-ROUTES an equippable item straight back into its slot (re-equipping what
+  you just took off), so unequip-to-loose must target a loose section's `addItem` directly.
+  A genuinely-new worn item with no loose copy to equip remains best-effort `create+equip`
+  (may not persist). Validated by `inv_reequip` (unequip a real worn item to loose, then
+  re-equip it: per-rank dip-then-restore + cross-client convergence, both directions) plus
+  the `inv_equip` down-path drop test.
+- **Doctrine 26 - Debounce inventory publishes; never replicate mid-drag transients.** The
+  inventory UI holds a dragged item on the CURSOR, so for a fraction of a second the
+  character's inventory reports the item FULLY GONE (not loose, not worn - absent from
+  `_allItems` and every section). A peer that acts on that transient DESTROYS its real copy,
+  and it cannot refabricate a worn weapon (createItemAndAdd fails for weapons; equipped
+  fabrication is discarded - d25), so the item is lost permanently. `publishInventories`
+  therefore requires a changed content fingerprint to stay STABLE before sending, and the
+  window is **removal-aware**: additions and equip<->loose MOVES (entry count unchanged) use a
+  fast `INV_SETTLE_MS` (350 ms), but a count DECREASE (`n < lastSentN` - the in-cursor "gone"
+  flicker AND a genuine drop) must hold for `INV_REMOVE_SETTLE_MS` (1800 ms). A flat 350 ms is
+  NOT enough: a human cursor-hold during re-equip was measured at ~960 ms, well past it. So
+  only resting states replicate, and removals specifically ride out the human drag - the peer
+  reconciles every weapon change as a MOVE of its real item, never a destroy. The tradeoff is
+  a ~1.8 s lag before a genuine drop appears on the peer (accepted). Diagnose inventory
+  desyncs with `KENSHICOOP_INV_DUMP=1` (full inventory dump on
+  every SEND/APPLY + a `[recon]` per-branch trace in `applyContainerContents`) and the
+  `inv_wpnseq` scenario, which drives the reconcile through a crafted snapshot sequence on a
+  single instance - reproducing the bug deterministically without any manual play.
+- **Doctrine 27 - Replicate the equip SECTION, not just the AttachSlot, for weapons.** A
+  character's two weapon slots (`hip` = Weapon II, `back` = Weapon I) BOTH carry
+  `limitedSlot = ATTACH_WEAPON`, so the `slot` field cannot tell them apart and `equipItem`
+  auto-routes a re-equipped weapon to the default slot. Carry a 16-bit hash of the equip
+  section NAME (`section`, identical on both clients since sections are built from the same
+  race/inventory data) on each `InvItemEntry`, FOLD IT INTO `invEntryHash` (else a Weapon
+  I<->II move has an unchanged fingerprint and never publishes), and add a SLOT-FIDELITY pass
+  to `applyContainerContents` that MOVES the real worn weapon between weapon sections
+  (`removeItemDontDestroy` + target `InventorySection::addItem`) to match the author's section.
+  Armour needs none of this (unique per-slot sections). Validated manually both directions
+  (one `SLOT-MOVE` per side, zero REMOVE).

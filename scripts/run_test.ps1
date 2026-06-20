@@ -156,6 +156,12 @@ function Set-CoopEnv {
     # KENSHICOOP_SCENARIO: empty string = normal co-op tick (no scenario). When
     # set, KENSHICOOP_TEST_SECONDS still applies as a hard backstop.
     $env:KENSHICOOP_SCENARIO     = $Scenario
+    # Reconcile trace gate: inv_wpnseq is a local diagnostic that drives applyContainerContents
+    # directly and needs the [recon]/DUMP traces to see which primitive fails for weapons.
+    # Reconcile/world-item trace gate: inv_wpnseq needs the [recon] traces; the world_item_*
+    # family enables the [wi] SEND/SPAWN/MOVE/CULL traces so the mechanism (not just the
+    # outcome) is verifiable from the log.
+    $env:KENSHICOOP_INV_DUMP     = if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -like "world_item_*") { "1" } else { "" }
     # Join-only AI-suspend probe. Host ignores it (plugin guards on !isHost), but
     # we still only set it for the join so the env is unambiguous.
     $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
@@ -544,6 +550,522 @@ function Test-CoopPresence {
     $ok = ($h2j -and $j2h)
     $v = if ($ok) { "PASS" } else { "FAIL" }
     Write-Host "  COOP-PRESENCE $v - bidirectional presence (host->join=$h2j, join->host=$j2h, tol=$t)"
+    return $ok
+}
+
+# inv_order (Phase 4a): container-contents replication. Both clients anchor on the
+# SAME container and sample its contents (count + order-independent content hash)
+# over time; the host performs a LIVE add mid-run. This is the content-snapshot /
+# reconcile proof, so the gate is a MULTISET match, not a transform cross-check:
+#   * host logged a live ADD (added>=1),
+#   * the join OBSERVED a content change (>=1 distinct hash, not a static load),
+#   * BOTH sides' item count GREW over their own baseline (the add landed), and
+#   * the host's and join's FINAL content hashes are EQUAL (identical multiset -
+#     same invEntryHash on both, so equal hash == equal contents).
+# world_item_sync (Phase W1): host-authored ground-item visual sync. The host DROPS a
+# known item (a free world item), which streams netId-keyed to the join; the join spawns a
+# LOCAL proxy so its OWN interest scan enumerates it. Then the host DESPAWNS the item and
+# the join must CULL its proxy. Both clients log "SCENARIO WI <HOST|JOIN> t=.. n=.. pos=..
+# hash=..". PASS requires: host dropped + despawned; the join's observed ground item matched
+# the host's CONTENT hash exactly and its position within tolerance (horizontal); and the
+# join SPAWNED (n 0->>=1) then cleanly CULLED (n ->0) - i.e. no leaked proxy.
+function Test-WorldItemSync {
+    param([string]$HostFile, [string]$JoinFile, [double]$Tol = 3.0)
+    $rx = 'SCENARIO WI (HOST|JOIN) t=(\d+) n=(\d+) pos=(-?[0-9.]+),(-?[0-9.]+),(-?[0-9.]+) hash=(\d+)'
+    $series = {
+        param($file, $role)
+        $arr = @()
+        if (Test-Path $file) {
+            foreach ($ln in Get-Content $file) {
+                if ($ln -match $rx -and $matches[1] -eq $role) {
+                    $arr += [pscustomobject]@{
+                        n = [int]$matches[3]; x = [double]$matches[4]; y = [double]$matches[5]
+                        z = [double]$matches[6]; hash = [uint32]$matches[7]
+                    }
+                }
+            }
+        }
+        return ,$arr
+    }
+    $H = & $series $HostFile "HOST"
+    $J = & $series $JoinFile "JOIN"
+    if ($H.Count -lt 2 -or $J.Count -lt 2) {
+        Write-Host "  WI-SYNC FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
+        return $false
+    }
+    $drop    = [bool](Select-String -Path $HostFile -Pattern 'SCENARIO WI DROP .*dropped=[1-9]' -Quiet)
+    $despawn = [bool](Select-String -Path $HostFile -Pattern 'SCENARIO WI DESPAWN destroyed=[1-9]' -Quiet)
+    # First "item present" sample on each side (its pos + content hash).
+    $hostPresent = $H | Where-Object { $_.n -ge 1 } | Select-Object -First 1
+    $joinPresent = $J | Where-Object { $_.n -ge 1 } | Select-Object -First 1
+    $joinSpawned = ($joinPresent -ne $null)
+    $hostSaw     = ($hostPresent -ne $null)
+    # Horizontal (XZ) placement match - Y can shift if the join re-grounds the proxy.
+    $posMatch = $false; $hashMatch = $false; $dxz = -1.0
+    if ($hostSaw -and $joinSpawned) {
+        $dx = $hostPresent.x - $joinPresent.x; $dz = $hostPresent.z - $joinPresent.z
+        $dxz = [math]::Sqrt($dx * $dx + $dz * $dz)
+        $posMatch  = ($dxz -le $Tol)
+        $hashMatch = ($hostPresent.hash -eq $joinPresent.hash)
+    }
+    # Clean cull: each side saw the item, and its LAST sample is back to n=0 (no leak).
+    $hostCulled = $hostSaw -and ($H[$H.Count - 1].n -eq 0)
+    $joinCulled = $joinSpawned -and ($J[$J.Count - 1].n -eq 0)
+    $ok = $drop -and $despawn -and $joinSpawned -and $posMatch -and $hashMatch -and $joinCulled -and $hostCulled
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host ("  WI-SYNC $v - drop=$drop despawn=$despawn joinSpawned=$joinSpawned " +
+                "posMatch=$posMatch (dXZ=$([math]::Round($dxz,2))u tol=$Tol) hashMatch=$hashMatch " +
+                "hostCulled=$hostCulled joinCulled=$joinCulled")
+    if ($hostPresent -and $joinPresent) {
+        Write-Host ("  WI-SYNC   host item pos=($($hostPresent.x),$($hostPresent.y),$($hostPresent.z)) hash=$($hostPresent.hash)")
+        Write-Host ("  WI-SYNC   join item pos=($($joinPresent.x),$($joinPresent.y),$($joinPresent.z)) hash=$($joinPresent.hash)")
+    }
+    return $ok
+}
+
+# drop_probe (Phase W0, DIAGNOSTIC): the deliverable is the EVIDENCE, not a sync gate
+# (W0 has no world-item channel yet). The host seeds a known loose item, enumerates
+# nearby world items as a BEFORE baseline, drops the item, and re-enumerates (AFTER). We
+# assert the probe actually EXECUTED (a drop happened and a RESULT line was produced) and
+# surface the characterization (before/after counts + whether getObjectsWithinSphere
+# enumerated the dropped object) so the W1 design rests on observed facts, not guesses.
+function Test-DropProbe {
+    param([string]$HostFile)
+    if (-not (Test-Path $HostFile)) {
+        Write-Host "  DROP-PROBE FAIL - no host log"
+        return $false
+    }
+    $rx = 'SCENARIO DROP RESULT dropped=(-?\d+) before=(-?\d+) after=(-?\d+) enumerated=(\d+)'
+    $line = Select-String -Path $HostFile -Pattern $rx | Select-Object -Last 1
+    if (-not $line) {
+        Write-Host "  DROP-PROBE FAIL - no 'SCENARIO DROP RESULT' evidence line"
+        return $false
+    }
+    $null = ($line.Line -match $rx)
+    $dropped    = [int]$matches[1]
+    $before     = [int]$matches[2]
+    $after      = [int]$matches[3]
+    $enumerated = [int]$matches[4]
+    # Also report the dropped object's itemType/hand/pos from the AFTER scan for the design.
+    $seeded = Select-String -Path $HostFile -Pattern 'SCENARIO DROP SEEDED added=\d+ sid=' | Select-Object -Last 1
+    $ok = ($dropped -gt 0)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host ("  DROP-PROBE $v - dropped=$dropped before=$before after=$after enumerated=$enumerated")
+    if ($seeded) { Write-Host ("  DROP-PROBE   " + $seeded.Line.Trim()) }
+    # Surface the enumerated world objects from the AFTER scan (the characterization).
+    $afterScan = $false
+    foreach ($ln in Get-Content $HostFile) {
+        if ($ln -match 'SCENARIO DROP AFTER-scan:') { $afterScan = $true; continue }
+        if ($afterScan) {
+            if ($ln -match 'WORLDITEM (scan|  )') { Write-Host ("  DROP-PROBE   " + ($ln -replace '^.*WORLDITEM', 'WORLDITEM').Trim()) }
+            elseif ($ln -match 'SCENARIO DROP RESULT') { break }
+        }
+    }
+    return $ok
+}
+
+function Test-InventorySync {
+    param([string]$HostFile, [string]$JoinFile)
+    # No '^' anchor: log lines carry a "[ts] [ROLE] INFO:" prefix before the payload.
+    $rx = 'SCENARIO INV (MEMBER|RECV) t=(\d+) count=(\d+) hash=(\d+)'
+    $series = {
+        param($file)
+        $arr = @()
+        if (Test-Path $file) {
+            foreach ($ln in Get-Content $file) {
+                if ($ln -match $rx) {
+                    $arr += [pscustomobject]@{ count = [int]$matches[3]; hash = [uint32]$matches[4] }
+                }
+            }
+        }
+        return ,$arr
+    }
+    $H = & $series $HostFile
+    $J = & $series $JoinFile
+    if ($H.Count -lt 2 -or $J.Count -lt 1) {
+        Write-Host "  INV-SYNC FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
+        return $false
+    }
+    $added = $false
+    if (Test-Path $HostFile) { $added = [bool](Select-String -Path $HostFile -Pattern 'SCENARIO INV ADD added=[1-9]' -Quiet) }
+    $hFirst = $H[0]; $hLast = $H[$H.Count - 1]
+    $jFirst = $J[0]; $jLast = $J[$J.Count - 1]
+    # Advisory: did the join witness the live transition itself? (Defeated by the
+    # launch stagger when the join starts sampling AFTER the add already propagated.)
+    $jChanged = $false
+    foreach ($s in $J) { if ($s.hash -ne $jFirst.hash) { $jChanged = $true; break } }
+    # Authoritative gate (stagger-robust):
+    #   * host performed a LIVE add (added),
+    #   * the host's content actually CHANGED (first hash != last hash) - proves it
+    #     was created at runtime, not loaded from the save, and is robust to stacking,
+    #   * the host's and join's FINAL content hashes MATCH (identical multiset), and
+    #   * the join ends holding NON-EMPTY synced content (the save's leader baseline is
+    #     empty, so a non-empty matching multiset proves cross-client reconstruction).
+    $hostChanged = ($hFirst.hash -ne $hLast.hash)
+    $hashMatch   = ($hLast.hash -eq $jLast.hash)
+    $joinNonEmpty= ($jLast.count -gt 0)
+    $ok = ($added -and $hostChanged -and $hashMatch -and $joinNonEmpty)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host ("  INV-SYNC $v - add=$added hostChanged=$hostChanged hashMatch=$hashMatch " +
+                "joinNonEmpty=$joinNonEmpty (joinSawTransition=$jChanged advisory) " +
+                "host=$($hFirst.count)->$($hLast.count) join=$($jFirst.count)->$($jLast.count) " +
+                "finalHash host=$($hLast.hash) join=$($jLast.hash)")
+    return $ok
+}
+
+# inv_bidir (Phase 4a): BIDIRECTIONAL container-contents replication. Each client
+# mutates ONLY a container it OWNS (host = squad-tab rank 0, join = rank 1) with an
+# ADD-then-REMOVE sequence, and samples BOTH containers (logging OWN / PEER lines keyed
+# by rank). The proof is PER-RANK convergence in BOTH directions:
+#   * rank 0 is authored by the HOST; the JOIN must converge its PEER view to the
+#     host's FINAL rank-0 contents (host -> join), and
+#   * rank 1 is authored by the JOIN; the HOST must converge its PEER view to the
+#     join's FINAL rank-1 contents (join -> host).
+# For each rank: the author's own contents must actually CHANGE (>=2 distinct hashes,
+# proving live mutation incl. the removal), and the observer's FINAL (count,hash) must
+# EQUAL the author's FINAL (count,hash) - identical multiset, so no loss and no dupe.
+function Test-InventoryBidir {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'SCENARIO INVB r=(\d+) (OWN|PEER) t=(\d+) count=(\d+) hash=(\d+)'
+    # Parsed series of {rank, role, count, hash} in log order for one file.
+    $series = {
+        param($file)
+        $arr = @()
+        if (Test-Path $file) {
+            foreach ($ln in Get-Content $file) {
+                if ($ln -match $rx) {
+                    $arr += [pscustomobject]@{
+                        rank = [int]$matches[1]; role = $matches[2]
+                        count = [int]$matches[4]; hash = [uint32]$matches[5]
+                    }
+                }
+            }
+        }
+        return ,$arr
+    }
+    $H = & $series $HostFile
+    $J = & $series $JoinFile
+    if ($H.Count -lt 2 -or $J.Count -lt 2) {
+        Write-Host "  INV-BIDIR FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
+        return $false
+    }
+    # Filter helpers: ordered samples for (file, rank, role); distinct-hash count.
+    $pick = { param($S, $rank, $role) @($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
+    $distinct = { param($rows) ($rows | ForEach-Object { $_.hash } | Select-Object -Unique).Count }
+    # Verify one direction: $authorRows OWN the container; $obsRows reconcile it.
+    $checkDir = {
+        param($name, $authorRows, $obsRows)
+        if ($authorRows.Count -lt 1 -or $obsRows.Count -lt 1) {
+            Write-Host "  INV-BIDIR $name FAIL - missing samples (author=$($authorRows.Count) observer=$($obsRows.Count))"
+            return $false
+        }
+        $aLast = $authorRows[$authorRows.Count - 1]
+        $oLast = $obsRows[$obsRows.Count - 1]
+        $aChanged = ((& $distinct $authorRows) -ge 2)         # author mutated live (add+remove)
+        $converged = ($aLast.hash -eq $oLast.hash) -and ($aLast.count -eq $oLast.count)
+        $r = $aChanged -and $converged
+        Write-Host ("  INV-BIDIR $name " + $(if ($r) { "PASS" } else { "FAIL" }) +
+                    " - authorChanged=$aChanged converged=$converged" +
+                    " authorFinal=(c$($aLast.count),h$($aLast.hash)) observerFinal=(c$($oLast.count),h$($oLast.hash))")
+        return $r
+    }
+    # host -> join: rank 0 authored by host, observed by join.
+    $h2j = & $checkDir "host->join(r0)" (& $pick $H 0 "OWN") (& $pick $J 0 "PEER")
+    # join -> host: rank 1 authored by join, observed by host.
+    $j2h = & $checkDir "join->host(r1)" (& $pick $J 1 "OWN") (& $pick $H 1 "PEER")
+    # Confirm both sides actually ran their add+remove sequence.
+    $hostSeq = (Select-String -Path $HostFile -Pattern 'SCENARIO INVB ADD r=0 n=[1-9]' -Quiet) -and `
+               (Select-String -Path $HostFile -Pattern 'SCENARIO INVB REM r=0 n=[1-9]' -Quiet)
+    $joinSeq = (Select-String -Path $JoinFile -Pattern 'SCENARIO INVB ADD r=1 n=[1-9]' -Quiet) -and `
+               (Select-String -Path $JoinFile -Pattern 'SCENARIO INVB REM r=1 n=[1-9]' -Quiet)
+    $ok = $h2j -and $j2h -and $hostSeq -and $joinSeq
+    Write-Host ("  INV-BIDIR " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - host->join=$h2j join->host=$j2h hostSeq=$hostSeq joinSeq=$joinSeq")
+    return $ok
+}
+
+# inv_equip (Phase 4a): EQUIPPED-gear (armour/weapon slot) replication. Each client
+# UNEQUIPS one REAL (save-loaded) worn item from the geared member of a squad tab it OWNS
+# (host = rank 0, join = rank 1) and leaves it off, while sampling BOTH tabs (OWN / PEER
+# lines keyed by rank, with an `eq` count of how many items are worn). The proof is
+# PER-RANK convergence in BOTH directions, on the EQUIPPED dimension specifically:
+#   * rank 0 worn gear is authored by the HOST; the JOIN must converge its PEER view, and
+#   * rank 1 worn gear is authored by the JOIN; the HOST must converge its PEER view.
+# For each rank: the author's worn count must DROP below its peak (a real unequip), and
+# the observer's FINAL (count, eq, hash) must EQUAL the author's. The observer loaded the
+# same save, so its copy started wearing the SAME gear (worn-count = peak); converging to
+# the reduced final can only happen via a real removal - so equipped-gear removal (the
+# loose-only blind spot the user hit) replicated with no loss. The equip (up) path is out
+# of scope: fabricated re-equips don't persist in the engine.
+function Test-InventoryEquip {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'SCENARIO INVE r=(\d+) (OWN|PEER) t=(\d+) count=(\d+) eq=(\d+) hash=(\d+)'
+    $series = {
+        param($file)
+        $arr = @()
+        if (Test-Path $file) {
+            foreach ($ln in Get-Content $file) {
+                if ($ln -match $rx) {
+                    $arr += [pscustomobject]@{
+                        rank = [int]$matches[1]; role = $matches[2]
+                        count = [int]$matches[4]; eq = [int]$matches[5]; hash = [uint32]$matches[6]
+                    }
+                }
+            }
+        }
+        return ,$arr
+    }
+    $H = & $series $HostFile
+    $J = & $series $JoinFile
+    if ($H.Count -lt 2 -or $J.Count -lt 2) {
+        Write-Host "  INV-EQUIP FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
+        return $false
+    }
+    $pick = { param($S, $rank, $role) @($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
+    $maxEq = { param($rows) ($rows | ForEach-Object { $_.eq } | Measure-Object -Maximum).Maximum }
+    # One direction: the author UNEQUIPS a worn item; the observer (which loaded the same
+    # save, so it starts wearing it too) must converge to the author's reduced worn state.
+    $checkDir = {
+        param($name, $authorRows, $obsRows)
+        if ($authorRows.Count -lt 1 -or $obsRows.Count -lt 1) {
+            Write-Host "  INV-EQUIP $name FAIL - missing samples (author=$($authorRows.Count) observer=$($obsRows.Count))"
+            return $false
+        }
+        $aLast = $authorRows[$authorRows.Count - 1]; $oLast = $obsRows[$obsRows.Count - 1]
+        $aPeak = & $maxEq $authorRows
+        $authorReduced = ($aPeak -ge 1) -and ($aLast.eq -lt $aPeak)   # a worn item was removed
+        # Converged on the EQUIPPED dimension: identical worn-count AND content hash AND
+        # total count. Since the observer's own copy was geared at load (worn-count $aPeak),
+        # matching the author's reduced final can only happen via a real removal - proving
+        # the worn-gear removal replicated (no loss: a stuck observer keeps the higher eq).
+        $converged = ($aLast.hash -eq $oLast.hash) -and ($aLast.count -eq $oLast.count) -and `
+                     ($aLast.eq -eq $oLast.eq)
+        $r = $authorReduced -and $converged
+        Write-Host ("  INV-EQUIP $name " + $(if ($r) { "PASS" } else { "FAIL" }) +
+                    " - authorReduced=$authorReduced(peakEq$aPeak`->$($aLast.eq)) converged=$converged" +
+                    " authorFinal=(c$($aLast.count),eq$($aLast.eq),h$($aLast.hash))" +
+                    " observerFinal=(c$($oLast.count),eq$($oLast.eq),h$($oLast.hash))")
+        return $r
+    }
+    # host -> join: rank 0 worn gear authored by host, observed by join.
+    $h2j = & $checkDir "host->join(r0)" (& $pick $H 0 "OWN") (& $pick $J 0 "PEER")
+    # join -> host: rank 1 worn gear authored by join, observed by host.
+    $j2h = & $checkDir "join->host(r1)" (& $pick $J 1 "OWN") (& $pick $H 1 "PEER")
+    # Confirm both sides actually unequipped a worn item from their own tab.
+    $hostSeq = (Select-String -Path $HostFile -Pattern 'SCENARIO INVE UNEQUIP r=0 n=[1-9]' -Quiet)
+    $joinSeq = (Select-String -Path $JoinFile -Pattern 'SCENARIO INVE UNEQUIP r=1 n=[1-9]' -Quiet)
+    $ok = $h2j -and $j2h -and $hostSeq -and $joinSeq
+    Write-Host ("  INV-EQUIP " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - host->join=$h2j join->host=$j2h hostSeq=$hostSeq joinSeq=$joinSeq")
+    return $ok
+}
+
+# inv_reequip (Phase 4a, UP path): each client UNEQUIPS a real worn item from the geared
+# member of a tab it OWNS to LOOSE (move, preserving it), HOLDS that dip, then RE-EQUIPS it
+# (move loose -> slot). Re-equipping a REAL item persists (fabricated equips are discarded),
+# so the slot fills back in. The proof, per direction (host authors rank 0, join authors
+# rank 1):
+#   * authorRestored - the author's own worn count DIPS below its peak (the unequip) and
+#     RETURNS to the peak and HOLDS it (the re-equip persisted - the d25 risk), and
+#   * converged - the observer's FINAL (count, eq, hash) EQUALS the author's, AND the
+#     observer's PEER series shows the same dip-then-restore (it down-moved when it saw the
+#     unequip, then UP-moved when it saw the re-equip). A broken up path leaves the observer
+#     stuck loose (eq below peak) -> converged fails. observerSawCycle is required because a
+#     plain final-state match could be the untouched baseline on a late-joining observer.
+function Test-InventoryReequip {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'SCENARIO INVE r=(\d+) (OWN|PEER) t=(\d+) count=(\d+) eq=(\d+) hash=(\d+)'
+    $series = {
+        param($file)
+        $arr = @()
+        if (Test-Path $file) {
+            foreach ($ln in Get-Content $file) {
+                if ($ln -match $rx) {
+                    $arr += [pscustomobject]@{
+                        rank = [int]$matches[1]; role = $matches[2]
+                        count = [int]$matches[4]; eq = [int]$matches[5]; hash = [uint32]$matches[6]
+                    }
+                }
+            }
+        }
+        return ,$arr
+    }
+    $H = & $series $HostFile
+    $J = & $series $JoinFile
+    if ($H.Count -lt 2 -or $J.Count -lt 2) {
+        Write-Host "  INV-REEQUIP FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
+        return $false
+    }
+    $pick = { param($S, $rank, $role) @($S | Where-Object { $_.rank -eq $rank -and $_.role -eq $role }) }
+    $maxEq = { param($rows) ($rows | ForEach-Object { $_.eq } | Measure-Object -Maximum).Maximum }
+    $minEq = { param($rows) ($rows | ForEach-Object { $_.eq } | Measure-Object -Minimum).Minimum }
+    $checkDir = {
+        param($name, $authorRows, $obsRows)
+        if ($authorRows.Count -lt 2 -or $obsRows.Count -lt 2) {
+            Write-Host "  INV-REEQUIP $name FAIL - missing samples (author=$($authorRows.Count) observer=$($obsRows.Count))"
+            return $false
+        }
+        $aLast = $authorRows[$authorRows.Count - 1]; $oLast = $obsRows[$obsRows.Count - 1]
+        $aPeak = & $maxEq $authorRows; $aDip = & $minEq $authorRows
+        # Author dipped (unequip seen) AND returned to peak and held it (re-equip persisted).
+        $authorRestored = ($aPeak -ge 1) -and ($aDip -lt $aPeak) -and ($aLast.eq -eq $aPeak)
+        # Observer witnessed the same dip-then-restore on its PEER view of that tab.
+        $oPeak = & $maxEq $obsRows; $oDip = & $minEq $obsRows
+        $observerSawCycle = ($oDip -lt $oPeak) -and ($oLast.eq -eq $oPeak)
+        # Converged on the equipped dimension (worn-count + content hash + total count).
+        $converged = ($aLast.hash -eq $oLast.hash) -and ($aLast.count -eq $oLast.count) -and `
+                     ($aLast.eq -eq $oLast.eq)
+        $r = $authorRestored -and $converged -and $observerSawCycle
+        Write-Host ("  INV-REEQUIP $name " + $(if ($r) { "PASS" } else { "FAIL" }) +
+                    " - authorRestored=$authorRestored(peak$aPeak dip$aDip ->$($aLast.eq))" +
+                    " observerSawCycle=$observerSawCycle(peak$oPeak dip$oDip ->$($oLast.eq))" +
+                    " converged=$converged" +
+                    " authorFinal=(c$($aLast.count),eq$($aLast.eq),h$($aLast.hash))" +
+                    " observerFinal=(c$($oLast.count),eq$($oLast.eq),h$($oLast.hash))")
+        return $r
+    }
+    $h2j = & $checkDir "host->join(r0)" (& $pick $H 0 "OWN") (& $pick $J 0 "PEER")
+    $j2h = & $checkDir "join->host(r1)" (& $pick $J 1 "OWN") (& $pick $H 1 "PEER")
+    # Confirm both sides actually unequipped AND re-equipped a worn item from their own tab.
+    $hostUn = (Select-String -Path $HostFile -Pattern 'SCENARIO INVE UNEQUIP r=0 n=[1-9]' -Quiet)
+    $hostRe = (Select-String -Path $HostFile -Pattern 'SCENARIO INVE REEQUIP r=0 n=[1-9]' -Quiet)
+    $joinUn = (Select-String -Path $JoinFile -Pattern 'SCENARIO INVE UNEQUIP r=1 n=[1-9]' -Quiet)
+    $joinRe = (Select-String -Path $JoinFile -Pattern 'SCENARIO INVE REEQUIP r=1 n=[1-9]' -Quiet)
+    $seq = $hostUn -and $hostRe -and $joinUn -and $joinRe
+    $ok = $h2j -and $j2h -and $seq
+    Write-Host ("  INV-REEQUIP " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - host->join=$h2j join->host=$j2h hostUn=$hostUn hostRe=$hostRe joinUn=$joinUn joinRe=$joinRe")
+    return $ok
+}
+
+# inv_addequip (Phase 4a, d25 fix): LOCAL single-client reconcile test. Reproduces the
+# "picked-up weapon auto-equips into the empty slot, flickers, then VANISHES" bug: when the
+# reconcile must ADD an EQUIPPED item with NO existing copy, the old code fabricated-and-
+# equipped it (discarded within a tick). The fix creates it LOOSE and equips the now-real
+# copy on a LATER reconcile pass. The scenario removes a worn item, then re-applies the worn
+# baseline across ticks. ADD-EQUIP asserts the slot refilled to baseline AND persisted when
+# we STOPPED re-applying (eqPersist>=baseWorn) - the proof the equipped copy is now durable.
+function Test-AddEquip {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'ADDEQ verdict pass=(\d+) baseWorn=(-?\d+) create=(-?\d+) equip=(-?\d+) persist=(-?\d+)'
+    $eval = {
+        param($file, $label)
+        if (-not (Test-Path $file)) { return $null }
+        $line = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $line) { return $null }
+        $baseWorn = [int]$line.Matches[0].Groups[2].Value
+        $create   = [int]$line.Matches[0].Groups[3].Value
+        $equip    = [int]$line.Matches[0].Groups[4].Value
+        $persist  = [int]$line.Matches[0].Groups[5].Value
+        # Durable-equip invariants: had a worn baseline, refilled to it after the 2nd apply,
+        # and HELD it without re-applying (the fabricate path would show persist=0 here).
+        $ok = ($baseWorn -ge 1) -and ($equip -ge $baseWorn) -and ($persist -ge $baseWorn)
+        Write-Host ("  ADD-EQUIP [$label] " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                    " - baseWorn=$baseWorn create=$create equip=$equip persist=$persist" +
+                    $(if ($create -lt $baseWorn) { " (create<baseWorn => equip was correctly DEFERRED)" } else { "" }))
+        return $ok
+    }
+    $h = & $eval $HostFile "host"
+    $j = & $eval $JoinFile "join"
+    if ($null -eq $h -and $null -eq $j) {
+        Write-Host "  ADD-EQUIP FAIL - no ADDEQ verdict line on either client"
+        return $false
+    }
+    # Single-client deterministic scenario: every client that produced a verdict must pass.
+    $ok = $true
+    if ($null -ne $h) { $ok = $ok -and $h }
+    if ($null -ne $j) { $ok = $ok -and $j }
+    Write-Host ("  ADD-EQUIP " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return $ok
+}
+
+# wpn_relocate (SPIKE for the conservation model): LOCAL single-client test. A WEAPON cannot
+# be fabricated by the engine factory (createItem returns null), so the trade model RELOCATES
+# the real object instead of creating one. This proves the primitive end to end on one client:
+#   drop : the worn weapon is unequipped to loose, then DROPPED -> a free ground weapon
+#          appears (inv-1, ground>=1) and PERSISTS ticks later (held>=1) - real object.
+#   pick : the ground weapon is RE-HOMED into the bag (inv back to baseline, ground drops)
+#          and PERSISTS (persist>=invBase) - no createItem anywhere in the path.
+function Test-WpnRelocate {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'RELOC verdict pass=(\d+) invBase=(-?\d+) drop\(inv=(-?\d+) grnd=(-?\d+) held=(-?\d+)\) pick\(inv=(-?\d+) grnd=(-?\d+) persist=(-?\d+)\)'
+    $eval = {
+        param($file, $label)
+        if (-not (Test-Path $file)) { return $null }
+        $line = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $line) { return $null }
+        $g = $line.Matches[0].Groups
+        $pass = [int]$g[1].Value; $invBase = [int]$g[2].Value
+        $dInv = [int]$g[3].Value; $dGrnd = [int]$g[4].Value; $held = [int]$g[5].Value
+        $pInv = [int]$g[6].Value; $pGrnd = [int]$g[7].Value; $persist = [int]$g[8].Value
+        $dropOk   = ($invBase -ge 1) -and ($dInv -le $invBase - 1) -and ($dGrnd -ge 1)
+        $dropHeld = ($held -ge 1)
+        $pickOk   = ($pInv -ge $invBase) -and ($pGrnd -lt $dGrnd)
+        $pickHeld = ($persist -ge $invBase)
+        $ok = ($pass -eq 1) -and $dropOk -and $dropHeld -and $pickOk -and $pickHeld
+        Write-Host ("  WPN-RELOCATE [$label] " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                    " - invBase=$invBase drop(inv=$dInv grnd=$dGrnd held=$held) pick(inv=$pInv grnd=$pGrnd persist=$persist)")
+        if ($ok) { Write-Host "    conservation OK: weapon moved bag->ground->bag as a REAL object (no createItem)" }
+        return $ok
+    }
+    # The HOST is authoritative - its local relocation cannot be overwritten by anyone, so it
+    # is the deterministic proof of the engine primitive and GATES the result. The JOIN runs
+    # the same sequence while also being a host-driven reconcile target, so its result is
+    # ADVISORY cross-client evidence (a clean join pass means both sides conserved in lockstep).
+    $h = & $eval $HostFile "host"
+    $j = & $eval $JoinFile "join"
+    if ($null -eq $h) {
+        Write-Host "  WPN-RELOCATE FAIL - no RELOC verdict line on the host (authoritative)"
+        return $false
+    }
+    if ($null -ne $j) {
+        Write-Host ("  WPN-RELOCATE [join] advisory cross-client result: " + $(if ($j) { "consistent" } else { "perturbed (host reconcile timing)" }))
+    }
+    Write-Host ("  WPN-RELOCATE " + $(if ($h) { "PASS" } else { "FAIL" }) + " (gated on host)")
+    return $h
+}
+
+# world_weapon_drop (Phase W2): CROSS-CLIENT conservation drop. The HOST drops its leader's
+# weapon; the JOIN (which does NOT own the leader) must RELOCATE its own copy to the ground -
+# the weapon LEAVES the join leader's bag AND APPEARS as a free ground weapon (not destroyed
+# by the inventory reconcile, which cannot rebuild a weapon). Two roles, two verdict lines.
+function Test-WeaponDrop {
+    param([string]$HostFile, [string]$JoinFile)
+    $rxHost = 'WDROP verdict role=host pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invAfter=(-?\d+) grndAfter=(-?\d+)'
+    $rxJoin = 'WDROP verdict role=join pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invMin=(-?\d+) grndMax=(-?\d+) relocated=(\d+)'
+    # Host authored the drop?
+    $hostOk = $false
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $invBase = [int]$g[3].Value; $invAfter = [int]$g[4].Value; $grnd = [int]$g[5].Value
+            $hostOk = ($invBase -ge 1) -and ($invAfter -le $invBase - 1) -and ($grnd -ge 1)
+            Write-Host ("  WEAPON-DROP [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - dropped weapon to ground (invBase=$invBase invAfter=$invAfter ground=$grnd)")
+        } else { Write-Host "  WEAPON-DROP [host] FAIL - no host WDROP verdict" }
+    }
+    # Join relocated its own copy (crossed over by conservation)?
+    $joinOk = $false
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $invBase = [int]$g[3].Value; $invMin = [int]$g[4].Value; $grndMax = [int]$g[5].Value
+            $joinOk = ($invBase -ge 1) -and ($invMin -le $invBase - 1) -and ($grndMax -ge 1)
+            Write-Host ("  WEAPON-DROP [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - relocated own copy to ground (invBase=$invBase invMin=$invMin grndMax=$grndMax)")
+            if (-not $joinOk -and $invMin -le $invBase - 1 -and $grndMax -lt 1) {
+                Write-Host "    NOTE: weapon LEFT the bag but never appeared on the ground => destroyed by inv-reconcile, not conserved"
+            }
+        } else { Write-Host "  WEAPON-DROP [join] FAIL - no join WDROP verdict" }
+    }
+    # Cross-client trace corroboration: host authored a DROP and join APPLIED it (moved>=1).
+    $authored = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] DROP id=' -Quiet)
+    $applied  = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wd\] APPLY id=\d+ .* moved=1' -Quiet)
+    Write-Host ("  WEAPON-DROP trace: host authored DROP=$authored, join APPLY moved=1=$applied")
+    $ok = $hostOk -and $joinOk
+    Write-Host ("  WEAPON-DROP " + $(if ($ok) { "PASS" } else { "FAIL" }))
     return $ok
 }
 
@@ -1060,6 +1582,51 @@ if ($Scenario -ne "") {
         # Phase 3.5 BIDIRECTIONAL presence: both players' owned characters must be
         # present + tracking on the OTHER client. Time-aligned cross-check, both ways.
         $cross = Test-CoopPresence -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
+    } elseif ($Scenario -eq "inv_order") {
+        # Phase 4a CONTENT-SNAPSHOT: the host adds an item to a shared container mid-run;
+        # the join must reconstruct it locally so both sides' contents match. Multiset
+        # (content-hash) gate, not a transform cross-check.
+        $cross = Test-InventorySync -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "inv_bidir") {
+        # Phase 4a BIDIRECTIONAL: each side mutates only the container it owns (host
+        # rank 0, join rank 1); the peer must converge BOTH ways with no loss/dupe.
+        $cross = Test-InventoryBidir -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "inv_equip") {
+        # Phase 4a EQUIPPED-GEAR: each side runs an unequip/equip/unequip cycle on worn
+        # gear of a tab it owns (host rank 0, join rank 1); the peer must converge the
+        # worn (equipped) state BOTH ways - the case loose-only sync missed.
+        $cross = Test-InventoryEquip -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "inv_reequip") {
+        # Phase 4a RE-EQUIP (up path): each side UNEQUIPS a real worn item to loose, then
+        # RE-EQUIPS it (move, not fabricate). The observer must down-move then up-move its
+        # copy to track the dip+restore; the author's worn count must return to its peak.
+        $cross = Test-InventoryReequip -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "inv_addequip") {
+        # Phase 4a d25 fix: LOCAL reconcile test. Adding an EQUIPPED item with no existing
+        # copy must converge to EQUIPPED and PERSIST (create-loose-then-equip-next-tick),
+        # not fabricate-and-vanish. ADD-EQUIP asserts the slot refilled and held.
+        $cross = Test-AddEquip -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "drop_probe") {
+        # Phase W0 DIAGNOSTIC: host seeds + drops a known item and enumerates nearby world
+        # items before/after. Host-side only (no world-item channel yet); the log IS the
+        # deliverable - DROP-PROBE asserts the probe executed and surfaces the facts.
+        $cross = Test-DropProbe -HostFile $hostLog
+    } elseif ($Scenario -eq "world_item_sync") {
+        # Phase W1: host drops a ground item that streams (netId-keyed) to the join, which
+        # spawns a local proxy; then the host despawns it and the join culls the proxy.
+        # WI-SYNC asserts content-hash + position match on spawn and a clean cull both ways.
+        $cross = Test-WorldItemSync -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
+    } elseif ($Scenario -eq "wpn_relocate") {
+        # SPIKE (conservation model): LOCAL single-client test that a WEAPON the factory CANNOT
+        # create can still be moved bag->ground->bag by relocating the REAL object, persisting
+        # at each step. WPN-RELOCATE asserts drop produced a persistent ground weapon and the
+        # pickup re-homed it durably (no createItem) - the trade primitive for shared weapons.
+        $cross = Test-WpnRelocate -HostFile $hostLog -JoinFile $joinLog
+    } elseif ($Scenario -eq "world_weapon_drop") {
+        # Phase W2: host drops its leader's weapon; the join must RELOCATE its own copy to the
+        # ground (conservation) rather than have the inventory reconcile destroy it. WEAPON-DROP
+        # asserts the host dropped + the join's copy left the bag AND landed on the ground.
+        $cross = Test-WeaponDrop -HostFile $hostLog -JoinFile $joinLog
     } else {
         $cross = Compare-Scenario -HostFile $hostLog -JoinFile $joinLog -Tol $Tolerance
     }
@@ -1094,9 +1661,17 @@ if ($Scenario -ne "") {
     # on that small sample. They print as advisory; COOP-PRESENCE (bidirectional
     # cross-check) + MARCH are the authoritative gates.
     $isPresence = ($Scenario -eq "coop_presence")
-    $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder -or $isPresence) { $true } else { $smooth }
-    $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder -or $isPresence) { $true } else { $anim }
-    $gateMarch  = if ($isReadProbe -or $isCombatOrder) { $true } else { $march }
+    # inv_order is a CONTENT test on (stationary) squad members: the locomotion-tuned
+    # smoothness/anim/march metrics aren't meaningful here and print as advisory;
+    # INV-SYNC (multiset match) is the authoritative gate.
+    $isInventory = ($Scenario -eq "inv_order") -or ($Scenario -eq "inv_bidir") -or ($Scenario -eq "inv_equip") -or ($Scenario -eq "inv_reequip") -or ($Scenario -eq "inv_wpnseq") -or ($Scenario -eq "inv_addequip") -or ($Scenario -eq "wpn_relocate")
+    # World-item scenarios (drop_probe + the Phase W1+ world_item_* family) are stationary
+    # content/diagnostic tests on a host-driven world stream; the join doesn't walk-drive,
+    # so the locomotion-tuned smoothness/anim/march metrics are advisory here.
+    $isWorldItem = ($Scenario -eq "drop_probe") -or ($Scenario -like "world_item_*") -or ($Scenario -eq "world_weapon_drop")
+    $gateSmooth = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder -or $isPresence -or $isInventory -or $isWorldItem) { $true } else { $smooth }
+    $gateAnim   = if ($Scenario -eq "craft_order" -or $isDownScene -or $isReadProbe -or $isCombatOrder -or $isPresence -or $isInventory -or $isWorldItem) { $true } else { $anim }
+    $gateMarch  = if ($isReadProbe -or $isCombatOrder -or $isInventory -or $isWorldItem) { $true } else { $march }
     $pass = ($pass -and $hostNoFail -and $joinNoFail -and $hostResultPass -and $joinResultPass -and $cross -and $gateSmooth -and $gateAnim -and $gateMarch -and $pose -and $poseState -and $bodyState)
 }
 

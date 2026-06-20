@@ -45,6 +45,32 @@ public:
     // peers; client sends to the host). Thread-safe; copied under lock.
     void queueEvent(const EventPacket& ev);
 
+    // MAIN thread: queue a reliable container-contents snapshot (Phase 4a). The net
+    // thread serializes [InvSnapshotHeader][InvItemEntry*count] and sends it on the
+    // RELIABLE channel next tick. count may be 0 ("container now empty"). Copied
+    // under lock; only enqueued on content-change so the reliable channel stays cheap.
+    void queueInvSnapshot(u32 ownerId, const u32 cHand[5],
+                          const InvItemEntry* items, unsigned int count);
+
+    // MAIN thread: queue a reliable world-item snapshot (Phase W1). The net thread
+    // serializes [WorldItemSnapshotHeader][WorldItemEntry*count] and sends it on the
+    // RELIABLE channel next tick. Only enqueued for new/changed ground items, so the
+    // channel stays quiet for a settled world. Copied under lock.
+    void queueWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count);
+
+    // MAIN thread: queue a reliable world-item cull (Phase W1) - the netIds of ground
+    // items that left the world / interest sphere. [WorldItemRemoveHeader][u32*count].
+    void queueWorldRemove(u32 ownerId, const u32* netIds, unsigned int count);
+
+    // MAIN thread: queue a reliable conservation DROP intent (Phase W2). A fixed-size POD
+    // (like an event), sent once on the RELIABLE channel; the peer relocates its own copy
+    // of the weapon to the ground. Copied under lock.
+    void queueWorldDrop(const WorldDropPacket& pkt);
+
+    // MAIN thread: queue a reliable conservation PICKUP intent (Phase W3), mirror of the
+    // drop. The peer re-homes its tracked ground copy back into the character's bag.
+    void queueWorldPickup(const WorldPickupPacket& pkt);
+
     // Debug WAN simulation. When delayMs > 0, received entity batches are held in a
     // net-thread queue and delivered to the game thread only after delayMs +/- jitter
     // has elapsed (lossPct of them are dropped outright). Must be called before
@@ -79,6 +105,24 @@ private:
     // Reliable events queued by the main thread, drained + sent by the net thread.
     // Guarded by outCs_ (same publish lock as out_).
     std::vector<EventPacket> outEvents_;
+    // Reliable container-contents snapshots queued by the main thread, drained +
+    // serialized by the net thread. Variable-length, so each carries its own item
+    // list. Guarded by outCs_.
+    struct OutInv {
+        u32                       ownerId;
+        u32                       cHand[5];
+        std::vector<InvItemEntry> items;
+    };
+    std::vector<OutInv>      outInv_;
+    // Reliable world-item snapshots / culls queued by the main thread (Phase W1),
+    // drained + serialized by the net thread. Guarded by outCs_.
+    struct OutWorldItems { u32 ownerId; std::vector<WorldItemEntry> items; };
+    struct OutWorldRemove { u32 ownerId; std::vector<u32> netIds; };
+    std::vector<OutWorldItems>  outWorldItems_;
+    std::vector<OutWorldRemove> outWorldRemove_;
+    // Reliable conservation DROP intents (Phase W2), fixed-size PODs. Guarded by outCs_.
+    std::vector<WorldDropPacket> outWorldDrops_;
+    std::vector<WorldPickupPacket> outWorldPickups_;
 
     HANDLE        thread_;
     volatile LONG running_;

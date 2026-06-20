@@ -32,6 +32,21 @@ void loadConfig(Config& c) {
     c.probeRecruit = envOr("KENSHICOOP_PROBE_RECRUIT", "") == "1";
     c.probeAiSuspend = envOr("KENSHICOOP_PROBE_AISUSPEND", "") == "1";
 
+    // Inventory sync (Phase 4a): explicit env, OR auto-on when the inventory bake
+    // scene / the inv_order scenario is active (so the test + manual gate just work).
+    c.invSync = (envOr("KENSHICOOP_INV_SYNC", "") == "1") ||
+                (c.setupScene == "inventory") ||
+                (c.scenario == "inv_order") || (c.scenario == "inv_bidir") ||
+                (c.scenario == "inv_equip") || (c.scenario == "inv_reequip") ||
+                (c.scenario == "world_weapon_drop"); // W2 drop must beat the inv-reconcile destroy
+
+    // World-item sync (Phase W1/W2): explicit env, OR auto-on for the world_item_* family
+    // (the drop_probe diagnostic is host-only and needs no world stream) and the W2
+    // conservation-drop scenario (which rides the world-drop channel).
+    c.worldSync = (envOr("KENSHICOOP_WORLD_SYNC", "") == "1") ||
+                  (c.scenario.compare(0, 11, "world_item_") == 0) ||
+                  (c.scenario == "world_weapon_drop");
+
     int delay  = std::atoi(envOr("KENSHICOOP_NETSIM_DELAY_MS", "0").c_str());
     int jitter = std::atoi(envOr("KENSHICOOP_NETSIM_JITTER_MS", "0").c_str());
     int loss   = std::atoi(envOr("KENSHICOOP_NETSIM_LOSS_PCT", "0").c_str());

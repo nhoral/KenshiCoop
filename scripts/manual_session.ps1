@@ -60,7 +60,32 @@ param(
     # AI-suspend probe (join only, KENSHICOOP_PROBE_AISUSPEND=1): detour
     # Character::periodicUpdate so host-driven NPCs stop self-tasking (decision
     # layer off) while still animating. Faction is untouched.
-    [switch]$ProbeAiSuspend
+    [switch]$ProbeAiSuspend,
+    # Bidirectional inventory sync (KENSHICOOP_INV_SYNC=1 on BOTH clients): each side
+    # streams the contents of the squad tabs it owns (host tab 0, join tab 1) and
+    # reconciles the peer's. Add an item to a join-owned character and watch it appear
+    # on the host (and vice versa). Pair with -SetupScene inventory to also seed the
+    # leader so the host->join direction is visible at startup.
+    [switch]$InvSync,
+    # World-item sync (KENSHICOOP_WORLD_SYNC=1 on BOTH clients, Phase W1): the HOST streams
+    # free GROUND items in the interest sphere; the JOIN spawns local proxies so a dropped
+    # item appears on the join at the same spot (and is culled when it despawns). In W1 only
+    # host-authored drops sync (join-originated DROP intent is W2). Drop an item from a host
+    # squad member's bag and watch it appear on the join.
+    [switch]$WorldSync,
+    # Diagnostic: log a full inventory dump (loose _allItems + every section + weapon
+    # accessors) on each inventory SEND (host capture) and APPLY (peer reconcile result),
+    # so we can see exactly where an unequipped weapon goes. Sets KENSHICOOP_INV_DUMP=1.
+    [switch]$InvDump,
+    # Tile the two game windows side-by-side (host left, join right) the same way the
+    # automated tests do (scripts\arrange_windows.ps1, re-pinned through the load
+    # screen). Requires windowed mode (kenshi.cfg Full Screen=No).
+    [switch]$Tile,
+    [ValidateSet("widest", "primary")]
+    [string]$TileMonitor = "primary",
+    # How long to keep re-pinning. Must outlast host launch + join delay + both load
+    # screens (Kenshi re-centers on gameplay entry), matching run_test.ps1's default.
+    [int]$TileRepeatSec = 75
 )
 
 $ErrorActionPreference = "Stop"
@@ -172,6 +197,12 @@ function Set-CoopEnv {
     $env:KENSHICOOP_SETUP        = if ($Mode -eq "join") { "" } else { $SetupScene }
     $env:KENSHICOOP_PROBE_RECRUIT = if ($Mode -eq "join" -and $ProbeRecruit) { "1" } else { "" }
     $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
+    # Inventory sync is bidirectional, so enable it on BOTH clients.
+    $env:KENSHICOOP_INV_SYNC     = if ($InvSync) { "1" } else { "" }
+    # World-item sync is host-authored + join-observed, but the gate is read on both
+    # clients (host publishes, join applies), so enable it on BOTH.
+    $env:KENSHICOOP_WORLD_SYNC   = if ($WorldSync) { "1" } else { "" }
+    $env:KENSHICOOP_INV_DUMP     = if ($InvDump) { "1" } else { "" }
     # Per-mode log next to the install so host/join don't clobber each other.
     $env:KENSHICOOP_LOG          = if ($Mode -eq "join") { "KenshiCoop_join.log" } else { "KenshiCoop_host.log" }
 }
@@ -210,6 +241,22 @@ Write-Host "  host PID=$hostPid  join PID=$joinPid"
 Write-Host "  The host spawns $AutoSpawn squad members a few seconds after gameplay starts."
 Write-Host "  Select them on the HOST and move them around; watch the JOIN render and"
 Write-Host "  follow them. Close both windows when you're done (no auto-exit)."
+
+if ($Tile -and $hostPid -ne 0) {
+    # Same mechanism the automated tests use (scripts\arrange_windows.ps1): place the
+    # two windows side by side (host left / join right) and RE-PIN through the load
+    # screen, because Kenshi re-centers its window on the load->gameplay switch. Runs in
+    # the background so this launcher returns immediately. Requires windowed mode
+    # (kenshi.cfg Full Screen=No); it MOVES only, preserving each window's native size.
+    $arrangeScript = Join-Path $scriptDir "arrange_windows.ps1"
+    Write-Host ""
+    Write-Host "Arranging windows side by side ($TileMonitor monitor, host left / join right; re-pinning ${TileRepeatSec}s) ..."
+    Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$arrangeScript`"",
+        "-HostPid", "$hostPid", "-JoinPid", "$joinPid",
+        "-Monitor", $TileMonitor, "-TimeoutSec", "90", "-RepeatSec", "$TileRepeatSec"
+    ) | Out-Null
+}
 
 # Build-freshness guard: confirm the running plugin is the one we expect. In
 # -Inhabit mode the plugin logs "inhabit ownership = ..." once at load; if that

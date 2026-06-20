@@ -162,6 +162,50 @@ Explicitly deferred / out of scope for v1:
     attribution). Reuses `PKT_EVENT` for transitions; intent rides `TASK_COMBAT_MELEE`.
 - **Phase 4 - World objects:** inventory, buildings, and items within the active
   zone (including the production *results* of crafting from 3a).
+  - **4a Inventory / container-contents: DONE (content-snapshot/reconcile model).**
+    Items minted at runtime (craft output, loot) have host-only `hand`s that don't
+    resolve on the join, so we do NOT drive item objects by `hand`. The host streams a
+    container's CONTENTS (template `stringID` + `itemType` + quantity + quality) keyed
+    by the CONTAINER's stable `hand` on the RELIABLE channel (content-hash-gated +
+    periodic resend); the join RECONSTRUCTS items locally (`createItem`/`tryAddItem`,
+    `removeItemAutoDestroy`) to match. Idempotent + loss-tolerant, host-authoritative
+    (a client never reconciles a container it authors). v1 anchors on the leader's own
+    inventory (a save-stable container that accepts arbitrary items - many storage
+    buildings are resource-limited and reject seeded items). Wire `PROTOCOL_VERSION`=6,
+    `PKT_INV_SNAPSHOT`. **Now BIDIRECTIONAL:** each client authors the inventory of
+    every squad member it OWNS (host = tab-rank 0, join = tab-rank 1 - the same
+    `ownHands_` partition positional sync uses) and reconciles the peer's, so streams
+    are disjoint by construction and no client ever reconciles a container it authors.
+    `publishInventories` is gated behind `invSync` so ordinary co-op adds no inventory
+    traffic. Validated via `inv_order` (single-direction host live-add) and `inv_bidir`
+    (host AND join each ADD-then-REMOVE on their owned container; per-rank convergence
+    checked BOTH ways with distinct net deltas, +2 vs +1, so the streams can't be
+    confused) at 0 ms and WAN 120/40/30% - both reliable-channel, so they survive loss -
+    with `inv_order`/`coop_presence` regressions green. **Now covers EQUIPPED gear (all
+    slots):** worn gear lives in equipment SECTIONS (not `_allItems`), so the snapshot walks
+    `getAllSections()` and captures every section flagged `isAnEquippedItemSection`, tagging
+    each `equipped`+`slot` (protocol bump to 6). Walking all sections (not per-slot getters)
+    is slot-complete - every armour piece, both weapon slots, belt, worn backpack - and fixed
+    the weapon holster the armour/weapon getters missed. Reconcile keys on
+    `(stringID,itemType,equipped)` so worn vs loose converge independently and an unequip/drop
+    removes the peer's worn copy. Validated via `inv_equip` (each side unequips a real save-loaded worn item;
+    per-rank worn-count drop + convergence both ways) at 0 ms + WAN 80/20/1%. The equip
+    (up) path now works too: an equipped<->loose split change at unchanged total count
+    reconciles as an in-place MOVE of the REAL item (equip an existing loose copy; unequip
+    by re-homing into a loose section's `addItem`, NOT `tryAddItem` which auto-re-equips),
+    sidestepping the fabricated-equip discard. Validated via `inv_reequip` (unequip a real
+    worn item to loose then re-equip it; per-rank dip-then-restore + convergence both ways).
+    A genuinely-new worn item with no loose copy remains best-effort create+equip (d25).
+  - **4b Cross-squad TRADE via the world (drop -> pickup): PLANNED.** See the design
+    note below. Direct cross-squad item drag is fundamentally a non-atomic transfer
+    across two authorities, so the snapshot/reconcile model cannot make it safe (it
+    loses items moved INTO a peer-owned container and duplicates items moved OUT of
+    one). The sanctioned path routes trades through host-authoritative world state:
+    DROP removes from your owned inventory and spawns a ground item (host authoritative);
+    PICKUP removes the ground item and adds to the picker's owned inventory. Each leg is
+    single-owner end-to-end, so there is no race. Prerequisite: world/ground item sync
+    (verify dropped items have stable, cross-client-resolvable `hand`s, else apply the
+    same content-snapshot treatment to a ground cell).
 - **Phase 5 - Hardening:** interpolation buffer for real latency/jitter,
   packet-loss resilience, event ack/resend, rate limiting, reconnect, and
   anti-crash guards.
@@ -323,3 +367,74 @@ in `INTENT_REPLICATION.md`):
   movement, working combat, and stability across a typical play session.
 - The mod is **independently buildable and maintainable** by us as a
   RE_Kenshi / KenshiLib plugin.
+
+## Design note: Phase 4b - cross-squad trade via the world (drop -> pickup)
+
+*Status: PROPOSED, for review. Target trade model chosen: drop-mediated.*
+
+### Problem
+
+Phase 4a replicates a container's contents by streaming a per-container snapshot and
+having the non-owner reconcile to it. Each container converges to **its owner's** truth,
+which is correct only because exactly one client authors each container (host = squad
+tab 0, join = tab 1). A player dragging an item from one squad to the other crosses that
+ownership boundary, and that is a **two-container transaction split across two
+authorities**:
+
+- Item moved INTO a peer-owned container: the source removal (my owned container) is
+  authoritative, but the destination ADD is local-only; the destination's owner never
+  saw it, so its next snapshot lacks the item and the reconcile DELETES it -> **net loss**.
+- Item moved OUT OF a peer-owned container: the owner's snapshot still has it, so it gets
+  re-added -> **duplication**.
+
+This is the loss observed in manual testing. It is structural, not a bug: no single
+client owns both endpoints, so the move cannot be made atomic at the container level.
+(Doctrine 24.)
+
+### Decision
+
+Disallow direct cross-squad transfer; route trades through **host-authoritative world
+state** (the ground). This makes every leg single-owner end-to-end:
+
+1. **DROP** - player removes an item from their OWN inventory and it becomes a world
+   (ground) item. The world is host-authoritative, so the host owns the ground item.
+2. **(sync)** - the ground item replicates to the other client (world/ground item sync).
+3. **PICKUP** - the other player removes the ground item and adds it to THEIR OWN
+   inventory; the host (world authority) confirms the ground item's removal.
+
+No leg ever writes a container another client authors, so the race disappears. This is
+the inventory analogue of doctrine 8 (disjoint ownership) and reinforces the
+host-authoritative-world invariant.
+
+### Why not an atomic transfer protocol
+
+The alternative - keep direct drag and intercept each cross-ownership move into a
+reliable "move item X from A to B" event with a transfer id - was rejected for v1: it
+requires hooking Kenshi's inventory-move UI action to catch and rewrite the move BEFORE
+the engine commits it locally, which is fragile, where drop-mediated needs no UI hook
+and reuses machinery we already have.
+
+### Open questions / prerequisites (the first research tasks)
+
+1. **Do dropped items become world objects with stable, cross-client-resolvable
+   `hand`s?** If yes, the ground item can be driven/resolved by `hand` like other baked
+   world entities. If no (runtime-minted, host-only hand), apply the same
+   content-snapshot/reconcile treatment to a **ground cell / loot container** keyed by a
+   stable anchor (the cell, or the dropping character's position).
+2. **What does Kenshi's "drop" produce** - a free item, a small lootable pile, or a
+   container object? That determines the anchor.
+3. **Pickup authority handshake** - the picker proposes a take; the host (ground-item
+   owner) authoritatively removes it and the picker's owned-inventory add then
+   propagates normally. Need a reliable event or a host-confirmed removal so two players
+   can't both grab the same item (double-pickup guard).
+
+### Build/validate sketch (when scheduled)
+
+- Engine: detect/produce a ground item on drop; capture/reconcile ground items in the
+  active cell; SEH-guarded resolve + remove for pickup.
+- Wire: extend the reliable channel with a ground-item snapshot (or reuse
+  `PKT_INV_SNAPSHOT` keyed by a ground anchor) and a pickup-confirm event.
+- Scenario `trade_drop`: host drops an item -> join sees the ground item -> join picks it
+  up -> assert it left the host's inventory + the ground, and landed in the join's
+  inventory, with no loss/dupe; 0 ms + WAN. Flip the `inv_cross` characterization test
+  (if added) from documented-loss to PASS.

@@ -11,6 +11,7 @@
 
 #include <windows.h>
 #include <deque>
+#include <vector>
 #include "../../netproto/Wire.h"
 
 namespace coop {
@@ -28,6 +29,46 @@ struct InboundEntity {
 struct InboundEvent {
     u32         ownerId;
     EventPacket ev;
+};
+
+// One received container-contents snapshot (Phase 4a): the authoritative owner, the
+// container's hand, and the full item list. The receiver reconciles its local copy
+// of that container to match. count==0 means "now empty".
+struct InboundInv {
+    u32                       ownerId;
+    u32                       cHand[5]; // type, container, containerSerial, index, serial
+    std::vector<InvItemEntry> items;
+};
+
+// One received world-item snapshot (Phase W1): the authoritative owner (host) and the
+// netId-keyed ground items in its interest sphere. The join reconciles its local proxies
+// (spawn new / update moved / leave the rest) to match.
+struct InboundWorldItems {
+    u32                        ownerId;
+    std::vector<WorldItemEntry> items;
+};
+
+// One received world-item cull (Phase W1): the netIds whose ground items left the world /
+// interest sphere, so the join destroys the matching proxies.
+struct InboundWorldRemove {
+    u32              ownerId;
+    std::vector<u32> netIds;
+};
+
+// One received conservation DROP intent (Phase W2): the owning character + item identity +
+// ground position. The receiver relocates ITS OWN copy of the weapon from that character's
+// bag to the ground (no fabrication). Owner-tagged so the non-owner is the one that acts.
+struct InboundWorldDrop {
+    u32             ownerId;
+    WorldDropPacket pkt;
+};
+
+// One received conservation PICKUP intent (Phase W3): the picking character + item identity.
+// The receiver re-homes ITS OWN tracked ground copy of that weapon back into the character's
+// bag (world -> bag, no fabrication). Owner-tagged so the non-owner is the one that acts.
+struct InboundWorldPickup {
+    u32               ownerId;
+    WorldPickupPacket pkt;
 };
 
 class Inbound {
@@ -52,6 +93,39 @@ public:
         InboundEvent ievt; ievt.ownerId = ownerId; ievt.ev = ev;
         EnterCriticalSection(&cs_); evt_.push_back(ievt); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received container-contents snapshot, owner-tagged.
+    void pushInv(u32 ownerId, const u32 cHand[5], const InvItemEntry* items,
+                 unsigned int count) {
+        InboundInv ii;
+        ii.ownerId = ownerId;
+        for (int k = 0; k < 5; ++k) ii.cHand[k] = cHand[k];
+        if (items && count > 0) ii.items.assign(items, items + count);
+        EnterCriticalSection(&cs_); inv_.push_back(ii); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received world-item snapshot, owner-tagged.
+    void pushWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count) {
+        InboundWorldItems wi;
+        wi.ownerId = ownerId;
+        if (items && count > 0) wi.items.assign(items, items + count);
+        EnterCriticalSection(&cs_); wi_.push_back(wi); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received world-item cull (list of netIds), owner-tagged.
+    void pushWorldRemove(u32 ownerId, const u32* netIds, unsigned int count) {
+        InboundWorldRemove wr;
+        wr.ownerId = ownerId;
+        if (netIds && count > 0) wr.netIds.assign(netIds, netIds + count);
+        EnterCriticalSection(&cs_); wir_.push_back(wr); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received conservation DROP intent, owner-tagged.
+    void pushWorldDrop(u32 ownerId, const WorldDropPacket& pkt) {
+        InboundWorldDrop wd; wd.ownerId = ownerId; wd.pkt = pkt;
+        EnterCriticalSection(&cs_); wd_.push_back(wd); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received conservation PICKUP intent, owner-tagged.
+    void pushWorldPickup(u32 ownerId, const WorldPickupPacket& pkt) {
+        InboundWorldPickup wp; wp.ownerId = ownerId; wp.pkt = pkt;
+        EnterCriticalSection(&cs_); wp_.push_back(wp); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
     void drainConnects(std::deque<u32>& out) {
@@ -66,6 +140,21 @@ public:
     void drainEvents(std::deque<InboundEvent>& out) {
         EnterCriticalSection(&cs_); out.swap(evt_); LeaveCriticalSection(&cs_);
     }
+    void drainInv(std::deque<InboundInv>& out) {
+        EnterCriticalSection(&cs_); out.swap(inv_); LeaveCriticalSection(&cs_);
+    }
+    void drainWorldItems(std::deque<InboundWorldItems>& out) {
+        EnterCriticalSection(&cs_); out.swap(wi_); LeaveCriticalSection(&cs_);
+    }
+    void drainWorldRemove(std::deque<InboundWorldRemove>& out) {
+        EnterCriticalSection(&cs_); out.swap(wir_); LeaveCriticalSection(&cs_);
+    }
+    void drainWorldDrops(std::deque<InboundWorldDrop>& out) {
+        EnterCriticalSection(&cs_); out.swap(wd_); LeaveCriticalSection(&cs_);
+    }
+    void drainWorldPickups(std::deque<InboundWorldPickup>& out) {
+        EnterCriticalSection(&cs_); out.swap(wp_); LeaveCriticalSection(&cs_);
+    }
 
 private:
     CRITICAL_SECTION          cs_;
@@ -73,6 +162,11 @@ private:
     std::deque<u32>           leave_;
     std::deque<InboundEntity> ent_;
     std::deque<InboundEvent>  evt_;
+    std::deque<InboundInv>    inv_;
+    std::deque<InboundWorldItems>  wi_;
+    std::deque<InboundWorldRemove> wir_;
+    std::deque<InboundWorldDrop>   wd_;
+    std::deque<InboundWorldPickup> wp_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);
