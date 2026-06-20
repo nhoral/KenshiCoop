@@ -83,6 +83,7 @@ is the record of completed (DONE/PARTIAL) spikes.
 | 31 | Purchase modeled as transfer + money delta | STATIC | DONE | Purchase = conserved item transfer + per-platoon money int delta; reuses inventory-conservation; host-authoritative |
 | 32 | Shared-economy conflict model | STATIC | DONE | Per-squad wallets (SDK-native) + host-auth vendors + conservation avoids double-spend/dup without locks |
 | 33 | Unused hookable vtable methods | STATIC | DONE | Mod hooks only 3 fns (mainLoop, title-update, periodicUpdate) via KenshiLib _NV_ detours, no vtable patching. High-value unhooked twins: Character::_NV_hitByMeleeAttack + declareDead (damage/death), Inventory::_NV_dropItem (drop), PlayerInterface::_NV_factoryObjectCreatedCallback (spawn), per-entity _NV_update/MedicalSystem. Thread-affinity unverified |
+| 34 | Game time / speed / pause control | DUMP | DONE | Full named API on GameWorld (setGameSpeed/togglePause/userPause/isPaused/frameSpeedMult/clock). Levers work; paused bool & frameSpeedMult are 2 distinct knobs (effective pause = paused\|\|fsm==0). Speed/pause is PER-CLIENT LOCAL - 18/21 wall-aligned samples diverged (host x5 vs join x1; host running vs join paused). Co-op needs a speed/pause policy; unfocused-window auto-pause (fsm->0) is a hazard (hypothesis) |
 
 Carried-over originals 33-50 are still pending and live in
 [BACKLOG.md](BACKLOG.md) along with new spikes 51-450. As each completes it is
