@@ -26,7 +26,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 | # | Title | Type |
 |---|-------|------|
 | 9 | Battle sync fidelity vs combatant count | RUN | *(DONE - see [09](09-battle-sync-fidelity.md), README)* |
-| 10 | Combat event storm (reliable channel) | RUN |
+| 10 | Combat event storm (reliable channel) | RUN | *(DONE - see [10](10-combat-event-storm.md), README)* |
 | 11 | Attribution correctness at scale | RUN |
 | 12 | Battle bandwidth profile | RUN |
 | 13 | Ragdoll/corpse-pile consistency | RUN |

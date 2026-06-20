@@ -59,6 +59,7 @@ is the record of completed (DONE/PARTIAL) spikes.
 | 7 | Env-parameterized scenarios | WORKFLOW | DONE | Implemented: SpikeScenario dispatches on KENSHICOOP_SPIKE; one build serves all probes via run_spikes.ps1 |
 | 8 | Battle scale ceiling (tick time/FPS) | DUMP | DONE | Host holds ~90 idle NPCs at ~74fps (no hard ceiling); join unaffected (spawns don't replicate); combat-load TBD |
 | 9 | Battle sync fidelity vs combatant count | RUN | PARTIAL | Baked 5v5/10v10/20v20 melees; all combatants resolve+replicate to join, body-state agree 47/47 at 40-body; divergence flat (~18-20u) with count - bottleneck is interest-scatter, not load; absolute lag confounded by clock-skew (follow-up) |
+| 10 | Combat event storm (reliable channel) | RUN | DONE | Flooded KO/REVIVE at 84/s (peak 103/s): 2798/2798 delivered, contiguous ids, 0 loss/dup - reliable channel never drops; backpressure = latency tail (med 34ms, p95 753ms, max 2.3s). Real combat ~0.09/s (1000x headroom). Loopback only; NetSim follow-up |
 | 14 | Interest cap overflow behavior | DUMP | DONE | Caps: 96 far+96 near per query, MAX_PUBLISH=160/tick; overflow truncates silently (no crash, no priority) |
 | 15 | Measure current host interest radius | DUMP | DONE | World NPCs stream within 200u far/120u near of HOST leader; ground items only 60u; single host-centered sphere |
 | 16 | Leader-separation: peer update cutoff distance | RUN | PARTIAL | Peer SQUAD always syncs (no cutoff); shared WORLD degrades past 200u from host leader; runtime walk-apart recipe noted |
@@ -79,6 +80,6 @@ is the record of completed (DONE/PARTIAL) spikes.
 | 31 | Purchase modeled as transfer + money delta | STATIC | DONE | Purchase = conserved item transfer + per-platoon money int delta; reuses inventory-conservation; host-authoritative |
 | 32 | Shared-economy conflict model | STATIC | DONE | Per-squad wallets (SDK-native) + host-auth vendors + conservation avoids double-spend/dup without locks |
 
-Carried-over originals 10-13 and 33-50 are still pending and live in
+Carried-over originals 11-13 and 33-50 are still pending and live in
 [BACKLOG.md](BACKLOG.md) along with new spikes 51-450. As each completes it is
 moved into this table.
