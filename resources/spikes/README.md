@@ -1,9 +1,15 @@
 # Kenshi Co-op: Autonomous Spike Investigation
 
-This directory holds the findings of 50 investigative spikes run autonomously to
-deepen our understanding of the Kenshi/Ogre environment and improve the co-op
+This directory holds the findings of an autonomous spike investigation that
+deepens our understanding of the Kenshi/Ogre environment and improves the co-op
 workflow. Each spike has a `NN-slug.md` findings doc and a `NN/raw/` folder with
 the captured logs/screenshots.
+
+The investigation is a **living queue**, not a fixed count: 27 spikes are complete
+(indexed below), and the active TODO queue (~423 items: 23 carried-over originals +
+400 new spikes across 19 themes) lives in [BACKLOG.md](BACKLOG.md). The loop pulls
+the lowest-numbered non-DONE id, runs it, commits its findings, reverts code, and
+moves on.
 
 ## How spikes run
 
@@ -22,12 +28,25 @@ Workflow: implement a probe -> build -> run -> write `NN-slug.md` -> commit on t
 `spikes` branch -> `git restore` the experimental code -> next. Findings persist;
 experimental scaffolding does not (only the harness baseline stays).
 
+## Validation rule (required)
+
+Every findings doc MUST contain a `## Validation` section that says, per finding,
+exactly how it was validated (runtime `SPIKE` log lines on host/join, or a
+`path:line` / `header:line` citation). Do NOT state anything as a Finding unless it
+is validated this way - unverified ideas go under
+`## Open questions / hypotheses (UNVALIDATED)` with the test that would confirm them.
+See [_TEMPLATE.md](_TEMPLATE.md).
+
 ## Status legend
 
-DONE = question answered with evidence. PARTIAL = partial evidence / some blocked.
-BLOCKED = could not execute (reason recorded). PENDING = not yet run.
+DONE = every finding validated (per the Validation rule), question answered.
+PARTIAL = some findings validated; the core question still has an open/unvalidated
+hypothesis. BLOCKED = could not execute (reason recorded). PENDING = not yet run.
 
-## Index
+## Index (completed)
+
+Pending/queued spikes are not listed here - see [BACKLOG.md](BACKLOG.md). This table
+is the record of completed (DONE/PARTIAL) spikes.
 
 | # | Title | Type | Status | One-line finding |
 |---|-------|------|--------|------------------|
@@ -39,11 +58,6 @@ BLOCKED = could not execute (reason recorded). PENDING = not yet run.
 | 6 | Equip loadouts on spawned NPCs | DUMP | DONE | createItem + Inventory::equipItem / chooseMyClothing; baked loadouts resolve on both clients |
 | 7 | Env-parameterized scenarios | WORKFLOW | DONE | Implemented: SpikeScenario dispatches on KENSHICOOP_SPIKE; one build serves all probes via run_spikes.ps1 |
 | 8 | Battle scale ceiling (tick time/FPS) | DUMP | DONE | Host holds ~90 idle NPCs at ~74fps (no hard ceiling); join unaffected (spawns don't replicate); combat-load TBD |
-| 9 | Battle sync fidelity vs combatant count | RUN | PENDING | |
-| 10 | Combat event storm (reliable channel) | RUN | PENDING | |
-| 11 | Attribution correctness at scale | RUN | PENDING | |
-| 12 | Battle bandwidth profile | RUN | PENDING | |
-| 13 | Ragdoll/corpse-pile consistency | RUN | PENDING | |
 | 14 | Interest cap overflow behavior | DUMP | DONE | Caps: 96 far+96 near per query, MAX_PUBLISH=160/tick; overflow truncates silently (no crash, no priority) |
 | 15 | Measure current host interest radius | DUMP | DONE | World NPCs stream within 200u far/120u near of HOST leader; ground items only 60u; single host-centered sphere |
 | 16 | Leader-separation: peer update cutoff distance | RUN | PARTIAL | Peer SQUAD always syncs (no cutoff); shared WORLD degrades past 200u from host leader; runtime walk-apart recipe noted |
@@ -63,21 +77,7 @@ BLOCKED = could not execute (reason recorded). PENDING = not yet run.
 | 30 | Vendor proximity probe at 'c' | RUN | PARTIAL | Find vendors via getObjectsWithinSphere filter SHOP_TRADER_CLASS; 'c' likely has no shop - needs a market save/bake |
 | 31 | Purchase modeled as transfer + money delta | STATIC | DONE | Purchase = conserved item transfer + per-platoon money int delta; reuses inventory-conservation; host-authoritative |
 | 32 | Shared-economy conflict model | STATIC | DONE | Per-squad wallets (SDK-native) + host-auth vendors + conservation avoids double-spend/dup without locks |
-| 33 | Unused hookable vtable methods | STATIC | PENDING | |
-| 34 | Game time / speed / pause control | DUMP | PENDING | |
-| 35 | Camera / free-cam control | DUMP | PENDING | |
-| 36 | In-game messages/notifications/dialog | DUMP | PENDING | |
-| 37 | Weather/environment reads & control | DUMP | PENDING | |
-| 38 | Programmatic orders/input surface | STATIC | PENDING | |
-| 39 | Persisting custom coop state into the save | STATIC | PENDING | |
-| 40 | Ogre version + scene graph access | STATIC | PENDING | |
-| 41 | Ogre overlay rendering feasibility | DUMP | PENDING | |
-| 42 | Animation system internals | STATIC | PENDING | |
-| 43 | Worldspace -> zone/cell mapping | DUMP | PENDING | |
-| 44 | Frame/tick model + main-thread guarantees | STATIC | PENDING | |
-| 45 | Resource/mesh/name reads for UI | DUMP | PENDING | |
-| 46 | Ogre overlay HUD proof | RUN | PENDING | |
-| 47 | Peer-squad nameplates/markers | RUN | PENDING | |
-| 48 | Connection/status + ping overlay | RUN | PENDING | |
-| 49 | Minimap markers for peer squad | STATIC | PENDING | |
-| 50 | MyGUI native panel integration | STATIC | PENDING | |
+
+Carried-over originals 9-13 and 33-50 are still pending and live in
+[BACKLOG.md](BACKLOG.md) along with new spikes 51-450. As each completes it is
+moved into this table.
