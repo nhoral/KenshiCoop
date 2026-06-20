@@ -37,7 +37,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 |---|-------|------|
 | 33 | Unused hookable vtable methods | STATIC | *(DONE - see [33](33-unused-hookable-vtable-methods.md), README)* |
 | 34 | Game time / speed / pause control | DUMP | *(DONE - see [34](34-game-time-speed-pause-control.md), README)* |
-| 35 | Camera / free-cam control | DUMP |
+| 35 | Camera / free-cam control | DUMP | *(DONE - see [35](35-camera-freecam-control.md), README)* |
 | 36 | In-game messages/notifications/dialog | DUMP |
 | 37 | Weather/environment reads & control | DUMP |
 | 38 | Programmatic orders/input surface | STATIC |

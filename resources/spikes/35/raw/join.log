@@ -1,0 +1,132 @@
+[06:00:53.268] [JOIN] INFO: log opened
+[06:00:53.268] [JOIN] INFO: KenshiCoop loaded! (clean rebuild)
+[06:00:53.268] [JOIN] INFO: KenshiCoop: build Jun 20 2026 06:00:08
+[06:00:53.268] [JOIN] INFO: KenshiCoop: role=JOIN proto=v11 port=27800 save='c'
+[06:00:53.313] [JOIN] INFO: KenshiCoop: ownership ranks = {1} (bidirectional presence)
+[06:00:53.356] [JOIN] INFO: KenshiCoop: auto-load armed for save 'c'
+[06:00:53.356] [JOIN] INFO: KenshiCoop: test mode - self-exit 22 s after gameplay starts
+[06:00:53.356] [JOIN] INFO: KenshiCoop: scenario armed 'spike'
+[06:00:53.356] [JOIN] INFO: KenshiCoop: starting as CLIENT
+[06:00:53.365] [JOIN] INFO: [net] connecting
+[06:00:53.365] [JOIN] INFO: [net] connected to host; sent HELLO
+[06:00:53.366] [JOIN] INFO: [net] peer connected id=1 (proto v11) - received WELCOME
+[06:01:00.018] [JOIN] INFO: KenshiCoop: auto-load issued for save 'c' (after 5000 ms settle)
+[06:01:02.886] [JOIN] INFO: handshake: peer present id=0 (local id=1)
+[06:01:10.496] [JOIN] INFO: KenshiCoop: gameplay started
+[06:01:10.496] [JOIN] INFO: SCENARIO spike start
+[06:01:10.496] [JOIN] INFO: SPIKE 35 start id=35 host=0
+[06:01:10.498] [JOIN] INFO: [gate] hand=1,2590331904 host=51 local=65535  agree=0/1 (0%)
+[06:01:10.498] [JOIN] INFO: [pose] rest re-arm task 65535 -> 87
+[06:01:10.498] [JOIN] INFO: [pose] applyOrder hand=1,3996215808 task=87 subj=514,2909912064,0 det=1 r=2
+[06:01:10.498] [JOIN] INFO: [authority] suppress NPC hand=1,1723144576 (streamed=5 local=3 supp=1)
+[06:01:10.498] [JOIN] INFO: [authority] suppress NPC hand=3,3090698240 (streamed=5 local=3 supp=2)
+[06:01:10.498] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1547.65,2851.09
+[06:01:10.507] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:10.630] [JOIN] INFO: [taskkey] key=1 desc='Moving' repro=0 subject=1
+[06:01:11.006] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:11.505] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:11.505] [JOIN] INFO: SPIKE 35 cam role=J t=1016 pos=-51316.7,1646.9,2739.4 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:11.829] [JOIN] INFO: [taskkey] key=87 desc='Operating machine' repro=1 subject=1
+[06:01:11.829] [JOIN] INFO: [seatres] HOST task=87 npc=1,3996215808 subj=514,2909912064 ok=1 npcpos=-51200.6,2664.2 subjpos=-51206.5,2659.7 d=7.4
+[06:01:12.004] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:12.194] [JOIN] INFO: [authority] suppress NPC hand=1,1667968768 (streamed=5 local=6 supp=3)
+[06:01:12.503] [JOIN] INFO: [gate] hand=1,2590331904 host=51 local=1  agree=323/1031 (31%)
+[06:01:12.503] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:12.503] [JOIN] INFO: SPIKE 35 cam role=J t=2016 pos=-51316.7,1646.9,2739.4 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:12.528] [JOIN] INFO: [authority] suppress NPC hand=4,1276245120 (streamed=4 local=7 supp=4)
+[06:01:13.005] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:13.159] [JOIN] INFO: [taskkey] key=141 desc='Following leader' repro=0 subject=1
+[06:01:13.504] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:13.504] [JOIN] INFO: SPIKE 35 cam role=J t=3016 pos=-51316.7,1646.9,2739.4 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:14.003] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:14.502] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:14.502] [JOIN] INFO: SPIKE 35 cam role=J t=4016 pos=-51316.7,1646.9,2739.4 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:14.502] [JOIN] INFO: SPIKE 35 act t=4016 focusLeader ok=1
+[06:01:14.515] [JOIN] INFO: [gate] hand=1,2590331904 host=51 local=1  agree=645/2192 (29%)
+[06:01:15.005] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:15.502] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:15.502] [JOIN] INFO: SPIKE 35 cam role=J t=5016 pos=-51211.2,1567.8,2883.6 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:16.009] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:16.509] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:16.509] [JOIN] INFO: SPIKE 35 cam role=J t=6016 pos=-51211.2,1567.8,2883.6 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:16.517] [JOIN] INFO: [gate] hand=1,2590331904 host=51 local=1  agree=859/3624 (23%)
+[06:01:17.004] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:17.505] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:17.505] [JOIN] INFO: SPIKE 35 cam role=J t=7016 pos=-51211.2,1567.8,2883.6 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:17.718] [JOIN] INFO: [taskkey] key=22 desc='Patrolling' repro=0 subject=0
+[06:01:18.006] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:18.193] [JOIN] INFO: [authority] suppress NPC hand=12,2005004928 (streamed=13 local=17 supp=5)
+[06:01:18.510] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:18.510] [JOIN] INFO: SPIKE 35 cam role=J t=8016 pos=-51211.2,1567.8,2883.6 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:18.510] [JOIN] INFO: SPIKE 35 act t=8016 freecam(on) ok=1
+[06:01:18.520] [JOIN] INFO: [gate] hand=1,2590331904 host=51 local=1  agree=1154/5930 (19%)
+[06:01:19.003] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:19.129] [JOIN] INFO: [authority] suppress NPC hand=4,1159912064 (streamed=14 local=19 supp=6)
+[06:01:19.332] [JOIN] INFO: [authority] restore NPC hand=4,1159912064 (supp=5)
+[06:01:19.508] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:19.508] [JOIN] INFO: SPIKE 35 cam role=J t=9016 pos=-51211.2,1567.8,2883.6 yaw=0.00 pitch=0.00 alt=0.0 freecam=1
+[06:01:19.581] [JOIN] INFO: [authority] restore NPC hand=12,2005004928 (supp=4)
+[06:01:19.892] [JOIN] INFO: [authority] restore NPC hand=1,1667968768 (supp=3)
+[06:01:20.006] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:20.508] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:20.508] [JOIN] INFO: SPIKE 35 cam role=J t=10016 pos=-51211.2,1567.8,2883.6 yaw=0.00 pitch=0.00 alt=0.0 freecam=1
+[06:01:20.528] [JOIN] INFO: [gate] hand=1,2590331904 host=51 local=1  agree=1725/9055 (19%)
+[06:01:21.003] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:21.510] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:21.510] [JOIN] INFO: SPIKE 35 cam role=J t=11016 pos=-51211.2,1567.8,2883.6 yaw=0.00 pitch=0.00 alt=0.0 freecam=1
+[06:01:22.005] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:22.503] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:22.503] [JOIN] INFO: SPIKE 35 cam role=J t=12016 pos=-51211.2,1567.8,2883.6 yaw=0.00 pitch=0.00 alt=0.0 freecam=1
+[06:01:22.504] [JOIN] INFO: SPIKE 35 act t=12016 teleport(+2000,+2000) ok=1
+[06:01:22.610] [JOIN] INFO: [gate] hand=1,2590331904 host=51 local=1  agree=2651/12575 (21%)
+[06:01:23.002] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:23.505] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:23.505] [JOIN] INFO: SPIKE 35 cam role=J t=13016 pos=-49647.1,1565.2,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=1
+[06:01:24.005] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:24.503] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:24.503] [JOIN] INFO: SPIKE 35 cam role=J t=14016 pos=-49647.1,1565.2,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=1
+[06:01:24.612] [JOIN] INFO: [gate] hand=1,2590331904 host=51 local=1  agree=4054/15455 (26%)
+[06:01:25.011] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=1,3996215808 (streamed=0 local=19 supp=4)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=1,2590331904 (streamed=0 local=19 supp=5)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=1,1667968768 (streamed=0 local=19 supp=6)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=3,2274414080 (streamed=0 local=19 supp=7)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=8,161499024 (streamed=0 local=19 supp=8)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=6,3454589952 (streamed=0 local=19 supp=9)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=2,2727661056 (streamed=0 local=19 supp=10)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=1,3662475520 (streamed=0 local=19 supp=11)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=13,1247436544 (streamed=0 local=19 supp=12)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=12,2005004928 (streamed=0 local=19 supp=13)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=10,2733154304 (streamed=0 local=19 supp=14)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=7,3511962880 (streamed=0 local=19 supp=15)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=11,3073608448 (streamed=0 local=19 supp=16)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=4,1159912064 (streamed=0 local=19 supp=17)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=9,2357666048 (streamed=0 local=19 supp=18)
+[06:01:25.274] [JOIN] INFO: [authority] suppress NPC hand=5,1919189504 (streamed=0 local=19 supp=19)
+[06:01:25.334] [JOIN] INFO: [authority] suppress NPC hand=1,3808471552 (streamed=0 local=20 supp=20)
+[06:01:25.510] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:25.510] [JOIN] INFO: SPIKE 35 cam role=J t=15016 pos=-49647.1,1565.2,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=1
+[06:01:26.002] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:26.503] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:26.503] [JOIN] INFO: SPIKE 35 cam role=J t=16016 pos=-49647.1,1565.2,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=1
+[06:01:26.503] [JOIN] INFO: SPIKE 35 act t=16016 freecam(off) ok=1
+[06:01:27.006] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:27.508] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:27.508] [JOIN] INFO: SPIKE 35 cam role=J t=17016 pos=-49647.1,1601.4,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:28.010] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:28.505] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:28.505] [JOIN] INFO: SPIKE 35 cam role=J t=18016 pos=-49647.1,1601.4,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:29.010] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:29.072] [JOIN] INFO: [net] disconnected from host
+[06:01:29.072] [JOIN] INFO: handshake: peer left id=4294967295
+[06:01:29.123] [JOIN] INFO: [net] reconnecting
+[06:01:29.503] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:29.503] [JOIN] INFO: SPIKE 35 cam role=J t=19016 pos=-49647.1,1601.4,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:30.007] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:30.508] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:30.508] [JOIN] INFO: SPIKE 35 cam role=J t=20016 pos=-49647.1,1601.4,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:31.006] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:31.508] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:31.509] [JOIN] INFO: SPIKE 35 cam role=J t=21016 pos=-49647.1,1601.4,4445.7 yaw=0.00 pitch=0.00 alt=0.0 freecam=0
+[06:01:32.002] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51234.47,1555.93,2851.09
+[06:01:32.487] [JOIN] INFO: KenshiCoop: test duration elapsed; exiting
