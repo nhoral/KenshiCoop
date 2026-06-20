@@ -52,7 +52,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 | 42 | Animation system internals | STATIC | *(DONE - see [42](42-animation-system-internals.md), README)* |
 | 43 | Worldspace -> zone/cell mapping | DUMP | *(PARTIAL - see [43](43-worldspace-zone-cell-mapping.md), README)* |
 | 44 | Frame/tick model + main-thread guarantees | STATIC | *(DONE - see [44](44-frame-tick-model-main-thread.md), README)* |
-| 45 | Resource/mesh/name reads for UI | DUMP |
+| 45 | Resource/mesh/name reads for UI | DUMP | *(PARTIAL - see [45](45-resource-mesh-name-reads-for-ui.md), README)* |
 
 ### Group H - Coop UI (46-50)
 
