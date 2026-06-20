@@ -51,13 +51,13 @@ BLOCKED = could not execute (reason recorded). PENDING = not yet run.
 | 18 | Interest-boundary hysteresis / churn | RUN | PENDING | |
 | 19 | Dual-interest feasibility | DUMP | PENDING | |
 | 20 | Distance rate-tiering vs divergence | RUN | PENDING | |
-| 21 | Health/medical model field map | STATIC | PENDING | |
-| 22 | Limb-loss replication | RUN | PENDING | |
-| 23 | Bandage/first-aid detection + replication | RUN | PENDING | |
-| 24 | Sleeping in a bed (task+subject pose) | RUN | PENDING | |
-| 25 | Bleed-out progression sync | RUN | PENDING | |
-| 26 | bodyState bitfield gaps | DUMP | PENDING | |
-| 27 | Revive/recovery sync + EVT_REVIVE | RUN | PENDING | |
+| 21 | Health/medical model field map | STATIC | DONE | MedicalSystem is a large local-only model (blood, bleed, 4 limb HealthPartStatus, RobotLimbs states, wounds); none on the wire |
+| 22 | Limb-loss replication | RUN | DONE | Host severed left arm; join's same baked body stayed LA=100 all run - limb loss does NOT replicate |
+| 23 | Bandage/first-aid detection + replication | RUN | DONE | First-aid heals local medical only; no wire field; effects don't replicate |
+| 24 | Sleeping in a bed (task+subject pose) | RUN | PARTIAL | Sleep POSE should replicate via sit/craft node-AI path; rest benefit is local medical (no sync); pose run deferred |
+| 25 | Bleed-out progression sync | RUN | DONE | Host bled 75->0, join stayed 75.8; blood not synced + regenerates locally - stream collapse EDGE not blood |
+| 26 | bodyState bitfield gaps | DUMP | DONE | Join medical flags never moved even after host KO+kill; bodyState=pose only, misses blood/limbs/dead-flag |
+| 27 | Revive/recovery sync + EVT_REVIVE | RUN | DONE | Recovery is local medical; no EVT_REVIVE; needs paired BODY_KO/BODY_UP edges + set join medical flags |
 | 28 | Trading/shop API surface | STATIC | PENDING | |
 | 29 | Player money (Cats): scope + syncability | DUMP | PENDING | |
 | 30 | Vendor proximity probe at 'c' | RUN | PENDING | |
