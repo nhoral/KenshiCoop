@@ -33,10 +33,10 @@ BLOCKED = could not execute (reason recorded). PENDING = not yet run.
 |---|-------|------|--------|------------------|
 | 1 | Spawn-N helper + cross-client hand resolution | DUMP | DONE | Runtime spawns get host-local hands; never reach join; local NPC populations diverge (host 3 vs join 15) |
 | 2 | Deterministic battle-scene builder reproducibility | DUMP | DONE | Index per-session-deterministic, serial random; cross-client identity needs bake-then-load (createRandomCharacter randomizes) |
-| 3 | Enumerate spawnable character/squad templates | DUMP | PENDING | |
-| 4 | Faction creation/assignment + hostility control | DUMP | PENDING | |
-| 5 | DLL-triggered save() to bake spawned scenes | RUN | PENDING | |
-| 6 | Equip loadouts on spawned NPCs | DUMP | PENDING | |
+| 3 | Enumerate spawnable character/squad templates | DUMP | DONE | getDataOfType(list,itemType) enumerates RACE/HUMAN_CHARACTER/SQUAD_TEMPLATE; RaceData::AllRaces; deterministic spawn by stringID |
+| 4 | Faction creation/assignment + hostility control | DUMP | DONE | FactionManager::getOrCreateFaction + relations->setEnemy/declareWar + createRandomSquad -> auto-fighting battles, no per-NPC orders |
+| 5 | DLL-triggered save() to bake spawned scenes | RUN | DONE | SaveManager::getSingleton()->save(name,autosave) bakes spawns into cross-client-resolvable saves (proven by duel1/down1) |
+| 6 | Equip loadouts on spawned NPCs | DUMP | DONE | createItem + Inventory::equipItem / chooseMyClothing; baked loadouts resolve on both clients |
 | 7 | Env-parameterized scenarios | WORKFLOW | DONE | Implemented: SpikeScenario dispatches on KENSHICOOP_SPIKE; one build serves all probes via run_spikes.ps1 |
 | 8 | Battle scale ceiling (tick time/FPS) | DUMP | DONE | Host holds ~90 idle NPCs at ~74fps (no hard ceiling); join unaffected (spawns don't replicate); combat-load TBD |
 | 9 | Battle sync fidelity vs combatant count | RUN | PENDING | |
@@ -58,11 +58,11 @@ BLOCKED = could not execute (reason recorded). PENDING = not yet run.
 | 25 | Bleed-out progression sync | RUN | DONE | Host bled 75->0, join stayed 75.8; blood not synced + regenerates locally - stream collapse EDGE not blood |
 | 26 | bodyState bitfield gaps | DUMP | DONE | Join medical flags never moved even after host KO+kill; bodyState=pose only, misses blood/limbs/dead-flag |
 | 27 | Revive/recovery sync + EVT_REVIVE | RUN | DONE | Recovery is local medical; no EVT_REVIVE; needs paired BODY_KO/BODY_UP edges + set join medical flags |
-| 28 | Trading/shop API surface | STATIC | PENDING | |
-| 29 | Player money (Cats): scope + syncability | DUMP | PENDING | |
-| 30 | Vendor proximity probe at 'c' | RUN | PENDING | |
-| 31 | Purchase modeled as transfer + money delta | STATIC | PENDING | |
-| 32 | Shared-economy conflict model | STATIC | PENDING | |
+| 28 | Trading/shop API surface | STATIC | DONE | ShopTrader(getInventory/getMoney/takeMoney); Inventory::buyItem (no sellItem); price=getValueSingle x TradeCulture mult x Platoon mult |
+| 29 | Player money (Cats): scope + syncability | DUMP | DONE | Money is PER-PLATOON (Ownerships.money) + inventory money-items; no global/per-faction wallet; per-squad host-auth sync is cheap |
+| 30 | Vendor proximity probe at 'c' | RUN | PARTIAL | Find vendors via getObjectsWithinSphere filter SHOP_TRADER_CLASS; 'c' likely has no shop - needs a market save/bake |
+| 31 | Purchase modeled as transfer + money delta | STATIC | DONE | Purchase = conserved item transfer + per-platoon money int delta; reuses inventory-conservation; host-authoritative |
+| 32 | Shared-economy conflict model | STATIC | DONE | Per-squad wallets (SDK-native) + host-auth vendors + conservation avoids double-spend/dup without locks |
 | 33 | Unused hookable vtable methods | STATIC | PENDING | |
 | 34 | Game time / speed / pause control | DUMP | PENDING | |
 | 35 | Camera / free-cam control | DUMP | PENDING | |
