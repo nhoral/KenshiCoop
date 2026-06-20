@@ -62,7 +62,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 | 47 | Peer-squad nameplates/markers | RUN | *(DONE - see [47](47-peer-squad-nameplates.md), README)* |
 | 48 | Connection/status + ping overlay | RUN | *(DONE - see [48](48-connection-status-ping-overlay.md), README)* |
 | 49 | Minimap markers for peer squad | STATIC | *(DONE - see [49](49-minimap-markers-peer-squad.md), README)* |
-| 50 | MyGUI native panel integration | STATIC |
+| 50 | MyGUI native panel integration | STATIC | *(DONE - see [50](50-mygui-native-panel-integration.md), README)* |
 
 ---
 
