@@ -39,7 +39,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 | 34 | Game time / speed / pause control | DUMP | *(DONE - see [34](34-game-time-speed-pause-control.md), README)* |
 | 35 | Camera / free-cam control | DUMP | *(DONE - see [35](35-camera-freecam-control.md), README)* |
 | 36 | In-game messages/notifications/dialog | DUMP | *(DONE - see [36](36-ingame-messages-notifications.md), README)* |
-| 37 | Weather/environment reads & control | DUMP |
+| 37 | Weather/environment reads & control | DUMP | *(PARTIAL - see [37](37-weather-environment-reads.md), README)* |
 | 38 | Programmatic orders/input surface | STATIC |
 | 39 | Persisting custom coop state into the save | STATIC |
 
