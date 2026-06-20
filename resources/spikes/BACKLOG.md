@@ -41,7 +41,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 | 36 | In-game messages/notifications/dialog | DUMP | *(DONE - see [36](36-ingame-messages-notifications.md), README)* |
 | 37 | Weather/environment reads & control | DUMP | *(PARTIAL - see [37](37-weather-environment-reads.md), README)* |
 | 38 | Programmatic orders/input surface | STATIC | *(DONE - see [38](38-programmatic-orders-input-surface.md), README)* |
-| 39 | Persisting custom coop state into the save | STATIC |
+| 39 | Persisting custom coop state into the save | STATIC | *(DONE - see [39](39-persisting-custom-coop-state.md), README)* |
 
 ### Group G - Ogre / Kenshi internals (40-45)
 
