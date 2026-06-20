@@ -29,7 +29,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 | 10 | Combat event storm (reliable channel) | RUN | *(DONE - see [10](10-combat-event-storm.md), README)* |
 | 11 | Attribution correctness at scale | RUN | *(PARTIAL - see [11](11-attribution-correctness-at-scale.md), README)* |
 | 12 | Battle bandwidth profile | RUN | *(DONE - see [12](12-battle-bandwidth-profile.md), README)* |
-| 13 | Ragdoll/corpse-pile consistency | RUN |
+| 13 | Ragdoll/corpse-pile consistency | RUN | *(DONE - see [13](13-ragdoll-corpse-pile-consistency.md), README)* |
 
 ### Group F - DLL/engine capabilities (33-39)
 
