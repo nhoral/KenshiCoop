@@ -46,11 +46,11 @@ BLOCKED = could not execute (reason recorded). PENDING = not yet run.
 | 13 | Ragdoll/corpse-pile consistency | RUN | PENDING | |
 | 14 | Interest cap overflow behavior | DUMP | DONE | Caps: 96 far+96 near per query, MAX_PUBLISH=160/tick; overflow truncates silently (no crash, no priority) |
 | 15 | Measure current host interest radius | DUMP | DONE | World NPCs stream within 200u far/120u near of HOST leader; ground items only 60u; single host-centered sphere |
-| 16 | Leader-separation: peer update cutoff distance | RUN | PENDING | |
+| 16 | Leader-separation: peer update cutoff distance | RUN | PARTIAL | Peer SQUAD always syncs (no cutoff); shared WORLD degrades past 200u from host leader; runtime walk-apart recipe noted |
 | 17 | Un-streamed NPC behavior on the join | RUN | PARTIAL | Persistent population divergence (host 3-7 vs join 9-15) despite enforceHostAuthority; needs per-hand classification probe |
-| 18 | Interest-boundary hysteresis / churn | RUN | PENDING | |
-| 19 | Dual-interest feasibility | DUMP | PENDING | |
-| 20 | Distance rate-tiering vs divergence | RUN | PENDING | |
+| 18 | Interest-boundary hysteresis / churn | RUN | PARTIAL | Hard 200u radius, no hysteresis/dwell -> boundary churn expected; add enter/exit band |
+| 19 | Dual-interest feasibility | DUMP | DONE | Feasible+small: 2nd captureNpcs centered on join leader, merge/dedupe, raise caps, sphere-aware suppression |
+| 20 | Distance rate-tiering vs divergence | RUN | PARTIAL | No per-entity LOD today; tiered cadence feasible, bounded by interp; force combatants to tier 0 |
 | 21 | Health/medical model field map | STATIC | DONE | MedicalSystem is a large local-only model (blood, bleed, 4 limb HealthPartStatus, RobotLimbs states, wounds); none on the wire |
 | 22 | Limb-loss replication | RUN | DONE | Host severed left arm; join's same baked body stayed LA=100 all run - limb loss does NOT replicate |
 | 23 | Bandage/first-aid detection + replication | RUN | DONE | First-aid heals local medical only; no wire field; effects don't replicate |
