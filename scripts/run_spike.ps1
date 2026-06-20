@@ -30,6 +30,9 @@ param(
     [switch]$HostOnly,        # diagnostic probes that need no peer (faster)
     [int]$Port = 27800,
     [string]$Setup = "",
+    # Free-form per-spike argument forwarded to the plugin via KENSHICOOP_SPIKE_ARG
+    # (e.g. spike 9 "bake5" = host-only bake of a 10-body battle save).
+    [string]$SpikeArg = "",
     [int]$NetSimDelayMs = 0,
     [int]$NetSimJitterMs = 0,
     [int]$NetSimLossPct = 0
@@ -66,6 +69,7 @@ if (-not $SkipBuild) {
 # KENSHICOOP_SPIKE rides through to the launched processes (run_test.ps1's
 # Set-CoopEnv never overwrites it).
 $env:KENSHICOOP_SPIKE = $Id
+$env:KENSHICOOP_SPIKE_ARG = $SpikeArg
 
 $outDir = ""
 $runArgs = @(
@@ -84,6 +88,7 @@ $out | ForEach-Object {
     if ("$_" -match "out dir:\s+(.+)$") { $outDir = $Matches[1].Trim() }
 }
 $env:KENSHICOOP_SPIKE = ""
+$env:KENSHICOOP_SPIKE_ARG = ""
 
 # ---- 3. collect evidence -----------------------------------------------------
 if ($outDir -ne "" -and (Test-Path $outDir)) {
