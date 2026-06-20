@@ -31,21 +31,21 @@ BLOCKED = could not execute (reason recorded). PENDING = not yet run.
 
 | # | Title | Type | Status | One-line finding |
 |---|-------|------|--------|------------------|
-| 1 | Spawn-N helper + cross-client hand resolution | DUMP | PENDING | |
+| 1 | Spawn-N helper + cross-client hand resolution | DUMP | DONE | Runtime spawns get host-local hands; never reach join; local NPC populations diverge (host 3 vs join 15) |
 | 2 | Deterministic battle-scene builder reproducibility | DUMP | PENDING | |
 | 3 | Enumerate spawnable character/squad templates | DUMP | PENDING | |
 | 4 | Faction creation/assignment + hostility control | DUMP | PENDING | |
 | 5 | DLL-triggered save() to bake spawned scenes | RUN | PENDING | |
 | 6 | Equip loadouts on spawned NPCs | DUMP | PENDING | |
 | 7 | Env-parameterized scenarios | WORKFLOW | PENDING | |
-| 8 | Battle scale ceiling (tick time/FPS) | DUMP | PENDING | |
+| 8 | Battle scale ceiling (tick time/FPS) | DUMP | DONE | Host holds ~90 idle NPCs at ~74fps (no hard ceiling); join unaffected (spawns don't replicate); combat-load TBD |
 | 9 | Battle sync fidelity vs combatant count | RUN | PENDING | |
 | 10 | Combat event storm (reliable channel) | RUN | PENDING | |
 | 11 | Attribution correctness at scale | RUN | PENDING | |
 | 12 | Battle bandwidth profile | RUN | PENDING | |
 | 13 | Ragdoll/corpse-pile consistency | RUN | PENDING | |
-| 14 | Interest cap overflow behavior | DUMP | PENDING | |
-| 15 | Measure current host interest radius | DUMP | PENDING | |
+| 14 | Interest cap overflow behavior | DUMP | DONE | Caps: 96 far+96 near per query, MAX_PUBLISH=160/tick; overflow truncates silently (no crash, no priority) |
+| 15 | Measure current host interest radius | DUMP | DONE | World NPCs stream within 200u far/120u near of HOST leader; ground items only 60u; single host-centered sphere |
 | 16 | Leader-separation: peer update cutoff distance | RUN | PENDING | |
 | 17 | Un-streamed NPC behavior on the join | RUN | PENDING | |
 | 18 | Interest-boundary hysteresis / churn | RUN | PENDING | |
