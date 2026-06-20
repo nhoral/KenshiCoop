@@ -9,6 +9,8 @@
 
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
+#include <cstdarg>
 
 namespace coop {
 namespace {
@@ -2101,7 +2103,104 @@ private:
     char          sid_[48];
 };
 
+// ===========================================================================
+// SpikeScenario - generic investigative harness for the autonomous spike loop.
+// The concrete probe is selected by the KENSHICOOP_SPIKE env var ("1".."50").
+// Each probe emits "SPIKE <id> ..." evidence lines that run_spike.ps1 collects
+// and the per-spike findings doc summarizes. It is DIAGNOSTIC: passed() means
+// "the probe executed and produced evidence", not a cross-client sync gate.
+//
+// All spike-specific code lives HERE so it can be reverted in one place between
+// batches (the harness baseline keeps only the dispatcher + the smoke probe).
+// Add a probe by extending dispatchStart()/dispatchTick() with a new id branch.
+// ===========================================================================
+class SpikeScenario : public Scenario {
+public:
+    SpikeScenario()
+        : passed_(false), passedSet_(false), started_(false), smokeDone_(false),
+          lastLogMs_(0), durMs_(30000) {
+        const char* id = std::getenv("KENSHICOOP_SPIKE");
+        id_ = id ? id : "0";
+    }
+    virtual const char* name() const { return "spike"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        started_ = true;
+        logSpike("start id=%s host=%d", id_.c_str(), ctx.isHost ? 1 : 0);
+        dispatchStart(ctx);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Keep a MEMBER/RECV anchor flowing so the runner can time a screenshot
+        // and never stalls on the missing-anchor wait.
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            Character* ld = engine::leader(ctx.gw);
+            if (ld) logScenarioLine(ctx.isHost ? "MEMBER" : "RECV", ld);
+            dispatchTick(ctx);
+        }
+        if (ctx.elapsedMs >= durMs_) {
+            // Diagnostic: a probe "passes" if it executed without faulting and
+            // emitted at least its start line. Concrete probes set passed_ when
+            // their evidence is captured; default to true so a pure-enumeration
+            // probe still reports a clean RESULT.
+            if (!passedSet_) passed_ = true;
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    void logSpike(const char* fmt, ...) {
+        char b[480];
+        char f[512];
+        _snprintf(f, sizeof(f) - 1, "SPIKE %s %s", id_.c_str(), fmt);
+        f[sizeof(f) - 1] = '\0';
+        va_list ap; va_start(ap, fmt);
+        _vsnprintf(b, sizeof(b) - 1, f, ap);
+        va_end(ap);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+    void setPass(bool ok) { passed_ = ok; passedSet_ = true; }
+
+    // ---- per-spike dispatch ------------------------------------------------
+    void dispatchStart(const ScenarioContext& ctx) {
+        // id "0" = smoke probe (baseline): prove the harness runs end to end.
+        // Concrete spikes are added as additional id branches per batch.
+        (void)ctx;
+    }
+
+    void dispatchTick(const ScenarioContext& ctx) {
+        // Smoke probe: log the leader hand/pos + a rough nearby-NPC count once,
+        // so the baseline build is verifiably exercisable before real probes land.
+        if (!smokeDone_) {
+            smokeDone_ = true;
+            Character* ld = engine::leader(ctx.gw);
+            unsigned int h[5]; float x = 0, y = 0, z = 0;
+            if (ld && engine::readHand(ld, h) && engine::readPos(ld, &x, &y, &z)) {
+                logSpike("smoke leader hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f",
+                         h[0], h[1], h[2], h[3], h[4], x, y, z);
+            } else {
+                logSpike("smoke leader UNRESOLVED");
+            }
+            setPass(true);
+        }
+    }
+
+    std::string   id_;
+    bool          passed_;
+    bool          passedSet_;
+    bool          started_;
+    bool          smokeDone_;
+    unsigned long lastLogMs_;
+    unsigned long durMs_;
+};
+
 Scenario* makeScenario(const std::string& name) {
+    if (name == "spike")        return new SpikeScenario();
     if (name == "leader_move")  return new LeaderMoveScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();
     if (name == "npc_sync")     return new NpcSyncScenario();

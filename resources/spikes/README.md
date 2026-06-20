@@ -1,0 +1,83 @@
+# Kenshi Co-op: Autonomous Spike Investigation
+
+This directory holds the findings of 50 investigative spikes run autonomously to
+deepen our understanding of the Kenshi/Ogre environment and improve the co-op
+workflow. Each spike has a `NN-slug.md` findings doc and a `NN/raw/` folder with
+the captured logs/screenshots.
+
+## How spikes run
+
+A single generic scenario, `SpikeScenario` in
+[../../src/plugin/test/Scenario.cpp](../../src/plugin/test/Scenario.cpp), is
+selected by the `KENSHICOOP_SPIKE=<id>` env var and dispatches to the per-spike
+probe. Drivers:
+
+- `scripts/run_spike.ps1 -Id <n> -Save c` - build+deploy+run+collect one spike.
+- `scripts/run_spikes.ps1 -Ids 1,3,8 -Save c` - one build, many probes, skip-on-error.
+
+Execution types: **RUN** (networked sync test), **DUMP** (host-only engine
+enumeration), **STATIC** (SDK-header / code / binary analysis, no game run).
+
+Workflow: implement a probe -> build -> run -> write `NN-slug.md` -> commit on the
+`spikes` branch -> `git restore` the experimental code -> next. Findings persist;
+experimental scaffolding does not (only the harness baseline stays).
+
+## Status legend
+
+DONE = question answered with evidence. PARTIAL = partial evidence / some blocked.
+BLOCKED = could not execute (reason recorded). PENDING = not yet run.
+
+## Index
+
+| # | Title | Type | Status | One-line finding |
+|---|-------|------|--------|------------------|
+| 1 | Spawn-N helper + cross-client hand resolution | DUMP | PENDING | |
+| 2 | Deterministic battle-scene builder reproducibility | DUMP | PENDING | |
+| 3 | Enumerate spawnable character/squad templates | DUMP | PENDING | |
+| 4 | Faction creation/assignment + hostility control | DUMP | PENDING | |
+| 5 | DLL-triggered save() to bake spawned scenes | RUN | PENDING | |
+| 6 | Equip loadouts on spawned NPCs | DUMP | PENDING | |
+| 7 | Env-parameterized scenarios | WORKFLOW | PENDING | |
+| 8 | Battle scale ceiling (tick time/FPS) | DUMP | PENDING | |
+| 9 | Battle sync fidelity vs combatant count | RUN | PENDING | |
+| 10 | Combat event storm (reliable channel) | RUN | PENDING | |
+| 11 | Attribution correctness at scale | RUN | PENDING | |
+| 12 | Battle bandwidth profile | RUN | PENDING | |
+| 13 | Ragdoll/corpse-pile consistency | RUN | PENDING | |
+| 14 | Interest cap overflow behavior | DUMP | PENDING | |
+| 15 | Measure current host interest radius | DUMP | PENDING | |
+| 16 | Leader-separation: peer update cutoff distance | RUN | PENDING | |
+| 17 | Un-streamed NPC behavior on the join | RUN | PENDING | |
+| 18 | Interest-boundary hysteresis / churn | RUN | PENDING | |
+| 19 | Dual-interest feasibility | DUMP | PENDING | |
+| 20 | Distance rate-tiering vs divergence | RUN | PENDING | |
+| 21 | Health/medical model field map | STATIC | PENDING | |
+| 22 | Limb-loss replication | RUN | PENDING | |
+| 23 | Bandage/first-aid detection + replication | RUN | PENDING | |
+| 24 | Sleeping in a bed (task+subject pose) | RUN | PENDING | |
+| 25 | Bleed-out progression sync | RUN | PENDING | |
+| 26 | bodyState bitfield gaps | DUMP | PENDING | |
+| 27 | Revive/recovery sync + EVT_REVIVE | RUN | PENDING | |
+| 28 | Trading/shop API surface | STATIC | PENDING | |
+| 29 | Player money (Cats): scope + syncability | DUMP | PENDING | |
+| 30 | Vendor proximity probe at 'c' | RUN | PENDING | |
+| 31 | Purchase modeled as transfer + money delta | STATIC | PENDING | |
+| 32 | Shared-economy conflict model | STATIC | PENDING | |
+| 33 | Unused hookable vtable methods | STATIC | PENDING | |
+| 34 | Game time / speed / pause control | DUMP | PENDING | |
+| 35 | Camera / free-cam control | DUMP | PENDING | |
+| 36 | In-game messages/notifications/dialog | DUMP | PENDING | |
+| 37 | Weather/environment reads & control | DUMP | PENDING | |
+| 38 | Programmatic orders/input surface | STATIC | PENDING | |
+| 39 | Persisting custom coop state into the save | STATIC | PENDING | |
+| 40 | Ogre version + scene graph access | STATIC | PENDING | |
+| 41 | Ogre overlay rendering feasibility | DUMP | PENDING | |
+| 42 | Animation system internals | STATIC | PENDING | |
+| 43 | Worldspace -> zone/cell mapping | DUMP | PENDING | |
+| 44 | Frame/tick model + main-thread guarantees | STATIC | PENDING | |
+| 45 | Resource/mesh/name reads for UI | DUMP | PENDING | |
+| 46 | Ogre overlay HUD proof | RUN | PENDING | |
+| 47 | Peer-squad nameplates/markers | RUN | PENDING | |
+| 48 | Connection/status + ping overlay | RUN | PENDING | |
+| 49 | Minimap markers for peer squad | STATIC | PENDING | |
+| 50 | MyGUI native panel integration | STATIC | PENDING | |
