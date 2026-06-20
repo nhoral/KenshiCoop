@@ -82,6 +82,7 @@ is the record of completed (DONE/PARTIAL) spikes.
 | 30 | Vendor proximity probe at 'c' | RUN | PARTIAL | Find vendors via getObjectsWithinSphere filter SHOP_TRADER_CLASS; 'c' likely has no shop - needs a market save/bake |
 | 31 | Purchase modeled as transfer + money delta | STATIC | DONE | Purchase = conserved item transfer + per-platoon money int delta; reuses inventory-conservation; host-authoritative |
 | 32 | Shared-economy conflict model | STATIC | DONE | Per-squad wallets (SDK-native) + host-auth vendors + conservation avoids double-spend/dup without locks |
+| 33 | Unused hookable vtable methods | STATIC | DONE | Mod hooks only 3 fns (mainLoop, title-update, periodicUpdate) via KenshiLib _NV_ detours, no vtable patching. High-value unhooked twins: Character::_NV_hitByMeleeAttack + declareDead (damage/death), Inventory::_NV_dropItem (drop), PlayerInterface::_NV_factoryObjectCreatedCallback (spawn), per-entity _NV_update/MedicalSystem. Thread-affinity unverified |
 
 Carried-over originals 33-50 are still pending and live in
 [BACKLOG.md](BACKLOG.md) along with new spikes 51-450. As each completes it is
