@@ -49,7 +49,7 @@ These 23 were queued in the original 50 and not yet completed; they keep their i
 |---|-------|------|
 | 40 | Ogre version + scene graph access | STATIC | *(DONE - see [40](40-ogre-version-scene-graph-access.md), README)* |
 | 41 | Ogre overlay rendering feasibility | DUMP | *(PARTIAL - see [41](41-ogre-overlay-rendering-feasibility.md), README)* |
-| 42 | Animation system internals | STATIC |
+| 42 | Animation system internals | STATIC | *(DONE - see [42](42-animation-system-internals.md), README)* |
 | 43 | Worldspace -> zone/cell mapping | DUMP |
 | 44 | Frame/tick model + main-thread guarantees | STATIC |
 | 45 | Resource/mesh/name reads for UI | DUMP |
