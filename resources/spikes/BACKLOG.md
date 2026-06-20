@@ -80,7 +80,7 @@ nameplates, follow-peer cam, GameData custom-save blob, etc.).
 | 51 | spawnHostileBattle(perSide,red,blue) helper + 10v10 baseline sync | RUN | *(PARTIAL - see [51](51-spawnhostilebattle-10v10-baseline.md), README)* |
 | 52 | Combat-load FPS curve (host): 5v5/10v10/20v20/40v40 | RUN | *(DONE - see [52](52-combat-load-fps-curve-host.md), README)* |
 | 53 | Combat-load FPS curve (join) while host fights | RUN | *(DONE - see [53](53-combat-load-fps-curve-join.md), README)* |
-| 54 | Attribution correctness with 2 simultaneous fights | RUN |
+| 54 | Attribution correctness with 2 simultaneous fights | RUN | *(DONE - see [54](54-attribution-two-simultaneous-fights.md), README)* |
 | 55 | Attribution correctness with 4+ simultaneous fights | RUN |
 | 56 | KO event storm: reliable-channel backpressure at 20v20 | RUN |
 | 57 | Death event storm ordering/loss under load | RUN |
