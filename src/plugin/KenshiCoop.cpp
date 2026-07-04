@@ -2173,6 +2173,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             ctx.gw      = gw;
             ctx.isHost  = g_isHostMode;
             ctx.localId = g_net.localId();
+            ctx.peerReady = false; // legacy presence path has no entity-stream signal
             if (!g_scenarioStarted) {
                 g_scenarioStarted   = true;
                 g_scenarioStartTick = GetTickCount();

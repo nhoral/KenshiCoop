@@ -23,6 +23,11 @@ struct ScenarioContext {
     u32           localId;
     unsigned long elapsedMs; // since onStart
     unsigned int  tick;      // scenario tick counter
+    // True once this client has received an owned-entity batch from a peer. On the
+    // HOST this means the JOIN is loaded + streaming, so it is the correct gate for
+    // any time-sensitive host action (e.g. a live spawn) that the join must witness.
+    // Always false in HostOnly runs (no peer) - gate with a timeout fallback there.
+    bool          peerReady;
 };
 
 class Scenario {

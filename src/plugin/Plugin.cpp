@@ -269,6 +269,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         coop::ScenarioContext ctx;
         ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
         ctx.elapsedMs = 0; ctx.tick = g_scenarioTick;
+        ctx.peerReady = g_inbound.sawRemoteEntity();
         char m[160];
         _snprintf(m, sizeof(m) - 1, "SCENARIO %s start", g_scenario->name());
         m[sizeof(m) - 1] = '\0';
@@ -312,6 +313,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
         ctx.elapsedMs = GetTickCount() - g_scenarioStartTick;
         ctx.tick = ++g_scenarioTick;
+        ctx.peerReady = g_inbound.sawRemoteEntity();
         if (g_scenario->onTick(ctx)) {
             // Stage 2: the receiver emits its interpolation smoothness summary
             // alongside the verdict so the runner can assert per-frame gliding.

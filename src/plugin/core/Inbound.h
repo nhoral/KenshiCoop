@@ -73,7 +73,7 @@ struct InboundWorldPickup {
 
 class Inbound {
 public:
-    Inbound()  { InitializeCriticalSection(&cs_); }
+    Inbound()  { InitializeCriticalSection(&cs_); sawRemote_ = false; }
     ~Inbound() { DeleteCriticalSection(&cs_); }
 
     // NET thread: a peer joined (id) / a peer left (id, or OWNER_ID_ALL).
@@ -86,7 +86,17 @@ public:
     // NET thread: one received entity transform, owner-tagged.
     void pushEntity(u32 ownerId, const EntityState& e) {
         InboundEntity ie; ie.ownerId = ownerId; ie.e = e;
-        EnterCriticalSection(&cs_); ent_.push_back(ie); LeaveCriticalSection(&cs_);
+        EnterCriticalSection(&cs_); ent_.push_back(ie); sawRemote_ = true;
+        LeaveCriticalSection(&cs_);
+    }
+
+    // MAIN thread: has this client EVER received an owned-entity batch from a peer?
+    // A peer only publishes its owned entities once IT reaches gameplay, so on the
+    // host this flips true exactly when the JOIN is loaded + streaming (the reliable
+    // "peer is in-game" gate for time-sensitive host actions like a live spawn).
+    bool sawRemoteEntity() {
+        EnterCriticalSection(&cs_); bool v = sawRemote_; LeaveCriticalSection(&cs_);
+        return v;
     }
     // NET thread: one received reliable event, owner-tagged.
     void pushEvent(u32 ownerId, const EventPacket& ev) {
@@ -158,6 +168,7 @@ public:
 
 private:
     CRITICAL_SECTION          cs_;
+    bool                      sawRemote_; // set once any peer entity batch arrives
     std::deque<u32>           conn_;
     std::deque<u32>           leave_;
     std::deque<InboundEntity> ent_;
