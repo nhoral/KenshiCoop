@@ -71,6 +71,37 @@ struct InboundWorldPickup {
     WorldPickupPacket pkt;
 };
 
+// One received owner-authoritative medical snapshot (phase 2): the subject's
+// owner streams its local-only medical model; the receiver writes it onto its
+// driven copy of that body.
+struct InboundMedical {
+    u32           ownerId;
+    MedicalPacket pkt;
+};
+
+// One received treatment delta (phase 2): first aid administered on a DRIVEN
+// copy, forwarded to the body's owner, who applies the bandage levels raise-only.
+struct InboundTreatment {
+    u32             ownerId;
+    TreatmentPacket pkt;
+};
+
+// One received game-speed packet (consensus speed sync): a REQUEST from a peer
+// (host consumes; join requests never reach a join) or the host's arbitrated
+// SET (join applies). pkt.type distinguishes the two.
+struct InboundSpeed {
+    u32         ownerId;
+    SpeedPacket pkt;
+};
+
+// One received owner-authoritative character-stats snapshot (protocol 17): the
+// subject's owner streams its local-only CharStats; the receiver writes it onto
+// its driven copy of that body.
+struct InboundStats {
+    u32         ownerId;
+    StatsPacket pkt;
+};
+
 class Inbound {
 public:
     Inbound()  { InitializeCriticalSection(&cs_); sawRemote_ = false; }
@@ -136,6 +167,26 @@ public:
         InboundWorldPickup wp; wp.ownerId = ownerId; wp.pkt = pkt;
         EnterCriticalSection(&cs_); wp_.push_back(wp); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received medical snapshot, owner-tagged.
+    void pushMedical(u32 ownerId, const MedicalPacket& pkt) {
+        InboundMedical im; im.ownerId = ownerId; im.pkt = pkt;
+        EnterCriticalSection(&cs_); med_.push_back(im); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received treatment delta, owner-tagged.
+    void pushTreatment(u32 ownerId, const TreatmentPacket& pkt) {
+        InboundTreatment it; it.ownerId = ownerId; it.pkt = pkt;
+        EnterCriticalSection(&cs_); treat_.push_back(it); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received game-speed request/set, owner-tagged.
+    void pushSpeed(u32 ownerId, const SpeedPacket& pkt) {
+        InboundSpeed is; is.ownerId = ownerId; is.pkt = pkt;
+        EnterCriticalSection(&cs_); speed_.push_back(is); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received character-stats snapshot, owner-tagged.
+    void pushStats(u32 ownerId, const StatsPacket& pkt) {
+        InboundStats ist; ist.ownerId = ownerId; ist.pkt = pkt;
+        EnterCriticalSection(&cs_); stats_.push_back(ist); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
     void drainConnects(std::deque<u32>& out) {
@@ -165,6 +216,18 @@ public:
     void drainWorldPickups(std::deque<InboundWorldPickup>& out) {
         EnterCriticalSection(&cs_); out.swap(wp_); LeaveCriticalSection(&cs_);
     }
+    void drainMedical(std::deque<InboundMedical>& out) {
+        EnterCriticalSection(&cs_); out.swap(med_); LeaveCriticalSection(&cs_);
+    }
+    void drainTreatments(std::deque<InboundTreatment>& out) {
+        EnterCriticalSection(&cs_); out.swap(treat_); LeaveCriticalSection(&cs_);
+    }
+    void drainSpeed(std::deque<InboundSpeed>& out) {
+        EnterCriticalSection(&cs_); out.swap(speed_); LeaveCriticalSection(&cs_);
+    }
+    void drainStats(std::deque<InboundStats>& out) {
+        EnterCriticalSection(&cs_); out.swap(stats_); LeaveCriticalSection(&cs_);
+    }
 
 private:
     CRITICAL_SECTION          cs_;
@@ -178,6 +241,10 @@ private:
     std::deque<InboundWorldRemove> wir_;
     std::deque<InboundWorldDrop>   wd_;
     std::deque<InboundWorldPickup> wp_;
+    std::deque<InboundMedical>     med_;
+    std::deque<InboundTreatment>   treat_;
+    std::deque<InboundSpeed>       speed_;
+    std::deque<InboundStats>       stats_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);

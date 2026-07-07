@@ -1,0 +1,7 @@
+{
+  "_comment": "LAN host machine (machine 2) connection settings for run_lan_test.ps1 / setup_lan_host.ps1. Copy to lan.config.json and fill in. SSH key auth must already be configured (see resources/VALIDATION_BASELINE.md LAN section). Windows remote: ssh commands use backslash paths, scp uses forward slashes.",
+  "host": "192.168.1.10",
+  "user": "Mike",
+  "kenshiDir": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Kenshi",
+  "dropDir": "C:\\KenshiCoop"
+}

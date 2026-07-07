@@ -1,43 +1,36 @@
-# Build output
+# Build outputs
+src/plugin/x64/
 build/
-bin/
-out/
+dist/*.exe
+dist/remote-kit/
+dist/KenshiCoop-remote-kit-*.zip
 
-# Vendored dependency source (fetched via clone/submodule, not committed)
+# Vendored dependency source (fetched via clone/git-LFS, not committed; ~500MB)
 third_party/enet/enet/
-
-# KenshiLib + Boost deps (cloned via git-LFS from KenshiLib_Examples_deps; ~500MB extracted)
 third_party/KenshiLib_deps/
 
-# Downloaded toolchain installers (large Microsoft binaries, not committed)
-tools/
+# Test-run artifacts (logs, screenshots, verdicts, history)
+tools/test-runs/
+tools/*.log
+tools/_*.log
 
-# Visual Studio / MSBuild
-.vs/
-x64/
-Debug/
-Release/
-*.user
-*.suo
-*.sdf
-*.opensdf
-*.VC.db
-*.VC.opendb
-ipch/
+# Ad-hoc debug scratch scripts and captured screenshots
+tools/_*.ps1
+tools/float_fix*/
+tools/p*_validate/
+tools/last_dev_cycle.txt
 
-# Compiled / intermediate artifacts
-*.obj
-*.o
-*.lib
-*.exp
-*.ilk
-*.pdb
-*.dll
-*.exe
+# Downloaded toolchain installers (large Microsoft binaries)
+tools/*.exe
 
-# CMake
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
+# Root-level run logs (build/deploy/run drivers)
+/*.log
 
+# Machine-specific config (committed template: scripts/lan.config.example.json)
+scripts/lan.config.json
+
+# Spike raw captures (findings docs are tracked; raw logs/screenshots are not)
+resources/spikes/*/raw/
+
+# Stray shell artifact
 nul

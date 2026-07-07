@@ -215,20 +215,32 @@ bool woundSubject(GameWorld* gw, const unsigned int subjHand[5], float blood);
 struct CombatRead {
     bool         valid;       // at least one field read succeeded
     bool         inCombat;    // isInCombatMode(melee=true, ranged=true)
+    bool         modeActive;  // CombatClass::combatModeActive - STABLE across the
+                              // slot rotations/combo gaps that flicker inCombat
     bool         ranged;      // isInRangedCombatMode()
     bool         underMelee;  // isLiterallyUnderMeleeAttackRightNowForSure()
     bool         fleeing;     // isFleeing()
     bool         hasTarget;   // attack target is non-null
+    bool         waiting;     // engaged but QUEUED (no attack slot): sword state is
+                              // CIRCLE_MENACINGLY / WAIT_MENACINGLY / HESITATE
+    int          swordState;  // raw swordStateEnum (-1 = unreadable)
     unsigned int target[5];   // attack target hand (or zeros)
 };
 // SEH-guarded read of c's combat state into *out. Returns out->valid.
 bool readCombat(Character* c, CombatRead* out);
 
-// Join-side combat apply: e.task == TASK_COMBAT_MELEE and the subject hand is the
-// attack target. Resolve it locally and order THIS body to focus-melee it, so the
-// join's own engine animates the fight (replicate the cause, not the animation).
+// readCombat via a hand (readObjectHand layout). Scenario diagnostics.
+bool readCombatByHand(const unsigned int hand[5], CombatRead* out);
+
+// Join-side combat apply: e.task is a combat stance (TASK_COMBAT_MELEE or
+// TASK_COMBAT_WAIT) and the subject hand is the attack target. Resolve it locally
+// and order THIS body to focus-melee it, so the join's own engine animates the
+// fight (replicate the cause, not the animation).
+// breakOrder=true additionally routes the attack through the player-ORDER path
+// (addOrder clear=true) FIRST: a seat-injected copy holds a player order at its
+// stool which outranks the AI goal, so the goal alone never starts the fight.
 // Returns 2 ordered / 1 target not loaded / 0 no-op (not a combat intent) / -1 fault.
-int applyCombat(Character* c, const EntityState& e);
+int applyCombat(Character* c, const EntityState& e, bool breakOrder);
 
 // duel test scene: spawn two mutually-hostile non-squad NPCs in front of the leader
 // from the SAME nearby faction so they are PEACEFUL on spawn (no attack issued here).
@@ -558,6 +570,224 @@ bool         installAiSuspendHook();
 void         clearAiSuspend();
 void         addAiSuspend(Character* c);
 unsigned int aiSuspendCount();
+
+// Join-side damage suppression (the "cosmetic fights are actually cosmetic"
+// guard): detour Character::hitByMeleeAttack so that, for bodies in the guarded
+// set, a locally-simulated melee hit applies NO damage (returns HIT_MISSED
+// without running the engine's hit path). Kenshi's medical model is entirely
+// LOCAL (blood/limbs/bleed never cross the wire), so without this the join's
+// cosmetic copy of a host-authoritative fight accumulates real local damage that
+// nothing reconciles - a body could bleed toward a death the host never had.
+// Same pattern as the AI-suspend detour: pointer-compared set, rebuilt each tick
+// on the main thread, hook installed once.
+bool         installDamageGuardHook();
+void         clearDamageGuard();
+void         addDamageGuard(Character* c);
+unsigned int damageGuardCount();
+// Cumulative intercepted / passed-through melee hits since load (the damage_guard
+// oracle's engagement signal: guarded>0 proves local swings really targeted driven
+// bodies AND the hook stopped them).
+void         damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed);
+
+// Read a character's current blood level by hand (medical.blood). The vitals
+// ground-truth read for the damage_guard conformance oracle: the HOST's victim
+// must lose blood in a real fight while the JOIN's driven copy must not.
+bool readBloodByHand(const unsigned int hand[5], float* outBlood);
+
+// ---- Player-combat / medical validation primitives (spike 21 field map) ----
+
+// One anatomy part's damage model (protocol 16). Keyed by the part's index in
+// MedicalSystem::anatomy - deterministic across clients loading the same save.
+struct MedPartRead {
+    bool  used;      // this slot carries a live part
+    unsigned char partType; // HealthPartStatus::PartType
+    unsigned char side;     // LeftRight
+    float flesh;     // cut HP (-1 = unreadable)
+    float fleshStun; // stun HP (-1 = unreadable)
+    float bandaging; // bandage level (-1 = unreadable)
+    float juryRig;   // robotics jury-rig level (-1 = unreadable)
+    float maxHealth; // _maxHealth (local clamp; NOT sent on the wire)
+};
+
+// Full vitals snapshot of a rendered body's LOCAL medical model (the state that
+// never crosses the wire by itself - spikes 21-23). Protocol 16: carries the
+// FULL anatomy (parts[], anatomy order) plus limb-loss state; the legacy 4-limb
+// arrays remain for the scenario scaffolds/oracles (order matches
+// RobotLimbs::Limb: [0]=LEFT_ARM [1]=RIGHT_ARM [2]=LEFT_LEG [3]=RIGHT_LEG).
+struct MedicalRead {
+    bool  valid;
+    float blood;
+    float bleedRate;    // medical.currentBleedRate
+    float limbFlesh[4]; // HealthPartStatus::flesh (current HP; -1 = part missing)
+    float limbBand[4];  // HealthPartStatus::bandaging (-1 = part missing)
+    float limbMax[4];   // HealthPartStatus::_maxHealth (-1 = part missing)
+    bool  unconscious;  // medical.unconcious
+    bool  dead;         // medical.dead
+    // ---- protocol 16: full anatomy ----
+    unsigned int nParts;      // filled parts[] slots (MedicalSystem::anatomy order)
+    MedPartRead  parts[12];   // coop::MED_PARTS_MAX slots
+    // ---- protocol 16: limb loss (RobotLimbs::Limb order) ----
+    unsigned char limbState[4]; // LimbState (0xFF = unknown/no robotLimbs)
+    char limbSid[4][48];        // robotic replacement template stringID ("" unless REPLACED)
+};
+// SEH-guarded read of c's medical model into *out. Returns out->valid.
+bool readMedical(Character* c, MedicalRead* out);
+// Same, resolving the body from a readObjectHand-layout hand first.
+bool readMedicalByHand(const unsigned int hand[5], MedicalRead* out);
+
+// Phase-2 vitals sync: SEH-guarded WRITE of a received owner-authoritative
+// medical snapshot onto a DRIVEN copy (blood, bleedRate; full per-part
+// flesh/fleshStun/bandaging/juryRig when in.nParts > 0, else the legacy 4-limb
+// arrays; -1 fields skipped; a part is only written when the local anatomy slot
+// agrees on partType+side). unconscious/dead are NOT written - the reliable
+// event channel owns those transitions. Returns false on fault/null.
+bool writeMedical(Character* c, const MedicalRead& in);
+
+// Phase-2 treatment forwarding, owner side: raise-only per-limb bandaging apply
+// (bandaging = max(local, band[i]), clamped to _maxHealth; -1 = skip). Raise-only
+// makes a re-delivered delta idempotent. Returns the number of limbs raised.
+int applyBandageLevels(Character* c, const float band[4]);
+
+// ---- Protocol 17: character stats sync ----------------------------------
+// Snapshot of a body's LOCAL CharStats model: raw stat/skill levels indexed by
+// kenshi's StatsEnumerated (slot 0 = STAT_NONE, unused; -1 = unreadable), plus
+// xp and freeAttributePoints. Like the medical model these never cross the
+// wire by themselves - and unlike medical, the PEER's engine resolves real
+// fights with its local copy of these numbers.
+struct StatsRead {
+    bool  valid;
+    unsigned int nStats;    // filled slots (STAT_STRENGTH=1 .. STAT_END-1)
+    float stats[40];        // coop::STATS_SLOT_MAX; by StatsEnumerated index
+    float xp;               // CharStats::xp (-1 = unreadable)
+    float freeAttribPts;    // CharStats::freeAttributePoints (-1 = unreadable)
+};
+// SEH-guarded read of c's CharStats into *out (via CharStats::getStatRef so no
+// per-field offsets). Returns out->valid.
+bool readStats(Character* c, StatsRead* out);
+// Same, resolving the body from a readObjectHand-layout hand first.
+bool readStatsByHand(const unsigned int hand[5], StatsRead* out);
+// SEH-guarded WRITE of a received owner-authoritative stats snapshot onto a
+// DRIVEN copy (-1 fields skipped), then CharStats::_recalculateStats() so
+// derived values (attack/block speed, run speed, encumbrance) refresh
+// immediately. Returns false on fault/null.
+bool writeStats(Character* c, const StatsRead& in);
+
+// Deterministic STAT-RAISE scaffold (stats_sync scenario): set one stat (by
+// StatsEnumerated index) on the body at subjHand to 'value' (raise-only) and
+// recalculate. Runs on the body's OWNER; the peer asserts the crossing.
+bool raiseSubjectStat(GameWorld* gw, const unsigned int subjHand[5],
+                      int statId, float value);
+
+// ---- Protocol 18: carried-body sync --------------------------------------
+// Snapshot of a body's LOCAL carry relationship: is it carrying someone
+// (Character::isCarryingSomething + the carryingObject hand), and is it
+// itself on someone's shoulder (Character::isBeingCarried)?
+struct CarryRead {
+    bool valid;
+    bool carrying;           // this body carries something
+    bool beingCarried;       // this body is on someone's shoulder
+    unsigned int carried[5]; // carryingObject hand (readObjectHand layout;
+                             // zeroed unless carrying)
+};
+bool readCarry(Character* c, CarryRead* out);
+// Order the local CARRIER to pick up the local body at carriedHand via the
+// engine's own pickupObject (full chain: carry-mode ragdoll, shoulder bone
+// attach, carry animation, transform-follow). Idempotent: already carrying
+// that body = success; carrying a different body = refused. SEH-guarded.
+bool applyPickup(GameWorld* gw, Character* carrier, const unsigned int carriedHand[5]);
+// Release the carrier's carried body (dropCarriedObject; ragdoll = limp
+// ground drop). Idempotent: not carrying = success no-op. SEH-guarded.
+bool applyDrop(Character* carrier, bool ragdoll);
+// Scenario scaffolds (carry_order): resolve the carrier by hand, then
+// applyPickup / applyDrop. Run on the CARRIER's owner; the peer asserts the
+// crossing.
+bool carrySubject(GameWorld* gw, const unsigned int carrierHand[5],
+                  const unsigned int carriedHand[5]);
+bool dropSubject(GameWorld* gw, const unsigned int carrierHand[5], bool ragdoll);
+
+// Protocol-16 treatment forwarding: raise-only bandaging apply keyed by ANATOMY
+// index (all parts, not just limbs). band[i] = level for anatomy part i, -1 =
+// skip. Returns the number of parts raised.
+int applyBandageParts(Character* c, const float band[12]);
+
+// Limb-loss replication (Phase C/D): reconcile a driven copy's LimbStates with
+// the owner's. states[] is LimbState per RobotLimbs::Limb (0xFF = skip); sid[]
+// the robotic replacement template stringIDs ("" = none). ORIGINAL->STUMP/
+// REPLACED applies MedicalSystem::amputate(limb, createSeveredItem, zero
+// force); ORIGINAL->CRUSHED applies crushLimb. STUMP->REPLACED fabricates the
+// prosthetic from sid (LIMB_REPLACEMENT template) and fits it via
+// MedicalSystem::setRobotLimbItem. createSeveredItem: the HOST passes true
+// (world authority - its real severed item then streams to everyone via the
+// world-item channel); the JOIN passes false (the streamed copy is canonical).
+// Returns a bitmask of limbs changed (bit i = limb i), 0 if nothing to do,
+// -1 on fault.
+int applyLimbStates(GameWorld* gw, Character* c, const unsigned char states[4],
+                    const char sid[4][48], bool createSeveredItem);
+
+// Join-side severed-item dedupe (Phase C): the join's own damage sim creates a
+// REAL severed-limb ground item when an owned member loses a limb, but the
+// HOST's copy (spawned by its event-apply) is the canonical one - it streams
+// back as a world-item proxy. Destroy the local free severed-limb item(s)
+// (Item::itemFunction == ITEM_SEVERED_LIMB) within 'radius' of the body at
+// cHand. Returns the number destroyed.
+int destroySeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius);
+
+// limb_loss oracle read: count FREE severed-limb ground items (itemFunction ==
+// ITEM_SEVERED_LIMB, not in any inventory) within 'radius' of the body at cHand.
+int countSeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius);
+
+// Deterministic LIMB-LOSS scaffold (limb_loss scenario): run the engine's own
+// amputate on the body at subjHand (its OWNER calls this - authoritative damage,
+// exactly what a real severing hit does, severed item included). limb =
+// RobotLimbs::Limb (0..3). Returns true if the amputation ran.
+bool amputateSubjectLimb(GameWorld* gw, const unsigned int subjHand[5], int limb);
+
+// Deterministic LIMB wound scaffold (medic_order / player_ko): lower every limb's
+// flesh to 'flesh' (only lower, never heal) and the blood to 'blood' on the body
+// at subjHand. Produces a clean, oracle-visible medical delta on the body's OWNER
+// without waiting for random combat limb rolls. Returns true if applied.
+bool woundSubjectLimbs(GameWorld* gw, const unsigned int subjHand[5],
+                       float flesh, float blood);
+
+// Deterministic TREATMENT scaffold (medic_order): bandage every damaged limb on
+// the body at subjHand (HealthPartStatus::bandaging -> _maxHealth, raise only) -
+// the same medical fields a real first-aid pass raises incrementally
+// (MedicalSystem::applyFirstAid, spike 23). Returns the number of limbs bandaged.
+int healSubjectBandage(GameWorld* gw, const unsigned int subjHand[5]);
+
+// player_ko revive scaffold: wake the body at subjHand (clear the forced KO +
+// ragdoll, clear medical.unconcious, restore blood to a healthy floor) so its
+// owner publishes the upright edge -> reliable EVT_REVIVE. Returns true on ok.
+bool reviveSubject(GameWorld* gw, const unsigned int subjHand[5]);
+
+// player_combat victim pick: the UPRIGHT non-squad world NPC nearest the body at
+// refHand (excluding, optionally, up to two prior hands - pass 0 for none; the
+// second exclude lets a window drop a DUD striker that never engages without
+// re-picking it, run 033318). Fills outHand (readObjectHand layout). Returns
+// true if one was found.
+bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
+                      const unsigned int excludeHand[5], unsigned int outHand[5],
+                      const unsigned int excludeHand2[5] = 0);
+
+// Order the body at atkHand to focus-melee the body at vicHand (UNPROVOKED, same
+// goal path as startDuel). Both hands readObjectHand layout. Returns true if the
+// order was issued. Guarded: no-op (true) when the attacker is already in combat,
+// so a throttled re-issue doesn't thrash the AI (the combat_order lesson).
+bool orderAttackByHand(GameWorld* gw, const unsigned int atkHand[5],
+                       const unsigned int vicHand[5]);
+
+// ---- Consensus game-speed sync ----------------------------------------------
+
+// SEH-guarded read of the world's speed state: *mult = frameSpeedMult,
+// *paused = the user-pause flag. Returns false on fault/null.
+bool readGameSpeed(GameWorld* gw, float* mult, bool* paused);
+
+// SEH-guarded write through the engine's OWN setters (GameWorld::userPause +
+// GameWorld::setGameSpeed) so the UI speed buttons track the applied state
+// exactly like a real click. mult <= 0 means paused (the wire convention);
+// the pre-pause multiplier is left alone so unpausing restores it. Returns
+// false on fault/null/unresolved setters.
+bool writeGameSpeed(GameWorld* gw, float mult, bool paused);
 
 } // namespace engine
 } // namespace coop

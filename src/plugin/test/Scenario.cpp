@@ -64,6 +64,93 @@ void logScenarioEntity(const char* kind, const EntityState& e) {
     coop::logLine(b);
 }
 
+// Log one extended "SCENARIO VITALS" line for the body at hand h (readObjectHand
+// layout: [type,container,containerSerial,index,serial]). The prefix
+// "hand=i,s t=.. blood=.." is byte-compatible with the short form combat_kill
+// emits (Test-DamageGuard anchors on it); the medical-model fields the player-
+// combat/medic oracles need follow after. fl = per-limb flesh, bd = per-limb
+// bandaging, order LA,RA,LL,RL (RobotLimbs::Limb). Protocol-16 fields append
+// AFTER dead= (older regexes have no $ anchor, so they keep matching): pfl/pst
+// = min flesh / min stun across the FULL anatomy (head/chest/stomach included),
+// ls = the 4 LimbStates (255 = unknown). Silent no-op if unresolved.
+void logVitalsLine(const unsigned int h[5], unsigned long t) {
+    engine::MedicalRead mr;
+    if (!engine::readMedicalByHand(h, &mr) || !mr.valid) return;
+    float pfl = 1e9f, pst = 1e9f;
+    for (unsigned int i = 0; i < mr.nParts && i < 12; ++i) {
+        if (!mr.parts[i].used) continue;
+        if (mr.parts[i].flesh     >= 0.0f && mr.parts[i].flesh     < pfl) pfl = mr.parts[i].flesh;
+        if (mr.parts[i].fleshStun >= 0.0f && mr.parts[i].fleshStun < pst) pst = mr.parts[i].fleshStun;
+    }
+    if (pfl > 1e8f) pfl = -1.0f;
+    if (pst > 1e8f) pst = -1.0f;
+    char b[320];
+    _snprintf(b, sizeof(b) - 1,
+              "SCENARIO VITALS hand=%u,%u t=%lu blood=%.1f bleed=%.2f "
+              "fl=%.1f,%.1f,%.1f,%.1f bd=%.1f,%.1f,%.1f,%.1f unc=%d dead=%d "
+              "pfl=%.1f pst=%.1f ls=%u,%u,%u,%u",
+              h[3], h[4], t, mr.blood, mr.bleedRate,
+              mr.limbFlesh[0], mr.limbFlesh[1], mr.limbFlesh[2], mr.limbFlesh[3],
+              mr.limbBand[0], mr.limbBand[1], mr.limbBand[2], mr.limbBand[3],
+              mr.unconscious ? 1 : 0, mr.dead ? 1 : 0,
+              pfl, pst,
+              (unsigned)mr.limbState[0], (unsigned)mr.limbState[1],
+              (unsigned)mr.limbState[2], (unsigned)mr.limbState[3]);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+}
+
+// ---- Squad-tab classification (shared by the player_* / medic scenarios) ----
+// Mirrors CoopPresenceScenario's partition EXACTLY (and therefore the
+// Replicator's): a member's tab identity is its hand CONTAINER, and a tab's
+// rank is its position among the distinct containers sorted ascending. Host
+// owns rank 0, join owns rank 1.
+bool tabHandLess(const EntityState& a, const EntityState& b) {
+    if (a.hType != b.hType) return a.hType < b.hType;
+    if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+    if (a.hContainerSerial != b.hContainerSerial) return a.hContainerSerial < b.hContainerSerial;
+    if (a.hIndex != b.hIndex) return a.hIndex < b.hIndex;
+    return a.hSerial < b.hSerial;
+}
+bool tabCtnrLess(const EntityState& a, const EntityState& b) {
+    if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+    return a.hContainerSerial < b.hContainerSerial;
+}
+bool tabCtnrEq(const EntityState& a, const EntityState& b) {
+    return a.hContainer == b.hContainer && a.hContainerSerial == b.hContainerSerial;
+}
+// Rank of member i's squad tab among the distinct, sorted containers (-1 unknown).
+int tabRankOf(const EntityState* sq, unsigned int n, unsigned int i) {
+    const unsigned int MAXT = 32;
+    EntityState distinct[MAXT]; unsigned int dn = 0;
+    for (unsigned int a = 0; a < n; ++a) {
+        bool seen = false;
+        for (unsigned int b = 0; b < dn; ++b) if (tabCtnrEq(distinct[b], sq[a])) { seen = true; break; }
+        if (!seen && dn < MAXT) distinct[dn++] = sq[a];
+    }
+    for (unsigned int a = 1; a < dn; ++a)
+        for (unsigned int b = a; b > 0 && tabCtnrLess(distinct[b], distinct[b-1]); --b) {
+            EntityState t = distinct[b]; distinct[b] = distinct[b-1]; distinct[b-1] = t;
+        }
+    for (unsigned int b = 0; b < dn; ++b) if (tabCtnrEq(distinct[b], sq[i])) return (int)b;
+    return -1;
+}
+// The lowest-hand member of tab 'rank' ("that tab's leader" - the same stable
+// pick coop_presence uses for its mover). Returns the index into sq, or -1.
+int tabLeaderIdx(const EntityState* sq, unsigned int n, unsigned int rank) {
+    int best = -1;
+    for (unsigned int i = 0; i < n; ++i) {
+        if (tabRankOf(sq, n, i) != (int)rank) continue;
+        if (best < 0 || tabHandLess(sq[i], sq[best])) best = (int)i;
+    }
+    return best;
+}
+// Fill h[5] (readObjectHand layout) from a captured EntityState's hand fields.
+void handFromEntity(const EntityState& e, unsigned int h[5]) {
+    h[0] = e.hType; h[1] = e.hContainer; h[2] = e.hContainerSerial;
+    h[3] = e.hIndex; h[4] = e.hSerial;
+}
+
 // leader_move (Stage 1): the HOST orders its squad leader to walk to a nearby
 // destination and streams its transform; the JOIN drives its local copy of that
 // same (shared-save) leader to the received transform. Host logs MEMBER, join
@@ -222,24 +309,25 @@ public:
 
     virtual const char* name() const { return "craft_order"; }
 
+    // PIN the worker at LOCAL GAMEPLAY START (pre-arm), while the baked worker is
+    // still parked at the prop and is unambiguously the nearest non-squad NPC -
+    // waiting for peer-ready arming (a join-load, ~10-20 s) lets other world NPCs
+    // wander past the prop and the worker patrol away (observed: "pin FAILED").
+    // Then HOLD it at the fixture every pre-arm tick, exactly like the baseline
+    // phase does, so it is still there when the armed clock begins.
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        if (!ctx.isHost) return;
+        pinWorker(ctx);
+        if (haveWorker_) engine::holdWorkerAtFixture(ctx.gw, workerHand_);
+    }
+
     virtual void onStart(const ScenarioContext& ctx) {
-        // PIN the worker NOW (scene start), while the baked worker is still parked at
-        // the prop and is unambiguously the nearest non-squad NPC. Picking "nearest
-        // now" at order-time drifts: other world NPCs wander past the prop over the
-        // baseline window, so the host would order the wrong body (observed). Pinning
-        // by hand keeps host + join driving the SAME identity across the transition.
+        // Covers immediate arming (peer already streaming / arm-timeout 0), where
+        // no pre-arm tick ever ran.
         if (ctx.isHost) {
-            haveWorker_ = engine::pickCraftWorker(ctx.gw, workerHand_, &task_);
-            if (haveWorker_) {
-                char b[128];
-                _snprintf(b, sizeof(b) - 1,
-                          "SCENARIO craft worker pinned hand=%u,%u,%u,%u,%u task=%d",
-                          workerHand_[3], workerHand_[4], workerHand_[0],
-                          workerHand_[1], workerHand_[2], task_);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            } else {
+            pinWorker(ctx);
+            if (!haveWorker_)
                 coop::logLine("SCENARIO craft worker pin FAILED (no fixture/worker)");
-            }
         }
     }
 
@@ -299,6 +387,21 @@ private:
     static const unsigned long HOST_DURATION_MS = 52000; // outlive the join (cover post-order)
     static const unsigned long JOIN_DURATION_MS = 34000; // baseline + post-order observation
     static const unsigned int  MAX_LOG          = 40;
+
+    // Pin once; retried each pre-arm tick until it lands (the world may need a
+    // few frames after load before the fixture/worker query resolves).
+    void pinWorker(const ScenarioContext& ctx) {
+        if (haveWorker_) return;
+        haveWorker_ = engine::pickCraftWorker(ctx.gw, workerHand_, &task_);
+        if (haveWorker_) {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO craft worker pinned hand=%u,%u,%u,%u,%u task=%d",
+                      workerHand_[3], workerHand_[4], workerHand_[0],
+                      workerHand_[1], workerHand_[2], task_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
     bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
@@ -324,22 +427,20 @@ public:
 
     virtual const char* name() const { return "down_order"; }
 
+    // PIN the subject at local gameplay start (pre-arm) while it is still where
+    // the save baked it, and HOLD it upright until the armed clock begins - the
+    // peer-ready arming wait is long enough for it to wander otherwise.
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        if (!ctx.isHost) return;
+        pinSubject(ctx);
+        if (haveSubject_) engine::holdSubjectUpright(ctx.gw, subjHand_);
+    }
+
     virtual void onStart(const ScenarioContext& ctx) {
-        // PIN the subject now (upright), so the host knocks out the SAME baked NPC the
-        // join is already driving - re-picking "nearest now" at order-time could pick a
-        // different body that the join has no upright baseline for.
         if (ctx.isHost) {
-            haveSubject_ = engine::pickDownSubject(ctx.gw, subjHand_);
-            if (haveSubject_) {
-                char b[128];
-                _snprintf(b, sizeof(b) - 1,
-                          "SCENARIO down subject pinned hand=%u,%u,%u,%u,%u",
-                          subjHand_[3], subjHand_[4], subjHand_[0],
-                          subjHand_[1], subjHand_[2]);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            } else {
+            pinSubject(ctx); // covers immediate arming (no pre-arm tick ran)
+            if (!haveSubject_)
                 coop::logLine("SCENARIO down subject pin FAILED (no nearby NPC)");
-            }
         }
     }
 
@@ -394,6 +495,20 @@ private:
     static const unsigned long HOST_DURATION_MS = 52000;
     static const unsigned long JOIN_DURATION_MS = 34000;
     static const unsigned int  MAX_LOG          = 40;
+
+    void pinSubject(const ScenarioContext& ctx) {
+        if (haveSubject_) return;
+        haveSubject_ = engine::pickDownSubject(ctx.gw, subjHand_);
+        if (haveSubject_) {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO down subject pinned hand=%u,%u,%u,%u,%u",
+                      subjHand_[3], subjHand_[4], subjHand_[0],
+                      subjHand_[1], subjHand_[2]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
     bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
@@ -417,19 +532,18 @@ public:
 
     virtual const char* name() const { return "death_order"; }
 
+    // Same pre-arm pin+hold as down_order (see there for rationale).
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        if (!ctx.isHost) return;
+        pinSubject(ctx);
+        if (haveSubject_) engine::holdSubjectUpright(ctx.gw, subjHand_);
+    }
+
     virtual void onStart(const ScenarioContext& ctx) {
         if (ctx.isHost) {
-            haveSubject_ = engine::pickDownSubject(ctx.gw, subjHand_);
-            if (haveSubject_) {
-                char b[128];
-                _snprintf(b, sizeof(b) - 1,
-                          "SCENARIO death subject pinned hand=%u,%u,%u,%u,%u",
-                          subjHand_[3], subjHand_[4], subjHand_[0],
-                          subjHand_[1], subjHand_[2]);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            } else {
+            pinSubject(ctx);
+            if (!haveSubject_)
                 coop::logLine("SCENARIO death subject pin FAILED (no nearby NPC)");
-            }
         }
     }
 
@@ -483,6 +597,20 @@ private:
     static const unsigned long HOST_DURATION_MS = 52000;
     static const unsigned long JOIN_DURATION_MS = 34000;
     static const unsigned int  MAX_LOG          = 40;
+
+    void pinSubject(const ScenarioContext& ctx) {
+        if (haveSubject_) return;
+        haveSubject_ = engine::pickDownSubject(ctx.gw, subjHand_);
+        if (haveSubject_) {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO death subject pinned hand=%u,%u,%u,%u,%u",
+                      subjHand_[3], subjHand_[4], subjHand_[0],
+                      subjHand_[1], subjHand_[2]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
     bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
@@ -577,18 +705,19 @@ public:
 
     virtual const char* name() const { return "combat_order"; }
 
+    // Pre-arm: pin both duelists while they are still at their baked spawn and
+    // hold them peaceful until the armed clock begins (see craft_order rationale).
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        if (!ctx.isHost) return;
+        pinDuelists(ctx);
+        if (havePins_) engine::holdDuelistsPeaceful(ctx.gw);
+    }
+
     virtual void onStart(const ScenarioContext& ctx) {
         if (ctx.isHost) {
-            havePins_ = engine::pickDuelSubjects(ctx.gw, handA_, handB_);
-            if (havePins_) {
-                char b[160];
-                _snprintf(b, sizeof(b) - 1,
-                          "SCENARIO duel subjects pinned A=%u,%u B=%u,%u",
-                          handA_[3], handA_[4], handB_[3], handB_[4]);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            } else {
+            pinDuelists(ctx);
+            if (!havePins_)
                 coop::logLine("SCENARIO duel pin FAILED (need two nearby non-squad NPCs)");
-            }
         }
     }
 
@@ -643,6 +772,19 @@ private:
     static const unsigned long HOST_DURATION_MS = 52000;
     static const unsigned long JOIN_DURATION_MS = 34000;
     static const unsigned int  MAX_LOG          = 40;
+
+    void pinDuelists(const ScenarioContext& ctx) {
+        if (havePins_) return;
+        havePins_ = engine::pickDuelSubjects(ctx.gw, handA_, handB_);
+        if (havePins_) {
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO duel subjects pinned A=%u,%u B=%u,%u",
+                      handA_[3], handA_[4], handB_[3], handB_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
     bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
@@ -670,18 +812,18 @@ public:
 
     virtual const char* name() const { return "combat_kill"; }
 
+    // Same pre-arm pin+hold as combat_order.
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        if (!ctx.isHost) return;
+        pinDuelists(ctx);
+        if (havePins_) engine::holdDuelistsPeaceful(ctx.gw);
+    }
+
     virtual void onStart(const ScenarioContext& ctx) {
         if (ctx.isHost) {
-            havePins_ = engine::pickDuelSubjects(ctx.gw, handA_, handB_);
-            if (havePins_) {
-                char b[160];
-                _snprintf(b, sizeof(b) - 1,
-                          "SCENARIO duel subjects pinned A=%u,%u B=%u,%u",
-                          handA_[3], handA_[4], handB_[3], handB_[4]);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            } else {
+            pinDuelists(ctx);
+            if (!havePins_)
                 coop::logLine("SCENARIO duel pin FAILED (need two nearby non-squad NPCs)");
-            }
         }
     }
 
@@ -692,10 +834,15 @@ public:
         if (ctx.isHost && havePins_ && ctx.elapsedMs >= ORDER_AT_MS) {
             if (!combatLogged_) {
                 int n = engine::startDuel(ctx.gw);
-                char b[128];
+                // Weaken B on the HOST so the real fight draws decisive blood in the
+                // window (the damage_guard oracle needs a host-side blood drop as its
+                // ground truth; the join's copy must stay flat - it takes no local
+                // damage and blood never crosses the wire).
+                bool w = engine::woundSubject(ctx.gw, handB_, 45.0f);
+                char b[160];
                 _snprintf(b, sizeof(b) - 1,
-                          "SCENARIO COMBAT issued orders=%d loser=B(%u,%u)",
-                          n, handB_[3], handB_[4]);
+                          "SCENARIO COMBAT issued orders=%d loser=B(%u,%u) wounded=%d",
+                          n, handB_[3], handB_[4], w ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 combatLogged_ = true; lastRearmMs_ = ctx.elapsedMs;
             } else if (ctx.elapsedMs < (ORDER_AT_MS + KO_DELAY_MS)) {
@@ -734,6 +881,38 @@ public:
             const char* kind = ctx.isHost ? "MEMBER" : "RECV";
             for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
             if (!ctx.isHost && n > 0) ++recvCount_;
+            // Damage-guard vitals. HOST: log the PINNED duelists' blood the whole
+            // run (it knows the hands), so the series captures the full drop -
+            // pre-fight baseline through the wound bias + real melee. JOIN: it
+            // doesn't know the pins, so it logs any local copy that is fighting
+            // or down (== the duelists, once intent replicates). The oracle
+            // asserts the HOST victim's blood DROPPED while the JOIN's driven
+            // copy stayed FLAT (guarded cosmetic fight). Both reads come off the
+            // rendered body's medical state, not a field we wrote.
+            for (unsigned int i = 0; i < n; ++i) {
+                bool log;
+                if (ctx.isHost) {
+                    log = havePins_ &&
+                          ((npcs[i].hIndex == handA_[3] && npcs[i].hSerial == handA_[4]) ||
+                           (npcs[i].hIndex == handB_[3] && npcs[i].hSerial == handB_[4]));
+                } else {
+                    log = taskIsCombat(npcs[i].task) ||
+                          ((npcs[i].bodyState & 7u) != 0);
+                }
+                if (!log) continue;
+                unsigned int h[5] = { npcs[i].hType, npcs[i].hContainer,
+                                      npcs[i].hContainerSerial, npcs[i].hIndex,
+                                      npcs[i].hSerial };
+                float blood = 0.0f;
+                if (engine::readBloodByHand(h, &blood)) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO VITALS hand=%u,%u t=%lu blood=%.1f",
+                              npcs[i].hIndex, npcs[i].hSerial,
+                              (unsigned long)ctx.elapsedMs, blood);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
         }
 
         unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
@@ -753,10 +932,25 @@ public:
 
 private:
     static const unsigned long ORDER_AT_MS      = 14000;
-    static const unsigned long KO_DELAY_MS      = 8000;  // fight visibly before the takedown
-    static const unsigned long HOST_DURATION_MS = 60000;
-    static const unsigned long JOIN_DURATION_MS = 48000;
+    static const unsigned long KO_DELAY_MS      = 14000; // fight visibly before the takedown
+                                                         // (long enough for real landed hits,
+                                                         // which the damage_guard oracle needs)
+    static const unsigned long HOST_DURATION_MS = 66000;
+    static const unsigned long JOIN_DURATION_MS = 54000;
     static const unsigned int  MAX_LOG          = 40;
+
+    void pinDuelists(const ScenarioContext& ctx) {
+        if (havePins_) return;
+        havePins_ = engine::pickDuelSubjects(ctx.gw, handA_, handB_);
+        if (havePins_) {
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO duel subjects pinned A=%u,%u B=%u,%u",
+                      handA_[3], handA_[4], handB_[3], handB_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
     bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
@@ -896,6 +1090,130 @@ private:
     float         sx_, sy_, sz_;
 };
 const float CoopPresenceScenario::LEG = 12.0f;
+
+// split_interest (step 5, dual-interest conformance): the players SPLIT UP and the
+// shared world must keep streaming around BOTH of them. The HOST relocates its
+// whole owned tab (rank 0) ~260 u away from the bar and holds it there; the JOIN's
+// tab (rank 1) stays with the bar NPCs. Under the old single-host-leader interest
+// sphere the bar leaves the host's capture radius and its NPCs stop streaming -
+// exactly spike 16's degradation. With dual-interest (one sphere per tab leader)
+// the host's SECOND sphere - centered on the join's tab-1 member, resolved locally
+// from the shared save - keeps the bar streamed. Both sides log the standard NPC
+// MEMBER/RECV series; the runner's SPLIT-INTEREST oracle checks that bar-anchored
+// NPCs (near the logged bar anchor) still track AFTER the host moved away.
+class SplitInterestScenario : public Scenario {
+public:
+    SplitInterestScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          movedLogged_(false), haveBar_(false), bx_(0), by_(0), bz_(0) {}
+
+    virtual const char* name() const { return "split_interest"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        // Bar anchor = the rank-1 tab leader's position (the member that STAYS).
+        // Logged by both clients so the oracle can select bar-anchored NPCs.
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        for (unsigned int i = 0; i < n; ++i) {
+            if (containerRankOf(sq, n, i) == 1) {
+                haveBar_ = true; bx_ = sq[i].x; by_ = sq[i].y; bz_ = sq[i].z;
+                break;
+            }
+        }
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SPLIT bar=%.2f,%.2f,%.2f have=%d",
+                  bx_, by_, bz_, haveBar_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!haveBar_)
+            coop::logLine("SCENARIO SPLIT needs a 2-tab save (rank-1 member missing)");
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // HOST: from MOVE_AT_MS, hold every rank-0 member at the remote point.
+        // Teleport-park (not walk) so the split is deterministic and immediate.
+        if (ctx.isHost && haveBar_ && ctx.elapsedMs >= MOVE_AT_MS) {
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            unsigned int moved = 0;
+            for (unsigned int i = 0; i < n; ++i) {
+                if (containerRankOf(sq, n, i) != 0) continue;
+                Character* c = engine::resolve(sq[i]);
+                if (!c) continue;
+                float rx = bx_ + SPLIT_DIST + (float)moved * 3.0f;
+                float d2 = (sq[i].x - rx) * (sq[i].x - rx) + (sq[i].z - bz_) * (sq[i].z - bz_);
+                if (d2 > 4.0f) engine::park(c, rx, by_, bz_, 0.0f);
+                ++moved;
+            }
+            if (!movedLogged_ && moved > 0) {
+                movedLogged_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO SPLIT moved=%u to=%.2f,%.2f,%.2f",
+                          moved, bx_ + SPLIT_DIST, by_, bz_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // Standard NPC series on both sides (captureNpcs is dual-sphere now, so
+        // the host's MEMBER set must keep covering the bar after the move).
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (ctx.isHost) passed_ = haveBar_ && movedLogged_;
+            else            passed_ = haveBar_ && (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static bool ctnrLess(const EntityState& a, const EntityState& b) {
+        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+        return a.hContainerSerial < b.hContainerSerial;
+    }
+    static bool ctnrEq(const EntityState& a, const EntityState& b) {
+        return a.hContainer == b.hContainer && a.hContainerSerial == b.hContainerSerial;
+    }
+    static int containerRankOf(const EntityState* sq, unsigned int n, unsigned int i) {
+        EntityState distinct[MAX_SQUAD]; unsigned int dn = 0;
+        for (unsigned int a = 0; a < n; ++a) {
+            bool seen = false;
+            for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[a])) { seen = true; break; }
+            if (!seen && dn < MAX_SQUAD) distinct[dn++] = sq[a];
+        }
+        for (unsigned int a = 1; a < dn; ++a)
+            for (unsigned int b = a; b > 0 && ctnrLess(distinct[b], distinct[b-1]); --b) {
+                EntityState t = distinct[b]; distinct[b] = distinct[b-1]; distinct[b-1] = t;
+            }
+        for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[i])) return (int)b;
+        return -1;
+    }
+
+    static const unsigned long MOVE_AT_MS       = 8000;  // baseline, then split
+    static const unsigned long HOST_DURATION_MS = 60000; // outlive the join's window
+    static const unsigned long JOIN_DURATION_MS = 46000;
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const unsigned int  MAX_LOG          = 40;
+    static const float         SPLIT_DIST;               // how far rank-0 relocates
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          movedLogged_;
+    bool          haveBar_;
+    float         bx_, by_, bz_;
+};
+const float SplitInterestScenario::SPLIT_DIST = 260.0f;
 
 // Phase 4a: container-contents (inventory) replication. Both clients anchor on the
 // SAME container (v1: the leader's own inventory - a save-stable hand that resolves
@@ -2199,10 +2517,1382 @@ private:
     unsigned long durMs_;
 };
 
+// player_combat (player-combat validation, phase 1): real combat damage TO
+// player characters, both ownership directions, plus the players' own combat
+// intent crossing. Save 'sync' (2-tab squad in a bar full of ARMED NPCs).
+//
+// Design pivots from two characterization runs:
+//   * Unarmed ally-vs-ally player duels draw ZERO blood (block/stun sparring) -
+//     players cannot be each other's damage vector in these saves.
+//   * An ARMED bar NPC very much can (measured: mob took the host leader from
+//     75.8 blood to -16 with limb flesh at 2.0 in ~25 s).
+// So the ARMED NPC is the striker and the PLAYERS are the victims:
+//   Window A: the host orders NPC1 to melee the JOIN's tab-1 leader. The NPC's
+//     combat intent streams to the join, whose engine swings the NPC copy at the
+//     join's REAL (owned) member - authoritative damage lands on the victim's
+//     OWNER (the join), the exact authority rule under test. The join victim
+//     fights back automatically, which streams ITS combat intent join->host.
+//   Window B: NPC2 melees the HOST's tab-0 leader - the same mechanism with the
+//     victim owned by the host (all-local control, join renders both copies).
+class PlayerCombatScenario : public Scenario {
+public:
+    PlayerCombatScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderAMs_(0),
+          lastOrderBMs_(0), haveOwn_(false), havePeer_(false), haveNpcA_(false),
+          haveNpcB_(false), issuedA_(false), issuedB_(false),
+          noFightA_(0), noFightB_(0),
+          lastVicBloodA_(-1.0f), lastVicBloodB_(-1.0f) {}
+
+    virtual const char* name() const { return "player_combat"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        if (!haveOwn_ || !havePeer_) latchLeaders(ctx, ownRank);
+
+        // All attack orders are HOST-side (world NPCs are host-owned; the first
+        // characterization run showed a join-ordered NPC stops resolving on the
+        // host once the join's combat branch detaches it).
+        if (ctx.isHost && haveOwn_ && havePeer_) {
+            // Window A: a striker -> the JOIN's leader. The order + fight are
+            // host-local against the leader's DRIVEN copy; the striker's combat
+            // intent streams and the join's engine runs the authoritative fight
+            // on its OWNED member.
+            if (ctx.elapsedMs >= A_AT_MS && ctx.elapsedMs < B_AT_MS) {
+                driveWindow(ctx, "A", peerHand_, npcA_, haveNpcA_, issuedA_,
+                            lastOrderAMs_, haveNpcB_ ? npcB_ : 0, noFightA_,
+                            lastVicBloodA_);
+                // RESERVE window B's striker now, while the pool is still clean:
+                // by B time the whole bar is brawling and pickCombatVictim's
+                // in-combat filter can find nobody (run 011932's B pick FAILED).
+                if (haveNpcA_ && !haveNpcB_)
+                    haveNpcB_ = engine::pickCombatVictim(ctx.gw, ownHand_,
+                                                         npcA_, npcB_);
+            }
+            // Window B: a striker -> our OWN leader (host-owned victim,
+            // all-local; the join renders both copies).
+            if (ctx.elapsedMs >= B_AT_MS)
+                driveWindow(ctx, "B", ownHand_, npcB_, haveNpcB_, issuedB_,
+                            lastOrderBMs_, haveNpcA_ ? npcA_ : 0, noFightB_,
+                            lastVicBloodB_);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            logSeries(ctx, ownRank);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (issuedA_ && issuedB_ && haveNpcA_ && haveNpcB_)
+                                 : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Shared (peer-ready-armed) timeline: NPC1 fights the join's leader 12-34s,
+    // NPC2 fights the host's leader from 34s. The join outlives B by ~22s.
+    static const unsigned long A_AT_MS          = 12000;
+    static const unsigned long B_AT_MS          = 34000;
+    static const unsigned long HOST_DURATION_MS = 64000;
+    static const unsigned long JOIN_DURATION_MS = 58000;
+    static const unsigned int  MAX_LOG          = 40;
+
+    // Keep one live striker melee-ing 'vic', re-ordering every 2.5 s and
+    // REPLACING the striker if the bar brawl KOs it (run 010631: window A's
+    // striker was beaten unconscious by another bar NPC ~13 s in, silently
+    // ending the window with 0.6 blood of damage done).
+    void driveWindow(const ScenarioContext& ctx, const char* tag,
+                     const unsigned int vic[5], unsigned int striker[5],
+                     bool& haveStriker, bool& issued, unsigned long& lastMs,
+                     const unsigned int* exclude, unsigned int& noFight,
+                     float& lastVicBlood) {
+        if (issued && ctx.elapsedMs - lastMs < 2500) return;
+        lastMs = ctx.elapsedMs;
+        // Replace the striker when it is DOWN (brawl KO, run 010631), stuck
+        // fighting someone OTHER than our victim (a reserved striker dragged
+        // into the brawl before its window - orderAttackByHand deliberately
+        // no-ops on a fighting body, so it would never engage), or a DUD:
+        //   * upright + free yet ignoring the attack goal for 3 straight order
+        //     ticks (run 033318: window B's striker stood idle all window), or
+        //   * fighting the right victim but drawing NO blood for 5 straight
+        //     ticks (run 034659: an engaged striker landed 1.8 blood in 30 s -
+        //     weak/unarmed; the gate needs >= 3).
+        // A fresh pick is out-of-combat by pickCombatVictim's filter; a dud is
+        // excluded from its own re-pick (the old one keeps brawling - added
+        // pressure, no downside). If the pool is empty (whole bar brawling),
+        // keep the old one - re-orders are safe no-ops.
+        const unsigned int NOFIGHT_LIMIT  = 3;
+        const unsigned int NOBLOOD_LIMIT  = 5;
+        const float        DROP_PER_TICK  = 0.3f; // "real damage" floor per 2.5 s
+        bool vicDropped = false;
+        {
+            engine::MedicalRead vm;
+            if (engine::readMedicalByHand(vic, &vm) && vm.valid) {
+                vicDropped = (lastVicBlood >= 0.0f &&
+                              (lastVicBlood - vm.blood) >= DROP_PER_TICK);
+                lastVicBlood = vm.blood;
+            }
+        }
+        bool replace = !haveStriker;
+        const unsigned int* excludeDud = 0;
+        if (haveStriker) {
+            engine::MedicalRead mr;
+            if (!engine::readMedicalByHand(striker, &mr) || !mr.valid ||
+                mr.unconscious || mr.dead) {
+                replace = true;
+            } else {
+                Character* s = engine::resolveCharByHand(striker[3], striker[4],
+                                                         striker[0], striker[1],
+                                                         striker[2]);
+                engine::CombatRead cr;
+                bool fighting = s && engine::readCombat(s, &cr) && cr.inCombat;
+                if (fighting && !(cr.hasTarget && cr.target[3] == vic[3] &&
+                                  cr.target[4] == vic[4])) {
+                    replace = true;
+                } else if (vicDropped) {
+                    noFight = 0; // striker is delivering - keep it
+                } else if (issued &&
+                           ++noFight >= (fighting ? NOBLOOD_LIMIT
+                                                  : NOFIGHT_LIMIT)) {
+                    replace = true;
+                    excludeDud = striker; // don't hand the window back to the dud
+                }
+            }
+        }
+        if (replace) {
+            unsigned int fresh[5];
+            if (engine::pickCombatVictim(ctx.gw, ownHand_, exclude, fresh,
+                                         excludeDud)) {
+                bool replaced = haveStriker;
+                memcpy(striker, fresh, sizeof(fresh));
+                haveStriker = true;
+                noFight = 0; // fresh striker gets a full engagement window
+                if (replaced) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO PCOMBAT %s restrike atk=%u,%u",
+                              tag, striker[3], striker[4]);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            } else if (!haveStriker) {
+                if (!issued) {
+                    char b[96];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO PCOMBAT %s pick FAILED (no upright NPC)", tag);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    issued = true;
+                }
+                return;
+            }
+        }
+        bool ok = engine::orderAttackByHand(ctx.gw, striker, vic);
+        if (!issued) {
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO PCOMBAT %s issued atk=%u,%u vic=%u,%u ok=%d",
+                      tag, striker[3], striker[4], vic[3], vic[4], ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            issued = true;
+        }
+    }
+
+    void latchLeaders(const ScenarioContext& ctx, unsigned int ownRank) {
+        EntityState sq[MAX_LOG];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_LOG);
+        if (!haveOwn_) {
+            int idx = tabLeaderIdx(sq, n, ownRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], ownHand_);
+                haveOwn_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO PCOMBAT own rank=%u hand=%u,%u",
+                          ownRank, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!havePeer_) {
+            int idx = tabLeaderIdx(sq, n, ownRank == 0u ? 1u : 0u);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], peerHand_);
+                havePeer_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO PCOMBAT peer rank=%u hand=%u,%u",
+                          ownRank == 0u ? 1u : 0u, peerHand_[3], peerHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    void logSeries(const ScenarioContext& ctx, unsigned int ownRank) {
+        // Squad members: MEMBER for our tab, RECV for the peer's, VITALS for all
+        // (the players are the victims whose medical truth the oracle compares).
+        EntityState sq[MAX_LOG];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_LOG);
+        bool sawPeer = false;
+        for (unsigned int i = 0; i < n; ++i) {
+            int r = tabRankOf(sq, n, i);
+            if (r < 0) continue;
+            logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+            if ((unsigned int)r != ownRank) sawPeer = true;
+            unsigned int h[5]; handFromEntity(sq[i], h);
+            logVitalsLine(h, ctx.elapsedMs);
+        }
+        if (!ctx.isHost && sawPeer) ++recvCount_;
+        // World NPCs (the strikers): host MEMBER, join RECV - the join's RECV
+        // series for the striker hands is the intent-crossing signal.
+        EntityState npcs[MAX_LOG];
+        unsigned int nn = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+        for (unsigned int i = 0; i < nn; ++i)
+            logScenarioEntity(ctx.isHost ? "MEMBER" : "RECV", npcs[i]);
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastOrderAMs_;
+    unsigned long lastOrderBMs_;
+    bool          haveOwn_;
+    bool          havePeer_;
+    bool          haveNpcA_;
+    bool          haveNpcB_;
+    bool          issuedA_;
+    bool          issuedB_;
+    unsigned int  noFightA_;      // consecutive order ticks without the victim
+    unsigned int  noFightB_;      // bleeding (dud detection, runs 033318/034659)
+    float         lastVicBloodA_; // victim blood at the previous order tick
+    float         lastVicBloodB_; // (-1 = not yet sampled)
+    unsigned int  ownHand_[5];
+    unsigned int  peerHand_[5];
+    unsigned int  npcA_[5];
+    unsigned int  npcB_[5];
+};
+
+// player_ko (player-combat validation, phase 1): players as VICTIMS, both
+// directions. Save 'squad1'. Window A: the HOST knocks out its OWN tab-0 leader
+// (scaffold KO, the down_order pattern - deterministic; real combat damage is
+// player_combat's job), holds it down, then REVIVES it. The KO and revive edges
+// must cross as reliable EVT_KNOCKOUT/EVT_REVIVE and the join's driven copy must
+// lie down / stand up. Window B inverts it: the JOIN KOs + revives its OWN tab-1
+// member and the host's driven copy must follow. Both sides log squad
+// MEMBER/RECV + VITALS series.
+class PlayerKoScenario : public Scenario {
+public:
+    PlayerKoScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastAssertMs_(0),
+          haveSubj_(false), downLogged_(false), reviveLogged_(false) {}
+
+    virtual const char* name() const { return "player_ko"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned int  ownRank = ctx.isHost ? 0u : 1u;
+        const unsigned long downAt  = ctx.isHost ? A_DOWN_AT_MS : B_DOWN_AT_MS;
+        const unsigned long revAt   = ctx.isHost ? A_REV_AT_MS : B_REV_AT_MS;
+        const char* tag             = ctx.isHost ? "A" : "B";
+
+        if (!haveSubj_) latchSubject(ctx, ownRank);
+
+        if (haveSubj_ && ctx.elapsedMs >= downAt && ctx.elapsedMs < revAt) {
+            // KO our OWN member; re-assert on a throttle (tops the forced KO
+            // timer) so it stays down for the whole window.
+            if (!downLogged_ || ctx.elapsedMs - lastAssertMs_ >= 1500) {
+                lastAssertMs_ = ctx.elapsedMs;
+                bool ok = engine::orderDownSubject(ctx.gw, subjHand_);
+                if (!downLogged_) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO PKO %s down issued hand=%u,%u ok=%d",
+                              tag, subjHand_[3], subjHand_[4], ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    downLogged_ = true;
+                }
+            }
+        }
+        if (haveSubj_ && ctx.elapsedMs >= revAt) {
+            // Revive: clear the KO + restore blood so the body stands and the
+            // owner publishes the upright edge (EVT_REVIVE). Re-issued once.
+            if (!reviveLogged_ || (ctx.elapsedMs - lastAssertMs_ >= 1500 &&
+                                   ctx.elapsedMs < revAt + 4000)) {
+                lastAssertMs_ = ctx.elapsedMs;
+                bool ok = engine::reviveSubject(ctx.gw, subjHand_);
+                if (!reviveLogged_) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO PKO %s revive issued hand=%u,%u ok=%d",
+                              tag, subjHand_[3], subjHand_[4], ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    reviveLogged_ = true;
+                }
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+                unsigned int h[5]; handFromEntity(sq[i], h);
+                logVitalsLine(h, ctx.elapsedMs);
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (downLogged_ && reviveLogged_)
+                                 : (downLogged_ && reviveLogged_ && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Sequential windows on the peer-ready-armed shared timeline:
+    // A (host victim): down 10-24s, revive at 24s. B (join victim): down 34-48s,
+    // revive at 48s. The host outlives the join's whole window.
+    static const unsigned long A_DOWN_AT_MS    = 10000;
+    static const unsigned long A_REV_AT_MS     = 24000;
+    static const unsigned long B_DOWN_AT_MS    = 34000;
+    static const unsigned long B_REV_AT_MS     = 48000;
+    static const unsigned long HOST_DURATION_MS = 70000;
+    static const unsigned long JOIN_DURATION_MS = 60000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    void latchSubject(const ScenarioContext& ctx, unsigned int ownRank) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, ownRank);
+        if (idx < 0) return;
+        handFromEntity(sq[idx], subjHand_);
+        haveSubj_ = true;
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO PKO subject rank=%u hand=%u,%u",
+                  ownRank, subjHand_[3], subjHand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastAssertMs_;
+    bool          haveSubj_;
+    bool          downLogged_;
+    bool          reviveLogged_;
+    unsigned int  subjHand_[5];
+};
+
+// medic_order (medical replication validation): players HEAL each other, both
+// directions. Save 'squad1'. Window A: the HOST wounds its OWN tab-0 leader
+// (limb flesh + blood - the owner's authoritative medical truth), then the JOIN
+// "bandages" its DRIVEN copy of that member (healSubjectBandage = the medical
+// fields a real first-aid pass raises). Window B inverts the roles. The oracle
+// compares the wounded member's VITALS series on both sides: the wound must
+// reach the healer's copy, the treatment must reach the owner's body, and the
+// two series must converge. (Phase-1 truth per spikes 21-23: NEITHER crosses -
+// the healer's copy is pristine (nothing to bandage, n=0) and the owner never
+// sees the treatment. The vitals-sync + treatment-forwarding features are what
+// turn this green.)
+class MedicOrderScenario : public Scenario {
+public:
+    MedicOrderScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastHealMs_(0),
+          haveOwn_(false), havePeer_(false), woundLogged_(false),
+          healLogged_(false) {}
+
+    virtual const char* name() const { return "medic_order"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned int  ownRank  = ctx.isHost ? 0u : 1u;
+        const unsigned int  peerRank = ctx.isHost ? 1u : 0u;
+        const unsigned long woundAt  = ctx.isHost ? A_WOUND_AT_MS : B_WOUND_AT_MS;
+        const unsigned long healAt   = ctx.isHost ? B_HEAL_AT_MS : A_HEAL_AT_MS;
+        const char* wTag             = ctx.isHost ? "A" : "B";
+        const char* hTag             = ctx.isHost ? "B" : "A";
+
+        if (!haveOwn_ || !havePeer_) latchSubjects(ctx, ownRank, peerRank);
+
+        // WOUND our own member (we are its owner - authoritative medical truth).
+        if (haveOwn_ && !woundLogged_ && ctx.elapsedMs >= woundAt) {
+            bool ok = engine::woundSubjectLimbs(ctx.gw, ownHand_, 40.0f, 70.0f);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO MEDIC %s wound issued hand=%u,%u ok=%d",
+                      wTag, ownHand_[3], ownHand_[4], ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            woundLogged_ = true;
+        }
+
+        // HEAL the PEER's wounded member = bandage the DRIVEN copy we render.
+        // Re-applied ~1 Hz for a few seconds (a real first-aid pass is also
+        // incremental, and the phase-2 treatment detector samples).
+        if (havePeer_ && ctx.elapsedMs >= healAt && ctx.elapsedMs < healUntil(healAt)) {
+            if (ctx.elapsedMs - lastHealMs_ >= 1000) {
+                lastHealMs_ = ctx.elapsedMs;
+                int nb = engine::healSubjectBandage(ctx.gw, peerHand_);
+                if (!healLogged_) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO MEDIC %s heal issued hand=%u,%u n=%d",
+                              hTag, peerHand_[3], peerHand_[4], nb);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    healLogged_ = true;
+                }
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+                unsigned int h[5]; handFromEntity(sq[i], h);
+                logVitalsLine(h, ctx.elapsedMs);
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (woundLogged_ && healLogged_)
+                                 : (woundLogged_ && healLogged_ && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Shared timeline: host wounds A at 10s, join heals A 20-27s; join wounds B
+    // at 32s, host heals B 42-49s.
+    static const unsigned long A_WOUND_AT_MS   = 10000;
+    static const unsigned long A_HEAL_AT_MS    = 20000;
+    static const unsigned long B_WOUND_AT_MS   = 32000;
+    static const unsigned long B_HEAL_AT_MS    = 42000;
+    static const unsigned long HEAL_WINDOW_MS  = 7000;
+    static const unsigned long HOST_DURATION_MS = 62000;
+    static const unsigned long JOIN_DURATION_MS = 56000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    static unsigned long healUntil(unsigned long healAt) { return healAt + HEAL_WINDOW_MS; }
+
+    void latchSubjects(const ScenarioContext& ctx, unsigned int ownRank,
+                       unsigned int peerRank) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveOwn_) {
+            int idx = tabLeaderIdx(sq, n, ownRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], ownHand_);
+                haveOwn_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO MEDIC own rank=%u hand=%u,%u",
+                          ownRank, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!havePeer_) {
+            int idx = tabLeaderIdx(sq, n, peerRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], peerHand_);
+                havePeer_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO MEDIC peer rank=%u hand=%u,%u",
+                          peerRank, peerHand_[3], peerHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastHealMs_;
+    bool          haveOwn_;
+    bool          havePeer_;
+    bool          woundLogged_;
+    bool          healLogged_;
+    unsigned int  ownHand_[5];
+    unsigned int  peerHand_[5];
+};
+
+// limb_loss (protocol-16 limb replication validation): each client runs the
+// engine's own amputate on ITS OWN tab leader (window A = host member LEFT_ARM
+// at 12s, window B = join member RIGHT_ARM at 30s) - authoritative damage with
+// the severed ground item, exactly what a real severing hit does. Both sides
+// log VITALS (with the ls= LimbStates) for every squad member at 2 Hz plus a
+// "SCENARIO LIMBITEMS" severed-ground-item count near each subject. The
+// Test-LimbLoss oracle gates: the COPY side reaches the STUMP state within a
+// latency budget (event or self-heal), and both sides converge on exactly one
+// severed ground item per amputation (host-authoritative world-item channel;
+// the join's local duplicate must be deduped).
+class LimbLossScenario : public Scenario {
+public:
+    LimbLossScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          haveOwn_(false), havePeer_(false), cutLogged_(false) {}
+
+    virtual const char* name() const { return "limb_loss"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned int  ownRank = ctx.isHost ? 0u : 1u;
+        const unsigned int  peerRank = ctx.isHost ? 1u : 0u;
+        const unsigned long cutAt   = ctx.isHost ? A_CUT_AT_MS : B_CUT_AT_MS;
+        const int           limb    = ctx.isHost ? 0 : 1; // A: LEFT_ARM, B: RIGHT_ARM
+        const char*         wTag    = ctx.isHost ? "A" : "B";
+
+        if (!haveOwn_ || !havePeer_) latchSubjects(ctx, ownRank, peerRank);
+
+        // Amputate OUR OWN member (we are its owner - authoritative damage).
+        if (haveOwn_ && !cutLogged_ && ctx.elapsedMs >= cutAt) {
+            bool ok = engine::amputateSubjectLimb(ctx.gw, ownHand_, limb);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO LIMB %s amputate issued hand=%u,%u limb=%d ok=%d",
+                      wTag, ownHand_[3], ownHand_[4], limb, ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            cutLogged_ = true;
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+                unsigned int h[5]; handFromEntity(sq[i], h);
+                logVitalsLine(h, ctx.elapsedMs);
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+            // Severed ground items near each subject (both sides count their
+            // LOCAL world - convergence on exactly 1 per cut is the gate).
+            if (haveOwn_) logLimbItems(ctx, ownHand_);
+            if (havePeer_) logLimbItems(ctx, peerHand_);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? cutLogged_ : (cutLogged_ && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long A_CUT_AT_MS      = 12000;
+    static const unsigned long B_CUT_AT_MS      = 30000;
+    static const unsigned long HOST_DURATION_MS = 52000;
+    static const unsigned long JOIN_DURATION_MS = 46000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    void logLimbItems(const ScenarioContext& ctx, const unsigned int h[5]) {
+        int n = engine::countSeveredLimbsNear(ctx.gw, h, 20.0f);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO LIMBITEMS hand=%u,%u t=%lu n=%d",
+                  h[3], h[4], ctx.elapsedMs, n);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchSubjects(const ScenarioContext& ctx, unsigned int ownRank,
+                       unsigned int peerRank) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveOwn_) {
+            int idx = tabLeaderIdx(sq, n, ownRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], ownHand_);
+                haveOwn_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO LIMB own rank=%u hand=%u,%u",
+                          ownRank, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!havePeer_) {
+            int idx = tabLeaderIdx(sq, n, peerRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], peerHand_);
+                havePeer_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO LIMB peer rank=%u hand=%u,%u",
+                          peerRank, peerHand_[3], peerHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveOwn_;
+    bool          havePeer_;
+    bool          cutLogged_;
+    unsigned int  ownHand_[5];
+    unsigned int  peerHand_[5];
+};
+
+// stats_sync (protocol-17 character-stats replication validation): each client
+// raises stats on ITS OWN tab leader via the raise-only scaffold (window A =
+// host raises Strength+Stealth at 12s, window B = join raises Dexterity+
+// Athletics at 30s) - the owner-side write the stats channel must carry to the
+// peer's driven copy. Both sides log "SCENARIO STATS" series for BOTH leaders
+// at 2 Hz; the Test-StatsSync oracle gates: each raised value crosses to the
+// peer copy within a latency budget, stays sticky, and stats neither side
+// touched do not drift.
+class StatsSyncScenario : public Scenario {
+public:
+    StatsSyncScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          haveOwn_(false), havePeer_(false), raiseLogged_(false) {}
+
+    virtual const char* name() const { return "stats_sync"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned int  ownRank  = ctx.isHost ? 0u : 1u;
+        const unsigned int  peerRank = ctx.isHost ? 1u : 0u;
+        const unsigned long raiseAt  = ctx.isHost ? A_RAISE_AT_MS : B_RAISE_AT_MS;
+        // StatsEnumerated: host raises STRENGTH(1)+STEALTH(16); join raises
+        // DEXTERITY(18)+ATHLETICS(17). Disjoint so each direction is provable.
+        const int   stat1 = ctx.isHost ? 1  : 18;
+        const int   stat2 = ctx.isHost ? 16 : 17;
+        const char* wTag  = ctx.isHost ? "A" : "B";
+
+        if (!haveOwn_ || !havePeer_) latchSubjects(ctx, ownRank, peerRank);
+
+        // Raise target: well above any squad1 save-load stat so the crossing
+        // is an unambiguous step in the series (raise-only scaffold).
+        const float RAISE_TO = 60.0f;
+
+        // Raise OUR OWN leader's stats (we are its owner - authoritative write).
+        if (haveOwn_ && !raiseLogged_ && ctx.elapsedMs >= raiseAt) {
+            bool ok1 = engine::raiseSubjectStat(ctx.gw, ownHand_, stat1, RAISE_TO);
+            bool ok2 = engine::raiseSubjectStat(ctx.gw, ownHand_, stat2, RAISE_TO);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO STATRAISE %s hand=%u,%u stat%d=%.0f ok=%d stat%d=%.0f ok=%d",
+                      wTag, ownHand_[3], ownHand_[4], stat1, RAISE_TO, ok1 ? 1 : 0,
+                      stat2, RAISE_TO, ok2 ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            raiseLogged_ = true;
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+                unsigned int h[5]; handFromEntity(sq[i], h);
+                logStatsLine(h, ctx.elapsedMs);
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? raiseLogged_ : (raiseLogged_ && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long A_RAISE_AT_MS    = 12000;
+    static const unsigned long B_RAISE_AT_MS    = 30000;
+    static const unsigned long HOST_DURATION_MS = 52000;
+    static const unsigned long JOIN_DURATION_MS = 46000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    // One "SCENARIO STATS" line: the watched stats (STRENGTH/STEALTH raised by
+    // A, DEXTERITY/ATHLETICS by B, TOUGHNESS as the untouched-drift control)
+    // plus xp, read from the LOCAL CharStats of the body at h.
+    void logStatsLine(const unsigned int h[5], unsigned long t) {
+        engine::StatsRead sr;
+        if (!engine::readStatsByHand(h, &sr) || !sr.valid) return;
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO STATS hand=%u,%u t=%lu str=%.2f stealth=%.2f dex=%.2f athl=%.2f tough=%.2f xp=%.0f",
+                  h[3], h[4], t, sr.stats[1], sr.stats[16], sr.stats[18],
+                  sr.stats[17], sr.stats[21], sr.xp);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchSubjects(const ScenarioContext& ctx, unsigned int ownRank,
+                       unsigned int peerRank) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveOwn_) {
+            int idx = tabLeaderIdx(sq, n, ownRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], ownHand_);
+                haveOwn_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO STATS own rank=%u hand=%u,%u",
+                          ownRank, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!havePeer_) {
+            int idx = tabLeaderIdx(sq, n, peerRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], peerHand_);
+                havePeer_ = true;
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO STATS peer rank=%u hand=%u,%u",
+                          peerRank, peerHand_[3], peerHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveOwn_;
+    bool          havePeer_;
+    bool          raiseLogged_;
+    unsigned int  ownHand_[5];
+    unsigned int  peerHand_[5];
+};
+
+// carry_order (protocol-18 carried-body replication validation, save squad1:
+// host tab = leader L0 + second member M2, join tab = leader L1 only). Three
+// windows, covering own-tab and BOTH cross-tab directions:
+//   A (own-tab, host authors):   host downs M2, L0 picks it up, walks a short
+//                                leg, ragdoll-drops it. M2 stays KO'd.
+//   B (cross-tab, join carrier): join's L1 picks up the still-down HOST-owned
+//                                M2 (carrier owner != carried owner), walks,
+//                                drops.
+//   C (cross-tab, host carrier): join downs its own L1; host's L0 picks it
+//                                up (the other ownership direction), walks,
+//                                drops; join revives L1 at the end.
+// Both sides log "SCENARIO CARRY" for all three bodies at 2 Hz (isCarrying +
+// carried hand, isBeingCarried, position, bodyState). The Test-CarryOrder
+// oracle gates per window: the pickup CROSSES (the peer's local pair enters
+// the carried state within a latency budget), the carried copy TRACKS its
+// carrier while carried (median carrier-carried distance small - the dragged/
+// teleported-body artifact shows up as huge gaps), and the drop crosses (the
+// peer's copy leaves the carried state within budget).
+class CarryOrderScenario : public Scenario {
+public:
+    CarryOrderScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          haveL0_(false), haveM2_(false), haveL1_(false),
+          aDown_(false), aPick_(false), aWalk_(false), aDrop_(false),
+          bPick_(false), bWalk_(false), bDrop_(false),
+          cDown_(false), cPick_(false), cWalk_(false), cDrop_(false),
+          cRevive_(false), lastHoldMs_(0) {}
+
+    virtual const char* name() const { return "carry_order"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveL0_ || !haveM2_ || !haveL1_) latchSubjects(ctx);
+
+        // ---- Window A (host, own-tab): down M2, L0 carries it ----------------
+        if (ctx.isHost && haveM2_ && !aDown_ && ctx.elapsedMs >= A_DOWN_AT_MS) {
+            bool ok = engine::orderDownSubject(ctx.gw, m2Hand_);
+            logAct("A down", m2Hand_, ok); aDown_ = true;
+        }
+        if (ctx.isHost && haveL0_ && haveM2_ && !aPick_ && ctx.elapsedMs >= A_PICK_AT_MS) {
+            bool ok = engine::carrySubject(ctx.gw, l0Hand_, m2Hand_);
+            logAct("A pickup", m2Hand_, ok); aPick_ = true;
+        }
+        if (ctx.isHost && haveL0_ && !aWalk_ && ctx.elapsedMs >= A_WALK_AT_MS) {
+            aWalk_ = walkLeg(l0Hand_, "A");
+        }
+        if (ctx.isHost && haveL0_ && !aDrop_ && ctx.elapsedMs >= A_DROP_AT_MS) {
+            bool ok = engine::dropSubject(ctx.gw, l0Hand_, /*ragdoll*/true);
+            logAct("A drop", l0Hand_, ok); aDrop_ = true;
+        }
+
+        // Keep the KO'd subjects DOWN through their carry legs: the scaffold KO
+        // (knockoutForceTimer 8s) expires mid-carry and the engine truthfully
+        // stands the body back up, ending the carry at the drop (run 191905:
+        // M2 revived as it was dropped, bs 2->0, so the oracle's still-down
+        // gate read bs=0). Each subject's OWNER re-tops the timer every 2s
+        // (holdDown = timer-only, no fresh knockout on the shoulder) while its
+        // windows need the body down - owner-side, so the authoritative
+        // medical stream carries the KO state to the peer.
+        if (ctx.elapsedMs - lastHoldMs_ >= 2000) {
+            lastHoldMs_ = ctx.elapsedMs;
+            if (ctx.isHost && haveM2_ && aDown_ && ctx.elapsedMs < HOLD_M2_UNTIL_MS)
+                holdSubject(m2Hand_);
+            if (!ctx.isHost && haveL1_ && cDown_ && !cRevive_)
+                holdSubject(l1Hand_);
+        }
+
+        // ---- Window B (join carrier, cross-tab): L1 carries the host's M2 ----
+        if (!ctx.isHost && haveL1_ && haveM2_ && !bPick_ && ctx.elapsedMs >= B_PICK_AT_MS) {
+            bool ok = engine::carrySubject(ctx.gw, l1Hand_, m2Hand_);
+            logAct("B pickup", m2Hand_, ok); bPick_ = true;
+        }
+        if (!ctx.isHost && haveL1_ && !bWalk_ && ctx.elapsedMs >= B_WALK_AT_MS) {
+            bWalk_ = walkLeg(l1Hand_, "B");
+        }
+        if (!ctx.isHost && haveL1_ && !bDrop_ && ctx.elapsedMs >= B_DROP_AT_MS) {
+            bool ok = engine::dropSubject(ctx.gw, l1Hand_, /*ragdoll*/true);
+            logAct("B drop", l1Hand_, ok); bDrop_ = true;
+        }
+
+        // ---- Window C (host carrier, cross-tab): L0 carries the join's L1 ----
+        if (!ctx.isHost && haveL1_ && !cDown_ && ctx.elapsedMs >= C_DOWN_AT_MS) {
+            bool ok = engine::orderDownSubject(ctx.gw, l1Hand_);
+            logAct("C down", l1Hand_, ok); cDown_ = true;
+        }
+        if (ctx.isHost && haveL0_ && haveL1_ && !cPick_ && ctx.elapsedMs >= C_PICK_AT_MS) {
+            bool ok = engine::carrySubject(ctx.gw, l0Hand_, l1Hand_);
+            logAct("C pickup", l1Hand_, ok); cPick_ = true;
+        }
+        if (ctx.isHost && haveL0_ && !cWalk_ && ctx.elapsedMs >= C_WALK_AT_MS) {
+            cWalk_ = walkLeg(l0Hand_, "C");
+        }
+        if (ctx.isHost && haveL0_ && !cDrop_ && ctx.elapsedMs >= C_DROP_AT_MS) {
+            bool ok = engine::dropSubject(ctx.gw, l0Hand_, /*ragdoll*/true);
+            logAct("C drop", l0Hand_, ok); cDrop_ = true;
+        }
+        if (!ctx.isHost && haveL1_ && !cRevive_ && ctx.elapsedMs >= C_REVIVE_AT_MS) {
+            bool ok = engine::reviveSubject(ctx.gw, l1Hand_);
+            logAct("C revive", l1Hand_, ok); cRevive_ = true;
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+            if (haveL0_) logCarryLine(l0Hand_, ctx.elapsedMs);
+            if (haveM2_) logCarryLine(m2Hand_, ctx.elapsedMs);
+            if (haveL1_) logCarryLine(l1Hand_, ctx.elapsedMs);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (aDown_ && aPick_ && aDrop_ && cPick_ && cDrop_)
+                                 : (bPick_ && bDrop_ && cDown_ && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Shared timeline (peer-armed clock on both sides). Each carry leg is
+    // pickup +2s walk +8s drop, with 6s of settle between windows.
+    static const unsigned long A_DOWN_AT_MS    = 8000;
+    static const unsigned long A_PICK_AT_MS    = 12000;
+    static const unsigned long A_WALK_AT_MS    = 14000;
+    static const unsigned long A_DROP_AT_MS    = 22000;
+    static const unsigned long B_PICK_AT_MS    = 30000;
+    static const unsigned long B_WALK_AT_MS    = 32000;
+    static const unsigned long B_DROP_AT_MS    = 40000;
+    static const unsigned long C_DOWN_AT_MS    = 46000;
+    static const unsigned long C_PICK_AT_MS    = 50000;
+    static const unsigned long C_WALK_AT_MS    = 52000;
+    static const unsigned long C_DROP_AT_MS    = 60000;
+    static const unsigned long C_REVIVE_AT_MS  = 64000;
+    // Keep M2 KO'd through both its carry legs (A + B) plus post-drop settle;
+    // after this it may wake naturally (nothing gates on it).
+    static const unsigned long HOLD_M2_UNTIL_MS = 44000;
+    static const unsigned long HOST_DURATION_MS = 72000;
+    static const unsigned long JOIN_DURATION_MS = 68000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    void logAct(const char* what, const unsigned int h[5], bool ok) {
+        char b[144];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CARRYACT %s hand=%u,%u ok=%d",
+                  what, h[3], h[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Re-top the KO timer on our own KO'd subject (timer-only; never a fresh
+    // knockout while the body rides a shoulder).
+    void holdSubject(const unsigned int h[5]) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (c) engine::holdDown(c);
+    }
+
+    // Order the carrier to walk a short leg (+10u east of where it stands).
+    // The carried body must FOLLOW via its local shoulder attach on both sides.
+    bool walkLeg(const unsigned int h[5], const char* wTag) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return false;
+        float x, y, z;
+        if (!engine::readPos(c, &x, &y, &z)) return false;
+        bool ok = engine::orderMoveTo(c, x + 10.0f, y, z);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CARRYACT %s walk hand=%u,%u ok=%d",
+                  wTag, h[3], h[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return true;
+    }
+
+    // One "SCENARIO CARRY" line: this body's LOCAL carry relationship + pose.
+    void logCarryLine(const unsigned int h[5], unsigned long t) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return;
+        engine::CarryRead cr;
+        if (!engine::readCarry(c, &cr) || !cr.valid) return;
+        float x = 0, y = 0, z = 0;
+        engine::readPos(c, &x, &y, &z);
+        unsigned short bs = engine::readBodyState(c);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CARRY hand=%u,%u t=%lu carrying=%d carried=%u,%u "
+                  "beingCarried=%d pos=%.2f,%.2f,%.2f bs=%u",
+                  h[3], h[4], t, cr.carrying ? 1 : 0,
+                  cr.carried[3], cr.carried[4], cr.beingCarried ? 1 : 0,
+                  x, y, z, (unsigned)bs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchSubjects(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveL0_) {
+            int idx = tabLeaderIdx(sq, n, 0);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], l0Hand_);
+                haveL0_ = true;
+                logSubject("L0", l0Hand_);
+            }
+        }
+        if (haveL0_ && !haveM2_) {
+            // Host tab's SECOND member: the lowest hand of rank 0 that is not L0.
+            int best = -1;
+            for (unsigned int i = 0; i < n; ++i) {
+                if (tabRankOf(sq, n, i) != 0) continue;
+                unsigned int h[5]; handFromEntity(sq[i], h);
+                if (h[3] == l0Hand_[3] && h[4] == l0Hand_[4]) continue;
+                if (best < 0 || tabHandLess(sq[i], sq[best])) best = (int)i;
+            }
+            if (best >= 0) {
+                handFromEntity(sq[best], m2Hand_);
+                haveM2_ = true;
+                logSubject("M2", m2Hand_);
+            }
+        }
+        if (!haveL1_) {
+            int idx = tabLeaderIdx(sq, n, 1);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], l1Hand_);
+                haveL1_ = true;
+                logSubject("L1", l1Hand_);
+            }
+        }
+    }
+
+    void logSubject(const char* who, const unsigned int h[5]) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CARRY %s hand=%u,%u", who, h[3], h[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveL0_, haveM2_, haveL1_;
+    bool          aDown_, aPick_, aWalk_, aDrop_;
+    bool          bPick_, bWalk_, bDrop_;
+    bool          cDown_, cPick_, cWalk_, cDrop_, cRevive_;
+    unsigned long lastHoldMs_;
+    unsigned int  l0Hand_[5];
+    unsigned int  m2Hand_[5];
+    unsigned int  l1Hand_[5];
+};
+
+// speed_sync (consensus game-speed validation): both clients run the default-on
+// speed-sync module; the scenario SIMULATES user speed clicks by writing the
+// engine's speed directly (writeGameSpeed != the replicator's lastApplied ->
+// detected as a user request, exactly like a real click). Save 'sync' (the bar
+// with armed NPCs for the combat phase). Timeline (peer-ready armed), each step
+// exercising one consensus rule:
+//   T+10 s HOST clicks 3x -> DENIED (join still requests 1x; min holds 1x -
+//          the "both must raise" rule; the host engine snaps back).
+//   T+22 s JOIN clicks 3x -> requests now 3/3 -> both settle at 3x.
+//   T+34 s JOIN clicks 1x -> min rule: EITHER can lower -> both drop to 1x.
+//   T+44 s JOIN clicks 3x -> both back at 3x.
+//   T+52 s HOST orders a bar NPC onto its OWN leader -> own-squad combat ->
+//          the consensus cap demotes the effective speed to 1x mid-3x.
+// Both sides log "SCENARIO SPEED t=<ms> mult=<f> paused=<n>" at ~2 Hz; the
+// Test-SpeedSync oracle time-aligns the two series (CLOCKSYNC-corrected) and
+// gates the transition count, the denied lone raise, each transition's follow
+// latency, the match fraction, and the combat window sitting at 1x.
+class SpeedSyncScenario : public Scenario {
+public:
+    SpeedSyncScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
+          haveOwn_(false), haveStriker_(false), hostClicked_(false),
+          joinClicked3a_(false), joinClicked1_(false), joinClicked3b_(false),
+          combatIssued_(false) {}
+
+    virtual const char* name() const { return "speed_sync"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        if (!haveOwn_) latchLeader(ctx, ownRank);
+
+        // Simulated user clicks. writeGameSpeed goes through the engine's own
+        // setters, so the replicator's detector sees state != lastApplied and
+        // registers a genuine request - the same path a real UI click takes.
+        if (ctx.isHost && !hostClicked_ && ctx.elapsedMs >= HOST_3X_AT_MS) {
+            bool ok = engine::writeGameSpeed(ctx.gw, 3.0f, false);
+            logClick("host", 3.0f, ok);
+            hostClicked_ = true;
+        }
+        if (!ctx.isHost && !joinClicked3a_ && ctx.elapsedMs >= JOIN_3XA_AT_MS) {
+            bool ok = engine::writeGameSpeed(ctx.gw, 3.0f, false);
+            logClick("join", 3.0f, ok);
+            joinClicked3a_ = true;
+        }
+        if (!ctx.isHost && !joinClicked1_ && ctx.elapsedMs >= JOIN_1X_AT_MS) {
+            bool ok = engine::writeGameSpeed(ctx.gw, 1.0f, false);
+            logClick("join", 1.0f, ok);
+            joinClicked1_ = true;
+        }
+        if (!ctx.isHost && !joinClicked3b_ && ctx.elapsedMs >= JOIN_3XB_AT_MS) {
+            bool ok = engine::writeGameSpeed(ctx.gw, 3.0f, false);
+            logClick("join", 3.0f, ok);
+            joinClicked3b_ = true;
+        }
+
+        // Combat phase: a bar NPC onto the host's OWN leader, so the host's
+        // own-squad combat flag trips and the consensus cap demotes to 1x.
+        // Re-ordered every 2.5 s (safe no-op while fighting); a KO'd striker
+        // is replaced (the player_combat restrike lesson).
+        if (ctx.isHost && haveOwn_ && ctx.elapsedMs >= COMBAT_AT_MS &&
+            (ctx.elapsedMs - lastOrderMs_ >= 2500 || lastOrderMs_ == 0)) {
+            lastOrderMs_ = ctx.elapsedMs;
+            bool pick = !haveStriker_;
+            if (haveStriker_) {
+                engine::MedicalRead mr;
+                if (!engine::readMedicalByHand(striker_, &mr) || !mr.valid ||
+                    mr.unconscious || mr.dead)
+                    pick = true;
+            }
+            if (pick)
+                haveStriker_ = engine::pickCombatVictim(ctx.gw, ownHand_,
+                                                        haveStriker_ ? striker_ : 0,
+                                                        striker_);
+            if (haveStriker_) {
+                bool ok = engine::orderAttackByHand(ctx.gw, striker_, ownHand_);
+                if (!combatIssued_) {
+                    char b[128];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO SPEEDSYNC combat issued atk=%u,%u vic=%u,%u ok=%d",
+                              striker_[3], striker_[4], ownHand_[3], ownHand_[4],
+                              ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    combatIssued_ = true;
+                }
+            } else if (!combatIssued_) {
+                coop::logLine("SCENARIO SPEEDSYNC combat pick FAILED (no upright NPC)");
+                combatIssued_ = true;
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            // The SPEED series the oracle compares across the two clients.
+            float mult = 0.0f; bool paused = false;
+            if (engine::readGameSpeed(ctx.gw, &mult, &paused)) {
+                char b[96];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO SPEED t=%lu mult=%.2f paused=%d",
+                          ctx.elapsedMs, mult, paused ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // Squad MEMBER/RECV series (harness anchors + advisory transform
+            // oracles; also proves the 3x window doesn't break the stream).
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (hostClicked_ && combatIssued_)
+                                 : (joinClicked3a_ && joinClicked1_ &&
+                                    joinClicked3b_ && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Shared (peer-ready-armed) timeline; the combat window runs 52 s -> end.
+    static const unsigned long HOST_3X_AT_MS    = 10000;
+    static const unsigned long JOIN_3XA_AT_MS   = 22000;
+    static const unsigned long JOIN_1X_AT_MS    = 34000;
+    static const unsigned long JOIN_3XB_AT_MS   = 44000;
+    static const unsigned long COMBAT_AT_MS     = 52000;
+    static const unsigned long HOST_DURATION_MS = 75000;
+    static const unsigned long JOIN_DURATION_MS = 68000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    static void logClick(const char* who, float mult, bool ok) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SPEEDSYNC %s click mult=%.1f ok=%d",
+                  who, mult, ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchLeader(const ScenarioContext& ctx, unsigned int ownRank) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, ownRank);
+        if (idx < 0) return;
+        handFromEntity(sq[idx], ownHand_);
+        haveOwn_ = true;
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SPEEDSYNC own rank=%u hand=%u,%u",
+                  ownRank, ownHand_[3], ownHand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastOrderMs_;
+    bool          haveOwn_;
+    bool          haveStriker_;
+    bool          hostClicked_;
+    bool          joinClicked3a_;
+    bool          joinClicked1_;
+    bool          joinClicked3b_;
+    bool          combatIssued_;
+    unsigned int  ownHand_[5];
+    unsigned int  striker_[5];
+};
+
+// combat_crowd (waiting-attacker stance validation): the HOST orders a CROWD of
+// bar NPCs (up to 5) onto its own tab leader. Kenshi's AttackSlotManager grants
+// only 1-2 of them an active attack slot; the rest hold the WAITING stance
+// (circle/wait/hesitate sword states) - the exact case that used to teleport and
+// AI-reset on the join (the 1.5 s clearGoals re-issue loop against slot-queued
+// copies). The host streams TASK_COMBAT_WAIT for them (protocol 15); the join
+// leaves their copies menacing in the ring. Both sides log SCENARIO MEMBER/RECV
+// for every captured NPC at ~2 Hz. Test-CombatCrowd gates, per crowd hand: the
+// join's [combat] order re-issue count (loop dead), the join's [combat] snap
+// teleport count (artifact gone), host-vs-join position tracking, and - from the
+// host MEMBER task series - that BOTH stances (active 0xFE00 / waiting 0xFE01)
+// actually streamed (else the run proves nothing).
+class CombatCrowdScenario : public Scenario {
+public:
+    CombatCrowdScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
+          haveOwn_(false), nStrikers_(0), nSeen_(0), issuedLogged_(false) {}
+
+    virtual const char* name() const { return "combat_crowd"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        if (!haveOwn_) latchLeader(ctx, ownRank);
+
+        // HOST: pick the crowd once the window opens, then keep every striker
+        // ordered on a throttle (orderAttackByHand no-ops while one is already
+        // fighting, so the re-order never thrashes the host AI).
+        if (ctx.isHost && haveOwn_ && ctx.elapsedMs >= COMBAT_AT_MS &&
+            (ctx.elapsedMs - lastOrderMs_ >= 2500 || lastOrderMs_ == 0)) {
+            lastOrderMs_ = ctx.elapsedMs;
+            if (nStrikers_ == 0) pickCrowd(ctx);
+            for (unsigned int i = 0; i < nStrikers_; ++i)
+                engine::orderAttackByHand(ctx.gw, striker_[i], ownHand_);
+            if (!issuedLogged_ && nStrikers_ > 0) {
+                issuedLogged_ = true;
+                char b[112];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO CROWD issued n=%u vic=%u,%u",
+                          nStrikers_, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // Both sides: the NPC position/task series the oracle compares.
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+            // JOIN: a driven combat copy leaves the interest capture when the
+            // replicator detaches it into its own platoon (the capture's query
+            // no longer enumerates it), which blinds the tracking series for
+            // exactly the bodies under test. Remember every NPC hand ever
+            // captured and keep logging the missing ones by direct resolve.
+            if (!ctx.isHost) {
+                for (unsigned int i = 0; i < n; ++i) rememberSeen(npcs[i]);
+                for (unsigned int s = 0; s < nSeen_; ++s) {
+                    bool inCap = false;
+                    for (unsigned int i = 0; i < n; ++i)
+                        if (npcs[i].hIndex == seen_[s].hIndex &&
+                            npcs[i].hSerial == seen_[s].hSerial) { inCap = true; break; }
+                    if (inCap) continue;
+                    Character* c = engine::resolve(seen_[s]);
+                    if (!c) continue;
+                    EntityState e = seen_[s]; // original (host-frame) hand key
+                    float x, y, z;
+                    if (!engine::readPos(c, &x, &y, &z)) continue;
+                    e.x = x; e.y = y; e.z = z;
+                    e.task = TASK_NONE;
+                    e.bodyState = engine::readBodyState(c);
+                    logScenarioEntity("RECV", e);
+                }
+            }
+            // HOST: raw combat-read diagnostic per striker (why did the stance
+            // stream flicker?) - sword state + engaged flags + target presence.
+            if (ctx.isHost) {
+                for (unsigned int i = 0; i < nStrikers_; ++i) {
+                    engine::CombatRead cr;
+                    if (!engine::readCombatByHand(striker_[i], &cr)) continue;
+                    char b[144];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO CROWDSTATE hand=%u,%u sw=%d mode=%d fight=%d "
+                              "tgt=%d wait=%d",
+                              striker_[i][3], striker_[i][4], cr.swordState,
+                              cr.modeActive ? 1 : 0, cr.inCombat ? 1 : 0,
+                              cr.hasTarget ? 1 : 0, cr.waiting ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (nStrikers_ >= MIN_CROWD) : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Shared (peer-ready-armed) timeline; the crowd window runs 10 s -> end.
+    static const unsigned long COMBAT_AT_MS     = 10000;
+    static const unsigned long HOST_DURATION_MS = 75000;
+    static const unsigned long JOIN_DURATION_MS = 68000;
+    static const unsigned int  MAX_LOG      = 24;
+    static const unsigned int  MAX_CROWD    = 5;
+    static const unsigned int  MIN_CROWD    = 3;
+    static const unsigned int  MAX_SQUAD    = 32;
+    static const unsigned int  MAX_REMEMBER = 48;
+
+    void latchLeader(const ScenarioContext& ctx, unsigned int ownRank) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, ownRank);
+        if (idx < 0) return;
+        handFromEntity(sq[idx], ownHand_);
+        haveOwn_ = true;
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CROWD own rank=%u hand=%u,%u",
+                  ownRank, ownHand_[3], ownHand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void rememberSeen(const EntityState& e) {
+        for (unsigned int s = 0; s < nSeen_; ++s)
+            if (seen_[s].hIndex == e.hIndex && seen_[s].hSerial == e.hSerial) return;
+        if (nSeen_ < MAX_REMEMBER) seen_[nSeen_++] = e;
+    }
+
+    // The crowd: the nearest upright, not-yet-fighting bar NPCs (the captured
+    // set is already interest-sorted around the leaders).
+    void pickCrowd(const ScenarioContext& ctx) {
+        EntityState npcs[MAX_LOG];
+        unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+        for (unsigned int i = 0; i < n && nStrikers_ < MAX_CROWD; ++i) {
+            if (npcs[i].bodyState != 0) continue;           // down/dead/ragdoll
+            if (taskIsCombat(npcs[i].task)) continue;       // already brawling
+            handFromEntity(npcs[i], striker_[nStrikers_]);
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO CROWD striker=%u,%u",
+                      striker_[nStrikers_][3], striker_[nStrikers_][4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            ++nStrikers_;
+        }
+        if (nStrikers_ < MIN_CROWD)
+            coop::logLine("SCENARIO CROWD pick FAILED (too few upright NPCs)");
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastOrderMs_;
+    bool          haveOwn_;
+    unsigned int  nStrikers_;
+    unsigned int  nSeen_;
+    bool          issuedLogged_;
+    unsigned int  ownHand_[5];
+    unsigned int  striker_[MAX_CROWD][5];
+    EntityState   seen_[MAX_REMEMBER]; // JOIN: hands ever captured (resolve fallback)
+};
+
 Scenario* makeScenario(const std::string& name) {
     if (name == "spike")        return new SpikeScenario();
     if (name == "leader_move")  return new LeaderMoveScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();
+    if (name == "split_interest") return new SplitInterestScenario();
     if (name == "npc_sync")     return new NpcSyncScenario();
     if (name == "craft_order")  return new CraftOrderScenario();
     if (name == "down_order")   return new DownOrderScenario();
@@ -2210,6 +3900,14 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "combat_probe") return new CombatProbeScenario();
     if (name == "combat_order") return new CombatOrderScenario();
     if (name == "combat_kill")  return new CombatKillScenario();
+    if (name == "player_combat") return new PlayerCombatScenario();
+    if (name == "player_ko")    return new PlayerKoScenario();
+    if (name == "medic_order")  return new MedicOrderScenario();
+    if (name == "limb_loss")    return new LimbLossScenario();
+    if (name == "stats_sync")   return new StatsSyncScenario();
+    if (name == "carry_order")  return new CarryOrderScenario();
+    if (name == "speed_sync")   return new SpeedSyncScenario();
+    if (name == "combat_crowd") return new CombatCrowdScenario();
     if (name == "inv_order")    return new InventorySyncScenario();
     if (name == "inv_bidir")    return new InventoryBidirScenario();
     if (name == "inv_equip")    return new InventoryEquipScenario(/*reequip=*/false);

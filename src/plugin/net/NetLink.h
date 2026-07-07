@@ -71,6 +71,22 @@ public:
     // drop. The peer re-homes its tracked ground copy back into the character's bag.
     void queueWorldPickup(const WorldPickupPacket& pkt);
 
+    // MAIN thread: queue a reliable owner-authoritative medical snapshot (phase 2,
+    // player-squad only). Change-gated by the caller so the channel stays quiet.
+    void queueMedical(const MedicalPacket& pkt);
+
+    // MAIN thread: queue a reliable treatment delta (first aid administered on a
+    // driven copy, forwarded to the body's owner).
+    void queueTreatment(const TreatmentPacket& pkt);
+
+    // MAIN thread: queue a reliable game-speed packet (REQ join->host, SET
+    // host->join). Change-gated by the caller; pkt.type selects the direction.
+    void queueSpeed(const SpeedPacket& pkt);
+
+    // MAIN thread: queue a reliable owner-authoritative character-stats snapshot
+    // (protocol 17, player-squad only). Change-gated by the caller.
+    void queueStats(const StatsPacket& pkt);
+
     // Debug WAN simulation. When delayMs > 0, received entity batches are held in a
     // net-thread queue and delivered to the game thread only after delayMs +/- jitter
     // has elapsed (lossPct of them are dropped outright). Must be called before
@@ -123,6 +139,13 @@ private:
     // Reliable conservation DROP intents (Phase W2), fixed-size PODs. Guarded by outCs_.
     std::vector<WorldDropPacket> outWorldDrops_;
     std::vector<WorldPickupPacket> outWorldPickups_;
+    // Reliable medical snapshots + treatment deltas (phase 2). Guarded by outCs_.
+    std::vector<MedicalPacket>   outMedical_;
+    std::vector<TreatmentPacket> outTreatments_;
+    // Reliable game-speed REQ/SET packets (consensus speed sync). Guarded by outCs_.
+    std::vector<SpeedPacket>     outSpeed_;
+    // Reliable character-stats snapshots (protocol 17). Guarded by outCs_.
+    std::vector<StatsPacket>     outStats_;
 
     HANDLE        thread_;
     volatile LONG running_;

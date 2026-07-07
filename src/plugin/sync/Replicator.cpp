@@ -52,13 +52,47 @@ const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking 
 const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
 const float TRANSLATE_EPS = 0.02f; // per-frame actual movement counted as "translating"
 // Stage 3c combat. A combatant is engine-driven locally (its own footwork), so we do
-// NOT walk-drive/park it; we only soft-correct large positional drift (a wider gate
-// than rest, since the fight legitimately moves the body) and re-issue the attack
-// order on a throttle if the local copy disengaged while the host still reports combat.
-const float COMBAT_SNAP_DIST = 6.0f;       // teleport-correct combat drift beyond this
-const unsigned long COMBAT_REISSUE_MS = 1500; // re-arm the attack at most this often
+// NOT walk-drive/park it; positional drift is corrected in GRADED bands (a fight
+// legitimately moves the body): under COMBAT_SOFT_DIST leave it alone, between the
+// bands nudge it back with a real walk (stance/gait preserved), beyond
+// COMBAT_SNAP_DIST hard-teleport (logged - teleports should be rare, they were THE
+// waiting-crowd artifact). The attack order re-issues only when the local copy
+// disengaged from an ACTIVE fight or its target changed - never on a timer against
+// a WAITING (slot-queued) copy, and with exponential backoff (1.5 s -> 6 s cap) so
+// a copy that legitimately cannot engage is not clearGoals-reset forever.
+const float COMBAT_SOFT_DIST = 6.0f;       // walk-converge combat drift beyond this
+const float COMBAT_SNAP_DIST = 20.0f;      // teleport-correct combat drift beyond this
+                                           // (measured: a driven brawl legitimately churns
+                                           // 12-18 u against the walk band - snapping there
+                                           // is visible teleporting for no fidelity gain;
+                                           // past 20 u the host body has genuinely LEFT -
+                                           // sprint-chases measured 45-110 u)
+const unsigned long COMBAT_REISSUE_MS     = 1500; // base re-issue throttle
+const unsigned long COMBAT_REISSUE_MAX_MS = 6000; // backoff cap
+const unsigned int  COMBAT_REISSUE_CAP    = 5;    // max timer re-issues per episode: a copy
+                                                  // that won't engage (fleeing template,
+                                                  // blocked ring spot) is POSITION-driven
+                                                  // from then on, never AI-reset forever
+const unsigned long COMBAT_DISARM_MS      = 4000; // host-stream combat gap before the copy
+                                                  // is disarmed (stance samples ride the
+                                                  // lossy batch; a gap must not AI-reset)
+const unsigned long COMBAT_SNAP_COOL_MS   = 3000; // min gap between hard snaps per body (a
+                                                  // snap that can't stick - stagger, stale
+                                                  // interp - must not re-fire every frame)
 const unsigned long ATTR_WINDOW_MS = 3000; // remember a combatant's victim this long, so a
                                            // KO/death edge can still name the attacker
+// Carried-body sync (protocol 18): the reliable pickup/drop edges do the work;
+// these govern the SELF-HEAL only. Heal-pickup throttle mirrors the combat
+// re-issue base (each attempt runs the engine's real pickup, don't spam it);
+// the drop debounce must sit above the lossy batch's worst gap (the disarm
+// lesson: a 1-batch stream blip must not tear a valid carry down).
+const unsigned long CARRY_HEAL_MS = 1500; // min gap between self-heal pickups
+const unsigned long CARRY_DROP_MS = 3000; // stream must stop reporting the carry
+                                          // this long before the local copy drops
+// Step 4 divergence-gated authority (doctrine 18, behind KENSHICOOP_GATE_AUTHORITY).
+// applyTargets runs per FRAME, so the streak is frame-denominated: ~2 s at 75 fps.
+const unsigned int  TRUST_STREAK_FRAMES = 150;  // sustained agreement before trusting
+const float         TRUST_DRIFT_MAX     = 4.0f; // trusted body must stay this close
 
 float dist3(float ax, float ay, float az, float bx, float by, float bz) {
     float dx = ax - bx, dy = ay - by, dz = az - bz;
@@ -82,8 +116,16 @@ Replicator::Replicator()
       restSampleFrames_(0), marchFrames_(0),
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
       probeRecruit_(false), probedCount_(0),
-      probeAiSuspend_(false), aiLogTick_(0), nextEventId_(1),
-      nextWorldNetId_(1), nextDropId_(1), nextPickupId_(1) {}
+      aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
+      nextWorldNetId_(1), nextDropId_(1), nextPickupId_(1), nextTreatId_(1),
+      quietRelapse_(0), sitOrders_(0), detachUses_(0), noDetach_(false),
+      dmgGuard_(false), carrySync_(true), gateAuthority_(false), trustLogTick_(0),
+      trustGrants_(0), trustRevokes_(0),
+      authSuppresses_(0), authRestores_(0),
+      speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
+      speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
+      speedSeqOut_(1), speedSeqSeen_(0),
+      speedLastSendMs_(0), speedCombatSampleMs_(0) {}
 
 void Replicator::ingest(Inbound& in) {
     std::deque<InboundEntity> got;
@@ -91,7 +133,9 @@ void Replicator::ingest(Inbound& in) {
     if (got.empty()) return;
     unsigned long now = nowMs();
     for (std::deque<InboundEntity>::iterator it = got.begin(); it != got.end(); ++it) {
-        targets_[keyOf(it->e)].interp.push(it->e, now);
+        Driven& d = targets_[keyOf(it->e)];
+        d.interp.push(it->e, now);
+        d.lastSeenMs = now;
     }
 }
 
@@ -158,23 +202,69 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     net.setOwnedEntities(ownerId, buf, n);
 
     // Refresh the (sticky) attacker map from this tick's combat intents: a captured
-    // entity with task==TASK_COMBAT_MELEE carries its target in the subject fields, so it
+    // entity with a combat-stance task carries its target in the subject fields, so it
     // is the ATTACKER of that subject. Stamp lastSeen=now; entries persist (recency
     // window below) so a KO/death edge - where the attacker has already dropped its
     // now-fallen target - can still recover who did it. Prune entries older than the
     // window so stale pairings don't mis-attribute a later, unrelated death.
+    // An ACTIVE (slot-holding) attacker outranks a WAITING one: the queued crowd
+    // also targets the victim, but the KO/death lands from whoever is swinging.
     unsigned long nowPub = nowMs();
     for (unsigned int i = 0; i < n; ++i) {
         const EntityState& e = buf[i];
-        if (e.task != TASK_COMBAT_MELEE) continue;
+        if (!coop::taskIsCombat(e.task)) continue;
         Key victim; victim.t = e.sType; victim.c = e.sContainer;
         victim.cs = e.sContainerSerial; victim.i = e.sIndex; victim.s = e.sSerial;
+        if (coop::taskIsCombatWait(e.task)) {
+            std::map<Key, std::pair<Key, unsigned long> >::iterator ex =
+                attackerOf_.find(victim);
+            if (ex != attackerOf_.end() &&
+                (nowPub - ex->second.second) <= ATTR_WINDOW_MS)
+                continue; // a live ACTIVE stamp wins over the waiting crowd
+        }
         attackerOf_[victim] = std::make_pair(keyOf(e), nowPub);
     }
     for (std::map<Key, std::pair<Key, unsigned long> >::iterator pr = attackerOf_.begin();
          pr != attackerOf_.end(); ) {
         if (nowPub - pr->second.second > ATTR_WINDOW_MS) attackerOf_.erase(pr++);
         else ++pr;
+    }
+
+    // Phase B (protocol 16): refresh the combat-scoped NPC vitals set. The NPC
+    // segment of buf is [nOwned..n) (host only - the join streams no NPCs). An
+    // NPC qualifies while it FIGHTS (combat stance), is FOUGHT (a victim in the
+    // attacker map or the subject of any captured combat intent), or is DOWN /
+    // DEAD in interest. A stale grace window keeps vitals flowing over a brief
+    // stance flicker, then the NPC drops back to the events-only model.
+    if (streamNpcs_) {
+        unsigned int nOwned = (unsigned int)ownHands_.size();
+        std::set<Key> npcKeys;
+        for (unsigned int i = nOwned; i < n; ++i) npcKeys.insert(keyOf(buf[i]));
+        for (unsigned int i = nOwned; i < n; ++i) {
+            const EntityState& e = buf[i];
+            Key k = keyOf(e);
+            bool fighting = coop::taskIsCombat(e.task);
+            bool fought   = attackerOf_.find(k) != attackerOf_.end();
+            bool down     = coop::bodyIsDown(e.bodyState) ||
+                            (e.bodyState & BODY_DEAD) != 0;
+            if (fighting || fought || down) medNpc_[k] = nowPub;
+        }
+        // A combat intent's SUBJECT is a victim; if it's a world NPC (not a
+        // player-squad body - those have their own owner-authoritative stream),
+        // its vitals qualify too, even before it fights back.
+        for (unsigned int i = 0; i < n; ++i) {
+            const EntityState& e = buf[i];
+            if (!coop::taskIsCombat(e.task)) continue;
+            Key victim; victim.t = e.sType; victim.c = e.sContainer;
+            victim.cs = e.sContainerSerial; victim.i = e.sIndex; victim.s = e.sSerial;
+            if (npcKeys.find(victim) != npcKeys.end()) medNpc_[victim] = nowPub;
+        }
+        const unsigned long MEDNPC_STALE_MS = 10000;
+        for (std::map<Key, unsigned long>::iterator mit = medNpc_.begin();
+             mit != medNpc_.end(); ) {
+            if (nowPub - mit->second > MEDNPC_STALE_MS) medNpc_.erase(mit++);
+            else ++mit;
+        }
     }
 
     // Emit reliable transition events on bodyState edges. Continuous bodyState
@@ -184,8 +274,8 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     for (unsigned int i = 0; i < n; ++i) {
         const EntityState& e = buf[i];
         Key k = keyOf(e);
-        std::map<Key, u16>::iterator pit = hostBody_.find(k);
-        u16 prev = (pit != hostBody_.end()) ? pit->second : 0;
+        std::map<Key, HostBody>::iterator pit = hostBody_.find(k);
+        u16 prev = (pit != hostBody_.end()) ? pit->second.bs : 0;
         u16 cur  = e.bodyState;
         if (cur != prev) {
             bool wasDown = bodyIsDown(prev), isDownNow = bodyIsDown(cur);
@@ -222,7 +312,632 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
-        hostBody_[k] = cur;
+        HostBody& hb = hostBody_[k];
+        // Carried-body sync (protocol 18): emit reliable pickup/drop edges on
+        // carryingObject transitions of OWNED members (the carrier's owner
+        // authors the edge; TASK_CARRY_BODY + BODY_CARRIED are the self-heal).
+        // captureOne stamps TASK_CARRY_BODY + the carried hand as the subject
+        // whenever the member carries (combat overrides it, so a carrier that
+        // starts fighting reads as a drop here - the engine drops the body to
+        // fight anyway). NPC entities in buf never take this branch (only
+        // owned hands), keeping world-NPC carry out of scope.
+        if (carrySync_ && ownHands_.find(k) != ownHands_.end()) {
+            bool carryNow = coop::taskIsCarry(e.task);
+            bool sameBody = hb.carrying && carryNow &&
+                            hb.carried[3] == e.sIndex && hb.carried[4] == e.sSerial;
+            if ((hb.carrying && !carryNow) || (hb.carrying && carryNow && !sameBody)) {
+                // Drop edge (also fires as the first half of a carried-body
+                // SWAP): subject = the previously carried body, actor = us.
+                EventPacket ev; memset(&ev, 0, sizeof(ev));
+                ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_DROP_BODY;
+                ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+                ev.sType = hb.carried[0]; ev.sContainer = hb.carried[1];
+                ev.sContainerSerial = hb.carried[2];
+                ev.sIndex = hb.carried[3]; ev.sSerial = hb.carried[4];
+                ev.aType = e.hType; ev.aContainer = e.hContainer;
+                ev.aContainerSerial = e.hContainerSerial;
+                ev.aIndex = e.hIndex; ev.aSerial = e.hSerial;
+                ev.arg = 1.0f; // ragdoll ground drop (the body is KO'd)
+                net.queueEvent(ev);
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[carry] SEND DROP id=%u carrier=%u,%u carried=%u,%u",
+                    ev.eventId, e.hIndex, e.hSerial, hb.carried[3], hb.carried[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (carryNow && !sameBody) {
+                // Pickup edge: subject = the carried body, actor = us.
+                EventPacket ev; memset(&ev, 0, sizeof(ev));
+                ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_PICKUP_BODY;
+                ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+                ev.sType = e.sType; ev.sContainer = e.sContainer;
+                ev.sContainerSerial = e.sContainerSerial;
+                ev.sIndex = e.sIndex; ev.sSerial = e.sSerial;
+                ev.aType = e.hType; ev.aContainer = e.hContainer;
+                ev.aContainerSerial = e.hContainerSerial;
+                ev.aIndex = e.hIndex; ev.aSerial = e.hSerial;
+                net.queueEvent(ev);
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[carry] SEND PICKUP id=%u carrier=%u,%u carried=%u,%u",
+                    ev.eventId, e.hIndex, e.hSerial, e.sIndex, e.sSerial);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            hb.carrying = carryNow;
+            if (carryNow) {
+                hb.carried[0] = e.sType; hb.carried[1] = e.sContainer;
+                hb.carried[2] = e.sContainerSerial;
+                hb.carried[3] = e.sIndex; hb.carried[4] = e.sSerial;
+            }
+        }
+        hb.bs = cur; hb.seenMs = nowPub;
+    }
+    // Age out entities that left the interest set long ago (step 6): an unbounded
+    // hostBody_ leaks a session's worth of passers-by. 60 s is far beyond any
+    // interest-boundary flicker, so a pruned entry that returns just re-baselines
+    // (prev=0) - and a re-baselined DOWN body re-emits at most one KO edge.
+    const unsigned long HOSTBODY_STALE_MS = 60000;
+    for (std::map<Key, HostBody>::iterator hit = hostBody_.begin(); hit != hostBody_.end(); ) {
+        if (nowPub - hit->second.seenMs > HOSTBODY_STALE_MS) hostBody_.erase(hit++);
+        else ++hit;
+    }
+}
+
+// Quantized fingerprint of a medical snapshot (FNV-1a over rounded fields):
+// sub-noise wobble (blood regen ticks at ~0.01) must not chatter the reliable
+// channel, so blood/flesh/bandaging quantize to 0.5 units and bleed to 0.05.
+// Protocol 16: covers the FULL anatomy (flesh+stun+bandage+juryRig per part)
+// plus the 4 LimbStates - a stun hit or a limb loss re-fingerprints too.
+static coop::u32 medicalHash(const engine::MedicalRead& m) {
+    long q[4 + 12 * 4 + 4];
+    memset(q, 0, sizeof(q));
+    q[0] = (long)(m.blood * 2.0f);
+    q[1] = (long)(m.bleedRate * 20.0f);
+    q[2] = m.unconscious ? 1 : 0;
+    q[3] = m.dead ? 1 : 0;
+    unsigned int n = m.nParts; if (n > 12) n = 12;
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::MedPartRead& p = m.parts[i];
+        if (!p.used) continue;
+        q[4 + i * 4 + 0] = (long)(p.flesh * 2.0f);
+        q[4 + i * 4 + 1] = (long)(p.fleshStun * 2.0f);
+        q[4 + i * 4 + 2] = (long)(p.bandaging * 2.0f);
+        q[4 + i * 4 + 3] = (long)(p.juryRig * 2.0f);
+    }
+    for (int i = 0; i < 4; ++i) q[4 + 12 * 4 + i] = (long)m.limbState[i];
+    coop::u32 h = 2166136261u;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(q);
+    for (unsigned int i = 0; i < sizeof(q); ++i) { h ^= p[i]; h *= 16777619u; }
+    return h ? h : 1u; // 0 is the "never sent" sentinel
+}
+
+// Quantized fingerprint of a stats snapshot (protocol 17; the medicalHash
+// pattern). Raw stat levels creep by tiny XP fractions every swing; 0.1-unit
+// quantization keeps the reliable channel silent until a stat visibly moves.
+// xp and freeAttributePoints ride at their natural granularity.
+static coop::u32 statsHash(const engine::StatsRead& s) {
+    long q[40 + 2];
+    memset(q, 0, sizeof(q));
+    unsigned int n = s.nStats; if (n > 40) n = 40;
+    for (unsigned int i = 0; i < n; ++i)
+        q[i] = (s.stats[i] >= 0.0f) ? (long)(s.stats[i] * 10.0f) : -1;
+    q[40] = (s.xp >= 0.0f) ? (long)s.xp : -1;
+    q[41] = (s.freeAttribPts >= 0.0f) ? (long)s.freeAttribPts : -1;
+    coop::u32 h = 2166136261u;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(q);
+    for (unsigned int i = 0; i < sizeof(q); ++i) { h ^= p[i]; h *= 16777619u; }
+    return h ? h : 1u; // 0 is the "never sent" sentinel
+}
+
+// Fill a protocol-16 medical packet from a local read (shared by the owned-
+// member and combat-scoped-NPC publish paths). subj = the subject hand in
+// readObjectHand layout (t, c, cs, i, s).
+static void fillMedicalPacket(MedicalPacket& pkt, const unsigned int subj[5],
+                              coop::u32 ownerId, const engine::MedicalRead& mr) {
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type    = (u8)PKT_MEDICAL;
+    pkt.ownerId = ownerId;
+    pkt.sType = subj[0]; pkt.sContainer = subj[1]; pkt.sContainerSerial = subj[2];
+    pkt.sIndex = subj[3]; pkt.sSerial = subj[4];
+    pkt.blood     = mr.blood;
+    pkt.bleedRate = mr.bleedRate;
+    pkt.flags = (mr.unconscious ? MED_UNCONSCIOUS : 0) | (mr.dead ? MED_DEAD : 0);
+    unsigned int n = mr.nParts; if (n > MED_PARTS_MAX) n = MED_PARTS_MAX;
+    pkt.nParts = (u8)n;
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::MedPartRead& pr = mr.parts[i];
+        MedPartEntry& e = pkt.parts[i];
+        e.used      = pr.used ? 1 : 0;
+        e.partType  = pr.partType;
+        e.side      = pr.side;
+        e.flesh     = pr.flesh;
+        e.fleshStun = pr.fleshStun;
+        e.bandaging = pr.bandaging;
+        e.juryRig   = pr.juryRig;
+    }
+    for (int i = 0; i < 4; ++i) {
+        pkt.limbState[i] = mr.limbState[i];
+        strncpy(pkt.limbSid[i], mr.limbSid[i], sizeof(pkt.limbSid[i]) - 1);
+    }
+}
+
+void Replicator::publishMedical(GameWorld* gw, NetLink& net, u32 ownerId) {
+    const unsigned long RESEND_MS       = 3000; // safety resend (reliable, but cheap insurance)
+    const unsigned long MIN_SEND_MS     = 400;  // sampling floor: an active bleed changes the
+                                                // fingerprint EVERY tick, and 60 Hz reliable
+                                                // sends would flood the channel (and lag the
+                                                // copy). ~2.5 Hz is plenty for vitals.
+    const unsigned long NPC_MIN_SEND_MS = 1000; // combat-scoped NPCs: ~1 Hz is plenty (a
+                                                // whole brawl's worth of bodies shares the
+                                                // channel with the squad streams)
+    unsigned long now = nowMs();
+    // One publish list: owned squad members first, then (host) the combat-
+    // scoped world NPCs from medNpc_ (Phase B).
+    std::vector<std::pair<Key, bool> > list; // (key, isNpc)
+    for (std::set<Key>::const_iterator it = ownHands_.begin(); it != ownHands_.end(); ++it)
+        list.push_back(std::make_pair(*it, false));
+    if (streamNpcs_) {
+        for (std::map<Key, unsigned long>::const_iterator it = medNpc_.begin();
+             it != medNpc_.end(); ++it) {
+            if (ownHands_.find(it->first) != ownHands_.end()) continue;
+            list.push_back(std::make_pair(it->first, true));
+        }
+    }
+    for (unsigned int li = 0; li < list.size(); ++li) {
+        const Key& k  = list[li].first;
+        bool isNpc    = list[li].second;
+        unsigned long minSendMs = isNpc ? NPC_MIN_SEND_MS : MIN_SEND_MS;
+        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        engine::MedicalRead mr;
+        if (!engine::readMedicalByHand(hand, &mr) || !mr.valid) continue;
+        u32 h = medicalHash(mr);
+        MedPub& mp = medPub_[k];
+        // Limb-loss transition events (doctrine 16: the reliable event carries
+        // the edge, the packet's limbState[] is the self-heal). Detected on the
+        // PUBLISH sample so owned members and streamed NPCs share the path.
+        for (int i = 0; i < 4; ++i) {
+            u8 prev = mp.limbPrev[i], cur = mr.limbState[i];
+            if (cur != LIMB_STATE_UNKNOWN && prev != LIMB_STATE_UNKNOWN && cur != prev) {
+                u8 evType = EVT_NONE;
+                if ((cur == LIMB_WIRE_STUMP || cur == LIMB_WIRE_REPLACED) &&
+                    (prev == LIMB_WIRE_ORIGINAL || prev == LIMB_WIRE_CRUSHED))
+                    evType = EVT_AMPUTATE;
+                else if (cur == LIMB_WIRE_CRUSHED && prev == LIMB_WIRE_ORIGINAL)
+                    evType = EVT_CRUSH;
+                if (evType != EVT_NONE) {
+                    EventPacket ev;
+                    memset(&ev, 0, sizeof(ev));
+                    ev.type = (u8)PKT_EVENT; ev.event = evType;
+                    ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+                    ev.sType = k.t; ev.sContainer = k.c; ev.sContainerSerial = k.cs;
+                    ev.sIndex = k.i; ev.sSerial = k.s;
+                    ev.arg = (f32)i; // RobotLimbs::Limb
+                    net.queueEvent(ev);
+                    char eb[160]; _snprintf(eb, sizeof(eb) - 1,
+                        "[med] LIMB-EVT SEND id=%u ev=%u hand=%u,%u limb=%d state %u->%u",
+                        ev.eventId, (unsigned)evType, k.i, k.s, i,
+                        (unsigned)prev, (unsigned)cur);
+                    eb[sizeof(eb) - 1] = '\0'; coop::logLine(eb);
+                    // Severed-item dedupe (JOIN only): our own damage sim just
+                    // created a local severed-limb ground item, but the HOST's
+                    // copy is canonical (it spawns one on event-apply and the
+                    // world-item channel streams it back as a proxy). Destroy
+                    // the local one so the join doesn't end up with two.
+                    if (evType == EVT_AMPUTATE && !streamNpcs_ && !isNpc) {
+                        int nd = engine::destroySeveredLimbsNear(gw, hand, 15.0f);
+                        char db[120]; _snprintf(db, sizeof(db) - 1,
+                            "[med] LIMB-ITEM DEDUPE hand=%u,%u destroyed=%d",
+                            k.i, k.s, nd);
+                        db[sizeof(db) - 1] = '\0'; coop::logLine(db);
+                    }
+                }
+            }
+            if (cur != LIMB_STATE_UNKNOWN) mp.limbPrev[i] = cur;
+        }
+        if (mp.lastSendMs != 0 && (now - mp.lastSendMs) < minSendMs) continue;
+        if (h == mp.hash && (now - mp.lastSendMs) < RESEND_MS) continue;
+        bool changed = (h != mp.hash);
+        mp.hash = h; mp.lastSendMs = now;
+        MedicalPacket pkt;
+        fillMedicalPacket(pkt, hand, ownerId, mr);
+        net.queueMedical(pkt);
+        if (changed) { // periodic resends stay silent; changes are the signal
+            // Head/chest/stomach summary: min flesh and min stun across ALL
+            // parts (the fields the pre-16 stream never carried).
+            float minFl = 1e9f, minSt = 1e9f;
+            for (unsigned int i = 0; i < mr.nParts && i < 12; ++i) {
+                if (!mr.parts[i].used) continue;
+                if (mr.parts[i].flesh >= 0.0f && mr.parts[i].flesh < minFl)
+                    minFl = mr.parts[i].flesh;
+                if (mr.parts[i].fleshStun >= 0.0f && mr.parts[i].fleshStun < minSt)
+                    minSt = mr.parts[i].fleshStun;
+            }
+            if (minFl > 1e8f) minFl = -1.0f;
+            if (minSt > 1e8f) minSt = -1.0f;
+            char b[240]; _snprintf(b, sizeof(b) - 1,
+                "[med] SEND hand=%u,%u npc=%d blood=%.1f bleed=%.2f fl=%.1f,%.1f,%.1f,%.1f bd=%.1f,%.1f,%.1f,%.1f flags=%u nparts=%u pmin=%.1f smin=%.1f ls=%u,%u,%u,%u",
+                k.i, k.s, isNpc ? 1 : 0, mr.blood, mr.bleedRate,
+                mr.limbFlesh[0], mr.limbFlesh[1], mr.limbFlesh[2], mr.limbFlesh[3],
+                mr.limbBand[0], mr.limbBand[1], mr.limbBand[2], mr.limbBand[3],
+                (unsigned)pkt.flags, (unsigned)pkt.nParts, minFl, minSt,
+                (unsigned)mr.limbState[0], (unsigned)mr.limbState[1],
+                (unsigned)mr.limbState[2], (unsigned)mr.limbState[3]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    // Age out entries no longer published (left the owned set / NPC set went
+    // stale) - the map must not grow unbounded across saves or brawls.
+    for (std::map<Key, MedPub>::iterator mit = medPub_.begin(); mit != medPub_.end(); ) {
+        bool live = ownHands_.find(mit->first) != ownHands_.end() ||
+                    medNpc_.find(mit->first) != medNpc_.end();
+        if (!live) medPub_.erase(mit++);
+        else ++mit;
+    }
+}
+
+void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId) {
+    // 1. Drain received snapshots onto driven copies (never a body we own).
+    std::deque<InboundMedical> got;
+    in.drainMedical(got);
+    for (std::deque<InboundMedical>::iterator it = got.begin(); it != got.end(); ++it) {
+        const MedicalPacket& p = it->pkt;
+        Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
+        k.i = p.sIndex; k.s = p.sSerial;
+        if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
+        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        Character* c = engine::resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+        if (!c) continue;
+        engine::MedicalRead w;
+        memset(&w, 0, sizeof(w));
+        w.valid = true;
+        w.blood = p.blood; w.bleedRate = p.bleedRate;
+        for (int i = 0; i < 4; ++i) {
+            // Legacy 4-limb fields unused when nParts > 0 (writeMedical takes
+            // the full-anatomy path); keep them inert regardless.
+            w.limbFlesh[i] = -1.0f; w.limbBand[i] = -1.0f; w.limbMax[i] = -1.0f;
+        }
+        unsigned int n = p.nParts; if (n > 12) n = 12;
+        w.nParts = n;
+        for (unsigned int i = 0; i < n; ++i) {
+            const MedPartEntry& e = p.parts[i];
+            engine::MedPartRead& pr = w.parts[i];
+            pr.used      = e.used != 0;
+            pr.partType  = e.partType;
+            pr.side      = e.side;
+            pr.flesh     = e.flesh;
+            pr.fleshStun = e.fleshStun;
+            pr.bandaging = e.bandaging;
+            pr.juryRig   = e.juryRig;
+            pr.maxHealth = -1.0f;
+        }
+        w.unconscious = (p.flags & MED_UNCONSCIOUS) != 0;
+        w.dead        = (p.flags & MED_DEAD) != 0;
+        engine::writeMedical(c, w);
+        // Limb-state self-heal (Phase C/D): reconcile stump/crushed/robotic
+        // state with the owner's. The reliable EVT_AMPUTATE/EVT_CRUSH events
+        // carry the transition moment; this closes any gap (late join, missed
+        // pre-event state) and fits robotic replacements (sid + gw available).
+        // The HOST (streamNpcs_ = world authority) creates the severed ground
+        // item - it then streams to everyone via the world-item channel; the
+        // join never creates one (the streamed copy is canonical).
+        int lchg = engine::applyLimbStates(gw, c, p.limbState, p.limbSid,
+                                           /*createSeveredItem*/streamNpcs_);
+        if (lchg != 0) {
+            char lb[160]; _snprintf(lb, sizeof(lb) - 1,
+                "[med] LIMB APPLY hand=%u,%u mask=%d ls=%u,%u,%u,%u",
+                k.i, k.s, lchg,
+                (unsigned)p.limbState[0], (unsigned)p.limbState[1],
+                (unsigned)p.limbState[2], (unsigned)p.limbState[3]);
+            lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+        }
+        MedRecv& r = medRecv_[k];
+        for (unsigned int i = 0; i < 12; ++i) {
+            float band = (i < n && p.parts[i].used) ? p.parts[i].bandaging : -1.0f;
+            r.recvBand[i] = band;
+            // The owner's stream now reflects (or supersedes) anything we
+            // forwarded; re-arm the detector against the new baseline.
+            if (r.sentBand[i] >= 0.0f && band >= r.sentBand[i] - 0.25f)
+                r.sentBand[i] = -1.0f;
+        }
+        r.have = true;
+    }
+
+    // 2. Treatment detector: local bandaging risen ABOVE the last received level
+    // on a driven copy = first aid administered on THIS machine. Forward the
+    // resulting levels (not the call stream) reliably to the owner. ~1 Hz per
+    // body; sentBand[] suppresses re-sends while the owner's echo is in flight.
+    // Protocol 16: keyed by anatomy part, so a head/chest bandage forwards too.
+    const float         RISE_EPS = 0.5f;
+    const unsigned long FWD_THROTTLE_MS = 1000;
+    unsigned long now = nowMs();
+    for (std::map<Key, MedRecv>::iterator it = medRecv_.begin(); it != medRecv_.end(); ++it) {
+        const Key& k = it->first;
+        MedRecv&   r = it->second;
+        if (!r.have || (now - r.lastFwdMs) < FWD_THROTTLE_MS) continue;
+        if (ownHands_.find(k) != ownHands_.end()) continue;
+        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        engine::MedicalRead mr;
+        if (!engine::readMedicalByHand(hand, &mr) || !mr.valid) continue;
+        TreatmentPacket tp;
+        memset(&tp, 0, sizeof(tp));
+        bool rise = false;
+        int nRise = 0; float hiBand = -1.0f;
+        for (unsigned int i = 0; i < 12; ++i) {
+            tp.partBand[i] = -1.0f;
+            float local = (i < mr.nParts && mr.parts[i].used) ? mr.parts[i].bandaging : -1.0f;
+            if (local < 0.0f || r.recvBand[i] < 0.0f) continue;
+            if (local > r.recvBand[i] + RISE_EPS &&
+                (r.sentBand[i] < 0.0f || local > r.sentBand[i] + RISE_EPS)) {
+                tp.partBand[i] = local;
+                r.sentBand[i]  = local;
+                rise = true; ++nRise;
+                if (local > hiBand) hiBand = local;
+            }
+        }
+        if (!rise) continue;
+        r.lastFwdMs = now;
+        tp.type    = (u8)PKT_TREATMENT;
+        tp.ownerId = ownerId;
+        tp.treatId = nextTreatId_++;
+        tp.sType = k.t; tp.sContainer = k.c; tp.sContainerSerial = k.cs;
+        tp.sIndex = k.i; tp.sSerial = k.s;
+        net.queueTreatment(tp);
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[med] TREAT SEND id=%u hand=%u,%u parts=%d hi=%.1f",
+            tp.treatId, k.i, k.s, nRise, hiBand);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyTreatments(GameWorld* gw, Inbound& in) {
+    (void)gw;
+    std::deque<InboundTreatment> got;
+    in.drainTreatments(got);
+    for (std::deque<InboundTreatment>::iterator it = got.begin(); it != got.end(); ++it) {
+        const TreatmentPacket& p = it->pkt;
+        Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
+        k.i = p.sIndex; k.s = p.sSerial;
+        // Only the AUTHORITY applies a treatment to the real body: the owner of
+        // a squad member, or the host for a combat-scoped world NPC (medNpc_).
+        // A delta for a body we aren't authoritative for is a partition error
+        // (log-visible, ignored).
+        bool authority = ownHands_.find(k) != ownHands_.end() ||
+                         (streamNpcs_ && medNpc_.find(k) != medNpc_.end());
+        if (!authority) continue;
+        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        if (!c) continue;
+        int n = engine::applyBandageParts(c, p.partBand);
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[med] TREAT RECV id=%u hand=%u,%u applied=%d",
+            p.treatId, k.i, k.s, n);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::publishStats(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    const unsigned long RESEND_MS   = 5000; // safety resend (cheap insurance)
+    const unsigned long MIN_SEND_MS = 1000; // stats creep every swing; ~1 Hz is plenty
+    unsigned long now = nowMs();
+    // Owned player-squad members ONLY. World NPCs are deliberately excluded:
+    // their authoritative fights run on the host with the host's own (correct)
+    // local stats, so streaming them would be traffic without a consumer.
+    for (std::set<Key>::const_iterator it = ownHands_.begin(); it != ownHands_.end(); ++it) {
+        const Key& k = *it;
+        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        engine::StatsRead sr;
+        if (!engine::readStatsByHand(hand, &sr) || !sr.valid) continue;
+        u32 h = statsHash(sr);
+        StatsPub& sp = statsPub_[k];
+        if (sp.lastSendMs != 0 && (now - sp.lastSendMs) < MIN_SEND_MS) continue;
+        if (h == sp.hash && (now - sp.lastSendMs) < RESEND_MS) continue;
+        bool changed = (h != sp.hash);
+        sp.hash = h; sp.lastSendMs = now;
+        StatsPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_STATS;
+        pkt.ownerId = ownerId;
+        pkt.sType = k.t; pkt.sContainer = k.c; pkt.sContainerSerial = k.cs;
+        pkt.sIndex = k.i; pkt.sSerial = k.s;
+        unsigned int n = sr.nStats; if (n > STATS_SLOT_MAX) n = STATS_SLOT_MAX;
+        pkt.nStats = (u8)n;
+        for (unsigned int i = 0; i < STATS_SLOT_MAX; ++i)
+            pkt.stats[i] = (i < n) ? sr.stats[i] : -1.0f;
+        pkt.xp                  = sr.xp;
+        pkt.freeAttributePoints = sr.freeAttribPts;
+        net.queueStats(pkt);
+        if (changed) { // periodic resends stay silent; changes are the signal
+            // str/dex/tough/stealth/athletics cover the scenario + the stats a
+            // player watches; the full vector is in the packet regardless.
+            // StatsEnumerated: STRENGTH=1 STEALTH=16 ATHLETICS=17 DEXTERITY=18
+            // TOUGHNESS=21 (Enums.h).
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "[stats] SEND hand=%u,%u str=%.1f dex=%.1f tough=%.1f stealth=%.1f athl=%.1f xp=%.0f fap=%.0f",
+                k.i, k.s, sr.stats[1], sr.stats[18], sr.stats[21], sr.stats[16],
+                sr.stats[17], sr.xp, sr.freeAttribPts);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    // Age out entries that left the owned set (save reload, squad change).
+    for (std::map<Key, StatsPub>::iterator sit = statsPub_.begin(); sit != statsPub_.end(); ) {
+        if (ownHands_.find(sit->first) == ownHands_.end()) statsPub_.erase(sit++);
+        else ++sit;
+    }
+}
+
+void Replicator::applyStats(GameWorld* gw, Inbound& in) {
+    (void)gw;
+    std::deque<InboundStats> got;
+    in.drainStats(got);
+    for (std::deque<InboundStats>::iterator it = got.begin(); it != got.end(); ++it) {
+        const StatsPacket& p = it->pkt;
+        Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
+        k.i = p.sIndex; k.s = p.sSerial;
+        if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
+        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        if (!c) continue;
+        engine::StatsRead w;
+        memset(&w, 0, sizeof(w));
+        w.valid = true;
+        unsigned int n = p.nStats; if (n > 40) n = 40;
+        w.nStats = n;
+        for (unsigned int i = 0; i < 40; ++i)
+            w.stats[i] = (i < n) ? p.stats[i] : -1.0f;
+        w.xp            = p.xp;
+        w.freeAttribPts = p.freeAttributePoints;
+        bool ok = engine::writeStats(c, w);
+        char b[200]; _snprintf(b, sizeof(b) - 1,
+            "[stats] RECV hand=%u,%u ok=%d str=%.1f dex=%.1f tough=%.1f stealth=%.1f athl=%.1f xp=%.0f",
+            k.i, k.s, ok ? 1 : 0, p.stats[1], p.stats[18], p.stats[21],
+            p.stats[16], p.stats[17], p.xp);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
+                           bool isHost) {
+    const unsigned long RESEND_MS        = 3000; // safety resend (late join / lost state)
+    const unsigned long COMBAT_SAMPLE_MS = 1000; // own-squad combat poll cadence
+    const float         EPS              = 0.01f;
+    unsigned long now = nowMs();
+
+    // Own-squad combat flag, ~1 Hz (readCombat per owned member; the cap only
+    // needs second-level reactivity). An edge forces a REQ send below so the
+    // host's cap reacts faster than the safety resend.
+    bool combatEdge = false;
+    if (speedCombatSampleMs_ == 0 || (now - speedCombatSampleMs_) >= COMBAT_SAMPLE_MS) {
+        speedCombatSampleMs_ = now;
+        bool fighting = false;
+        for (std::set<Key>::const_iterator it = ownHands_.begin();
+             it != ownHands_.end(); ++it) {
+            Character* c = engine::resolveCharByHand(it->i, it->s, it->t, it->c, it->cs);
+            engine::CombatRead cr;
+            if (c && engine::readCombat(c, &cr) && cr.inCombat) { fighting = true; break; }
+        }
+        combatEdge     = (fighting != speedMyCombat_);
+        speedMyCombat_ = fighting;
+    }
+
+    // Local click detector: the engine's current state differing from what WE
+    // last applied means the USER acted (the treatment detector's own-write-vs-
+    // user-intent pattern) - that becomes our new request. Pause requests as
+    // speed 0. First read seeds the baseline (the save's starting speed).
+    float mult = 0.0f; bool paused = false;
+    if (!engine::readGameSpeed(gw, &mult, &paused)) return;
+    float cur = paused ? 0.0f : mult;
+    bool userActed = false;
+    if (speedLastApplied_ < 0.0f) {
+        speedLastApplied_ = cur;
+        speedMyReq_       = cur;
+        userActed = true; // announce the initial request so the peer's state seeds
+    } else if (fabs(cur - speedLastApplied_) > EPS) {
+        speedMyReq_       = cur;
+        speedLastApplied_ = cur;
+        userActed = true;
+        char b[112]; _snprintf(b, sizeof(b) - 1,
+            "[speed] REQ mult=%.2f paused=%d combat=%d",
+            speedMyReq_, (speedMyReq_ <= EPS) ? 1 : 0, speedMyCombat_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // A click is a REQUEST, not a local override: snap the join's engine
+        // back to the arbitrated effective right away (the host re-applies in
+        // its arbitration block below). Without this a DENIED raise would run
+        // this engine fast for up to the 3 s resend - silent divergence.
+        if (!isHost && speedLastSet_ >= 0.0f &&
+            fabs(cur - speedLastSet_) > EPS) {
+            if (engine::writeGameSpeed(gw, speedLastSet_, speedLastSet_ <= EPS))
+                speedLastApplied_ = speedLastSet_;
+        }
+    }
+
+    // Drain peer speed packets: the host keeps the join's latest REQUEST; the
+    // join applies the host's arbitrated SET. The reliable channel is ordered,
+    // but the seq guard keeps a (theoretical) stale packet from rolling back.
+    std::deque<InboundSpeed> got;
+    in.drainSpeed(got);
+    for (std::deque<InboundSpeed>::iterator it = got.begin(); it != got.end(); ++it) {
+        const SpeedPacket& p = it->pkt;
+        if (p.seq != 0 && speedSeqSeen_ != 0 && (long)(p.seq - speedSeqSeen_) <= 0)
+            continue;
+        speedSeqSeen_ = p.seq;
+        bool pkPaused = (p.flags & SPEED_PAUSED) != 0 || p.speed <= EPS;
+        if (p.type == (u8)PKT_SPEED_REQ && isHost) {
+            float req = pkPaused ? 0.0f : p.speed;
+            bool  cmb = (p.flags & SPEED_IN_COMBAT) != 0;
+            if (speedPeerReq_ < 0.0f || fabs(req - speedPeerReq_) > EPS ||
+                cmb != speedPeerCombat_) {
+                char b[112]; _snprintf(b, sizeof(b) - 1,
+                    "[speed] REQ RECV owner=%u mult=%.2f paused=%d combat=%d",
+                    (unsigned)it->ownerId, req, pkPaused ? 1 : 0, cmb ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            speedPeerReq_    = req;
+            speedPeerCombat_ = cmb;
+        } else if (p.type == (u8)PKT_SPEED_SET && !isHost) {
+            float eff = pkPaused ? 0.0f : p.speed;
+            if (engine::writeGameSpeed(gw, eff, pkPaused)) {
+                speedLastApplied_ = eff;
+                bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
+                speedLastSet_ = eff;
+                if (changed) { // safety resends stay silent; changes are the signal
+                    char b[112]; _snprintf(b, sizeof(b) - 1,
+                        "[speed] SET mult=%.2f paused=%d combat=%d",
+                        eff, pkPaused ? 1 : 0,
+                        (p.flags & SPEED_IN_COMBAT) ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+    }
+
+    if (isHost) {
+        // Arbitrate: effective = min(my request, peer request), capped at 1x
+        // while either player squad fights. The cap never force-unpauses -
+        // pause (0) is already below 1, so min semantics preserve it.
+        float eff = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
+        if (speedPeerReq_ >= 0.0f && speedPeerReq_ < eff) eff = speedPeerReq_;
+        bool combat = speedMyCombat_ || speedPeerCombat_;
+        if (combat && eff > 1.0f) eff = 1.0f;
+        bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
+        // userActed with an UNCHANGED effective = a denied raise (consensus
+        // holdback): re-apply immediately so the host engine doesn't run fast
+        // until the safety resend - a click is a request, not an override.
+        if (changed || userActed || speedLastSendMs_ == 0 ||
+            (now - speedLastSendMs_) >= RESEND_MS) {
+            bool effPaused = (eff <= EPS);
+            if (engine::writeGameSpeed(gw, eff, effPaused))
+                speedLastApplied_ = eff;
+            SpeedPacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type    = (u8)PKT_SPEED_SET;
+            pkt.ownerId = ownerId;
+            pkt.seq     = speedSeqOut_++;
+            pkt.speed   = eff;
+            pkt.flags   = (effPaused ? SPEED_PAUSED : 0) |
+                          (combat ? SPEED_IN_COMBAT : 0);
+            net.queueSpeed(pkt);
+            speedLastSet_    = eff;
+            speedLastSendMs_ = now;
+            if (changed) {
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[speed] SET mult=%.2f paused=%d combat=%d (my=%.2f peer=%.2f)",
+                    eff, effPaused ? 1 : 0, combat ? 1 : 0,
+                    speedMyReq_, speedPeerReq_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    } else {
+        // Join: send our request on change / combat edge / safety resend.
+        if (userActed || combatEdge || speedLastSendMs_ == 0 ||
+            (now - speedLastSendMs_) >= RESEND_MS) {
+            SpeedPacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type    = (u8)PKT_SPEED_REQ;
+            pkt.ownerId = ownerId;
+            pkt.seq     = speedSeqOut_++;
+            pkt.speed   = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
+            pkt.flags   = ((speedMyReq_ >= 0.0f && speedMyReq_ <= EPS) ? SPEED_PAUSED : 0) |
+                          (speedMyCombat_ ? SPEED_IN_COMBAT : 0);
+            net.queueSpeed(pkt);
+            speedLastSendMs_ = now;
+        }
     }
 }
 
@@ -621,6 +1336,9 @@ void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
         std::pair<u32, u32> id(p.ownerId, p.dropId);
         if (appliedDrops_.count(id) != 0) continue; // idempotent (reliable resend / replay)
         appliedDrops_.insert(id);
+        // Bounded (step 6): ids are per-sender monotonic, so evicting the smallest
+        // discards the oldest - far outside any plausible reliable-channel replay.
+        if (appliedDrops_.size() > 4096) appliedDrops_.erase(appliedDrops_.begin());
         Key ok; ok.t = p.oType; ok.c = p.oContainer; ok.cs = p.oContainerSerial;
         ok.i = p.oIndex; ok.s = p.oSerial;
         if (ownHands_.count(ok) != 0) continue;     // we own this char -> we dropped it locally
@@ -650,6 +1368,7 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
         std::pair<u32, u32> id(p.ownerId, p.pickupId);
         if (appliedPickups_.count(id) != 0) continue; // idempotent (reliable resend / replay)
         appliedPickups_.insert(id);
+        if (appliedPickups_.size() > 4096) appliedPickups_.erase(appliedPickups_.begin());
         Key ok; ok.t = p.oType; ok.c = p.oContainer; ok.cs = p.oContainerSerial;
         ok.i = p.oIndex; ok.s = p.oSerial;
         if (ownHands_.count(ok) != 0) continue;        // we own this char -> we picked it up locally
@@ -682,6 +1401,67 @@ void Replicator::applyEvents(Inbound& in) {
             case EVT_DEATH:    d.deathLatched = true;  d.koLatched = true;  break;
             case EVT_KNOCKOUT: d.koLatched = true;                          break;
             case EVT_REVIVE:   d.deathLatched = false; d.koLatched = false; break;
+            case EVT_AMPUTATE:
+            case EVT_CRUSH: {
+                // Reliable limb-loss transition (protocol 16): apply the same
+                // engine lever the owner's damage sim ran (amputate WITHOUT the
+                // severed item - the world-item channel owns the ground copy).
+                // Never on a body we own (our sim is the authority there), and
+                // idempotent: applyLimbStates no-ops when states already match.
+                if (ownHands_.find(k) != ownHands_.end()) break;
+                int limb = (int)ev.arg;
+                if (limb < 0 || limb > 3) break;
+                Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                if (!c) break; // not loaded here; the medical stream self-heals later
+                unsigned char states[4] = { LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN,
+                                            LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN };
+                states[limb] = (ev.event == EVT_AMPUTATE) ? LIMB_WIRE_STUMP
+                                                          : LIMB_WIRE_CRUSHED;
+                // Host = world authority: create the real severed ground item
+                // here (it streams to the join via the world-item channel).
+                int r = engine::applyLimbStates(0, c, states, 0,
+                                                /*createSeveredItem*/streamNpcs_);
+                char lb[140]; _snprintf(lb, sizeof(lb) - 1,
+                    "[med] LIMB-EVT APPLY ev=%u hand=%u,%u limb=%d mask=%d",
+                    (unsigned)ev.event, k.i, k.s, limb, r);
+                lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+                break;
+            }
+            case EVT_PICKUP_BODY: {
+                // Carried-body sync (protocol 18): subject = the CARRIED body,
+                // actor = the CARRIER. Resolve BOTH locally and run the engine's
+                // own pickup between the LOCAL pair - the shoulder attach, carry
+                // animation, and transform-follow are all engine-native here.
+                // Works for own-tab, cross-tab, and either direction: each
+                // machine mirrors the relationship between its own instances.
+                if (!carrySync_) break;
+                Character* carrier = engine::resolveCharByHand(
+                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
+                unsigned int ch[5] = { ev.sType, ev.sContainer, ev.sContainerSerial,
+                                       ev.sIndex, ev.sSerial };
+                bool ok = carrier && engine::applyPickup(0, carrier, ch);
+                char cb[160]; _snprintf(cb, sizeof(cb) - 1,
+                    "[carry] RECV PICKUP id=%u carrier=%u,%u carried=%u,%u ok=%d",
+                    ev.eventId, ev.aIndex, ev.aSerial, ev.sIndex, ev.sSerial,
+                    ok ? 1 : 0);
+                cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
+                break;
+            }
+            case EVT_DROP_BODY: {
+                // The inverse: release the local carrier's carried body (arg =
+                // ragdoll flag). Idempotent - a carrier that never picked up
+                // locally (lost/late pickup) is a no-op success.
+                if (!carrySync_) break;
+                Character* carrier = engine::resolveCharByHand(
+                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
+                bool ok = carrier && engine::applyDrop(carrier, ev.arg != 0.0f);
+                char cb[160]; _snprintf(cb, sizeof(cb) - 1,
+                    "[carry] RECV DROP id=%u carrier=%u,%u carried=%u,%u ok=%d",
+                    ev.eventId, ev.aIndex, ev.aSerial, ev.sIndex, ev.sSerial,
+                    ok ? 1 : 0);
+                cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
+                break;
+            }
             default: break;
         }
         char b[200]; _snprintf(b, sizeof(b) - 1,
@@ -700,7 +1480,16 @@ void Replicator::applyTargets(GameWorld* gw) {
     // tick stay suspended; anything we stop driving (stale/suppressed) is dropped
     // here so its AI resumes. Safe to rebuild now - the periodicUpdate detour only
     // reads the set during the engine tick, which already ran this frame.
-    if (probeAiSuspend_) engine::clearAiSuspend();
+    if (aiSuspend_) engine::clearAiSuspend();
+    // Damage-guard set rebuilds the same way: every body we DRIVE this tick (all
+    // are non-owned - owned hands are skipped below) is protected from local melee
+    // damage, so the join's cosmetic fights cannot diverge the local-only medical
+    // model. A body we stop driving drops out and takes local damage again.
+    if (dmgGuard_) engine::clearDamageGuard();
+    // Driven-body pointer set rebuilds per tick too: enforceHostAuthority uses it
+    // to recognise a streamed body whose LOCAL hand key changed (combat detach
+    // re-containers world NPCs) so it never hides a body we are driving.
+    drivenChars_.clear();
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
         // Never drive a body WE own: we control + stream it locally, the peer drives
         // its copy from our stream. The disjoint partition + no local loopback means
@@ -718,6 +1507,11 @@ void Replicator::applyTargets(GameWorld* gw) {
 
         Character* c = engine::resolve(out);
         if (!c) continue;
+        drivenChars_.insert(c);
+
+        // Every driven body is damage-guarded (locally-simulated hits must not
+        // mutate the local-only medical model; outcomes arrive as host events).
+        if (dmgGuard_) engine::addDamageGuard(c);
 
         float ax, ay, az;
         bool haveActual = engine::readPos(c, &ax, &ay, &az);
@@ -749,6 +1543,25 @@ void Replicator::applyTargets(GameWorld* gw) {
         // the down treatment even if this tick's (lossy) continuous sample momentarily
         // reads upright - the whole point of the reliable event is that the down/dead
         // transition is honoured regardless of a dropped batch. EVT_REVIVE clears it.
+        //
+        // ---- Carried carve-out (protocol 18) -----------------------------------
+        // A body on someone's shoulder (streamed BODY_CARRIED, or LOCALLY attached
+        // - the local pickup may lead/trail the stream by a beat) is transform-
+        // owned by its local carry attach: the down override (knockDown/holdDown
+        // + the 2u co-locate snap) would rip it off the shoulder and pin it to the
+        // ground - the dragged/teleported-body artifact this feature fixes. Skip
+        // the down path AND all locomotion driving for it this tick. koLatched is
+        // deliberately NOT cleared: the body is still KO'd, and the hold re-engages
+        // the tick after the local drop releases it.
+        if (carrySync_) {
+            engine::CarryRead lcr;
+            bool locallyCarried = engine::readCarry(c, &lcr) && lcr.beingCarried;
+            if (coop::bodyIsCarried(out.bodyState) || locallyCarried) {
+                d.parked = false; d.haveDest = false;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                continue;
+            }
+        }
         if (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched) {
             unsigned short localBs = engine::readBodyState(c);
             if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
@@ -770,41 +1583,191 @@ void Replicator::applyTargets(GameWorld* gw) {
         }
 
         // ---- Stage 3c: combat override (melee) --------------------------------
-        // The host streams a combat INTENT (task == TASK_COMBAT_MELEE, subject = the
-        // attack target's hand). Reproduce the cause: order the local copy to melee the
-        // same resolved target and let the join's own engine run the fight (draw, swing,
-        // footwork) - the proven "replicate the intent" path (sit/work/down all do this).
-        // We deliberately do NOT walk-drive or park a combatant: that fights the local
-        // combat movement and would freeze/slide the body. Position is only soft-corrected
-        // on large drift (the fight legitimately moves the body around). The attack order
-        // is issued once and re-armed on a throttle if the local copy disengaged while the
-        // host still reports combat. Combatants skip the AI-suspend path below (their AI
-        // must run to animate), reached only via this early `continue`.
+        // The host streams a combat INTENT (task == TASK_COMBAT_MELEE for an ACTIVE
+        // attacker, TASK_COMBAT_WAIT for one queued by the AttackSlotManager; subject
+        // = the attack target's hand). Reproduce the cause: order the local copy to
+        // melee the same resolved target and let the join's own engine run the fight
+        // (draw, swing, footwork) - the proven "replicate the intent" path.
+        // A WAITING combatant is a STANCE, not a failed attack: its copy holds the
+        // goal and menaces in the ring, and is never re-issued on a timer (each
+        // re-issue clearGoals-resets the local AI - THE teleporting-crowd artifact).
+        // Re-issues happen only on a new episode, a target change, or an ACTIVE copy
+        // that disengaged, with exponential backoff. Positional drift is corrected in
+        // graded bands (leave / walk-converge / logged teleport). Combatants skip the
+        // AI-suspend path below (their AI must run to animate), reached only via this
+        // early `continue`.
         if (coop::taskIsCombat(out.task)) {
-            if (!d.detached) d.detached = engine::detachFromTownAI(c);
+            bool hostWaiting = coop::taskIsCombatWait(out.task);
+            d.combatSeenTick = now; // feeds the disarm debounce below
+            // Detach only WORLD NPCs from their town AI. A driven SQUAD member must
+            // NEVER be detached: separateIntoMyOwnSquad changes its hand CONTAINER,
+            // which breaks the cross-client identity (the standers lesson, doctrine
+            // asymmetry rule) - found when player_combat first drove a peer-owned
+            // player character into a fight.
+            if (!isSquad && !d.detached) d.detached = engine::detachFromTownAI(c);
             engine::CombatRead lc;
-            bool localFighting = engine::readCombat(c, &lc) && lc.inCombat;
-            if (!d.combatArmed || (!localFighting && (now - d.combatTick) >= COMBAT_REISSUE_MS)) {
-                int r = engine::applyCombat(c, out);
-                d.combatArmed = true; d.combatTick = now;
-                { char b[176]; _snprintf(b, sizeof(b) - 1,
-                    "[combat] order hand=%u,%u tgt=%u,%u localFight=%d r=%d",
-                    out.hIndex, out.hSerial, out.sIndex, out.sSerial,
-                    localFighting ? 1 : 0, r); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            // modeActive is the STABLE engaged read; isInCombatMode flickers off
+            // between combo sections and slot rotations (the crowd lesson).
+            bool localFighting = engine::readCombat(c, &lc) &&
+                                 (lc.inCombat || lc.modeActive);
+            // The copy is engaged with the WRONG body (the local brawl grabbed it).
+            bool wrongLocalTgt = localFighting && lc.hasTarget &&
+                (lc.target[3] != out.sIndex || lc.target[4] != out.sSerial);
+            // The host retargeted since our last order.
+            bool tgtChanged = d.combatArmed &&
+                (d.combatTgtIdx != out.sIndex || d.combatTgtSer != out.sSerial);
+            // Backoff: 1.5 s base, doubling per re-issue in this episode, 6 s cap -
+            // a copy that legitimately cannot engage is not AI-reset forever.
+            unsigned long interval = COMBAT_REISSUE_MS;
+            if (d.combatOrders > 1) {
+                unsigned int shift = d.combatOrders - 1;
+                if (shift > 2) shift = 2;
+                interval = COMBAT_REISSUE_MS << shift;
+                if (interval > COMBAT_REISSUE_MAX_MS) interval = COMBAT_REISSUE_MAX_MS;
             }
-            // Soft position correction only (don't kill the gait): teleport-converge
-            // only when the bodies have drifted far apart.
-            if (haveActual && dist3(ax, ay, az, out.x, out.y, out.z) > COMBAT_SNAP_DIST)
-                engine::applyRaw(c, out);
+            bool reissue = false;
+            if (!d.combatArmed) {
+                reissue = true;
+                d.combatOrders = 0; // new episode: backoff restarts
+            } else if (tgtChanged && (now - d.combatTick) >= COMBAT_REISSUE_MS) {
+                reissue = true;     // retarget promptly (base throttle, no backoff)
+            } else if ((wrongLocalTgt || (!hostWaiting && !localFighting)) &&
+                       (now - d.combatTick) >= interval &&
+                       d.combatOrders <= COMBAT_REISSUE_CAP) {
+                // Active copy disengaged / fighting the wrong body - and the
+                // WAIT -> MELEE promotion case (the slot rotates every few
+                // seconds, so promotions recur: backoff applies, and after
+                // COMBAT_REISSUE_CAP failed attempts the copy is left to the
+                // position bands - a template that won't fight here (fear,
+                // blocked ring spot) must not be clearGoals-reset all fight;
+                // that WAS the artifact. The backoff counter deliberately
+                // never resets mid-episode: local engagement flickers (combo
+                // gaps), and a flicker-reset defeated the backoff (measured:
+                // 30 orders/hand, every one at the base interval).
+                reissue = true;
+            }
+            if (reissue) {
+                // A seat-INJECTED copy (applyRest committed a player order at the
+                // stool) ignores the goal-path attack: player orders outrank AI
+                // goals, so the body stays seated and the fight never starts (run
+                // 014713: the pre-seated striker re-ordered 15x, localFight=0 all
+                // window). Flush the order via the order-path attack, once.
+                bool breakSeat = d.taskApplied || d.issuedTask != TASK_NONE;
+                int r = engine::applyCombat(c, out, breakSeat);
+                if (breakSeat && r == 2) {
+                    d.taskApplied = false; d.taskBad = false;
+                    d.issuedTask  = TASK_NONE;
+                }
+                d.combatArmed = true; d.combatTick = now;
+                if (d.combatOrders < 1000000u) ++d.combatOrders;
+                d.combatTgtIdx = out.sIndex; d.combatTgtSer = out.sSerial;
+                { char b[192]; _snprintf(b, sizeof(b) - 1,
+                    "[combat] order hand=%u,%u tgt=%u,%u localFight=%d r=%d wait=%d n=%u%s",
+                    out.hIndex, out.hSerial, out.sIndex, out.sSerial,
+                    localFighting ? 1 : 0, r, hostWaiting ? 1 : 0, d.combatOrders,
+                    breakSeat ? " seatbrk=1" : "");
+                  b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            }
+            // Graded position correction (don't kill the gait): under the soft band
+            // the fight owns the footwork; drifted past it, a WAITING copy converges
+            // with a real walk (stance preserved, no AI reset); far gone, teleport
+            // and say so - but on a COOLDOWN: a snap that cannot stick (mid-stagger,
+            // stale interp while the host body sprints) must not re-fire every frame
+            // (measured: one hand snapped ~50x/s at constant drift).
+            // The walk band never runs while the copy is still ARMING (an active
+            // stance with re-issues left): walkTo is the player-move/HIGH_PRIORITY-
+            // destination path and it STOMPS a pending attack goal, so walk-driving
+            // there keeps the copy from ever engaging (player_combat: the striker
+            // must arm and land real blood on the victim's owner). Once armed - or
+            // once the arming budget is spent (a copy that won't fight here) - the
+            // walk band is what keeps a non-engaging body tracking the host's
+            // roaming brawl (combat_crowd: without it, medians hit 50+ u).
+            if (haveActual) {
+                bool arming = !hostWaiting && !localFighting &&
+                              d.combatOrders <= COMBAT_REISSUE_CAP;
+                float drift = dist3(ax, ay, az, out.x, out.y, out.z);
+                if (drift > COMBAT_SNAP_DIST &&
+                    (now - d.combatSnapTick) >= COMBAT_SNAP_COOL_MS) {
+                    engine::applyRaw(c, out);
+                    d.combatSnapTick = now;
+                    { char b[144]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] snap hand=%u,%u drift=%.1f wait=%d",
+                        out.hIndex, out.hSerial, drift, hostWaiting ? 1 : 0);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                } else if (drift > COMBAT_SOFT_DIST && !localFighting && !arming) {
+                    engine::walkTo(c, out.x, out.y, out.z, 0.0f);
+                }
+            }
             d.parked = false; d.haveDest = false;
             if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
             continue;
         }
-        // Host no longer reports combat for this body -> disarm so the next fight re-arms
-        // and the body falls back to the normal locomotion/rest drive below.
+        // Host no longer reports combat for this body. The stance rides the LOSSY
+        // entity batch and the engine's own combat read blips off mid-fight, so a
+        // short gap is NOISE: hold the fight (skip the rest-drive entirely) and
+        // only disarm - clearGoals + fall back to locomotion/rest - after a
+        // sustained combat-free window. Pre-debounce, every blip disarmed the copy
+        // (clearGoals), re-armed it next batch (another order), and the AI reset
+        // wandered it until the snap teleported it - the crowd artifact's second
+        // driver, alongside the waiting-stance re-issue loop.
         if (d.combatArmed) {
+            if ((now - d.combatSeenTick) < COMBAT_DISARM_MS) {
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                continue;
+            }
             d.combatArmed = false;
+            d.combatOrders = 0;
+            d.combatTgtIdx = 0; d.combatTgtSer = 0;
             engine::clearGoals(c); // drop the stale attack goal before re-parking
+        }
+
+        // ---- Carried-body sync (protocol 18): carrier self-heal ----------------
+        // The reliable pickup/drop edges do the work; this repairs the losses.
+        // A driven SQUAD carrier streaming TASK_CARRY_BODY whose local copy is
+        // not carrying that body gets a throttled local pickup (a lost/failed
+        // pickup event, or the carried body resolved late). A local copy still
+        // carrying after the stream stopped reporting the carry (debounced -
+        // stance samples ride the lossy batch) gets a local drop. The carrier
+        // itself then falls through to the ordinary locomotion drive: it walks
+        // like any squad member; the carried body follows its local attach.
+        if (carrySync_ && isSquad) {
+            if (coop::taskIsCarry(out.task)) {
+                d.carryNoSeeTick = 0;
+                engine::CarryRead lcr;
+                bool haveCr = engine::readCarry(c, &lcr);
+                bool carryingRight = haveCr && lcr.carrying &&
+                                     lcr.carried[3] == out.sIndex &&
+                                     lcr.carried[4] == out.sSerial;
+                if (haveCr && !carryingRight &&
+                    (now - d.carryHealTick) >= CARRY_HEAL_MS) {
+                    d.carryHealTick = now;
+                    unsigned int ch[5] = { out.sType, out.sContainer,
+                                           out.sContainerSerial,
+                                           out.sIndex, out.sSerial };
+                    bool ok = engine::applyPickup(gw, c, ch);
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[carry] HEAL PICKUP carrier=%u,%u carried=%u,%u ok=%d",
+                        out.hIndex, out.hSerial, out.sIndex, out.sSerial,
+                        ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            } else {
+                engine::CarryRead lcr;
+                if (engine::readCarry(c, &lcr) && lcr.carrying) {
+                    if (d.carryNoSeeTick == 0) {
+                        d.carryNoSeeTick = now;
+                    } else if ((now - d.carryNoSeeTick) > CARRY_DROP_MS) {
+                        d.carryNoSeeTick = 0;
+                        bool ok = engine::applyDrop(c, true);
+                        char b[144]; _snprintf(b, sizeof(b) - 1,
+                            "[carry] HEAL DROP carrier=%u,%u ok=%d",
+                            out.hIndex, out.hSerial, ok ? 1 : 0);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                } else {
+                    d.carryNoSeeTick = 0;
+                }
+            }
         }
 
         // AI-suspend decision is made BELOW, once we know whether this NPC is
@@ -828,6 +1791,53 @@ void Replicator::applyTargets(GameWorld* gw) {
                     out.hIndex, out.hSerial, (unsigned)out.rawTask, localKey,
                     gateAgree_, gateSamples_, pct);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+
+            // ---- Step 4: divergence-gated authority (doctrine 18, flagged) -----
+            // A world NPC whose LOCAL AI has agreed with the host's raw task for a
+            // sustained streak while staying in position is TRUSTED: its own AI is
+            // provably doing what the host's is, so we stop suspending + driving
+            // it (fewer fights with the AI, graceful under latency). Divergence or
+            // drift revokes trust instantly and the normal drive re-engages this
+            // same tick. Bodies in host-reported combat/down never reach here
+            // (their branches continue earlier), so trust only governs the
+            // locomotion/rest regime.
+            if (gateAuthority_) {
+                float drift = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 1e9f;
+                bool inPos = (drift <= TRUST_DRIFT_MAX);
+                if (agree && inPos) {
+                    if (d.agreeStreak < 1000000u) ++d.agreeStreak;
+                } else {
+                    d.agreeStreak = 0;
+                }
+                if (d.trusted) {
+                    if (agree && inPos) {
+                        // Stay trusted: no suspend (set not re-added), no drive.
+                        if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                        continue;
+                    }
+                    d.trusted = false;
+                    ++trustRevokes_;
+                    d.parked = false; d.haveDest = false;
+                    d.taskApplied = false; d.taskBad = false; d.goalsCleared = false;
+                    { char b[128]; _snprintf(b, sizeof(b) - 1,
+                        "[trust] revoke hand=%u,%u reason=%s drift=%.1f",
+                        out.hIndex, out.hSerial, agree ? "drift" : "task", drift);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    // fall through: the normal drive re-engages below this tick
+                } else if (d.agreeStreak >= TRUST_STREAK_FRAMES) {
+                    d.trusted = true;
+                    ++trustGrants_;
+                    // Hand the body back to its own AI cleanly.
+                    d.parked = false; d.haveDest = false;
+                    d.taskApplied = false; d.taskBad = false; d.goalsCleared = false;
+                    { char b[112]; _snprintf(b, sizeof(b) - 1,
+                        "[trust] grant hand=%u,%u streak=%u",
+                        out.hIndex, out.hSerial, d.agreeStreak);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    continue;
+                }
             }
 
             // Probe the "inhabit" lever: the first time we see a diverged NPC,
@@ -873,13 +1883,14 @@ void Replicator::applyTargets(GameWorld* gw) {
         // (Releasing node-anchored sitters to local AI was tried - Idea I4 - and
         // regressed: the freed AI wandered them off-host, CROSSCHECK 0.5, and it
         // still did not reliably sit them. So we suspend uniformly.)
-        if (probeAiSuspend_ && !isSquad) engine::addAiSuspend(c);
+        if (aiSuspend_ && !isSquad) engine::addAiSuspend(c);
 
         // Re-arm rest-pose reproduction whenever the body is genuinely moving, so
         // the next time it stops we re-evaluate the host's (possibly new) task.
         bool genuinelyMoving = isSquad ? hostMoving : npcMoving;
         if (genuinelyMoving) {
             d.taskApplied = false; d.taskBad = false; d.issuedTask = TASK_NONE;
+            d.goalsCleared = false; // next rest episode gets one fresh goal-clear
         }
 
         if (!isSquad) {
@@ -1008,17 +2019,76 @@ void Replicator::applyTargets(GameWorld* gw) {
         }
         if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
     }
-    if (probeAiSuspend_ && (now - aiLogTick_) > 3000) {
+    if (aiSuspend_ && (now - aiLogTick_) > 3000) {
         aiLogTick_ = now;
         char b[96];
         _snprintf(b, sizeof(b), "[ai] suspended=%u driven=%u",
                   engine::aiSuspendCount(), (unsigned)targets_.size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
+    if (gateAuthority_ && (now - trustLogTick_) > 3000) {
+        trustLogTick_ = now;
+        unsigned int trusted = 0;
+        for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it)
+            if (it->second.trusted) ++trusted;
+        char b[112];
+        _snprintf(b, sizeof(b), "[trust] trusted=%u driven=%u grants=%lu revokes=%lu",
+                  trusted, (unsigned)targets_.size() - trusted, trustGrants_, trustRevokes_);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+
+    // Step 6: age out long-stale entries so a session's worth of interest-boundary
+    // passers-by doesn't accumulate forever. Reliable-event latches are PRESERVED
+    // (a dead body must stay dead even while unstreamed); everything else is
+    // reconstructed from the stream if the entity ever returns.
+    const unsigned long TARGET_STALE_MS = 30000;
+    for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ) {
+        Driven& d = it->second;
+        bool stale   = (d.lastSeenMs == 0) || (now - d.lastSeenMs > TARGET_STALE_MS);
+        bool latched = d.deathLatched || d.koLatched;
+        if (stale && !latched) targets_.erase(it++);
+        else ++it;
+    }
+    // The authority hysteresis counters are pruned in enforceHostAuthority (by
+    // what its local-NPC enumeration actually saw), NOT here by targets_
+    // membership: a join-local NPC the host NEVER streamed is never in targets_,
+    // and erasing its counter every tick reset the unstreamed streak to 1 forever,
+    // so the suppress threshold (75 frames) was unreachable - the "phantom walker
+    // on the join that never gets hidden" bug.
+}
+
+void Replicator::sweepCarries(GameWorld* gw) {
+    (void)gw;
+    if (!carrySync_) return;
+    // The departed peer's stream will never author its drop edges, so any
+    // driven (non-owned) copy still carrying gets a local ragdoll drop here;
+    // the carried body then returns to the ordinary KO/down channels.
+    for (std::map<Key, Driven>::iterator it = targets_.begin();
+         it != targets_.end(); ++it) {
+        const Key& k = it->first;
+        if (ownHands_.find(k) != ownHands_.end()) continue;
+        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        if (!c) continue;
+        engine::CarryRead cr;
+        if (engine::readCarry(c, &cr) && cr.carrying) {
+            bool ok = engine::applyDrop(c, true);
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[carry] SWEEP DROP carrier=%u,%u ok=%d", k.i, k.s, ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        it->second.carryNoSeeTick = 0;
+    }
 }
 
 void Replicator::enforceHostAuthority(GameWorld* gw) {
     if (!gw) return;
+    // Hysteresis (step 5, spike 18): a hard streamed/unstreamed edge churned
+    // boundary NPCs. Suppress only after a sustained unstreamed run (~1 s), and
+    // restore only after a sustained streamed dwell (~2 s), counted in frames.
+    const unsigned int SUPPRESS_AFTER_FRAMES = 75;
+    const unsigned int RESTORE_AFTER_FRAMES  = 150;
+
     // Hands the host streamed a fresh sample for this tick = the authoritative set.
     std::set<Key> keep;
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
@@ -1031,32 +2101,56 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     static EntityState states[MAX_NPCS];
     unsigned int n = engine::listNpcs(gw, chars, states, MAX_NPCS);
 
+    // Prune counters for hands the enumeration no longer sees (left interest),
+    // preserving suppressed entries (a hidden body may drop out of the query but
+    // must keep its counters so the restore dwell works when it returns).
+    std::set<Key> seen;
+    for (unsigned int i = 0; i < n; ++i) seen.insert(keyOf(states[i]));
+    for (std::map<Key, AuthCount>::iterator it = authCount_.begin(); it != authCount_.end(); ) {
+        if (seen.find(it->first) == seen.end() &&
+            suppressed_.find(it->first) == suppressed_.end()) authCount_.erase(it++);
+        else ++it;
+    }
+
     for (unsigned int i = 0; i < n; ++i) {
         Key k = keyOf(states[i]);
-        bool streamed = keep.find(k) != keep.end();
+        // Streamed = the hand is in this tick's fresh set, OR the body pointer is
+        // one applyTargets drove this tick. The pointer check covers combat-
+        // detached NPCs: detachFromTownAI re-containers the body, so its LOCAL
+        // key differs from the streamed key and the hand lookup alone would
+        // suppress an actively-driven combatant (crowd copies froze mid-brawl).
+        bool streamed = (keep.find(k) != keep.end()) ||
+                        (drivenChars_.find(chars[i]) != drivenChars_.end());
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
+        AuthCount& ac = authCount_[k];
+        if (streamed) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
+        else          { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
         if (streamed) {
-            // Host owns it now: hand it back to the engine so the drive can pose it.
-            if (s != suppressed_.end()) {
+            // Host owns it again: hand it back once the stream has DWELLED (a
+            // boundary NPC that flickers into the set for a frame stays hidden).
+            if (s != suppressed_.end() && ac.streamed >= RESTORE_AFTER_FRAMES) {
                 engine::restoreNpc(gw, chars[i]);
                 suppressed_.erase(s);
-                { char b[96]; _snprintf(b, sizeof(b) - 1,
-                    "[authority] restore NPC hand=%u,%u (supp=%u)",
+                ++authRestores_;
+                { char b[112]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] restore NPC hand=%u,%u (supp=%u churn=%lu/%lu)",
                     states[i].hIndex, states[i].hSerial,
-                    (unsigned)suppressed_.size()); b[sizeof(b) - 1] = '\0';
-                  coop::logLine(b); }
+                    (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
+                  b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             }
         } else {
-            // Host isn't streaming it: hide + freeze so the local AI can't run a
-            // divergent (standing) copy on top of the host-driven world.
-            if (s == suppressed_.end()) {
+            // Host isn't streaming it: after the debounce, hide + freeze so the
+            // local AI can't run a divergent (standing) copy on top of the
+            // host-driven world.
+            if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
                 engine::suppressNpc(gw, chars[i]);
                 suppressed_[k] = chars[i];
-                { char b[96]; _snprintf(b, sizeof(b) - 1,
-                    "[authority] suppress NPC hand=%u,%u (streamed=%u local=%u supp=%u)",
+                ++authSuppresses_;
+                { char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] suppress NPC hand=%u,%u (streamed=%u local=%u supp=%u churn=%lu/%lu)",
                     states[i].hIndex, states[i].hSerial, (unsigned)keep.size(), n,
-                    (unsigned)suppressed_.size()); b[sizeof(b) - 1] = '\0';
-                  coop::logLine(b); }
+                    (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
+                  b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             }
         }
     }
@@ -1072,19 +2166,34 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
     // down to a standing park every few frames -> the body oscillated sit/stand and
     // mostly rendered standing. Holding through NONE keeps the seated pose sticky;
     // genuine stand-up is caught by the movement re-arm in applyTargets.
-    if (out.task != TASK_NONE && out.task != d.issuedTask) {
+    // Carried-body sync (protocol 18): TASK_CARRY_BODY is a SYNTHETIC marker
+    // (the carry self-heal in applyTargets owns it), not an engine task - never
+    // inject it as a pose. A stationary carrier just parks like a task-less body
+    // (the engine's own carry attach keeps the shoulder animation running).
+    bool syntheticCarry = coop::taskIsCarry(out.task);
+    if (!syntheticCarry && out.task != TASK_NONE && out.task != d.issuedTask) {
         { char b[96]; _snprintf(b, sizeof(b) - 1,
             "[pose] rest re-arm task %u -> %u", (unsigned)d.issuedTask,
             (unsigned)out.task); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
         d.taskApplied = false; d.taskBad = false; d.issuedTask = out.task;
     }
     // Commit a reproducible pose (sit/operate) at the SAME fixture, once.
-    if (out.task != TASK_NONE && !d.taskBad && !d.taskApplied) {
+    if (!syntheticCarry && out.task != TASK_NONE && !d.taskBad && !d.taskApplied) {
         // I9: detach from the town-AI FIRST (once) so nothing auto-tasks this NPC,
         // then reproduce the pose via the PLAYER-ORDER path (explicit seat location)
         // so it pins THIS stool instead of running SIT_AROUND's own seat search.
-        if (!d.detached) { d.detached = engine::detachFromTownAI(c); }
+        //
+        // Step-2 pruning candidate: with AI-suspend as the default quieting layer
+        // the town-AI's re-tasker never runs, so the detach (which carries the
+        // hand-identity hazard - it re-containers the body) may be redundant.
+        // detachUses_ measures how often this fires; KENSHICOOP_NO_DETACH=1 skips
+        // it for a manual A/B before any deletion.
+        if (!d.detached && !noDetach_) {
+            d.detached = engine::detachFromTownAI(c);
+            if (d.detached) ++detachUses_;
+        }
         int r = engine::applyTaskOrder(c, out);
+        ++sitOrders_;
         d.taskTick = now;
         { char b[176]; _snprintf(b, sizeof(b) - 1,
             "[pose] applyOrder hand=%u,%u task=%u subj=%u,%u,%u det=%d r=%d",
@@ -1114,6 +2223,14 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
     // host transform. Settle once (clean halt+teleport), then only re-place on
     // drift WITHOUT halting (halting every frame freezes the idle clip on frame 0).
     //
+    // Step-2 finding (2026-07-05 A/B): the once-on-rest-entry clearGoals variant
+    // was tried and REVERTED - coupled with suspension it degraded npc_sync
+    // smoothness/tracking, and the relapse counters below proved the residual
+    // quieting patchwork is still load-bearing even under AI-suspend (relapse
+    // fired ~100-1000x/run in BOTH modes). The per-tick clear stays; the QUIET
+    // counters stay as permanent health telemetry.
+    engine::clearGoals(c);
+    d.goalsCleared = true;
     // I10: a node-anchored stander (STAND_AT_NODE, not reproducible) that we
     // suspend mid-walk keeps EXECUTING its walk-to-node action, so held in place it
     // marches. END its current action once so the (already AI-suspended) body drops
@@ -1124,7 +2241,6 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
     // ORDER; a stander gets no replacement intent, so once detached into its own
     // squad it wanders off the spot (observed: standers went ABSENT). endAction
     // under the existing AI-suspend is enough to quiet the march without detaching.
-    engine::clearGoals(c);
     float gapOut = haveActual ? dist3(ax, ay, az, out.x, out.y, out.z) : 0.0f;
     if (!d.parked) {
         engine::endAction(c); // stop the residual walk -> idle (not march in place)
@@ -1136,10 +2252,16 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
     // walk action after settling and march again. Re-quiet only when the body
     // actually reports a walk motion while we hold it stationary (the precise
     // march signature), so a genuinely idle body's clip is never reset.
+    //
+    // Step-2 pruning candidate: under default AI-suspend the relapse source (the
+    // AI re-acquiring a walk) should be gone. quietRelapse_ counts every firing
+    // ("SCENARIO QUIET relapse=N" per run); sustained zeros = safe to delete.
     {
         bool reMoving = false; float reSpeed = 0.0f;
-        if (engine::readMotion(c, &reMoving, &reSpeed) && reMoving && reSpeed > 0.1f)
+        if (engine::readMotion(c, &reMoving, &reSpeed) && reMoving && reSpeed > 0.1f) {
             engine::endAction(c);
+            ++quietRelapse_;
+        }
     }
     engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
 }
@@ -1182,6 +2304,49 @@ void Replicator::logSmoothSummary() {
               restSampleFrames_, marchFrames_, marchFrac);
     m[sizeof(m) - 1] = '\0';
     coop::logLine(m);
+
+    // Step-2 pruning evidence: how often the legacy quieting patchwork actually
+    // fired this run. Sustained relapse=0 across regressions = the I11 re-quiet is
+    // dead code under default AI-suspend and can be deleted; detach counts feed the
+    // KENSHICOOP_NO_DETACH A/B decision.
+    char q[160];
+    _snprintf(q, sizeof(q) - 1,
+              "SCENARIO QUIET relapse=%lu sitOrders=%lu detach=%lu noDetach=%d",
+              quietRelapse_, sitOrders_, detachUses_, noDetach_ ? 1 : 0);
+    q[sizeof(q) - 1] = '\0';
+    coop::logLine(q);
+
+    // Step-4 evidence: how much of the driven set the divergence gate handed back
+    // to local AI. grants>0 = the mechanism engages; the npc_track oracle proves
+    // trusted bodies still track.
+    if (gateAuthority_) {
+        char t[128];
+        _snprintf(t, sizeof(t) - 1,
+                  "SCENARIO TRUST grants=%lu revokes=%lu", trustGrants_, trustRevokes_);
+        t[sizeof(t) - 1] = '\0';
+        coop::logLine(t);
+    }
+
+    // Step-5 evidence: suppression churn under the hysteresis band (split_interest
+    // metric; boundary flip-flops show up as high counts).
+    char au[112];
+    _snprintf(au, sizeof(au) - 1,
+              "SCENARIO AUTH suppresses=%lu restores=%lu", authSuppresses_, authRestores_);
+    au[sizeof(au) - 1] = '\0';
+    coop::logLine(au);
+
+    // Step-3 evidence: how many locally-simulated melee hits the damage guard
+    // intercepted vs passed through. guarded>0 in a combat scenario proves the
+    // hook engaged (complements the blood-flat vitals check).
+    if (dmgGuard_) {
+        unsigned long guarded = 0, passed = 0;
+        engine::damageGuardStats(&guarded, &passed);
+        char dg[112];
+        _snprintf(dg, sizeof(dg) - 1,
+                  "SCENARIO DMGGUARD guarded=%lu passed=%lu", guarded, passed);
+        dg[sizeof(dg) - 1] = '\0';
+        coop::logLine(dg);
+    }
 }
 
 } // namespace coop

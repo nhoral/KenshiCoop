@@ -40,8 +40,59 @@ typedef float          f32;
 // mirror of a drop: when a character picks a dropped weapon up, its owner authors a reliable
 // PICKUP intent and each peer relocates the REAL ground copy it has been tracking back into
 // that character's bag (world -> bag). Because the engine's spatial item query is unreliable
-// in towns, each client tracks the actual dropped Item* handle rather than re-finding it.
-const u16 PROTOCOL_VERSION = 11;
+// in towns, each client tracks the actual dropped Item* handle rather than re-finding it;
+// to 12 when the wall-clock TIME-SYNC channel (PKT_TIME_PING/PKT_TIME_PONG) was added -
+// the join periodically pings with its wall clock, the host echoes with its own, and the
+// join estimates the host-relative clock OFFSET (NTP-style, min-RTT filtered), logging
+// CLOCKSYNC lines the validation oracles use to time-align host/join logs across two
+// machines whose wall clocks disagree (a remote-play prerequisite);
+// to 13 when the owner-authoritative MEDICAL channel was added (phase 2 of the
+// player-combat/medical plan): PKT_MEDICAL streams an owned PLAYER-SQUAD
+// character's local-only medical model (blood, bleed, per-limb flesh+bandaging,
+// unc/dead flags) to the peer, change-gated + throttled, so driven copies render
+// true vitals instead of diverging forever (spikes 21-23); and PKT_TREATMENT
+// carries first aid administered ON a driven copy back to the body's OWNER
+// (per-limb bandage levels, raise-only apply) so cross-player healing lands on
+// the authoritative body. World NPCs stay on the events-only model;
+// to 14 when the CONSENSUS GAME-SPEED channel was added: each client's UI speed
+// (pause/1x/2x/3x) is a REQUEST (PKT_SPEED_REQ, join -> host; the host consumes
+// its own locally), the host arbitrates effective = min(requests) capped at 1x
+// while either player squad is in combat, and broadcasts PKT_SPEED_SET which
+// both sides apply. Divergent speeds would diverge every rate-based local
+// simulation (medical, hunger, cosmetic fights), so speed is consensus state;
+// to 15 when the combat intent split into ACTIVE vs WAITING stances
+// (TASK_COMBAT_WAIT): Kenshi's attack-slot system keeps most of a crowd
+// "engaged but queued", and driving those copies with the active-attack
+// re-issue loop reset their AI every throttle tick (clearGoals) and teleported
+// them around. The host now classifies its combatState (sword state) and the
+// join leaves waiting copies holding their goal in a menace ring;
+// to 16 when the medical channel grew to FULL anatomy + limb loss (full
+// medical/limb sync plan): MedicalPacket now carries every body part (head/
+// chest/stomach + limbs; humans have 7, MED_PARTS_MAX slots) with flesh AND
+// fleshStun AND bandaging AND juryRigging per part (keyed by anatomy index -
+// deterministic across clients loading the same save), plus the 4 LimbStates
+// (stump/crushed/replaced) and the robotic replacement template stringIDs;
+// TreatmentPacket forwards per-PART bandage levels; EVT_AMPUTATE/EVT_CRUSH
+// reliable events carry the limb-loss transitions (medical packet states are
+// the self-heal). Combat-scoped world NPCs now stream vitals too (host-
+// authoritative), so a battered NPC no longer renders pristine on the join;
+// to 17 when the owner-authoritative CHARACTER-STATS channel (PKT_STATS) was
+// added: CharStats (strength..smithing, xp) is local-only like medical, so a
+// character leveled mid-session stayed stale on the peer - and the peer's
+// engine RESOLVES real fights with that stale copy (a join character vs a
+// world NPC resolves on the HOST). Owned player-squad members only,
+// change-gated + throttled; the stream also self-heals the junk XP a driven
+// copy's cosmetic fights accumulate locally;
+// to 18 when CARRIED-BODY sync was added: picking up / carrying / dropping a
+// KO'd player-squad member. The CARRIER's owner authors reliable
+// EVT_PICKUP_BODY/EVT_DROP_BODY edges (subject = carried, actor = carrier);
+// continuous state self-heals them (synthetic TASK_CARRY_BODY on the carrier
+// + a BODY_CARRIED bodyState bit on the carried). Each machine executes the
+// SAME pickup between its LOCAL pair via the engine's own pickupObject, so
+// the shoulder attach / carry animation / transform-follow are engine-native
+// on both sides; a carried copy is exempt from the down-enforcement hold and
+// all position driving (the local attach owns its transform).
+const u16 PROTOCOL_VERSION = 18;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -54,7 +105,14 @@ enum PacketType {
     PKT_WORLD_ITEM       = 7, // RELIABLE world-item snapshot (Phase W1); WorldItemSnapshotHeader
     PKT_WORLD_ITEM_REMOVE= 8, // RELIABLE world-item cull by netId (Phase W1); WorldItemRemoveHeader
     PKT_WORLD_DROP       = 9, // RELIABLE conservation drop intent (Phase W2); WorldDropPacket
-    PKT_WORLD_PICKUP     = 10 // RELIABLE conservation pickup intent (Phase W3); WorldPickupPacket
+    PKT_WORLD_PICKUP     = 10,// RELIABLE conservation pickup intent (Phase W3); WorldPickupPacket
+    PKT_TIME_PING        = 11,// UNRELIABLE wall-clock sync probe (join -> host); TimePingPacket
+    PKT_TIME_PONG        = 12,// UNRELIABLE wall-clock sync echo (host -> join); TimePongPacket
+    PKT_MEDICAL          = 13,// RELIABLE owner-authoritative vitals snapshot; MedicalPacket
+    PKT_TREATMENT        = 14,// RELIABLE first-aid-on-a-driven-copy delta; TreatmentPacket
+    PKT_SPEED_REQ        = 15,// RELIABLE game-speed REQUEST (join -> host); SpeedPacket
+    PKT_SPEED_SET        = 16,// RELIABLE arbitrated effective speed (host -> join); SpeedPacket
+    PKT_STATS            = 17 // RELIABLE owner-authoritative CharStats snapshot; StatsPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -66,7 +124,15 @@ enum EventType {
     EVT_NONE     = 0,
     EVT_KNOCKOUT = 1, // subject went down / unconscious (BODY_DOWN edge)
     EVT_DEATH    = 2, // subject died (BODY_DEAD edge) - permanent, latched on the join
-    EVT_REVIVE   = 3  // subject stood back up (down -> upright edge)
+    EVT_REVIVE   = 3, // subject stood back up (down -> upright edge)
+    EVT_AMPUTATE = 4, // subject lost a limb (LimbState -> STUMP edge); arg = RobotLimbs::Limb
+    EVT_CRUSH    = 5, // subject's limb was crushed (LimbState -> CRUSHED edge); arg = limb
+    // Carried-body sync (protocol 18). subject = the CARRIED body, actor = the
+    // CARRIER (both resolve locally on each machine; the receiver performs the
+    // same pickup/drop between its LOCAL pair). arg: 0 for pickup; for drop,
+    // 1 = ragdoll the body on release (the normal ground drop), 0 = gentle.
+    EVT_PICKUP_BODY = 6, // carrier lifted the subject onto its shoulder
+    EVT_DROP_BODY   = 7  // carrier released the subject
 };
 
 // Sentinel ownerId meaning "all remote peers" (used on local disconnect to sweep
@@ -164,7 +230,26 @@ const u16 TASK_NONE = 0xFFFFu;
 // melee that same resolved target (let its own engine animate the fight). Combat takes
 // priority over rest poses, so it overrides any reproducible sit/work task that frame.
 const u16 TASK_COMBAT_MELEE = 0xFE00u;
-inline bool taskIsCombat(u16 t) { return t == TASK_COMBAT_MELEE; }
+
+// Combat STANCE split (protocol 15). Kenshi's AttackSlotManager grants only a
+// couple of attackers an active slot; the rest of an engaged crowd WAITS
+// (CIRCLE_MENACINGLY / WAIT_MENACINGLY / HESITATE sword states). A waiting
+// combatant is a stance, not a failed attack: the join must keep its copy
+// holding the attack goal in the menace ring, NOT re-issue the focused attack
+// on a timer (each re-issue clearGoals-resets the local AI, which wanders the
+// body until the drift snap teleports it - the exact artifact this fixes).
+const u16 TASK_COMBAT_WAIT = 0xFE01u;
+inline bool taskIsCombat(u16 t)     { return t == TASK_COMBAT_MELEE || t == TASK_COMBAT_WAIT; }
+inline bool taskIsCombatWait(u16 t) { return t == TASK_COMBAT_WAIT; }
+
+// Carried-body sync (protocol 18): synthetic task meaning "this body is
+// CARRYING the subject hand on its shoulder". Set by the carrier's owner
+// whenever Character::isCarryingSomething holds; the join uses it as the
+// SELF-HEAL for a lost EVT_PICKUP_BODY (a driven carrier reporting
+// TASK_CARRY_BODY whose local copy is not carrying gets a throttled local
+// pickup). Priority sits below combat, above rest poses.
+const u16 TASK_CARRY_BODY = 0xFE02u;
+inline bool taskIsCarry(u16 t) { return t == TASK_CARRY_BODY; }
 
 // bodyState bit-flags. A body is "down" (on the ground, not upright) when any of
 // BODY_DOWN / BODY_RAGDOLL / BODY_DEAD is set; BODY_CRAWL is an upright-ish stealth/
@@ -174,9 +259,17 @@ const u16 BODY_DOWN    = 1 << 0; // Character::isDown()  (KO'd / unconscious / c
 const u16 BODY_RAGDOLL = 1 << 1; // Character::isRagdoll()
 const u16 BODY_DEAD    = 1 << 2; // Character::isDead()
 const u16 BODY_CRAWL   = 1 << 3; // Character::isStealthModeOrCrawling()
+// Carried-body sync (protocol 18): Character::isBeingCarried(). A carried body
+// still reads down/ragdoll (it is KO'd, in carry-mode ragdoll), but it must be
+// EXEMPT from the down enforcement (knockDown/holdDown/co-locate snap) and all
+// position driving - its transform is owned by the local shoulder attach.
+const u16 BODY_CARRIED = 1 << 4;
 
 // True if the body should be treated as lying down (suppress walk-drive / parking).
-inline bool bodyIsDown(u16 s) { return (s & (BODY_DOWN | BODY_RAGDOLL | BODY_DEAD)) != 0; }
+// Deliberately ignores BODY_CARRIED: the receiver checks bodyIsCarried FIRST and
+// skips the down path entirely for a carried body.
+inline bool bodyIsDown(u16 s)    { return (s & (BODY_DOWN | BODY_RAGDOLL | BODY_DEAD)) != 0; }
+inline bool bodyIsCarried(u16 s) { return (s & BODY_CARRIED) != 0; }
 
 // An entity batch is: [EntityBatchHeader][EntityState * count]. ownerId tags the
 // streaming peer; the receiver attributes every contained hand to that owner so
@@ -360,6 +453,176 @@ struct WorldPickupPacket {
 
 // Reserved netId meaning "no/invalid world item".
 const u32 WORLD_ITEM_NETID_NONE = 0u;
+
+// ---- Wall-clock time sync (remote-play prerequisite) ------------------------
+// The validation oracles time-align host/join log samples by their "[HH:MM:SS.mmm]"
+// wall-clock stamps - which only works when both clients share a machine. This
+// channel measures the wall-clock OFFSET between the two machines, NTP-style:
+// the JOIN sends a TIME_PING carrying its wall clock t0 (ms since local midnight,
+// coop::wallClockMs()); the HOST immediately echoes a TIME_PONG with t0 plus its
+// own wall clock th; the join receives it at t1 and computes
+//     rtt    = t1 - t0
+//     offset = th + rtt/2 - t1      (host wall clock minus join wall clock)
+// keeping the minimum-RTT sample (least queueing noise). The join logs
+// "CLOCKSYNC offset=<ms> rtt=<ms> n=<samples>" lines which Get-ScenarioSeries
+// applies to normalize its log stamps into the host clock frame. Rides the
+// UNRELIABLE channel: a retransmitted (reliable) probe would carry a stale t0
+// and poison the RTT estimate; a lost probe just means one missing sample.
+// ---- Phase 2 (player combat + medical): owner-authoritative vitals sync -----
+// Kenshi's medical model (blood, bleed rate, per-limb flesh + bandaging) is
+// entirely LOCAL (spikes 21-23): a driven copy's vitals never move unless we
+// move them. For PLAYER-SQUAD characters - the bodies players actually care
+// about healing - each client streams its OWNED members' medical model to the
+// peer, which writes the fields straight onto its driven copy (killSubject/
+// woundSubject direct-write precedent). Change-gated on a quantized fingerprint
+// + throttled, with a periodic safety resend, on the RELIABLE channel (a change
+// must not be lost; steady state is silent). Unconscious/dead ride ALONG for
+// the record but the KO/death/revive EVENT channel remains the transition
+// authority (the latches in applyEvents). Protocol 16: the same packet also
+// carries combat-scoped WORLD-NPC vitals (host-authoritative) so a battered
+// NPC renders true health on the join instead of pristine.
+const u8 MED_UNCONSCIOUS = 1 << 0;
+const u8 MED_DEAD        = 1 << 1;
+
+// Protocol 16: one anatomy part's full damage model. Parts are keyed by their
+// ANATOMY INDEX (MedicalSystem::anatomy order) - both clients load the same
+// save/race data, so the ordering is deterministic (the same doctrine that keys
+// fixtures by hand). partType/side ride along as a sanity check: the receiver
+// verifies its local part at that index agrees before writing.
+struct MedPartEntry {
+    u8  used;      // 1 = this slot carries a part, 0 = empty tail slot
+    u8  partType;  // HealthPartStatus::PartType (TORSO/LEG/ARM/HEAD)
+    u8  side;      // LeftRight enum value
+    f32 flesh;     // cut HP    (-1 = unreadable; never written)
+    f32 fleshStun; // stun HP   (-1 = unreadable; never written)
+    f32 bandaging; // bandage level (-1 = unreadable)
+    f32 juryRig;   // robotics jury-rig level (-1 = unreadable)
+};
+
+// Max anatomy slots on the wire. Humans carry 7 parts (head, chest, stomach +
+// 4 limbs); 12 leaves headroom for modded/animal anatomies without a resize.
+const u8 MED_PARTS_MAX = 12;
+
+// LimbState wire values match kenshi's enum; 0xFF = unknown/unreadable on the
+// owner (never applied).
+const u8 LIMB_WIRE_ORIGINAL = 0;
+const u8 LIMB_WIRE_STUMP    = 1;
+const u8 LIMB_WIRE_REPLACED = 2;
+const u8 LIMB_WIRE_CRUSHED  = 3;
+const u8 LIMB_STATE_UNKNOWN = 0xFF;
+// Robotic replacement template stringID capacity (matches InvItemEntry).
+const u8 MED_SID_LEN = 48;
+
+struct MedicalPacket {
+    u8  type;    // = PKT_MEDICAL
+    u32 ownerId; // network player id of the sender (the subject's owner)
+    // subject hand (whose vitals these are)
+    u32 sType;
+    u32 sContainer;
+    u32 sContainerSerial;
+    u32 sIndex;
+    u32 sSerial;
+    f32 blood;
+    f32 bleedRate;
+    u8  flags;  // MED_* bits (advisory; events own the transitions)
+    u8  nParts; // filled MedPartEntry slots (anatomy order, from index 0)
+    MedPartEntry parts[MED_PARTS_MAX];
+    // Limb loss (protocol 16): LimbState per RobotLimbs::Limb order
+    // (LEFT_ARM, RIGHT_ARM, LEFT_LEG, RIGHT_LEG). Self-heal for the reliable
+    // EVT_AMPUTATE/EVT_CRUSH transitions (doctrine 16: state + events).
+    u8  limbState[4];
+    // Robotic replacement template stringID per limb (empty unless the
+    // matching limbState == LIMB_REPLACED). Lets the peer fabricate + fit
+    // the same prosthetic (Phase D).
+    char limbSid[4][48];
+};
+
+// First aid administered ON a driven copy, forwarded to the body's OWNER.
+// The healer's machine detects its local bandaging rising ABOVE the last
+// RECEIVED medical snapshot for that copy (a stream overwrite can only lower
+// it back, so the comparison is race-free) and sends the resulting per-PART
+// bandage LEVELS - not the per-frame applyFirstAid call stream (hot path).
+// The owner applies them raise-only (max(local, received)), which makes the
+// packet idempotent; the vitals stream then mirrors the healed state back to
+// everyone. treatId is per-sender monotonic for log correlation. Protocol 16:
+// levels are keyed by ANATOMY INDEX (all parts, not just the 4 limbs).
+struct TreatmentPacket {
+    u8  type;    // = PKT_TREATMENT
+    u32 ownerId; // network player id of the sender (the HEALER's machine)
+    u32 treatId; // monotonic per-sender (log correlation; apply is idempotent)
+    // subject hand (whose body was bandaged - owned by the RECEIVER)
+    u32 sType;
+    u32 sContainer;
+    u32 sContainerSerial;
+    u32 sIndex;
+    u32 sSerial;
+    f32 partBand[MED_PARTS_MAX]; // bandage level per anatomy part (-1 = not raised)
+};
+
+// Consensus game speed (pause/1x/2x/3x). As PKT_SPEED_REQ it carries one
+// client's REQUESTED speed (what its player last clicked) plus an IN_COMBAT
+// bit for that client's own squad; as PKT_SPEED_SET it carries the host's
+// arbitrated EFFECTIVE speed both engines must apply. Pause travels as
+// speed 0 (so min() gives "either can pause, both must raise"); the PAUSED
+// flag is kept explicit for log clarity. seq is per-sender monotonic so a
+// late retransmit never rolls back a newer decision.
+enum SpeedFlags {
+    SPEED_PAUSED    = 1,
+    SPEED_IN_COMBAT = 2
+};
+struct SpeedPacket {
+    u8  type;    // = PKT_SPEED_REQ or PKT_SPEED_SET
+    u32 ownerId; // network player id of the sender
+    u32 seq;     // monotonic per-sender (stale-packet guard)
+    f32 speed;   // requested/effective multiplier (0 = paused)
+    u8  flags;   // SPEED_* bits
+};
+
+// ---- Protocol 17: owner-authoritative character stats -----------------------
+// CharStats (attributes, weapon skills, craft skills, xp) is entirely LOCAL,
+// like the medical model - but unlike medical it also STEERS authoritative
+// outcomes on the peer: a join-owned character fighting a world NPC resolves
+// the real damage on the HOST, using the host's copy of that character's
+// stats. So each client streams its OWNED player-squad members' stats
+// (change-gated, ~1 Hz floor, reliable) and the peer writes them onto its
+// driven copy + recalculates derived values. The stream is also the self-heal
+// for junk XP a driven copy's cosmetic fights generate locally (the damage
+// guard blocks damage, not XP events). World NPCs are excluded: their
+// authoritative fights run on the host with the host's own (correct) stats.
+//
+// Slots are indexed by kenshi's StatsEnumerated (STAT_STRENGTH=1 ..
+// STAT_SMITHING_BOW=38, read via CharStats::getStatRef); slot 0 (STAT_NONE)
+// is unused. -1 = unreadable on the owner, never written by the receiver
+// (the medical convention).
+const u8 STATS_SLOT_MAX = 40; // headroom above STAT_END (39)
+
+struct StatsPacket {
+    u8  type;    // = PKT_STATS
+    u32 ownerId; // network player id of the sender (the subject's owner)
+    // subject hand (whose stats these are)
+    u32 sType;
+    u32 sContainer;
+    u32 sContainerSerial;
+    u32 sIndex;
+    u32 sSerial;
+    u8  nStats;  // filled slots (from index 1; receiver clamps to its own max)
+    f32 stats[STATS_SLOT_MAX]; // by StatsEnumerated index (-1 = unreadable)
+    f32 xp;                    // CharStats::xp (-1 = unreadable)
+    f32 freeAttributePoints;   // CharStats::freeAttributePoints (int on wire as f32; -1 = unreadable)
+};
+
+struct TimePingPacket {
+    u8  type;       // = PKT_TIME_PING
+    u32 nonce;      // echo-match key
+    u32 senderWallMs; // join's wallClockMs() at send
+};
+
+struct TimePongPacket {
+    u8  type;         // = PKT_TIME_PONG
+    u32 nonce;        // echoed from the ping
+    u32 echoWallMs;   // the ping's senderWallMs, echoed verbatim
+    u32 responderWallMs; // host's wallClockMs() at echo
+};
 
 #pragma pack(pop)
 

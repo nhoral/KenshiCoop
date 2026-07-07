@@ -34,6 +34,18 @@ class Scenario {
 public:
     virtual ~Scenario() {}
     virtual const char* name() const = 0;
+    // Called EVERY tick between local gameplay start and peer-ready arming.
+    // Scenarios that must capture a subject while the freshly-loaded world is
+    // still in its baked pose (the craft worker at the prop, the duelists at
+    // their spawn) PIN it on the first call and HOLD it on subsequent calls -
+    // the arming wait (a join-load, ~10-20 s) is long enough for faction AI to
+    // walk an unpinned subject away from where the save baked it. ctx.elapsedMs
+    // here is time since gameplay start (NOT the armed scenario clock).
+    virtual void onGameplay(const ScenarioContext&) {}
+    // Called ONCE when the scenario ARMS: at peer-ready (the first owned-entity
+    // batch from the peer - on the host, "the join is loaded + streaming"), or
+    // at the arm-timeout fallback. ctx.elapsedMs is measured from THIS moment,
+    // so every scripted action happens with the peer watching.
     virtual void onStart(const ScenarioContext& ctx) = 0;
     // Returns true when the scenario is complete (caller logs RESULT then holds).
     virtual bool onTick(const ScenarioContext& ctx) = 0;

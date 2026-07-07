@@ -373,8 +373,14 @@ These extend the numbered doctrine in `POSTMORTEM.md`:
     intent + body state; let the local engine produce the animation. Never stream
     clips/phases. This keeps the wire constant-cost per entity and idempotent.
 15. **A new behavior is a new (class -> lever-set) entry, not new netcode.** Pick
-    its apply lever, its quieting lever, and its guard; do not reuse the previous
-    class's lever blindly (the sit/stand asymmetry).
+    its apply lever and its guard; do not reuse the previous class's lever blindly
+    (the sit/stand asymmetry). *Amended 2026-07-05:* **AI-suspend (the
+    `periodicUpdate` decision-layer detour) is the UNIVERSAL quieting layer,
+    default-on for every host-driven world NPC on the join** - validated at
+    parity-or-better on the pose oracles (pose_state 0.972 vs 0.962). Classes now
+    differ only in their APPLY lever; the remaining per-class quieting moves
+    (`endAction` relapse re-quiets, sitter `detachFromTownAI`) are measured by
+    counters and pruned as the data allows.
 16. **State on the unreliable channel; transitions on the reliable channel.**
     Continuous state self-heals at 20 Hz; one-shot events (death, KO, hit) must not
     be lost - carry them on `PKT_EVENT`.
@@ -383,7 +389,12 @@ These extend the numbered doctrine in `POSTMORTEM.md`:
     "done" on a single screenshot.
 18. **Prefer divergence-gated authority where the local AI already agrees.** Use
     the `[gate]` signal to drive only what diverges; it scales the active driven
-    set down and degrades gracefully.
+    set down and degrades gracefully. *Promoted to default 2026-07-05 (step-4
+    A/B):* a world NPC whose local task has agreed with the host's `rawTask` for
+    ~2 s while in position enters TRUSTED mode (no suspend, no drive, cheap
+    monitor); task divergence or drift past tolerance re-engages the drive the
+    same tick. Measured: trusted ~5 of 12 driven bar NPCs, grants 5-8 per run,
+    tracking gates at parity. `KENSHICOOP_GATE_AUTHORITY=0` is the escape hatch.
 19. **For runtime-created content, replicate the CONTAINER's contents, not the item
     objects.** Items minted at runtime (craft output, loot) have host-only `hand`s
     that don't resolve on the peer, so stream a content DESCRIPTION (template
@@ -392,3 +403,248 @@ These extend the numbered doctrine in `POSTMORTEM.md`:
     so the channel stays quiet; reconcile is idempotent and loss-tolerant. (Mirrors
     doctrine 14 "replicate causes" one layer up: the container is the cause, the item
     instances are the effect.) See `POSTMORTEM.md` doctrine 23.
+20. **The join's simulation of driven bodies is COSMETIC; never let it write
+    authoritative state.** (2026-07-05, step 3.) Kenshi's medical model is
+    local-only, so a locally-simulated melee hit on a host-driven body would
+    diverge its health forever - there is no health stream to heal it. The
+    `hitByMeleeAttack` detour makes every locally-simulated hit on a non-owned
+    body report `HIT_MISSED` (damage guard, default-on for joins,
+    `KENSHICOOP_DAMAGE_GUARD=0` to disable); real outcomes (KO/death/revive)
+    arrive as reliable host events. The `damage_guard` oracle in `combat_kill`
+    reads the rendered bodies' blood on both clients: host victim bleeds, join
+    copy must not. Generalization: any local-only model (medical, hunger, ...)
+    a cosmetic simulation could touch needs the same one-way guard.
+21. **Interest is per-owned-tab-leader, and boundary membership needs
+    hysteresis.** (2026-07-05, step 5.) One capture sphere per squad-tab leader
+    - each side resolves the PEER's leader locally from the shared save, so the
+    world keeps streaming around BOTH players when they split up (validated by
+    `split_interest`; the old single-sphere design failed exactly this, spike
+    16). The 96-body cap splits across spheres, merged + deduped by hand.
+    Suppress an unstreamed NPC only after a sustained unstreamed run (~1 s) and
+    restore only after a ~2 s streamed dwell: a hard streamed/unstreamed edge
+    churned boundary NPCs (suppress/restore counters in `SCENARIO AUTH` lines
+    trend this). *Amended 2026-07-06 (two suppression bugs found together):*
+    (a) the hysteresis counters must be pruned by what the local enumeration
+    SAW this tick, not by driven-target membership - an NPC the host NEVER
+    streamed (join-local divergent spawn) was never in `targets_`, so its
+    counter was erased every tick and the suppress threshold was unreachable:
+    the "phantom walker on the join that never gets hidden" bug; (b) the
+    "streamed" test must also match by BODY POINTER against the set applyTargets
+    actually drove - a combat-driven world NPC is detached into its own squad
+    (its hand CONTAINER changes), so the hand-keyed streamed-set lookup missed
+    it and suppression froze copies mid-brawl once (a) let the counters run.
+22. **Quieting patchwork is pruned by counters, not by faith.** (2026-07-05,
+    step 2.) With AI-suspend default-on the I10/I11 relapse re-quiets and the
+    sitter detach were EXPECTED to be dead code; the counters said otherwise
+    (`SCENARIO QUIET relapse=449-2044` per run, both with and without
+    suspension), and the once-on-rest-entry clearGoals variant regressed
+    npc_sync when tried. The residual patchwork stays, the counters stay as
+    permanent health telemetry, and any future deletion must show sustained
+    zeros first.
+23. **Medical state resolves on the victim's OWNER; driven copies are
+    display-only.** (2026-07-06, player-combat/medical phases 2-3.) Kenshi's
+    medical model (blood, bleed, per-limb flesh/bandaging, KO/dead flags) is
+    local-only, so authority is assigned by the squad-tab partition: each
+    client is the single writer for its own tab's vitals. Three cooperating
+    pieces, protocol 13:
+    - **Damage guard on BOTH sides** (extends doctrine 20 to the host): a
+      driven peer-squad body never takes locally-simulated damage anywhere -
+      the cosmetic fight the other machine renders cannot diverge it.
+    - **`PKT_MEDICAL` vitals stream** (owner -> everyone, reliable,
+      change-gated by a quantized FNV hash + 400 ms floor + 3 s safety
+      resend): the owner publishes each owned player-squad member's vitals;
+      receivers write them onto the driven copy (`writeMedical`). Player-squad
+      only - world NPCs stay on the events-only model (doctrine 16).
+    - **`PKT_TREATMENT` forwarding** (healer -> owner, reliable): first aid
+      applied to a DRIVEN copy is detected as local bandaging rising above the
+      last RECEIVED level; the resulting per-limb bandage LEVELS (not the
+      per-frame call stream) go to the owner, who applies them raise-only
+      (idempotent, loss-tolerant); the vitals stream mirrors the result back.
+    Corollary paid for in run 014713: a seat-INJECTED driven copy holds a
+    player ORDER, and player orders outrank the AI goals the combat branch
+    uses - the copy sits through 15 attack orders without ever swinging. A
+    driven body entering combat from a committed pose must have that order
+    FLUSHED (order-path attack, `addOrder` clear=true) before the goal-path
+    attack can run (`seatbrk=1` in the `[combat] order` log line).
+24. **Game time is a CONSENSUS authority: effective speed = min of both
+    players' requests, host-arbitrated.** (2026-07-06, protocol 14.) Each
+    client simulates its own squad tab (medical, hunger, cosmetic fights), so
+    divergent game speeds diverge every rate-based system. A local speed
+    click is detected as a REQUEST (same own-write-vs-user-intent detection
+    as the treatment detector), sent reliable (`PKT_SPEED_REQ`); the host
+    computes `min(hostReq, joinReq)` - pause is speed 0, so "either can
+    pause, both must raise" falls out of min semantics - capped at 1x while
+    EITHER player squad is in combat (the join reports its combat bit in the
+    request; the cap never force-unpauses), and broadcasts `PKT_SPEED_SET`
+    (reliable, seq-guarded, 3 s safety resend). Both sides apply via the
+    engine's own `setGameSpeed`/`userPause` and record `lastApplied` so the
+    write is not re-detected as a click. Corollary: a DENIED request must
+    snap the clicker's engine back to the arbitrated speed the same tick -
+    a click is a request, never a local override, or the denied side runs
+    fast until the next SET (silent divergence). Validated by `speed_sync` +
+    `Test-SpeedSync` (denied lone raise, follow latency, match fraction,
+    combat window). `KENSHICOOP_SPEED_SYNC=0` is the escape hatch.
+25. **A queued combatant is a STANCE, not a failed attack: re-issue on target
+    mismatch, never on a timer against a slot-limited engine system.**
+    (2026-07-06, protocol 15.) Kenshi's AttackSlotManager grants only 1-2
+    attackers an active slot; the rest of an engaged crowd WAITS
+    (`CIRCLE_MENACINGLY`/`WAIT_MENACINGLY`/`HESITATE` sword states). The old
+    combat branch treated "not in combat mode" as "attack failed" and
+    re-issued the order every 1.5 s - each re-issue a `clearGoals` AI reset,
+    whose footwork drifted past the 6 u snap gate and teleported the copy
+    (manual session: 173 order lines, the same 5 waiting hands re-ordered all
+    fight). Five cooperating fixes:
+    - **Stream the stance** (`TASK_COMBAT_WAIT` vs `TASK_COMBAT_MELEE`, read
+      off `CombatClass::combatState`): a waiting copy gets the attack goal
+      ONCE and menaces in the ring; only stance/target changes touch it.
+    - **Read the STABLE engaged signal**: `isInCombatMode()` flickers off
+      between combo sections and slot rotations, and every flicker disarmed +
+      reset the peer's copies mid-fight; `CombatClass::combatModeActive` holds
+      for the whole engagement (both the host capture and the join's
+      local-fight read use it).
+    - **Debounce the disarm** (4 s): the stance rides the lossy entity batch;
+      a one-batch gap must hold the fight, not `clearGoals` + re-park.
+    - **Backoff + budget the re-issues** (1.5 s doubling to 6 s, ~6 orders per
+      episode, never flicker-reset): a copy that won't engage here is
+      position-driven from then on, not AI-reset forever.
+    - **Grade the position correction**: < 6 u the fight owns the footwork;
+      6-20 u walk-converge ONLY when not locally fighting and not still
+      arming (`walkTo` is the player-move path and STOMPS a pending attack
+      goal - walk-driving an arming striker kept it from ever swinging, which
+      broke player_combat's authoritative-damage path); > 20 u teleport, on a
+      3 s cooldown (an unstickable snap re-fired ~50x/s), logged as
+      `[combat] snap`.
+    Validated by `combat_crowd` + `Test-CombatCrowd` (both stances streamed,
+    re-issue count per hand, WAIT-stance snap count, per-hand median tracking
+    with DOWN samples excluded); regressions `combat_order`, `combat_kill`,
+    `player_combat` stay green.
+26. **Medical truth is the FULL anatomy plus limb topology, and world-NPC
+    vitals follow combat interest.** (2026-07-06, protocol 16.) Protocol 13
+    streamed only blood + 4 limbs' flesh/bandaging; Kenshi tracks ~7 parts per
+    human (head/chest/stomach + 4 limbs, `MedicalSystem::anatomy`) with TWO
+    damage tracks each (`flesh` cut, `fleshStun` stun) - so head wounds and
+    all stun damage silently diverged. Protocol 16 extends the same
+    owner-authoritative machinery instead of inventing new channels:
+    - **Full-anatomy snapshot** (`MedPartEntry[12]` keyed by anatomy index -
+      deterministic on a shared save; partType+side echoed as a write guard):
+      flesh + stun + bandaging + juryRig per part; the quantized hash and the
+      treatment rise-detector cover the full list, so first aid on a HEAD
+      wound forwards too.
+    - **Combat-scoped world-NPC vitals** (host -> join): NPCs fighting, being
+      fought, or down/dead within interest join the medical publish set
+      (change-gated, 1 Hz floor, 10 s stale window). The join's copies are
+      damage-guarded (doctrine 20), so the stream is the ONLY writer - a
+      battered host NPC now shows its true blood on the join. KO/death
+      remain event-authoritative (doctrine 16).
+    - **Limb loss = reliable edge + self-healing state** (doctrine 16 shape):
+      the owner emits `EVT_AMPUTATE`/`EVT_CRUSH` on a `LimbState` transition;
+      the packet carries all 4 `LimbState`s + robotic-limb template sids as
+      the self-heal. Peers apply via the engine's own `amputate`/`crushLimb`
+      (full effect chain: mesh detach, bleed, stats) with
+      `createSeveredItem=false` - only the WORLD AUTHORITY spawns the ground
+      item, which replicates as an ordinary W1 world-item proxy; a JOIN-side
+      amputation destroys its local duplicate and lets the host's proxy
+      stream back (`LIMB-ITEM DEDUPE`).
+    - **Robotic replacements** ride the same packet: `LIMB_REPLACED` + the
+      prosthetic's template sid; the peer fabricates via `createItem` (the
+      weapon/manufacturer lesson did NOT recur - limb templates resolve) and
+      fits it with `setRobotLimbItem(isLoadingASave=true)`.
+    Engine corollary: `RobotLimbs` is LAZILY allocated (null until first
+    limb loss) - always read limb state through `MedicalSystem::getLimbState`
+    (null robotLimbs == all-ORIGINAL); guarding on the pointer made every
+    healthy character report "unknown" and no-op'd the whole channel.
+    Validated by `limb_loss` (+ WAN) with `Test-LimbLoss` (stump latency,
+    stickiness, severed-item convergence), `Test-NpcVitals` on `combat_kill`
+    (median cross-side blood gap), and the extended `Test-MedicOrder`
+    (part/stun crossing). `KENSHICOOP_MED_SYNC=0` remains the escape hatch.
+27. **Character stats are owner-authoritative continuous state - and their
+    staleness is a GAMEPLAY bug, not a display one.** (2026-07-06, protocol
+    17.) `CharStats` (attributes, weapon/craft skills, xp) is entirely local,
+    like the medical model - but unlike medical, the PEER'S engine resolves
+    real outcomes with its copy of these numbers: a join-owned character
+    fighting a world NPC resolves the authoritative damage on the HOST
+    (doctrine 23), using the host's copy of that character's stats. Without
+    sync those are the save-load values all session, so a character leveled
+    mid-session fights at its old strength whenever the fight crosses the
+    partition. Driven copies also accumulate junk XP from cosmetic fights
+    (the damage guard blocks damage, not XP events). Protocol 17 reuses the
+    medical shape wholesale:
+    - **Owned player-squad members only** (`ownHands_`): each client streams
+      its own tabs' `CharStats` via `PKT_STATS` (all 38 `StatsEnumerated`
+      slots + xp + freeAttributePoints), change-gated on a 0.1-unit quantized
+      fingerprint with a 1 s floor + 5 s safety resend - stats creep slowly,
+      so the reliable channel is near-silent between level-ups.
+    - **World NPCs are deliberately EXCLUDED**: their authoritative fights
+      run on the host with the host's own (correct) local stats; streaming
+      them would be traffic without a consumer.
+    - **The receiver writes through the engine's own accessor**
+      (`CharStats::getStatRef(StatsEnumerated)` - no per-field offsets), then
+      calls `CharStats::periodicUpdate` so derived caches (attack/block
+      speed, run speed, encumbrance) refresh immediately; `-1` fields are
+      never written (the medical unreadable convention).
+    - **The stream is the XP-pollution self-heal**: whatever junk a driven
+      copy's cosmetic fights accrue locally, the owner's next snapshot
+      overwrites.
+    Known limitation (out of scope): session setup mirrors the host's save,
+    so join-side gains persist only in the join's own save - cross-session
+    persistence is a save/session-flow feature, not a sync-channel one.
+    Validated by `stats_sync` (+ WAN) with `Test-StatsSync` (raised stats
+    cross within budget, stay sticky, untouched control stat does not
+    drift); regressions `coop_presence`, `player_combat`, `medic_order`
+    (reliable-channel coexistence) stay green. `KENSHICOOP_STATS_SYNC=0` is
+    the escape hatch.
+28. **Carried bodies are reliable edges + engine-native local execution -
+    and the down-enforcement must get out of the way.** (2026-07-06,
+    protocol 18.) Carrying a KO'd body is a RELATIONSHIP between two
+    characters, not a property of one: replicating either body's transform
+    reproduces neither the shoulder attach nor the carry animation, and the
+    join's down-enforcement actively fights it (a carried body still reads
+    down/ragdoll, so `applyTargets` held it on the ground and teleported it
+    after the carrier - the dragged-body artifact). The doctrine-16 shape
+    applies to the relationship itself:
+    - **The CARRIER's owner authors the edges**: `publishOwned` extends the
+      `hostBody_` edge detector with the carried hand and emits reliable
+      `EVT_PICKUP_BODY`/`EVT_DROP_BODY` (subject = carried, actor =
+      carrier; drop arg = ragdoll). Owned player-squad carriers only -
+      world-NPC carry (kidnap/bounty) is a documented follow-up.
+    - **Each machine executes the SAME pickup between its LOCAL pair** via
+      the engine's own `Character::pickupObject`/`dropCarriedObject`, so
+      the attach, carry animation, and transform-follow are engine-native
+      on both sides - and the mechanism is direction-agnostic (own-tab,
+      cross-tab, either owner) because the receiver just mirrors the
+      relationship between its own instances. `applyPickup` is idempotent
+      (already carrying it = success; carrying something else = refused).
+    - **Continuous state self-heals the edges**: the carrier streams
+      synthetic `TASK_CARRY_BODY` + the carried hand (priority below
+      combat, above rest poses - and NEVER injected as a pose by
+      `applyRest`); the carried body streams a `BODY_CARRIED` bodyState
+      bit (excluded from `bodyIsDown`). A driven carrier reporting the
+      task while not locally carrying gets a throttled pickup (1.5 s); a
+      copy still carrying after the stream stopped reporting it gets a
+      debounced drop (3 s - the combat-disarm lesson: a one-batch blip
+      must not tear a valid carry down).
+    - **The carried carve-out** (the critical fix): a copy with streamed
+      `BODY_CARRIED` OR locally `isBeingCarried` skips the down override
+      entirely (no `knockDown`/`holdDown`/2u co-locate snap) and all
+      walk-drive/park paths - the local shoulder attach owns its
+      transform. `koLatched` is preserved, not cleared: the body is still
+      KO'd, and the hold re-engages the tick after the local drop.
+    - **Peer-left sweep**: a departed peer's stream can never author its
+      drop edges, so any driven copy still carrying gets a local ragdoll
+      drop (`sweepCarries`).
+    Scenario corollary: the scaffold KO's forced timer (8 s) expires
+    mid-carry and the engine truthfully stands the body up at the drop -
+    a test that needs a body to STAY down through a carry must have its
+    OWNER re-top the timer (`holdDown`, timer-only), not re-knockout it on
+    the shoulder.
+    Known limitations (out of scope): world-NPC carry needs the
+    NPC-authority/suppression interplay; placing a carried body into
+    beds/cages (`PUT_SOMEONE_IN_BED`/`PUT_IN_CAGE`) is a follow-up - after
+    a plain drop the existing KO/medical channels own the state.
+    Validated by `carry_order` (+ WAN) with `Test-CarryOrder` (pickup/drop
+    cross within budget in all three windows - own-tab, join-carries-host,
+    host-carries-join; the carried copy rides its carrier with ~0 median
+    same-tick gap; the dropped body is still down where no revive
+    follows); regressions `player_ko` (the touched KO-hold path),
+    `medic_order`, `combat_kill`, `coop_presence` stay green.
+    `KENSHICOOP_CARRY_SYNC=0` is the escape hatch.

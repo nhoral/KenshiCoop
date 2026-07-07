@@ -75,7 +75,7 @@ void coopErr(const char* msg) { coop::logErrLine(msg); ErrorLog(msg); }
 // Drain peer connect/leave events and surface a single game-thread confirmation
 // per event. The net thread already logs the handshake; this proves the event
 // reached the game thread cleanly (and is where later stages spawn/sweep).
-void processNetEvents() {
+void processNetEvents(GameWorld* gw) {
     std::deque<coop::u32> conns, leaves;
     g_inbound.drainConnects(conns);
     g_inbound.drainLeaves(leaves);
@@ -91,6 +91,9 @@ void processNetEvents() {
         _snprintf(b, sizeof(b) - 1, "handshake: peer left id=%u", (unsigned)*it);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
+        // Carried-body sync (protocol 18): the departed peer's stream will never
+        // author its drop edges - release any carry its driven copies still hold.
+        if (gw && g_cfg.carrySync) g_repl.sweepCarries(gw);
     }
 }
 
@@ -117,7 +120,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         TerminateProcess(GetCurrentProcess(), 0);
     }
 
-    processNetEvents();
+    processNetEvents(gw);
 
     // Test-scene setup: host spawns the controlled scene ONCE, a few seconds after
     // gameplay starts, then leaves the game running so the user can arrange the
@@ -259,22 +262,80 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         // weapon can't be rebuilt via the W1 proxy path). Bidirectional; gated on worldSync.
         if (g_cfg.worldSync)
             g_repl.detectAndPublishWeaponDrops(gw, g_net, g_net.localId());
+        // Phase 2 (player combat + medical): owner-authoritative vitals sync for
+        // player-squad members, both directions. publishMedical streams OUR
+        // members' medical model (change-gated, reliable); applyMedical writes
+        // received snapshots onto the peer copies we drive AND forwards any
+        // local first aid administered on those copies back to their owner;
+        // applyTreatments lands forwarded first aid on the bodies we own.
+        // Ordered after publishOwned (they use the ownHands_ set it refreshes).
+        if (g_cfg.medSync) {
+            g_repl.publishMedical(gw, g_net, g_net.localId());
+            g_repl.applyMedical(gw, g_inbound, g_net, g_net.localId());
+            g_repl.applyTreatments(gw, g_inbound);
+        }
+        // Character stats sync (protocol 17): owner-authoritative CharStats
+        // stream for player-squad members, both directions. publishStats
+        // streams OUR members' stats (change-gated, reliable); applyStats
+        // writes received snapshots onto the peer copies we drive. Ordered
+        // after publishOwned (they use the ownHands_ set it refreshes).
+        if (g_cfg.statsSync) {
+            g_repl.publishStats(gw, g_net, g_net.localId());
+            g_repl.applyStats(gw, g_inbound);
+        }
+        // Consensus game-speed sync: detect local speed clicks as REQUESTS,
+        // host arbitrates effective = min(requests) (capped at 1x while either
+        // player squad fights) and broadcasts; the join applies the SET. Runs
+        // after publishOwned (the combat flag samples the ownHands_ set).
+        if (g_cfg.speedSync)
+            g_repl.syncSpeed(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
     }
 
     // Scenario onStart fires once, BEFORE the engine tick, so a host-issued move
     // order takes effect this frame.
+    //
+    // PEER-READY ARMING: the scenario clock does NOT start at gameplay start - it
+    // starts when this client first receives a peer's owned-entity batch
+    // (Inbound::sawRemoteEntity). On the HOST that flips true exactly when the
+    // JOIN is loaded + streaming, so every scripted host action (orders, kills,
+    // item adds - all timed off ctx.elapsedMs) happens with the join watching,
+    // instead of racing its load screen. On the JOIN the host's stream is already
+    // arriving by the time it reaches gameplay, so it arms ~immediately - which
+    // also aligns both clients' scenario clocks to roughly the same wall moment.
+    // Fallback: arm anyway after scenarioArmTimeoutMs of gameplay (peer never
+    // connected / host-only diagnostics); 0 = arm immediately (spike runs).
     if (g_scenario && g_gameStarted && gw && !g_scenarioStarted) {
-        g_scenarioStarted   = true;
-        g_scenarioStartTick = GetTickCount();
-        coop::ScenarioContext ctx;
-        ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
-        ctx.elapsedMs = 0; ctx.tick = g_scenarioTick;
-        ctx.peerReady = g_inbound.sawRemoteEntity();
-        char m[160];
-        _snprintf(m, sizeof(m) - 1, "SCENARIO %s start", g_scenario->name());
-        m[sizeof(m) - 1] = '\0';
-        coopLog(m);
-        g_scenario->onStart(ctx);
+        bool  peerReady = g_inbound.sawRemoteEntity();
+        DWORD waitedMs  = GetTickCount() - g_gameStartTick;
+        bool  fallback  = (g_cfg.scenarioArmTimeoutMs == 0) ||
+                          (waitedMs >= (DWORD)g_cfg.scenarioArmTimeoutMs);
+        // Pre-arm phase: every tick until arming, let the scenario pin/hold its
+        // subjects while the freshly-loaded world is still in its baked pose
+        // (waiting a join-load before pinning loses wandering NPCs).
+        {
+            coop::ScenarioContext pctx;
+            pctx.gw = gw; pctx.isHost = g_cfg.isHost; pctx.localId = g_net.localId();
+            pctx.elapsedMs = waitedMs; pctx.tick = g_scenarioTick;
+            pctx.peerReady = peerReady;
+            g_scenario->onGameplay(pctx);
+        }
+        if (peerReady || fallback) {
+            g_scenarioStarted   = true;
+            g_scenarioStartTick = GetTickCount();
+            coop::ScenarioContext ctx;
+            ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
+            ctx.elapsedMs = 0; ctx.tick = g_scenarioTick;
+            ctx.peerReady = peerReady;
+            char m[200];
+            _snprintf(m, sizeof(m) - 1, "SCENARIO arm trigger=%s waitedMs=%lu",
+                      peerReady ? "peer-ready" : "timeout", (unsigned long)waitedMs);
+            m[sizeof(m) - 1] = '\0';
+            coopLog(m);
+            _snprintf(m, sizeof(m) - 1, "SCENARIO %s start", g_scenario->name());
+            m[sizeof(m) - 1] = '\0';
+            coopLog(m);
+            g_scenario->onStart(ctx);
+        }
     }
 
     g_mainLoop_orig(gw, dt); // run the engine (incl. local AI)
@@ -383,9 +444,19 @@ void startNetworking() {
 // this must NOT be extern "C".
 __declspec(dllexport) void startPlugin() {
     coop::loadConfig(g_cfg);
+    // The fake clock skew must be armed BEFORE the first log line so every
+    // timestamp in this run (and every time-sync packet) shares the skewed clock.
+    coop::logSetFakeSkewMs(g_cfg.fakeClockSkewMs);
     coop::logInit(g_cfg.logPath.c_str(), g_cfg.isHost ? "HOST" : "JOIN");
 
     coopLog("KenshiCoop loaded! (clean rebuild)");
+    if (g_cfg.fakeClockSkewMs != 0) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "KenshiCoop: FAKE clock skew injected: %+ld ms",
+                  g_cfg.fakeClockSkewMs);
+        b[sizeof(b) - 1] = '\0';
+        coopLog(b);
+    }
     // Build stamp: changes every compile, so the test runner can confirm a fresh
     // DLL is actually deployed (anti-stale guard) rather than an old cached copy.
     {
@@ -437,19 +508,56 @@ __declspec(dllexport) void startPlugin() {
         coopLog(m.c_str());
     }
 
+    // Carried-body sync (protocol 18, default ON): reliable pickup/drop edges +
+    // self-healing carried state. KENSHICOOP_CARRY_SYNC=0 is the A/B escape hatch.
+    g_repl.setCarrySync(g_cfg.carrySync);
+
     // AI-gating probe (join side): recruit diverged NPCs to test the inhabit lever.
     if (!g_cfg.isHost && g_cfg.probeRecruit) g_repl.setProbeRecruit(true);
 
-    // AI-suspend probe (join side): detour Character::periodicUpdate so host-driven
-    // NPCs stop self-tasking (decision layer off) while still animating. Faction is
-    // untouched - we just hold the body's current action instead of letting the AI
-    // re-decide and wander/thrash.
-    if (!g_cfg.isHost && g_cfg.probeAiSuspend) {
+    // AI-suspend (join side, DEFAULT ON): detour Character::periodicUpdate so
+    // host-driven NPCs stop self-tasking (decision layer off) while still
+    // animating. Faction is untouched - we hold the body's current action instead
+    // of letting the AI re-decide and wander/thrash. This is the universal
+    // QUIETING layer (doctrine 15 amendment); per-class APPLY levers sit on top.
+    // KENSHICOOP_AI_SUSPEND=0 disables (A/B escape hatch).
+    if (!g_cfg.isHost && g_cfg.aiSuspend) {
         if (coop::engine::installAiSuspendHook()) {
-            g_repl.setProbeAiSuspend(true);
-            coopLog("[ai] periodicUpdate detour installed; AI-suspend probe ON");
+            g_repl.setAiSuspend(true);
+            coopLog("[ai] periodicUpdate detour installed; AI-suspend ON (default)");
         } else {
-            coopLog("[ai] FAILED to install periodicUpdate detour; probe disabled");
+            coopLog("[ai] FAILED to install periodicUpdate detour; AI-suspend disabled");
+        }
+    }
+    // Step-2 experiment: sitter no-detach A/B (manual runs only; off by default).
+    if (!g_cfg.isHost && g_cfg.noDetach) {
+        g_repl.setNoDetach(true);
+        coopLog("[quiet] KENSHICOOP_NO_DETACH=1: sitter detachFromTownAI SKIPPED (experiment)");
+    }
+
+    // Divergence-gated authority (join side, DEFAULT ON since the step-4 A/B):
+    // trust world NPCs whose local AI sustainedly agrees with the host; drive
+    // only divergence. KENSHICOOP_GATE_AUTHORITY=0 disables (A/B escape hatch).
+    if (!g_cfg.isHost && g_cfg.gateAuthority) {
+        g_repl.setGateAuthority(true);
+        coopLog("[trust] divergence-gated authority ON (default; KENSHICOOP_GATE_AUTHORITY=0 disables)");
+    }
+
+    // Damage guard (BOTH sides, DEFAULT ON): locally-simulated melee hits on
+    // driven bodies are suppressed (HIT_MISSED) so cosmetic fights cannot diverge
+    // the local-only medical model. The guard set is "every body this client
+    // drives": the peer's world-NPC copies on the join, the peer's SQUAD-member
+    // copies on the host (host-side extension 2026-07-06 - phase-1 player_combat
+    // measured the host's copy of a join victim bleeding 40+ blood while the
+    // join's guarded copies stayed at 0). KENSHICOOP_DAMAGE_GUARD=0 disables.
+    if (g_cfg.damageGuard) {
+        if (coop::engine::installDamageGuardHook()) {
+            g_repl.setDamageGuard(true);
+            coopLog(g_cfg.isHost
+                ? "[dmg] hitByMeleeAttack detour installed; damage guard ON (host, driven peer-squad bodies)"
+                : "[dmg] hitByMeleeAttack detour installed; damage guard ON (default)");
+        } else {
+            coopLog("[dmg] FAILED to install hitByMeleeAttack detour; damage guard disabled");
         }
     }
 

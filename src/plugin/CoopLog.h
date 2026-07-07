@@ -22,6 +22,19 @@ namespace coop {
 // short mode tag (e.g. "HOST"/"JOIN"). Safe to call once at plugin load.
 void logInit(const char* path, const char* modeTag);
 
+// The wall clock every timestamp in this plugin derives from: milliseconds
+// since local midnight PLUS the injected fake skew (see logSetFakeSkewMs).
+// Both the log-line "[HH:MM:SS.mmm]" stamps AND the wire time-sync packets
+// (NetLink CLOCKSYNC) read THIS function, so an injected skew shifts them
+// together - which is exactly what the clock-skew validation relies on: the
+// join's log stamps drift by +S while its estimated host-offset reads -S, and
+// the oracles' offset correction must recover alignment. Thread-safe.
+unsigned long wallClockMs();
+
+// Inject a fake wall-clock skew (ms, may be negative). Set once at startup from
+// KENSHICOOP_FAKE_CLOCK_SKEW_MS (join only) BEFORE logInit. 0 = real clock.
+void logSetFakeSkewMs(long skewMs);
+
 // Append one INFO/ERROR line (timestamped, tagged) and flush. Thread-safe.
 void logLine(const char* msg);
 void logErrLine(const char* msg);

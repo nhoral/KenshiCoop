@@ -11,6 +11,7 @@
 
 #include "Engine.h"
 #include "../CoopLog.h"
+#include "../../netproto/ContentHash.h" // invEntryHash / sectionNameHash (shared with prototest)
 
 #include <core/Functions.h>         // KenshiLib::GetRealAddress
 #include <kenshi/GameWorld.h>       // GameWorld::player
@@ -26,6 +27,8 @@
 #include <kenshi/Inventory.h>       // Inventory (Phase 4a container contents)
 #include <kenshi/Item.h>            // Item / InventoryItemBase (quantity/quality/equipped)
 #include <kenshi/CharBody.h>        // CharBody::currentAction / _NV_setCurrentAction
+#include <kenshi/CombatClass.h>     // CombatClass::combatState (active-vs-waiting stance)
+#include <kenshi/CharStats.h>       // CharStats (protocol 17 stats sync)
 #include <kenshi/Tasker.h>          // Tasker::key() -> TaskType, Tasker::subject (hand)
 #include <kenshi/util/hand.h>       // hand (5-field identity, getRootObject)
 #include <kenshi/util/lektor.h>     // lektor<T> (playerCharacters, interest query)
@@ -130,6 +133,35 @@ typedef void      (__fastcall* RagdollModeFn)(Character* self, bool on, int part
 // Unlike a bare ragdoll (which a healthy loaded NPC instantly fights out of), the KO
 // timer collapses the body AND holds it down, so it stays cleanly on the ground.
 typedef void      (__fastcall* MedFloatFn)(MedicalSystem* self, float v);
+// Limb-loss replication (protocol 16): the engine's own limb-loss paths, so a
+// replicated amputation runs the full effect chain (mesh detach, bleed, stats).
+// amputate takes the force by const& (== a pointer at the ABI level).
+typedef void      (__fastcall* MedAmputateFn)(MedicalSystem* self, int limb,
+                                              bool createSeveredItem,
+                                              const Ogre::Vector3* force);
+typedef void      (__fastcall* MedCrushLimbFn)(MedicalSystem* self, int limb);
+typedef void      (__fastcall* MedSetRobotLimbFn)(MedicalSystem* self, int limb,
+                                                  Item* item, bool isLoadingASave);
+// MedicalSystem::getLimbState: the engine's own accessor. MUST be used instead of
+// robotLimbs->states[] - robotLimbs is allocated LAZILY (null on any character
+// that never lost a limb), and reading through it made every healthy character
+// report 0xFF "unknown" limb states (the limb_loss ok=0 bug).
+typedef int       (__fastcall* MedGetLimbStateFn)(const MedicalSystem* self, int limb);
+// Character stats sync (protocol 17): CharStats::getStatRef(StatsEnumerated)
+// returns the RAW stat slot by enum (float& == float* at the ABI level), so we
+// need no per-field offsets; CharStats::periodicUpdate (via the public _NV_
+// wrapper) recalculates the derived caches (attack/block speed, run speed,
+// encumbrance) after a write.
+typedef float*    (__fastcall* StatsGetRefFn)(CharStats* self, int what);
+typedef void      (__fastcall* StatsRecalcFn)(CharStats* self);
+// Carried-body sync (protocol 18): pickupObject runs the engine's full pickup
+// chain on the CARRIER (carry-mode ragdoll on `who`, shoulder bone attach,
+// carry animation, transform-follow); dropCarriedObject is its inverse
+// (ragdollHim = drop the body limp on the ground, removeOnly = detach without
+// the physical drop - we always pass false).
+typedef void      (__fastcall* PickupObjectFn)(Character* self, Character* who);
+typedef void      (__fastcall* DropCarriedFn)(Character* self, bool ragdollHim,
+                                              bool removeOnly);
 
 TaskerKeyFn   g_taskerKeyFn   = 0;
 TaskerDescFn  g_taskerDescFn  = 0;
@@ -143,6 +175,32 @@ EndActionFn     g_endActionFn     = 0;
 RagdollModeFn   g_ragdollModeFn   = 0;
 MedFloatFn      g_knockoutFn      = 0;
 MedFloatFn      g_knockoutForceFn = 0;
+MedAmputateFn     g_medAmputateFn     = 0;
+MedCrushLimbFn    g_medCrushLimbFn    = 0;
+MedSetRobotLimbFn g_medSetRobotLimbFn = 0;
+MedGetLimbStateFn g_medGetLimbStateFn = 0;
+StatsGetRefFn     g_statsGetRefFn     = 0;
+StatsRecalcFn     g_statsRecalcFn     = 0;
+PickupObjectFn    g_pickupObjectFn    = 0;
+DropCarriedFn     g_dropCarriedFn     = 0;
+
+// Limb state with the engine's null policy: robotLimbs is lazily allocated, and
+// a null robotLimbs means "no limb ever lost/replaced" == ORIGINAL on all four.
+// Caller holds SEH.
+static unsigned char limbStateOf(MedicalSystem* med, int limb) {
+    if (g_medGetLimbStateFn) return (unsigned char)g_medGetLimbStateFn(med, limb);
+    RobotLimbs* rl = med ? med->robotLimbs : 0;
+    return rl ? (unsigned char)rl->states[limb] : (unsigned char)LIMB_ORIGINAL;
+}
+
+// Consensus game-speed sync: the engine's own speed setters, so an applied
+// consensus speed updates the UI buttons/audio exactly like a real click.
+// GameWorld::setGameSpeed(speed, click) drives frameSpeedMult; userPause(p)
+// drives the user-pause flag (0x8B9) independent of the multiplier.
+typedef void (__fastcall* SetGameSpeedFn)(GameWorld* self, float speed, bool click);
+typedef void (__fastcall* UserPauseFn)(GameWorld* self, bool p);
+SetGameSpeedFn g_setGameSpeedFn = 0;
+UserPauseFn    g_userPauseFn    = 0;
 
 // AI-gating probe lever: PlayerInterface::recruit(Character*, bool) adds an NPC
 // to the local player's squad (the "inhabit" path). A recruited body stops
@@ -170,6 +228,37 @@ void __fastcall periodicUpdate_hook(Character* self) {
         return; // decision layer suspended: host drives the task, AI stays quiet
     }
     g_periodicOrig(self);
+}
+
+// Join-side damage guard. Character::hitByMeleeAttack is where a landed melee
+// swing applies its Damages to the victim (wounds, blood loss, KO math). On the
+// join, fights involving host-authoritative bodies are COSMETIC - intent
+// replication makes the copies swing at each other so the fight renders, but the
+// outcome (KO/death) arrives from the host as reliable events. Without this
+// detour the cosmetic swings apply REAL local damage to the join's copies, and
+// Kenshi's medical model is local-only (spikes 21-27: blood/limbs/bleed never
+// cross the wire), so that damage silently diverges forever. For guarded victims
+// we skip the engine's hit path entirely and report HIT_MISSED - no damage, no
+// wound, no local KO; posture/outcome remain host-authoritative.
+// Same safety shape as periodicUpdate_hook: 'self' is only compared as a key.
+typedef HitMaterialType (__fastcall* HitByMeleeFn)(
+    Character* self, CutDirection dir, Damages& damage, Character* who,
+    CombatTechniqueData* attack, int comboID);
+HitByMeleeFn          g_hitByMeleeOrig = 0;
+std::set<Character*>  g_damageGuarded;
+unsigned long         g_dmgGuardedHits = 0; // swings intercepted (conformance signal)
+unsigned long         g_dmgPassedHits  = 0; // swings passed through to the engine
+
+HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
+                                           Damages& damage, Character* who,
+                                           CombatTechniqueData* attack, int comboID) {
+    if (!g_damageGuarded.empty() &&
+        g_damageGuarded.find(self) != g_damageGuarded.end()) {
+        ++g_dmgGuardedHits;
+        return HIT_MISSED; // cosmetic fight: the local swing never lands
+    }
+    ++g_dmgPassedHits;
+    return g_hitByMeleeOrig(self, dir, damage, who, attack, comboID);
 }
 
 // Test-scene spawning. createRandomCharacter / createBuilding take Vector3 (and
@@ -264,6 +353,9 @@ CharBodyBoolFn   g_isDownFn        = 0;
 CharBodyBoolFn   g_isRagdollFn     = 0;
 CharBodyBoolFn   g_isDeadCharFn    = 0;
 CharBodyBoolFn   g_isCrawlFn       = 0;
+// Carried-body sync (protocol 18): Character::isBeingCarried, same bare bool
+// getter ABI as the body-state reads above.
+CharBodyBoolFn   g_isBeingCarriedFn = 0;
 
 // Combat reads (L5 probe, Phase 3c). getAttackTarget returns a `hand` BY VALUE, so
 // it uses the same member-struct-return ABI as getBoneWorldPosition: this=RCX,
@@ -272,8 +364,10 @@ CharBodyBoolFn   g_isCrawlFn       = 0;
 // getters that reuse CharBodyBoolFn (this=RCX, returns bool).
 typedef hand* (__fastcall* GetAttackTargetFn)(Character* self, hand* ret);
 typedef bool  (__fastcall* InCombatModeFn)(Character* self, bool melee, bool ranged);
+typedef CombatClass* (__fastcall* GetCombatClassFn)(Character* self);
 GetAttackTargetFn g_getAttackTargetFn = 0;
 InCombatModeFn    g_inCombatModeFn    = 0;
+GetCombatClassFn  g_getCombatClassFn  = 0;
 CharBodyBoolFn    g_inRangedModeFn    = 0;
 CharBodyBoolFn    g_underMeleeFn      = 0;
 CharBodyBoolFn    g_fleeingFn         = 0;
@@ -335,6 +429,35 @@ void resolve() {
     g_knockoutFn      = (MedFloatFn)KenshiLib::GetRealAddress(&MedicalSystem::knockout);
     g_knockoutForceFn = (MedFloatFn)KenshiLib::GetRealAddress(&MedicalSystem::knockoutForceTimer);
 
+    // Limb-loss replication (protocol 16; non-fatal: unresolved -> limb sync off).
+    g_medAmputateFn  = (MedAmputateFn)KenshiLib::GetRealAddress(&MedicalSystem::amputate);
+    g_medCrushLimbFn = (MedCrushLimbFn)KenshiLib::GetRealAddress(&MedicalSystem::crushLimb);
+    g_medSetRobotLimbFn = (MedSetRobotLimbFn)KenshiLib::GetRealAddress(
+        &MedicalSystem::setRobotLimbItem);
+    g_medGetLimbStateFn = (MedGetLimbStateFn)KenshiLib::GetRealAddress(
+        &MedicalSystem::getLimbState);
+    if (!g_medAmputateFn || !g_medCrushLimbFn)
+        coop::logErrLine("engine: could not resolve limb-loss functions (limb sync off)");
+
+    // Character stats sync (protocol 17; non-fatal: unresolved -> stats sync off).
+    g_statsGetRefFn = (StatsGetRefFn)KenshiLib::GetRealAddress(&CharStats::getStatRef);
+    g_statsRecalcFn = (StatsRecalcFn)KenshiLib::GetRealAddress(&CharStats::_NV_periodicUpdate);
+    if (!g_statsGetRefFn)
+        coop::logErrLine("engine: could not resolve CharStats accessors (stats sync off)");
+
+    // Carried-body sync (protocol 18; non-fatal: unresolved -> carry sync off).
+    g_pickupObjectFn = (PickupObjectFn)KenshiLib::GetRealAddress(&Character::pickupObject);
+    g_dropCarriedFn  = (DropCarriedFn)KenshiLib::GetRealAddress(&Character::dropCarriedObject);
+    g_isBeingCarriedFn = (CharBodyBoolFn)KenshiLib::GetRealAddress(&Character::isBeingCarried);
+    if (!g_pickupObjectFn || !g_dropCarriedFn)
+        coop::logErrLine("engine: could not resolve carry functions (carry sync off)");
+
+    // Consensus game-speed sync (non-fatal: unresolved -> speed sync off).
+    g_setGameSpeedFn = (SetGameSpeedFn)KenshiLib::GetRealAddress(&GameWorld::setGameSpeed);
+    g_userPauseFn    = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::userPause);
+    if (!g_setGameSpeedFn || !g_userPauseFn)
+        coop::logErrLine("engine: could not resolve game-speed setters (speed sync off)");
+
     // AI-gating probe lever (non-fatal: only used when the probe is enabled).
     g_recruitFn = (RecruitFn)KenshiLib::GetRealAddress(
         static_cast<bool (PlayerInterface::*)(Character*, bool)>(&PlayerInterface::recruit));
@@ -382,6 +505,8 @@ void resolve() {
     g_getAttackTargetFn = (GetAttackTargetFn)KenshiLib::GetRealAddress(
         &Character::getAttackTarget);
     g_inCombatModeFn = (InCombatModeFn)KenshiLib::GetRealAddress(&Character::isInCombatMode);
+    g_getCombatClassFn = (GetCombatClassFn)KenshiLib::GetRealAddress(
+        &Character::getCombatClass);
     g_inRangedModeFn = (CharBodyBoolFn)KenshiLib::GetRealAddress(
         &Character::isInRangedCombatMode);
     g_underMeleeFn   = (CharBodyBoolFn)KenshiLib::GetRealAddress(
@@ -590,6 +715,22 @@ bool captureOne(Character* c, EntityState* e) {
         // Stage 2: body-state flags (down/KO/ragdoll/dead/crawl). 0 = upright. Read
         // last so a fault here can't lose the transform we already captured.
         e->bodyState = readBodyState(c);
+        // Carried-body sync (protocol 18): a body carrying someone streams the
+        // synthetic TASK_CARRY_BODY with the carried hand as the subject - the
+        // receiver's SELF-HEAL for a lost pickup event. Sits above rest poses
+        // (clobbers a sit/work task) and below combat (the combat override just
+        // after clobbers it - you drop the body to fight).
+        if (c->isCarryingSomething) {
+            const hand& ch = c->carryingObject;
+            if (ch.index != 0 || ch.serial != 0) {
+                e->task             = TASK_CARRY_BODY;
+                e->sType            = (u32)ch.type;
+                e->sContainer       = ch.container;
+                e->sContainerSerial = ch.containerSerial;
+                e->sIndex           = ch.index;
+                e->sSerial          = ch.serial;
+            }
+        }
         // Stage 3c combat: if the body is fighting a resolvable target, OVERRIDE the
         // pose task with the synthetic combat intent and stash the target's hand in the
         // subject fields. Combat outranks any rest pose (you can't sit and fight), so
@@ -598,9 +739,16 @@ bool captureOne(Character* c, EntityState* e) {
         // a combat-read fault can't lose the transform/body-state already captured.)
         {
             CombatRead cr;
-            if (readCombat(c, &cr) && cr.inCombat && cr.hasTarget &&
-                (cr.target[3] != 0 || cr.target[4] != 0)) {
-                e->task = TASK_COMBAT_MELEE;
+            // combatModeActive, not isInCombatMode(): the latter flickers OFF
+            // between combo sections / slot rotations, and a flickering stream
+            // disarm-reset the peer's copies every gap (measured in combat_crowd:
+            // a fighting hand's streamed task alternated combat/none all fight).
+            if (readCombat(c, &cr) && (cr.inCombat || cr.modeActive) &&
+                cr.hasTarget && (cr.target[3] != 0 || cr.target[4] != 0)) {
+                // Stance split (protocol 15): an attack-slot-QUEUED combatant
+                // streams TASK_COMBAT_WAIT so the join holds its copy in the
+                // menace ring instead of timer-re-issuing the focused attack.
+                e->task = cr.waiting ? TASK_COMBAT_WAIT : TASK_COMBAT_MELEE;
                 e->sType            = cr.target[0];
                 e->sContainer       = cr.target[1];
                 e->sContainerSerial = cr.target[2];
@@ -827,6 +975,33 @@ void clearAiSuspend()           { g_aiSuspended.clear(); }
 void addAiSuspend(Character* c) { if (c) g_aiSuspended.insert(c); }
 unsigned int aiSuspendCount()   { return (unsigned int)g_aiSuspended.size(); }
 
+bool installDamageGuardHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(&Character::_NV_hitByMeleeAttack);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&hitByMelee_hook,
+                              (void**)&g_hitByMeleeOrig) == KenshiLib::SUCCESS;
+}
+
+void clearDamageGuard()           { g_damageGuarded.clear(); }
+void addDamageGuard(Character* c) { if (c) g_damageGuarded.insert(c); }
+unsigned int damageGuardCount()   { return (unsigned int)g_damageGuarded.size(); }
+void damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed) {
+    if (outGuarded) *outGuarded = g_dmgGuardedHits;
+    if (outPassed)  *outPassed  = g_dmgPassedHits;
+}
+
+bool readBloodByHand(const unsigned int hand[5], float* outBlood) {
+    if (!outBlood) return false;
+    Character* c = resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+    if (!c) return false;
+    __try {
+        *outBlood = c->medical.blood;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 Character* leader(GameWorld* gw) {
     if (!gw) return 0;
     __try {
@@ -882,26 +1057,67 @@ Faction* findNearbyNonPlayerFaction(GameWorld* gw) {
 }
 } // namespace
 
+// DUAL-INTEREST centers (step 5): one interest sphere per squad TAB leader, up
+// to two. Both clients load the same save, so the shared playerCharacters list
+// (and its tab/container partition) is identical on each machine - the first
+// member of each distinct hand-container IS the other player's leader as seen
+// locally. A single host-leader-centered sphere meant the shared world degraded
+// the moment the players split up (spike 16); with one sphere per tab leader,
+// NPCs around EACH player stay streamed (spike 19's validated design). Writes up
+// to two centers; returns the count. Caller holds the SEH frame.
+unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[2]) {
+    PlayerInterface* pl = gw->player;
+    if (!pl || pl->playerCharacters.size() == 0) return 0;
+    unsigned int pairs[2][2];
+    unsigned int nc = 0;
+    unsigned int total = pl->playerCharacters.size();
+    for (unsigned int i = 0; i < total && nc < 2; ++i) {
+        Character* m = pl->playerCharacters[i];
+        if (!m) continue;
+        unsigned int h[5];
+        if (!readObjectHand(static_cast<RootObject*>(m), h)) continue;
+        bool seen = false;
+        for (unsigned int k = 0; k < nc; ++k)
+            if (pairs[k][0] == h[1] && pairs[k][1] == h[2]) { seen = true; break; }
+        if (seen) continue;
+        pairs[nc][0] = h[1]; pairs[nc][1] = h[2];
+        outC[nc] = m->getPosition();
+        ++nc;
+    }
+    return nc;
+}
+
 unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
     if (!g_getCharsFn || !gw || !out || maxOut == 0) return 0;
     unsigned int n = 0;
     __try {
-        PlayerInterface* pl = gw->player;
-        if (!pl || pl->playerCharacters.size() == 0) return 0;
+        // Interest: one sphere per squad-tab leader (dual-interest, step 5). The
+        // query radii approximate a town-block footprint (~200u far) per sphere.
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
 
-        // Interest center: the local player's leader. The query radii approximate
-        // a town-block footprint (~200u far) so the bar's NPCs are all captured.
-        Ogre::Vector3 center = pl->playerCharacters[0]->getPosition();
-        g_npcQuery.clear();
-        g_getCharsFn(gw, &g_npcQuery, &center, 200.0f, 120.0f, 30.0f, 96, 96, 0);
-
-        unsigned int total = g_npcQuery.size();
-        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
-            RootObject* obj = g_npcQuery[i];
-            if (!obj) continue;
-            if (isPlayerSquad(gw, obj)) continue; // never stream our own squad here
-            // getCharactersWithinSphere returns Characters as RootObject* bases.
-            if (captureOne(static_cast<Character*>(obj), &out[n])) ++n;
+        // Dedupe across the (possibly overlapping) spheres by object pointer.
+        static RootObject* appended[512]; // main-thread only
+        unsigned int nApp = 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], 200.0f, 120.0f, 30.0f, 96, 96, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* obj = g_npcQuery[i];
+                if (!obj) continue;
+                if (isPlayerSquad(gw, obj)) continue; // never stream our own squad here
+                bool dup = false;
+                for (unsigned int k = 0; k < nApp; ++k)
+                    if (appended[k] == obj) { dup = true; break; }
+                if (dup) continue;
+                // getCharactersWithinSphere returns Characters as RootObject* bases.
+                if (captureOne(static_cast<Character*>(obj), &out[n])) {
+                    if (nApp < 512) appended[nApp++] = obj;
+                    ++n;
+                }
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return n;
@@ -958,18 +1174,26 @@ unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outState
     if (!g_getCharsFn || !gw || !outChars || !outStates || maxOut == 0) return 0;
     unsigned int n = 0;
     __try {
-        PlayerInterface* pl = gw->player;
-        if (!pl || pl->playerCharacters.size() == 0) return 0;
-        Ogre::Vector3 center = pl->playerCharacters[0]->getPosition();
-        g_npcQuery.clear();
-        g_getCharsFn(gw, &g_npcQuery, &center, 200.0f, 120.0f, 30.0f, 96, 96, 0);
-        unsigned int total = g_npcQuery.size();
-        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
-            RootObject* obj = g_npcQuery[i];
-            if (!obj) continue;
-            if (isPlayerSquad(gw, obj)) continue; // never suppress our own squad
-            Character* ch = static_cast<Character*>(obj);
-            if (captureOne(ch, &outStates[n])) { outChars[n] = ch; ++n; }
+        // Same dual-interest spheres as captureNpcs, so the join's suppression
+        // view matches what the host is willing to stream.
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], 200.0f, 120.0f, 30.0f, 96, 96, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* obj = g_npcQuery[i];
+                if (!obj) continue;
+                if (isPlayerSquad(gw, obj)) continue; // never suppress our own squad
+                Character* ch = static_cast<Character*>(obj);
+                bool dup = false;
+                for (unsigned int k = 0; k < n; ++k)
+                    if (outChars[k] == ch) { dup = true; break; }
+                if (dup) continue;
+                if (captureOne(ch, &outStates[n])) { outChars[n] = ch; ++n; }
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return n;
@@ -1169,45 +1393,10 @@ RootObject* resolveObjectByHand(const unsigned int cHand[5]) {
 
 namespace {
 
-// Order-independent per-entry hash (FNV-1a over stringID, mixed with type/qty/qual).
-// Summing these across a container's entries yields a content fingerprint that is
-// invariant to item ordering, so the host only re-sends a snapshot on real change.
-// FNV-1a over a section NAME, folded to 16 bits. The section set is built identically
-// from race/inventory data on both clients, so the same name yields the same hash -
-// a stable cross-client section identity that survives the wire (where STL strings
-// cannot). 0 is reserved for "no section" (loose), so a real section that hashes to 0
-// is nudged to 1 (collision with "loose" would be worse than a 1-in-65k name clash).
-unsigned short sectionNameHash(const char* name) {
-    if (!name || !name[0]) return 0;
-    unsigned int h = 2166136261u;
-    for (const char* p = name; *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
-    unsigned short s = (unsigned short)((h ^ (h >> 16)) & 0xFFFFu);
-    return s ? s : 1;
-}
-
-unsigned int invEntryHash(const InvItemEntry& e) {
-    unsigned int h = 2166136261u;
-    for (const char* p = e.stringID; *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
-    h ^= (unsigned int)e.itemType * 2654435761u;
-    h ^= (unsigned int)e.quantity * 40503u;
-    h ^= (unsigned int)e.quality  * 2246822519u;
-    // Equipped vs loose is a DISTINCT content state: an item worn in a slot must hash
-    // differently from the same item sitting loose, so equipping/unequipping registers
-    // as a content change (triggers a resend) and the peer reconciles the slot too.
-    h ^= (unsigned int)(e.equipped ? 0x9E3779B9u : 0u);
-    h ^= (unsigned int)e.slot * 2716044179u;
-    // The SECTION must be part of the fingerprint too: the two weapon slots ('hip' vs
-    // 'back') share AttachSlot ATTACH_WEAPON, so `slot` is identical for both - without
-    // hashing the section a Weapon I<->II move produces an UNCHANGED fingerprint and is
-    // never published, so the peer never learns the slot changed.
-    h ^= (unsigned int)e.section * 2475825337u;
-    // Manufacturer + material are part of a WEAPON's identity (mesh/company + grade): two
-    // otherwise-identical base weapons with different manufacturers are visually distinct,
-    // so they must hash differently (a swap registers as a content change + resend).
-    for (const char* p = e.manufacturer; *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
-    for (const char* p = e.material;     *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
-    return h;
-}
+// invEntryHash / sectionNameHash moved to ../../netproto/ContentHash.h (shared
+// with the prototest unit layer, which locks their cross-client stability).
+using coop::sectionNameHash;
+using coop::invEntryHash;
 
 // SEH-guarded helper: copy an item's manufacturer + material GameData stringIDs into the
 // snapshot entry. WEAPONS need them to be reconstructable on the peer (createItem requires
@@ -3071,12 +3260,31 @@ bool woundSubject(GameWorld* gw, const unsigned int subjHand[5], float blood) {
 bool readCombat(Character* c, CombatRead* out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
+    out->swordState = -1;
     if (!c) return false;
     __try {
         if (g_inCombatModeFn) out->inCombat   = g_inCombatModeFn(c, true, true);
         if (g_inRangedModeFn) out->ranged     = g_inRangedModeFn(c) ? true : false;
         if (g_underMeleeFn)   out->underMelee  = g_underMeleeFn(c) ? true : false;
         if (g_fleeingFn)      out->fleeing     = g_fleeingFn(c) ? true : false;
+        // Stance: the sword state distinguishes an ACTIVE attacker (attacking /
+        // blocking / pathing in) from one QUEUED by the AttackSlotManager
+        // (circling / waiting / hesitating - most of any crowd). Direct member
+        // reads (CombatClass, header layout) inside this SEH frame.
+        // combatModeActive is the STABLE engaged signal: isInCombatMode()
+        // flickers off between slot rotations / combo sections (measured: a
+        // crowd hand's streamed task alternated combat/none for the whole
+        // fight), and every flicker used to disarm+reset the peer's copy.
+        if (g_getCombatClassFn) {
+            CombatClass* cc = g_getCombatClassFn(c);
+            if (cc) {
+                out->modeActive = cc->combatModeActive;
+                out->swordState = (int)cc->combatState;
+                out->waiting = (cc->combatState == CIRCLE_MENACINGLY ||
+                                cc->combatState == WAIT_MENACINGLY ||
+                                cc->combatState == HESITATE);
+            }
+        }
         if (g_getAttackTargetFn) {
             // getAttackTarget returns a hand by value into our buffer (this=RCX,
             // retbuf=RDX). Read its POD fields into readObjectHand layout.
@@ -3119,6 +3327,26 @@ static bool orderMeleeAttack(Character* attacker, Character* target) {
         if (g_clearGoalsFn) g_clearGoalsFn(attacker);
         g_addGoalFn(attacker, (int)UNPROVOKED_FOCUSED_MELEE_ATTACK,
                     static_cast<RootObject*>(target));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Route the SAME attack through the player-ORDER path with clear=true. A driven
+// copy that was seat-INJECTED (applyTaskOrder) holds a player order at the stool,
+// and player orders OUTRANK AI goals - orderMeleeAttack's addGoal is dead on
+// arrival (run 014713: the pre-seated window-A striker re-ordered 15x with
+// localFight=0 the whole window; only never-seated restrike picks ever engaged).
+// clear=true flushes the seat order and makes the attack the new current order.
+// dest=NULL mirrors the player's own right-click attack (no destination building).
+static bool orderMeleeAttackViaOrder(Character* attacker, Character* target) {
+    if (!attacker || !target || !g_addOrderFn) return false;
+    __try {
+        Ogre::Vector3 loc = static_cast<RootObject*>(target)->getPosition();
+        g_addOrderFn(attacker, 0, (int)UNPROVOKED_FOCUSED_MELEE_ATTACK,
+                     static_cast<RootObject*>(target), /*shift*/false,
+                     /*clear*/true, &loc);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -3558,6 +3786,7 @@ unsigned short readBodyState(Character* c) {
         if (g_isRagdollFn && g_isRagdollFn(c)) s |= BODY_RAGDOLL;
         if (g_isDeadCharFn && g_isDeadCharFn(c)) s |= BODY_DEAD;
         if (g_isCrawlFn   && g_isCrawlFn(c))   s |= BODY_CRAWL;
+        if (g_isBeingCarriedFn && g_isBeingCarriedFn(c)) s |= BODY_CARRIED;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
@@ -3710,18 +3939,653 @@ int applyTaskOrder(Character* c, const EntityState& e) {
     }
 }
 
-// Stage 3c (join-side): reproduce a streamed combat intent. e.task == TASK_COMBAT_MELEE
-// and the subject hand is the attack target; resolve it to a local Character and order
-// THIS body to focus-melee it (UNPROVOKED so it engages regardless of faction). The
-// join's own engine then animates the fight (draw/swing/footwork) - we replicate the
-// CAUSE, not the animation. Returns 2 ordered / 1 target not loaded here / 0 no-op /
-// -1 fault. orderMeleeAttack clears prior goals so a re-issue cleanly re-targets.
-int applyCombat(Character* c, const EntityState& e) {
-    if (!c || e.task != TASK_COMBAT_MELEE) return 0;
+// Stage 3c (join-side): reproduce a streamed combat intent. e.task is a combat
+// stance (TASK_COMBAT_MELEE or TASK_COMBAT_WAIT) and the subject hand is the attack
+// target; resolve it to a local Character and order THIS body to focus-melee it
+// (UNPROVOKED so it engages regardless of faction). The join's own engine then
+// animates the fight (draw/swing/footwork) - we replicate the CAUSE, not the
+// animation. A WAITING copy gets the same goal (it enters combat stance and menaces
+// the target); the difference is the CALLER never timer-re-issues it. Returns 2
+// ordered / 1 target not loaded here / 0 no-op / -1 fault. orderMeleeAttack clears
+// prior goals so a re-issue cleanly re-targets. breakOrder additionally flushes a
+// committed player order (seat inject) via the order-path attack - without it a
+// seated copy ignores the goal (see the helper).
+int applyCombat(Character* c, const EntityState& e, bool breakOrder) {
+    if (!c || !coop::taskIsCombat(e.task)) return 0;
     Character* target = resolveCharByHand(e.sIndex, e.sSerial, e.sType,
                                           e.sContainer, e.sContainerSerial);
     if (!target) return 1; // opponent not loaded on this client -> caller just holds
+    if (breakOrder && !orderMeleeAttackViaOrder(c, target)) return -1;
     return orderMeleeAttack(c, target) ? 2 : -1;
+}
+
+// ---- Player-combat / medical validation primitives (spike 21 field map) ----
+
+bool readMedical(Character* c, MedicalRead* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < 4; ++i) {
+        out->limbFlesh[i] = -1.0f; out->limbBand[i] = -1.0f; out->limbMax[i] = -1.0f;
+        out->limbState[i] = 0xFF;
+    }
+    if (!c) return false;
+    __try {
+        MedicalSystem* med = &c->medical;
+        out->blood       = med->blood;
+        out->bleedRate   = med->currentBleedRate;
+        out->unconscious = med->unconcious;
+        out->dead        = med->dead;
+        // Limb order = RobotLimbs::Limb (LEFT_ARM, RIGHT_ARM, LEFT_LEG, RIGHT_LEG).
+        MedicalSystem::HealthPartStatus* parts[4] = {
+            med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
+        };
+        for (int i = 0; i < 4; ++i) {
+            if (!parts[i]) continue;
+            out->limbFlesh[i] = parts[i]->flesh;
+            out->limbBand[i]  = parts[i]->bandaging;
+            out->limbMax[i]   = parts[i]->_maxHealth;
+        }
+        // Protocol 16: the FULL anatomy (head/chest/stomach + limbs), keyed by
+        // anatomy index - deterministic across clients on the same save. An
+        // amputated limb's HealthPartStatus stays in the lektor (the medical
+        // GUI still lists it), so indices remain stable across a limb loss.
+        unsigned int n = med->anatomy.count;
+        if (n > 12) n = 12;
+        for (unsigned int i = 0; i < n; ++i) {
+            MedicalSystem::HealthPartStatus* p =
+                med->anatomy.stuff ? med->anatomy.stuff[i] : 0;
+            MedPartRead& pr = out->parts[i];
+            if (!p) { pr.used = false; continue; }
+            pr.used      = true;
+            pr.partType  = (unsigned char)p->whatAmI;
+            pr.side      = (unsigned char)p->side;
+            pr.flesh     = p->flesh;
+            pr.fleshStun = p->fleshStun;
+            pr.bandaging = p->bandaging;
+            pr.juryRig   = p->juryRigging;
+            pr.maxHealth = p->_maxHealth;
+        }
+        out->nParts = n;
+        // Limb-loss state + robotic replacement template ids (Phase C/D).
+        // limbStateOf handles the LAZY robotLimbs allocation: null means no
+        // limb was ever lost == ORIGINAL (reporting 0xFF here made every
+        // healthy character's limb states "unknown" and broke replication).
+        RobotLimbs* rl = med->robotLimbs;
+        for (int i = 0; i < 4; ++i) {
+            out->limbState[i] = limbStateOf(med, i);
+            Item* it = rl ? rl->items[i] : 0;
+            if (out->limbState[i] == (unsigned char)LIMB_REPLACED && it) {
+                GameData* gd = it->getGameData();
+                if (gd) {
+                    const char* s = gd->stringID.c_str();
+                    strncpy(out->limbSid[i], s ? s : "", sizeof(out->limbSid[i]) - 1);
+                }
+            }
+        }
+        out->valid = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool readMedicalByHand(const unsigned int hand[5], MedicalRead* out) {
+    Character* c = resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+    return readMedical(c, out);
+}
+
+bool readCombatByHand(const unsigned int hand[5], CombatRead* out) {
+    Character* c = resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+    return readCombat(c, out);
+}
+
+bool writeMedical(Character* c, const MedicalRead& in) {
+    if (!c) return false;
+    __try {
+        MedicalSystem* med = &c->medical;
+        med->blood            = in.blood;
+        med->currentBleedRate = in.bleedRate;
+        if (in.nParts > 0) {
+            // Protocol 16: full-anatomy write by anatomy index. Only write a
+            // slot when the LOCAL part at that index agrees on partType+side
+            // (same save + race data -> always agrees; the check is a guard
+            // against a modded-race mismatch silently corrupting vitals).
+            unsigned int n = in.nParts;
+            if (n > 12) n = 12;
+            if (n > med->anatomy.count) n = med->anatomy.count;
+            for (unsigned int i = 0; i < n; ++i) {
+                const MedPartRead& pr = in.parts[i];
+                if (!pr.used) continue;
+                MedicalSystem::HealthPartStatus* p =
+                    med->anatomy.stuff ? med->anatomy.stuff[i] : 0;
+                if (!p) continue;
+                if ((unsigned char)p->whatAmI != pr.partType ||
+                    (unsigned char)p->side    != pr.side) continue;
+                // -1 = the OWNER's field is unreadable; never write that.
+                if (pr.flesh     >= 0.0f) p->flesh       = pr.flesh;
+                if (pr.fleshStun >= 0.0f) p->fleshStun   = pr.fleshStun;
+                if (pr.bandaging >= 0.0f) p->bandaging   = pr.bandaging;
+                if (pr.juryRig   >= 0.0f) p->juryRigging = pr.juryRig;
+            }
+        } else {
+            // Legacy 4-limb write (pre-16 callers / scaffolds).
+            MedicalSystem::HealthPartStatus* parts[4] = {
+                med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
+            };
+            for (int i = 0; i < 4; ++i) {
+                if (!parts[i]) continue;
+                if (in.limbFlesh[i] >= 0.0f) parts[i]->flesh     = in.limbFlesh[i];
+                if (in.limbBand[i]  >= 0.0f) parts[i]->bandaging = in.limbBand[i];
+            }
+        }
+        // unconscious/dead deliberately NOT written: the reliable KO/death/revive
+        // event channel (+ bodyState latches) owns those transitions.
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+int applyBandageLevels(Character* c, const float band[4]) {
+    if (!c || !band) return 0;
+    int n = 0;
+    __try {
+        MedicalSystem* med = &c->medical;
+        MedicalSystem::HealthPartStatus* parts[4] = {
+            med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
+        };
+        for (int i = 0; i < 4; ++i) {
+            if (!parts[i] || band[i] < 0.0f) continue;
+            // Raise-only (idempotent): a stale/duplicate delta can never undo a
+            // higher local bandage, and the owner's own first aid always wins ties.
+            float lvl = band[i];
+            if (lvl > parts[i]->_maxHealth) lvl = parts[i]->_maxHealth;
+            if (parts[i]->bandaging < lvl) { parts[i]->bandaging = lvl; ++n; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return n;
+}
+
+int applyBandageParts(Character* c, const float band[12]) {
+    if (!c || !band) return 0;
+    int n = 0;
+    __try {
+        MedicalSystem* med = &c->medical;
+        unsigned int cnt = med->anatomy.count;
+        if (cnt > 12) cnt = 12;
+        for (unsigned int i = 0; i < cnt; ++i) {
+            if (band[i] < 0.0f) continue;
+            MedicalSystem::HealthPartStatus* p =
+                med->anatomy.stuff ? med->anatomy.stuff[i] : 0;
+            if (!p) continue;
+            // Raise-only (idempotent) - see applyBandageLevels.
+            float lvl = band[i];
+            if (lvl > p->_maxHealth) lvl = p->_maxHealth;
+            if (p->bandaging < lvl) { p->bandaging = lvl; ++n; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return n;
+}
+
+// ---- Protocol 17: character stats sync --------------------------------------
+
+bool readStats(Character* c, StatsRead* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    for (int i = 0; i < 40; ++i) out->stats[i] = -1.0f;
+    out->xp = -1.0f; out->freeAttribPts = -1.0f;
+    if (!c || !g_statsGetRefFn) return false;
+    __try {
+        CharStats* st = c->stats;
+        if (!st) return false;
+        // Raw stat slots by the engine's own accessor (STAT_STRENGTH..STAT_END-1).
+        for (int i = (int)STAT_STRENGTH; i < (int)STAT_END; ++i) {
+            float* p = g_statsGetRefFn(st, i);
+            if (p) out->stats[i] = *p;
+        }
+        out->nStats = (unsigned int)STAT_END; // slots [1, nStats) filled
+        out->xp = st->xp;
+        out->freeAttribPts = (float)st->freeAttributePoints;
+        out->valid = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool readStatsByHand(const unsigned int hand[5], StatsRead* out) {
+    Character* c = resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+    return readStats(c, out);
+}
+
+bool writeStats(Character* c, const StatsRead& in) {
+    if (!c || !g_statsGetRefFn) return false;
+    __try {
+        CharStats* st = c->stats;
+        if (!st) return false;
+        unsigned int n = in.nStats;
+        if (n > 40u) n = 40u;
+        if (n > (unsigned int)STAT_END) n = (unsigned int)STAT_END;
+        for (unsigned int i = (unsigned int)STAT_STRENGTH; i < n; ++i) {
+            if (in.stats[i] < 0.0f) continue; // -1 = unreadable on the owner
+            float* p = g_statsGetRefFn(st, (int)i);
+            if (p) *p = in.stats[i];
+        }
+        if (in.xp >= 0.0f)            st->xp = in.xp;
+        if (in.freeAttribPts >= 0.0f) st->freeAttributePoints = (int)in.freeAttribPts;
+        // Refresh the derived caches now (attack/block speed, run speed,
+        // encumbrance) instead of waiting for the engine's next periodic pass.
+        if (g_statsRecalcFn) g_statsRecalcFn(st);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool raiseSubjectStat(GameWorld* gw, const unsigned int subjHand[5],
+                      int statId, float value) {
+    (void)gw;
+    if (statId <= (int)STAT_NONE || statId >= (int)STAT_END || !g_statsGetRefFn)
+        return false;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    __try {
+        CharStats* st = s->stats;
+        if (!st) return false;
+        float* p = g_statsGetRefFn(st, statId);
+        if (!p) return false;
+        if (*p < value) *p = value; // raise-only (idempotent scaffold)
+        if (g_statsRecalcFn) g_statsRecalcFn(st);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// ---- Protocol 18: carried-body sync ------------------------------------------
+
+bool readCarry(Character* c, CarryRead* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!c) return false;
+    __try {
+        out->carrying     = c->isCarryingSomething;
+        out->beingCarried = g_isBeingCarriedFn ? g_isBeingCarriedFn(c)
+                                               : c->_isBeingCarried;
+        if (out->carrying) {
+            const hand& h = c->carryingObject;
+            out->carried[0] = (unsigned int)h.type;
+            out->carried[1] = h.container;
+            out->carried[2] = h.containerSerial;
+            out->carried[3] = h.index;
+            out->carried[4] = h.serial;
+        }
+        out->valid = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool applyPickup(GameWorld* gw, Character* carrier, const unsigned int carriedHand[5]) {
+    (void)gw;
+    if (!carrier || !g_pickupObjectFn) return false;
+    Character* who = resolveCharByHand(carriedHand[3], carriedHand[4], carriedHand[0],
+                                       carriedHand[1], carriedHand[2]);
+    if (!who) return false;
+    __try {
+        // Idempotent: already carrying exactly this body -> success no-op;
+        // carrying something ELSE -> refuse (never stack / steal a carry).
+        if (carrier->isCarryingSomething) {
+            const hand& h = carrier->carryingObject;
+            return (h.index == carriedHand[3] && h.serial == carriedHand[4]);
+        }
+        // The body is already on someone's shoulder locally (e.g. the real
+        // carry raced the event on the owner side) - treat as done.
+        if (g_isBeingCarriedFn && g_isBeingCarriedFn(who)) return true;
+        g_pickupObjectFn(carrier, who);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool applyDrop(Character* carrier, bool ragdoll) {
+    if (!carrier || !g_dropCarriedFn) return false;
+    __try {
+        if (!carrier->isCarryingSomething) return true; // idempotent no-op
+        g_dropCarriedFn(carrier, ragdoll, /*removeOnly*/false);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool carrySubject(GameWorld* gw, const unsigned int carrierHand[5],
+                  const unsigned int carriedHand[5]) {
+    Character* carrier = resolveCharByHand(carrierHand[3], carrierHand[4], carrierHand[0],
+                                           carrierHand[1], carrierHand[2]);
+    if (!carrier) return false;
+    return applyPickup(gw, carrier, carriedHand);
+}
+
+bool dropSubject(GameWorld* gw, const unsigned int carrierHand[5], bool ragdoll) {
+    (void)gw;
+    Character* carrier = resolveCharByHand(carrierHand[3], carrierHand[4], carrierHand[0],
+                                           carrierHand[1], carrierHand[2]);
+    if (!carrier) return false;
+    return applyDrop(carrier, ragdoll);
+}
+
+// SEH-guarded: fabricate a robotic-limb item from its LIMB_REPLACEMENT template
+// stringID (blank handle - the factory owns the id; the same pattern as
+// createItemAndAdd, but the item goes to setRobotLimbItem, not an inventory).
+static Item* createLimbItem(GameWorld* gw, const char* sid) {
+    if (!gw || !gw->theFactory || !g_createItemFn || !sid || !sid[0]) return 0;
+    __try {
+        GameData* tmpl = findItemTemplateImpl(gw, sid, (unsigned int)LIMB_REPLACEMENT);
+        if (!tmpl) return 0;
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, 0, 0, (itemType)LIMB_REPLACEMENT, 0, 0);
+        return g_createItemFn(gw->theFactory, tmpl, h, 0, 0, -1, 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+int applyLimbStates(GameWorld* gw, Character* c, const unsigned char states[4],
+                    const char sid[4][48], bool createSeveredItem) {
+    if (!c || !states) return 0;
+    int changed = 0;
+    __try {
+        MedicalSystem* med = &c->medical;
+        // NOTE: robotLimbs is lazily allocated - do NOT bail on null (a healthy
+        // character has none until the first amputation; the engine's own
+        // amputate/crushLimb paths allocate it on demand).
+        for (int i = 0; i < 4; ++i) {
+            unsigned char want = states[i];
+            if (want == 0xFF) continue; // owner couldn't read it
+            unsigned char have = limbStateOf(med, i);
+            if (want == have) continue;
+            RobotLimbs::Limb limb = (RobotLimbs::Limb)i;
+            if (want == (unsigned char)LIMB_CRUSHED) {
+                // ORIGINAL -> CRUSHED (a crushed robotic limb also lands here;
+                // crushLimb handles both).
+                if (g_medCrushLimbFn) { g_medCrushLimbFn(med, limb); changed |= (1 << i); }
+            } else if (want == (unsigned char)LIMB_STUMP ||
+                       want == (unsigned char)LIMB_REPLACED) {
+                // Sever when the local limb is still attached. createSeveredItem
+                // only on the WORLD AUTHORITY (host) - its real ground item then
+                // streams to everyone via the world-item channel; a peer creating
+                // one too would duplicate it.
+                if (have == (unsigned char)LIMB_ORIGINAL ||
+                    have == (unsigned char)LIMB_CRUSHED) {
+                    if (g_medAmputateFn) {
+                        Ogre::Vector3 zero(0.0f, 0.0f, 0.0f);
+                        g_medAmputateFn(med, limb, createSeveredItem, &zero);
+                        changed |= (1 << i);
+                        have = limbStateOf(med, i);
+                    }
+                }
+                // Fit the prosthetic (Phase D): fabricate the same template and
+                // attach it via the engine's own fit path (isLoadingASave=true =
+                // the save-load reconstruction path, no side-effect chatter).
+                if (want == (unsigned char)LIMB_REPLACED &&
+                    have == (unsigned char)LIMB_STUMP &&
+                    sid && sid[i][0] && g_medSetRobotLimbFn) {
+                    Item* it = createLimbItem(gw, sid[i]);
+                    if (it) {
+                        g_medSetRobotLimbFn(med, limb, it, /*isLoadingASave*/true);
+                        changed |= (1 << i);
+                    }
+                    // Feasibility research (weapon lesson, protocol 9): log the
+                    // fabricate outcome so a factory-null template is visible.
+                    char rb[120]; _snprintf(rb, sizeof(rb) - 1,
+                        "[med] LIMB-FIT limb=%d sid='%s' created=%d", i, sid[i],
+                        it ? 1 : 0);
+                    rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+                }
+            }
+            // want == LIMB_ORIGINAL with a severed local limb cannot be healed
+            // back (no engine lever); the mismatch is benign (fresh save load
+            // resolves it) and writeMedical keeps the vitals honest meanwhile.
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+    return changed;
+}
+
+int destroySeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius) {
+    if (!gw || !g_getObjsFn || !g_destroyObjFn) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    int destroyed = 0;
+    __try {
+        Ogre::Vector3 center = ro->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, ITEM, 64, 0);
+        unsigned int n = g_npcQuery.size();
+        RootObject* victims[16]; unsigned int nv = 0;
+        for (unsigned int i = 0; i < n && nv < 16; ++i) {
+            RootObject* o = g_npcQuery[i]; if (!o) continue;
+            Item* it = reinterpret_cast<Item*>(o);
+            if (it->isInInventory) continue; // only FREE ground copies
+            if (it->itemFunction != ITEM_SEVERED_LIMB) continue;
+            victims[nv++] = o;
+        }
+        for (unsigned int i = 0; i < nv; ++i) {
+            if (g_destroyObjFn(gw, victims[i], /*justUnloaded*/false,
+                               "coop-severed-limb-dedupe"))
+                ++destroyed;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return destroyed; }
+    return destroyed;
+}
+
+int countSeveredLimbsNear(GameWorld* gw, const unsigned int cHand[5], float radius) {
+    if (!gw || !g_getObjsFn) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    int count = 0;
+    __try {
+        Ogre::Vector3 center = ro->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, ITEM, 64, 0);
+        unsigned int n = g_npcQuery.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            RootObject* o = g_npcQuery[i]; if (!o) continue;
+            Item* it = reinterpret_cast<Item*>(o);
+            if (it->isInInventory) continue;
+            if (it->itemFunction != ITEM_SEVERED_LIMB) continue;
+            ++count;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return count; }
+    return count;
+}
+
+bool amputateSubjectLimb(GameWorld* gw, const unsigned int subjHand[5], int limb) {
+    (void)gw;
+    if (limb < 0 || limb > 3 || !g_medAmputateFn) return false;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    __try {
+        MedicalSystem* med = &s->medical;
+        // limbStateOf, NOT robotLimbs->states: robotLimbs is lazily allocated
+        // (null on any character that never lost a limb - i.e. exactly the
+        // scenario subject), and bailing on null made the scaffold a no-op.
+        if (limbStateOf(med, limb) != (unsigned char)LIMB_ORIGINAL)
+            return false; // already gone
+        Ogre::Vector3 zero(0.0f, 0.0f, 0.0f);
+        // createSeveredItem=true: this runs on the body's OWNER, mirroring what
+        // a real severing hit does (the peer paths never create the item).
+        g_medAmputateFn(med, (RobotLimbs::Limb)limb, true, &zero);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool woundSubjectLimbs(GameWorld* gw, const unsigned int subjHand[5],
+                       float flesh, float blood) {
+    (void)gw;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    __try {
+        MedicalSystem* med = &s->medical;
+        // Protocol 16: wound the FULL anatomy (head/chest/stomach + limbs), and
+        // the STUN track too (flesh+15, above the cut so the collapse behaviour
+        // stays the same as the original 4-limb scaffold) - so the medic_order
+        // oracle genuinely exercises every field the wire now carries.
+        float stun = flesh + 15.0f;
+        unsigned int n = med->anatomy.count;
+        for (unsigned int i = 0; i < n; ++i) {
+            MedicalSystem::HealthPartStatus* p =
+                med->anatomy.stuff ? med->anatomy.stuff[i] : 0;
+            if (!p) continue;
+            if (p->flesh > flesh)    p->flesh = flesh;      // only lower, never heal
+            if (p->fleshStun > stun) p->fleshStun = stun;
+        }
+        if (blood < 0.0f) blood = 0.0f;
+        if (med->blood > blood) med->blood = blood; // only weaken, never heal
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+int healSubjectBandage(GameWorld* gw, const unsigned int subjHand[5]) {
+    (void)gw;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return 0;
+    int n = 0;
+    __try {
+        MedicalSystem* med = &s->medical;
+        // Protocol 16: bandage the FULL anatomy (matches the extended wound
+        // scaffold), so per-PART treatment forwarding is exercised end to end.
+        unsigned int cnt = med->anatomy.count;
+        for (unsigned int i = 0; i < cnt; ++i) {
+            MedicalSystem::HealthPartStatus* p =
+                med->anatomy.stuff ? med->anatomy.stuff[i] : 0;
+            if (!p) continue;
+            // Bandage only what is damaged, and only RAISE (the same field a real
+            // applyFirstAid pass raises incrementally toward _maxHealth; the flesh
+            // then self-heals up to the bandaged level via the local medical sim).
+            if (p->flesh < p->_maxHealth &&
+                p->bandaging < p->_maxHealth) {
+                p->bandaging = p->_maxHealth;
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return n;
+}
+
+bool reviveSubject(GameWorld* gw, const unsigned int subjHand[5]) {
+    (void)gw;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    // knockDown(off) clears the forced KO timer + releases the ragdoll (own SEH).
+    if (!knockDown(s, false)) return false;
+    __try {
+        MedicalSystem* med = &s->medical;
+        med->unconcious = false;
+        if (med->blood < 80.0f) med->blood = 80.0f; // healthy floor (raise only)
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
+                      const unsigned int excludeHand[5], unsigned int outHand[5],
+                      const unsigned int excludeHand2[5]) {
+    if (!g_getCharsFn || !gw) return false;
+    Character* ref = resolveCharByHand(refHand[3], refHand[4], refHand[0],
+                                       refHand[1], refHand[2]);
+    if (!ref) return false;
+    // Gather nearby non-squad candidates by distance inside one SEH frame, then
+    // apply the upright filter (readBodyState has its own SEH) on the shortlist.
+    const unsigned int MAXC = 16;
+    Character* cand[MAXC]; float candD[MAXC]; unsigned int nc = 0;
+    __try {
+        Ogre::Vector3 center = ref->getPosition();
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &center, 30.0f, 30.0f, 30.0f, 64, 64, 0);
+        for (unsigned int i = 0; i < g_npcQuery.size() && nc < MAXC; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o || isPlayerSquad(gw, o)) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - center.x, dz = p.z - center.z;
+            cand[nc] = static_cast<Character*>(o);
+            candD[nc] = dx * dx + dz * dz;
+            ++nc;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    Character* best = 0; float bestD = 1e18f;
+    for (unsigned int i = 0; i < nc; ++i) {
+        if (readBodyState(cand[i]) != 0) continue; // down/dead/ragdoll = not a victim
+        CombatRead cr; // already fighting = someone else's victim (window A's)
+        if (readCombat(cand[i], &cr) && cr.inCombat) continue;
+        unsigned int h[5];
+        if (!readObjectHand(static_cast<RootObject*>(cand[i]), h)) continue;
+        if (excludeHand && h[3] == excludeHand[3] && h[4] == excludeHand[4]) continue;
+        if (excludeHand2 && h[3] == excludeHand2[3] && h[4] == excludeHand2[4]) continue;
+        if (candD[i] < bestD) { bestD = candD[i]; best = cand[i]; }
+    }
+    if (!best) return false;
+    return readObjectHand(static_cast<RootObject*>(best), outHand);
+}
+
+bool orderAttackByHand(GameWorld* gw, const unsigned int atkHand[5],
+                       const unsigned int vicHand[5]) {
+    (void)gw;
+    Character* a = resolveCharByHand(atkHand[3], atkHand[4], atkHand[0],
+                                     atkHand[1], atkHand[2]);
+    Character* v = resolveCharByHand(vicHand[3], vicHand[4], vicHand[0],
+                                     vicHand[1], vicHand[2]);
+    if (!a || !v) return false;
+    CombatRead cr;
+    if (readCombat(a, &cr) && cr.inCombat) return true; // already fighting - don't thrash
+    return orderMeleeAttack(a, v);
+}
+
+bool readGameSpeed(GameWorld* gw, float* mult, bool* paused) {
+    if (!gw || !mult || !paused) return false;
+    __try {
+        *mult   = gw->frameSpeedMult;
+        *paused = gw->paused;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool writeGameSpeed(GameWorld* gw, float mult, bool paused) {
+    if (!gw || !g_setGameSpeedFn || !g_userPauseFn) return false;
+    if (mult <= 0.0f) paused = true; // wire convention: speed 0 == paused
+    __try {
+        g_userPauseFn(gw, paused);
+        // Leave the multiplier untouched while paused, so unpausing restores
+        // the pre-pause speed (matching the engine's own pause behaviour).
+        if (!paused) g_setGameSpeedFn(gw, mult, /*click*/false);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 } // namespace engine
