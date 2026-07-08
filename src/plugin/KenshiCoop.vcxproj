@@ -43,7 +43,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -57,7 +57,7 @@
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -69,6 +69,7 @@
     <ClCompile Include="CoopLog.cpp" />
     <ClCompile Include="core\Config.cpp" />
     <ClCompile Include="net\NetLink.cpp" />
+    <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="game\Engine.cpp" />
     <ClCompile Include="sync\Interp.cpp" />
     <ClCompile Include="sync\Replicator.cpp" />
@@ -88,6 +89,7 @@
     <ClInclude Include="core\Config.h" />
     <ClInclude Include="core\Inbound.h" />
     <ClInclude Include="net\NetLink.h" />
+    <ClInclude Include="net\SteamP2P.h" />
     <ClInclude Include="game\Engine.h" />
     <ClInclude Include="sync\Interp.h" />
     <ClInclude Include="sync\Replicator.h" />

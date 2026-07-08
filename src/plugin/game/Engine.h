@@ -36,6 +36,11 @@ bool loadSave(const std::string& name);
 // true when the probe symbol is unavailable (so it never blocks auto-load).
 bool savesReady();
 
+// SEH-guarded: save the running game under 'name' via SaveManager::save (the
+// same path the in-game save menu takes; autosave=false). Used to BAKE fixture
+// saves without a manual menu round-trip. Main-thread only.
+bool saveGameAs(const std::string& name);
+
 // ---- Entity capture / resolve / apply (Stage 1+) ---------------------------
 
 // SEH-guarded: capture the local player's squad into 'out' (up to maxOut),
@@ -161,6 +166,18 @@ bool spawnMachineInFront(GameWorld* gw, float fwd, float side, Faction* owner,
 // work pose so the captured task streams to the join. Returns true if issued.
 bool orderWorkAt(Character* c, RootObject* fixture, int task);
 
+// Find the BAKED bed (kind=1) or prison cage (kind=2) near the leader by
+// scanning loaded BUILDING objects by template name (fixture relocation after
+// a bedcage1 reload; same shape as findWorkFixtureNear).
+RootObject* findFurnitureNear(GameWorld* gw, int kind);
+
+// Order the subject (by hand) to USE the baked bed via the player-order path
+// (USE_BED_ORDER at the bed fixture). Guarded no-op (returns true) when the
+// subject is already on a bed task. orderedTask/useBedTask report the numeric
+// TaskType ids for scenario logging. Host-side scenario scaffold.
+bool orderUseBed(GameWorld* gw, const unsigned int subjHand[5],
+                 int* orderedTask, int* useBedTask);
+
 // 'craft' setup scene (host-side): spawn a save-stable work fixture + a world NPC
 // and force the NPC into the matching work pose (OPERATE_MACHINERY / training), so
 // the host captures the work task and the join reproduces it once the save is
@@ -206,6 +223,40 @@ bool killSubject(GameWorld* gw, const unsigned int subjHand[5]);
 // ongoing real melee downs it decisively within the window - the down edge comes from
 // genuine combat, not a scaffold. Returns true if applied. subjHand readObjectHand layout.
 bool woundSubject(GameWorld* gw, const unsigned int subjHand[5], float blood);
+
+// ---- Protocol 21: runtime-spawn proxy replication ---------------------------
+// NPC sync resolves bodies by save-stable hand, so a squad the host's spawn
+// manager mints at RUNTIME (roaming bandits, dialog ambushes) has a host-only
+// hand the join can never resolve. The join asks (PKT_SPAWN_REQ), the host
+// describes (these reads), and the join mints a LOCAL proxy body (this spawn)
+// that the ordinary world-NPC drive path then owns.
+
+// SEH-guarded (host): describe the runtime spawn at 'c' - template GameData
+// stringID, faction stringID (via Faction::getData; "" when unreadable),
+// world transform, dead flag. Returns false when the template stringID is
+// unreadable (nothing to describe -> negative reply).
+bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
+                       char* facSid, unsigned int facSidLen,
+                       float* x, float* y, float* z, float* heading, bool* dead);
+
+// SEH-guarded (join): mint a LOCAL proxy body from a host description: template
+// by CHARACTER stringID, faction by FACTION stringID (FactionManager::
+// getFactionByStringID; falls back to a nearby non-player faction when the sid
+// doesn't resolve), parked at the host transform. Appearance/equipment are the
+// template's (randomized gear) - cosmetic; combat outcomes stay host-
+// authoritative + damage-guarded. Returns the proxy Character* or 0.
+Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
+                         float x, float y, float z, float heading);
+
+// spawn_probe / spawn_sync scenario scaffold (SEH-guarded): reproduce a runtime
+// squad spawn locally - 'count' world characters in a nearby NON-PLAYER faction
+// (findNearbyNonPlayerFaction; leader-faction fallback on a blank save), spread
+// in front of the leader, each detached from town-AI so the squad doesn't
+// immediately disband to jobs. Fills outHands (readObjectHand layout) up to
+// 'count'; returns the number spawned. Their hands are RUNTIME hands - exactly
+// the unresolvable-cross-client identity the probe/proxy path exercises.
+unsigned int spawnRuntimeSquad(GameWorld* gw, unsigned int count,
+                               unsigned int (*outHands)[5]);
 
 // ---- Combat (Phase 3c, L5) -------------------------------------------------
 
@@ -319,6 +370,14 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
 // On success, fills outHand[5] with the anchored container's hand. Returns true if a
 // container (or the leader fallback) was prepared.
 bool setupInventoryScene(GameWorld* gw, unsigned int outHand[5]);
+
+// Bed+cage scene (bed/cage occupancy sync, protocol 19): spawn one BED and one
+// PRISON CAGE near the leader so the user (or the auto-bake) can SAVE a fixture
+// save ('bedcage1') both clients load - save-stable furniture hands are what
+// let the occupancy events resolve the same bed/cage on both machines.
+// Templates are found by keyword over the BUILDING GameData set (camp bed /
+// prisoner cage preferred). Returns true when both spawned; hands logged.
+bool setupBedCageScene(GameWorld* gw);
 
 // Resolve the baked inventory container again after load (host + join): v1 anchors on
 // the leader's own inventory (a save-stable container that accepts arbitrary items).
@@ -705,6 +764,73 @@ bool carrySubject(GameWorld* gw, const unsigned int carrierHand[5],
                   const unsigned int carriedHand[5]);
 bool dropSubject(GameWorld* gw, const unsigned int carrierHand[5], bool ragdoll);
 
+// ---- Protocol 19: furniture occupancy (beds + prison cages) ---------------
+// Snapshot of a body's LOCAL furniture relationship: Character::inSomething
+// (IN_NOTHING/IN_BED/IN_PRISON) + the furniture's save-stable hand (inWhat).
+struct FurnitureRead {
+    bool valid;
+    int  kind;             // 0 = none, 1 = bed, 2 = prison cage
+    unsigned int furn[5];  // inWhat hand (readObjectHand layout; zeroed if none)
+};
+bool readFurniture(Character* c, FurnitureRead* out);
+// Place the local occupant into / remove it from the furniture at furnHand via
+// the engine's own setBedMode/setPrisonMode (kind: 1 bed, 2 cage) - pose,
+// attach and transform are engine-native. Idempotent: already in the desired
+// state = success no-op. On exit (on=false) an unresolvable furnHand falls
+// back to the occupant's own inWhat. SEH-guarded.
+bool applyFurniture(GameWorld* gw, Character* occupant,
+                    const unsigned int furnHand[5], int kind, bool on);
+// Scenario scaffolds (bed_put / cage_put): resolve the occupant by hand, then
+// applyFurniture against the baked fixture found via findFurnitureNear. Run on
+// the OCCUPANT's owner; the peer asserts the crossing.
+bool putSubjectInFurniture(GameWorld* gw, const unsigned int subjHand[5], int kind, bool on);
+// True when the streamed task is a CONSCIOUS bed-use pose (USE_BED /
+// USE_BED_ORDER / SLEEP_ON_FLOOR): those ride the validated L3 fixture-pose
+// path (bed_pose), so the occupancy machinery must not fight it - the
+// replicator scopes its edges/carve-out/self-heal away from them.
+bool taskIsBedPose(int t);
+// Self-heal helper (lost/late ENTER edge): find the nearest matching fixture
+// (kind: 1 bed, 2 cage) within 'radius' of the streamed position and place
+// the occupant in it (the continuous bodyState bit carries no furniture hand).
+bool enterFurnitureNearPos(GameWorld* gw, Character* occupant, int kind,
+                           float x, float y, float z, float radius);
+
+// ---- Protocol 20: stealth mode + detection indicators ----------------------
+// One seer entry of a sneaker's detection map: WHICH local character notices
+// the sneaker, and how far along the notice is (Character::WhoSeesMe).
+struct StealthSeer {
+    unsigned int npc[5];   // seer hand (readObjectHand layout)
+    unsigned char see;     // YesNoMaybe: 0 = NO, 1 = YES, 2 = MAYBE
+    float         prog;    // progressOfMaybe (0..1, meaningful for MAYBE)
+};
+// Snapshot of a body's LOCAL stealth state: Character::stealthMode (the mode
+// bool that drives the sneak-walk), stealthUnseen (overall HUD status), and a
+// capped copy of whoSeesMeSneaking - the per-NPC detection map the stealth
+// marker arrows render from.
+struct StealthRead {
+    bool valid;
+    bool sneaking;          // Character::stealthMode (0xD4)
+    unsigned char unseen;   // Character::stealthUnseen (YesNoMaybe key)
+    unsigned int nSeers;    // entries copied into seers[]
+    unsigned int mapSize;   // TOTAL entries in the engine map (may exceed cap)
+    StealthSeer seers[16];
+};
+bool readStealth(Character* c, StealthRead* out);
+// Cheap per-frame mode probe (no map iteration): -1 unreadable, 0 off, 1 on.
+int readStealthMode(Character* c);
+// Toggle the engine's own stealth mode on the LOCAL body (sneak-walk pose,
+// stealthUpdate scanning, skill use - the full chain). Idempotent. SEH-guarded.
+bool applyStealth(Character* c, bool on);
+// Replay one detection entry between the LOCAL pair: resolve the seer by hand
+// and run Character::notifyICanSeeYouSneaking on the local sneaker - exactly
+// what the seer's own vision check would have done, so the marker arrows and
+// unseen status render natively. SEH-guarded.
+bool applyStealthSeer(GameWorld* gw, Character* sneaker,
+                      const unsigned int npcHand[5], unsigned char see, float prog);
+// Scenario scaffold (sneak_pose / sneak_probe): resolve the subject by hand,
+// applyStealth. Run on the machine that owns the action being tested.
+bool sneakSubject(GameWorld* gw, const unsigned int subjHand[5], bool on);
+
 // Protocol-16 treatment forwarding: raise-only bandaging apply keyed by ANATOMY
 // index (all parts, not just limbs). band[i] = level for anatomy part i, -1 =
 // skip. Returns the number of parts raised.
@@ -776,6 +902,94 @@ bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
 bool orderAttackByHand(GameWorld* gw, const unsigned int atkHand[5],
                        const unsigned int vicHand[5]);
 
+// ---- Protocol 22 groundwork: money + vendor trading (shop_probe / money sync)
+// Kenshi's wallet is PER-PLATOON (Ownerships::money via Platoon, spike 29): there
+// is no global player wallet, so the sync unit is the squad TAB (the same
+// partition positional/inventory sync own). Vendors are ShopTrader RootObjects
+// with save-stable hands; a purchase is Inventory::buyItem mutating vendor stock
+// + wallet LOCALLY on one client only - the divergence the probe measures.
+
+// One nearby vendor (ShopTrader) summary for the shop_probe evidence log.
+struct VendorRead {
+    unsigned int hand[5]; // readObjectHand layout [type,container,containerSerial,index,serial]
+    int          money;   // vendor cash register (RootObject::getMoney; -1 unreadable)
+    int          stock;   // item ENTRIES in its inventory (-1 unreadable)
+    int          qty;     // summed item quantity (stack-shrink shows here; -1 unreadable)
+    int          src;     // which inventory answered: 0 none, 1 ShopTrader's own
+                          // (the aggregated trade-UI view; LAZY - null until the
+                          // shop opens), 2 the trader CHARACTER's inventory
+    unsigned int traderHand[5]; // the trader Character's SAVE-STABLE hand (zeros
+                          // if unread) - the cross-client vendor identity (the
+                          // ShopTrader wrapper's own hand serial is runtime)
+    char         sid[48]; // the wrapper's GameData stringID ("" if unread) -
+                          // identifies WHAT these SHOP_TRADER_CLASS objects are
+    float        x, y, z; // vendor world position
+};
+
+// SEH-guarded: enumerate SHOP_TRADER_CLASS objects within `radius` of the local
+// leader into out[] (up to maxOut). Returns the number written.
+unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut,
+                             float radius);
+
+// SEH-guarded: read the WALLET of the platoon containing the body at mHand
+// (Character -> ActivePlatoon -> Platoon -> Ownerships::getMoney - engine
+// accessors, never raw offsets). *outMoney = -1 on failure. Returns true on ok.
+bool readWalletByHand(const unsigned int mHand[5], int* outMoney);
+
+// SEH-guarded: write the wallet of the platoon containing the body at mHand via
+// Ownerships::setMoney (the money-sync apply primitive). Returns true on ok.
+bool writeWalletByHand(const unsigned int mHand[5], int money);
+
+// Purchase observability detour (protocol 22, 1c groundwork): hook Inventory::
+// buyItem so every REAL trade-UI purchase logs a "[shop] BUY-LOCAL" line
+// (seller identity + money, item sid, buyer). Automation cannot reach a real
+// purchase in the test save (lazy vendor inventories, no bound trader), so
+// manual field sessions carry the evidence for the vendor-stock mirror design.
+bool installShopHook();
+
+// ---- Protocol 23: recruitment sync ------------------------------------------
+// Hook PlayerInterface::recruit so every SUCCESSFUL local recruit (dialog or
+// programmatic) records its before/after hand pair. The Replicator drains the
+// queue once per tick into EVT_RECRUIT (subject = old hand, actor = new hand);
+// the peer re-keys its local copy of the old hand to the new stream key.
+struct RecruitEdge { unsigned int before[5]; unsigned int after[5]; };
+bool installRecruitHook();
+unsigned int drainRecruitEdges(RecruitEdge* out, unsigned int maxOut);
+
+// ---- Protocol 23 phase 0: recruitment probe (recruit_probe) -----------------
+// SEH-guarded: perform ONE programmatic recruitment via the engine's own
+// PlayerInterface::recruit and report the identity evidence. runtimeSubject
+// selects the leg: true = recruit a freshly runtime-spawned NPC (host-only
+// hand - the spawn-sync regime), false = recruit the nearest BAKED world NPC
+// (save-stable hand - the bar-recruit regime). outHandBefore/After capture the
+// subject's hand around the call: recruit re-containers the body into a player
+// platoon, so the CONTAINER fields change - whether index/serial survive is
+// the finding that gates the protocol-23 design.
+// Returns 1 recruited, 0 refused / no subject, -1 fault.
+int probeRecruit(GameWorld* gw, bool runtimeSubject,
+                 unsigned int outHandBefore[5], unsigned int outHandAfter[5]);
+
+// SEH-guarded: force the vendor at vHand to BUILD its stock. A ShopTrader's
+// Inventory is created lazily (null until the trade UI first opens - shop_probe
+// run 101952: every vendor read stock=-1), so a programmatic purchase must first
+// run the engine's own stock builder: the trader's ActivePlatoon::
+// refreshInventory(firstTime=true), the same path the shop-open flow schedules.
+// Returns 1 = inventory present (already or after refresh), 0 = still null,
+// -1 = fault/unresolved.
+int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]);
+
+// SEH-guarded PROBE (shop_probe): drive ONE programmatic purchase - the first
+// loose item of the vendor at vHand, bought by the character at buyerHand via
+// the engine's own Inventory::buyItem (called on the VENDOR inventory,
+// sendingTo = the buyer). Emits "[shop]" log lines with vendor money/stock and
+// buyer wallet BEFORE/AFTER so the oracle can measure exactly what one local
+// purchase mutates. Writes the bought template stringID to outSid.
+// Returns 1 bought (buyItem returned an item), 0 nothing-to-buy/refused,
+// -1 fault or unresolved prerequisites.
+int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
+                   const unsigned int buyerHand[5],
+                   char* outSid, unsigned int sidLen);
+
 // ---- Consensus game-speed sync ----------------------------------------------
 
 // SEH-guarded read of the world's speed state: *mult = frameSpeedMult,
@@ -786,8 +1000,43 @@ bool readGameSpeed(GameWorld* gw, float* mult, bool* paused);
 // GameWorld::setGameSpeed) so the UI speed buttons track the applied state
 // exactly like a real click. mult <= 0 means paused (the wire convention);
 // the pre-pause multiplier is left alone so unpausing restores it. Returns
-// false on fault/null/unresolved setters.
+// false on fault/null/unresolved setters. This IS the loud "user clicked"
+// path: the speed-intent hooks see it, so scenarios use it as a simulated
+// click and the replicator must NEVER use it for the arbitrated apply.
 bool writeGameSpeed(GameWorld* gw, float mult, bool paused);
+
+// The QUIET write (vote/effective decoupling): drive the actual sim speed via
+// GameWorld::setFrameSpeedMultiplier + userPause WITHOUT updating the UI speed
+// buttons and WITHOUT registering as user intent (reentrancy-guarded against
+// the intent hooks). The buttons keep showing the player's last click (their
+// VOTE); the replicator enforces the arbitrated min(host, join) underneath.
+bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused);
+
+// Speed-intent capture (the vote source). Two complementary detectors,
+// because the MainBar click handler writes the speed INLINE (2026-07-08
+// manual-session finding: real UI clicks never reach a setGameSpeed detour):
+//   * hooks on setGameSpeed/userPause/togglePause catch every call that DOES
+//     route through the public setters (scenario writeGameSpeed clicks);
+//   * a per-tick poll catches the rest: engine state deviating from our last
+//     QUIET write = a real click / keyboard pause / RE_Kenshi; the button
+//     highlight deviating from the vote snapshot = a click on the speed
+//     EQUAL to the current effective (the stuck-vote case - engine state
+//     doesn't move, but the UI highlight does).
+// consumeSpeedIntent returns true once per new intent and fills the
+// requested state (intent pause preserves the requested multiplier,
+// mirroring the engine's model).
+bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused);
+
+// Install the three intent detours (setGameSpeed / userPause / togglePause)
+// and seed the intent state from the live engine so the first vote reflects
+// the save's starting speed. Call once, from the main thread, after gameplay
+// is live. Returns false when any target fails to resolve or hook.
+bool installSpeedIntentHooks(GameWorld* gw);
+
+// Spike probe (KENSHICOOP_SPEED_PROBE=1): read the MainBar speed-button
+// selected states into out (one char per button, '0'/'1', NUL-terminated;
+// cap n-1 buttons). Returns the button count read, -1 when the GUI isn't up.
+int readSpeedButtons(char* out, int n);
 
 } // namespace engine
 } // namespace coop

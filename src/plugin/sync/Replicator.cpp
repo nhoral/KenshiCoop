@@ -50,6 +50,13 @@ const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "
                                   // (vs a fidget/turn in place -> treat as at rest)
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose
 const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
+const unsigned long TASK_RETRY_MS = 1500;  // throttle between pose apply attempts
+// A far-fixture apply (r=3) is RETRIED, not latched bad: a snap-into-fixture on
+// the owner (bed entry teleports the body ~9 u instantly) streams the task while
+// the join's interp target is still mid-glide, so the first distance gate fails
+// spuriously. The park drive walks the body to the fixture meanwhile; only a
+// persistent mismatch is a genuinely wrong fixture.
+const unsigned int TASK_FAR_RETRY_MAX = 8;
 const float TRANSLATE_EPS = 0.02f; // per-frame actual movement counted as "translating"
 // Stage 3c combat. A combatant is engine-driven locally (its own footwork), so we do
 // NOT walk-drive/park it; positional drift is corrected in GRADED bands (a fight
@@ -89,6 +96,20 @@ const unsigned long ATTR_WINDOW_MS = 3000; // remember a combatant's victim this
 const unsigned long CARRY_HEAL_MS = 1500; // min gap between self-heal pickups
 const unsigned long CARRY_DROP_MS = 3000; // stream must stop reporting the carry
                                           // this long before the local copy drops
+// Furniture occupancy sync (protocol 19): same shape as the carry self-heal.
+const unsigned long FURN_HEAL_MS = 1500;  // min gap between self-heal enters
+const unsigned long FURN_EXIT_MS = 3000;  // stream must stop reporting occupancy
+                                          // this long before the local copy exits
+const float FURN_MATCH_DIST = 6.0f;       // self-heal fixture search radius around
+                                          // the streamed occupant position
+// Stealth sync (protocol 20). The posture is CONTINUOUS state (a pure bool in
+// every batch - the speed-sync class): apply throttled so a mode-flap (engine
+// auto-clearing stealth on a driven copy) doesn't fight setStealthMode every
+// frame. The detection feedback publishes at ~4 Hz while a driven sneaker's
+// map is non-empty (arrows animate progress; 4 Hz tracks it acceptably).
+const unsigned long SNEAK_APPLY_MS   = 1000; // min gap between setStealthMode applies
+const unsigned long STEALTH_SEND_MS  = 250;  // detection snapshot cadence (~4 Hz)
+const unsigned long STEALTH_RESEND_MS = 2000; // unchanged-map safety resend (unreliable channel)
 // Step 4 divergence-gated authority (doctrine 18, behind KENSHICOOP_GATE_AUTHORITY).
 // applyTargets runs per FRAME, so the streak is frame-denominated: ~2 s at 75 fps.
 const unsigned int  TRUST_STREAK_FRAMES = 150;  // sustained agreement before trusting
@@ -119,13 +140,15 @@ Replicator::Replicator()
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
       nextWorldNetId_(1), nextDropId_(1), nextPickupId_(1), nextTreatId_(1),
       quietRelapse_(0), sitOrders_(0), detachUses_(0), noDetach_(false),
-      dmgGuard_(false), carrySync_(true), gateAuthority_(false), trustLogTick_(0),
+      dmgGuard_(false), carrySync_(true), furnSync_(true), stealthSync_(true),
+      gateAuthority_(false), trustLogTick_(0),
       trustGrants_(0), trustRevokes_(0),
-      authSuppresses_(0), authRestores_(0),
+      authSuppresses_(0), authRestores_(0), authReassertMs_(0),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
-      speedLastSendMs_(0), speedCombatSampleMs_(0) {}
+      speedLastSendMs_(0), speedCombatSampleMs_(0),
+      spawnSync_(false), spawnPosLogMs_(0), moneySync_(true), recruitSync_(true) {}
 
 void Replicator::ingest(Inbound& in) {
     std::deque<InboundEntity> got;
@@ -191,9 +214,16 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         // Empty ownRanks_ (never configured) is a safety fallback to the first tab,
         // so a missing setOwnRanks never makes us stream every tab or nothing.
         bool owned = ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
+        // Protocol 23: a RECRUIT belongs to its RECRUITER regardless of which
+        // local tab rank the engine parked it in (recruit_probe: a join recruit
+        // landed in the host-owned rank-0 container). Our own recruits always
+        // publish; hands the peer recruited never do.
+        Key hk = keyOf(raw[i]);
+        if (recruitOwned_.count(hk))     owned = true;
+        else if (peerRecruit_.count(hk)) owned = false;
         if (!owned) continue;
         buf[n++] = raw[i];
-        ownHands_.insert(keyOf(raw[i]));
+        ownHands_.insert(hk);
     }
     // Host also streams nearby world NPCs (host-authoritative world). The join leaves
     // streamNpcs_ off, so on the join this publishes ONLY its owned squad subset.
@@ -314,14 +344,17 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
         HostBody& hb = hostBody_[k];
         // Carried-body sync (protocol 18): emit reliable pickup/drop edges on
-        // carryingObject transitions of OWNED members (the carrier's owner
-        // authors the edge; TASK_CARRY_BODY + BODY_CARRIED are the self-heal).
-        // captureOne stamps TASK_CARRY_BODY + the carried hand as the subject
-        // whenever the member carries (combat overrides it, so a carrier that
-        // starts fighting reads as a drop here - the engine drops the body to
-        // fight anyway). NPC entities in buf never take this branch (only
-        // owned hands), keeping world-NPC carry out of scope.
-        if (carrySync_ && ownHands_.find(k) != ownHands_.end()) {
+        // carryingObject transitions of OWNED members AND (host only) streamed
+        // world NPCs (the entity's streamer authors the edge; TASK_CARRY_BODY +
+        // BODY_CARRIED are the self-heal). captureOne stamps TASK_CARRY_BODY +
+        // the carried hand as the subject whenever the character carries (combat
+        // overrides it, so a carrier that starts fighting reads as a drop here -
+        // the engine drops the body to fight anyway). The NPC extension covers
+        // the 2026-07-07 session gap: a host-side NPC hauling a downed PC never
+        // reached the join. Join NPCs never take this branch (streamNpcs_ is
+        // host-only), so NPC carry authorship stays one-directional by design.
+        bool carryAuthor = ownHands_.find(k) != ownHands_.end() || streamNpcs_;
+        if (carrySync_ && carryAuthor) {
             bool carryNow = coop::taskIsCarry(e.task);
             bool sameBody = hb.carrying && carryNow &&
                             hb.carried[3] == e.sIndex && hb.carried[4] == e.sSerial;
@@ -368,7 +401,141 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 hb.carried[3] = e.sIndex; hb.carried[4] = e.sSerial;
             }
         }
+        // Furniture occupancy (protocol 19): emit reliable enter/exit edges on
+        // BODY_IN_BED/BODY_IN_CAGE transitions, same authorship scope as carry
+        // (owned members + host-streamed world NPCs). The furniture HAND is not
+        // in the stream (an unconscious occupant has no task subject), so it is
+        // read off the LOCAL character (inWhat) at the ENTER edge and remembered
+        // in HostBody for the matching EXIT. Scoped away from CONSCIOUS bed
+        // poses (USE_BED / USE_BED_ORDER / SLEEP_ON_FLOOR): those stream their
+        // TASK and the peer's copy walks in via the validated L3 fixture-pose
+        // path (bed_pose) - an ENTER event would teleport it in and fight that.
+        if (furnSync_ && carryAuthor && !engine::taskIsBedPose((int)e.task)) {
+            int curKind = (cur & BODY_IN_BED) ? 1 : ((cur & BODY_IN_CAGE) ? 2 : 0);
+            if (curKind != hb.furnKind) {
+                if (hb.furnKind != 0) {
+                    // Exit edge: subject = occupant, actor = the remembered furniture.
+                    EventPacket ev; memset(&ev, 0, sizeof(ev));
+                    ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_EXIT_FURNITURE;
+                    ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+                    ev.sType = e.hType; ev.sContainer = e.hContainer;
+                    ev.sContainerSerial = e.hContainerSerial;
+                    ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
+                    ev.aType = hb.furn[0]; ev.aContainer = hb.furn[1];
+                    ev.aContainerSerial = hb.furn[2];
+                    ev.aIndex = hb.furn[3]; ev.aSerial = hb.furn[4];
+                    ev.arg = (f32)hb.furnKind;
+                    net.queueEvent(ev);
+                    char b[176]; _snprintf(b, sizeof(b) - 1,
+                        "[furn] SEND EXIT id=%u occ=%u,%u furn=%u,%u kind=%d",
+                        ev.eventId, e.hIndex, e.hSerial, hb.furn[3], hb.furn[4],
+                        hb.furnKind);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    hb.furnKind = 0;
+                    hb.furn[0] = hb.furn[1] = hb.furn[2] = hb.furn[3] = hb.furn[4] = 0;
+                }
+                if (curKind != 0) {
+                    // Enter edge: the local occupant knows WHICH furniture (inWhat).
+                    // An unreadable hand this frame leaves furnKind 0 so the edge
+                    // re-attempts next publish (the bit is still streaming).
+                    engine::FurnitureRead fr;
+                    Character* oc = engine::resolve(e);
+                    if (oc && engine::readFurniture(oc, &fr) && fr.valid &&
+                        fr.kind == curKind) {
+                        EventPacket ev; memset(&ev, 0, sizeof(ev));
+                        ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_ENTER_FURNITURE;
+                        ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+                        ev.sType = e.hType; ev.sContainer = e.hContainer;
+                        ev.sContainerSerial = e.hContainerSerial;
+                        ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
+                        ev.aType = fr.furn[0]; ev.aContainer = fr.furn[1];
+                        ev.aContainerSerial = fr.furn[2];
+                        ev.aIndex = fr.furn[3]; ev.aSerial = fr.furn[4];
+                        ev.arg = (f32)curKind;
+                        net.queueEvent(ev);
+                        hb.furnKind = curKind;
+                        for (int fi = 0; fi < 5; ++fi) hb.furn[fi] = fr.furn[fi];
+                        char b[176]; _snprintf(b, sizeof(b) - 1,
+                            "[furn] SEND ENTER id=%u occ=%u,%u furn=%u,%u kind=%d",
+                            ev.eventId, e.hIndex, e.hSerial, fr.furn[3], fr.furn[4],
+                            curKind);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                }
+            }
+        }
         hb.bs = cur; hb.seenMs = nowPub;
+    }
+    // Carried-body sync: a carrier that VANISHED from the stream mid-carry
+    // (hauled the body out of interest, despawned) can never author its drop
+    // edge from a buf transition above - the peer's copy would carry forever
+    // (npc_carry run 123255: the NPC walked M2 ~700u out of the interest
+    // sphere and the join never saw a DROP). After a short absence debounce
+    // (beyond interest-boundary flicker), author the DROP for it here; the
+    // peer releases its copy, which then rides the ordinary down channels.
+    if (carrySync_) {
+        const unsigned long CARRY_GONE_MS = 3000;
+        std::set<Key> bufKeys;
+        for (unsigned int i = 0; i < n; ++i) bufKeys.insert(keyOf(buf[i]));
+        for (std::map<Key, HostBody>::iterator hit = hostBody_.begin();
+             hit != hostBody_.end(); ++hit) {
+            HostBody& hb = hit->second;
+            if (!hb.carrying) continue;
+            if (bufKeys.find(hit->first) != bufKeys.end()) continue;
+            if (nowPub - hb.seenMs < CARRY_GONE_MS) continue;
+            const Key& ck = hit->first;
+            EventPacket ev; memset(&ev, 0, sizeof(ev));
+            ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_DROP_BODY;
+            ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+            ev.sType = hb.carried[0]; ev.sContainer = hb.carried[1];
+            ev.sContainerSerial = hb.carried[2];
+            ev.sIndex = hb.carried[3]; ev.sSerial = hb.carried[4];
+            ev.aType = ck.t; ev.aContainer = ck.c; ev.aContainerSerial = ck.cs;
+            ev.aIndex = ck.i; ev.aSerial = ck.s;
+            ev.arg = 1.0f; // ragdoll ground drop (the body is KO'd)
+            net.queueEvent(ev);
+            hb.carrying = false;
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[carry] SEND DROP id=%u carrier=%u,%u carried=%u,%u (carrier left stream)",
+                ev.eventId, ck.i, ck.s, hb.carried[3], hb.carried[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    // Furniture occupancy: an occupant that VANISHED from the stream mid-
+    // occupancy (left interest, despawned) can never author its exit edge from
+    // a buf transition above - the peer's copy would stay in the bed/cage
+    // forever with nothing correcting it (the npc_carry lesson applied to the
+    // stateful attach). After the same absence debounce, author the EXIT here;
+    // if the body later re-enters the stream still occupied, the bit re-streams
+    // and the enter edge re-fires (idempotent on the receiver).
+    if (furnSync_) {
+        const unsigned long FURN_GONE_MS = 3000;
+        std::set<Key> bufKeys2;
+        for (unsigned int i = 0; i < n; ++i) bufKeys2.insert(keyOf(buf[i]));
+        for (std::map<Key, HostBody>::iterator hit = hostBody_.begin();
+             hit != hostBody_.end(); ++hit) {
+            HostBody& hb = hit->second;
+            if (hb.furnKind == 0) continue;
+            if (bufKeys2.find(hit->first) != bufKeys2.end()) continue;
+            if (nowPub - hb.seenMs < FURN_GONE_MS) continue;
+            const Key& ok = hit->first;
+            EventPacket ev; memset(&ev, 0, sizeof(ev));
+            ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_EXIT_FURNITURE;
+            ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+            ev.sType = ok.t; ev.sContainer = ok.c; ev.sContainerSerial = ok.cs;
+            ev.sIndex = ok.i; ev.sSerial = ok.s;
+            ev.aType = hb.furn[0]; ev.aContainer = hb.furn[1];
+            ev.aContainerSerial = hb.furn[2];
+            ev.aIndex = hb.furn[3]; ev.aSerial = hb.furn[4];
+            ev.arg = (f32)hb.furnKind;
+            net.queueEvent(ev);
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[furn] SEND EXIT id=%u occ=%u,%u furn=%u,%u kind=%d (occupant left stream)",
+                ev.eventId, ok.i, ok.s, hb.furn[3], hb.furn[4], hb.furnKind);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            hb.furnKind = 0;
+            hb.furn[0] = hb.furn[1] = hb.furn[2] = hb.furn[3] = hb.furn[4] = 0;
+        }
     }
     // Age out entities that left the interest set long ago (step 6): an unbounded
     // hostBody_ leaks a session's worth of passers-by. 60 s is far beyond any
@@ -792,6 +959,249 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
     }
 }
 
+// ---- Protocol 22: per-tab wallet sync ---------------------------------------
+
+namespace {
+// Squad-tab census for the money channel: fill ranks[] with ONE representative
+// hand per distinct squad-tab container (the same sorted-distinct-containers
+// ranking publishOwned partitions ownership by). Returns the tab count.
+// rankHand[r] = a member hand of the rank-r tab (readObjectHand layout).
+unsigned int tabRepresentatives(GameWorld* gw, unsigned int rankHand[][5],
+                                unsigned int maxRanks) {
+    const unsigned int MAX_SQ = 96;
+    static EntityState raw[MAX_SQ];
+    unsigned int nSquad = engine::captureSquad(gw, /*leaderOnly*/ false, raw, MAX_SQ);
+    std::vector<std::pair<u32, u32> > ctnrs;
+    ctnrs.reserve(nSquad);
+    for (unsigned int i = 0; i < nSquad; ++i)
+        ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
+    std::sort(ctnrs.begin(), ctnrs.end());
+    ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
+    unsigned int nRanks = (unsigned int)ctnrs.size();
+    if (nRanks > maxRanks) nRanks = maxRanks;
+    for (unsigned int r = 0; r < nRanks; ++r) rankHand[r][0] = 0xFFFFFFFFu; // unfilled
+    for (unsigned int i = 0; i < nSquad; ++i) {
+        std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);
+        unsigned int rank = (unsigned int)(std::lower_bound(ctnrs.begin(), ctnrs.end(), key)
+                                           - ctnrs.begin());
+        if (rank >= nRanks || rankHand[rank][0] != 0xFFFFFFFFu) continue;
+        rankHand[rank][0] = raw[i].hType;
+        rankHand[rank][1] = raw[i].hContainer;
+        rankHand[rank][2] = raw[i].hContainerSerial;
+        rankHand[rank][3] = raw[i].hIndex;
+        rankHand[rank][4] = raw[i].hSerial;
+    }
+    return nRanks;
+}
+} // namespace
+
+void Replicator::publishMoney(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (!moneySync_) return;
+    const unsigned long RESEND_MS   = 5000; // safety resend (a lost write self-heals)
+    const unsigned long MIN_SEND_MS = 1000; // wallets move in bursts; ~1 Hz is plenty
+    const unsigned int  MAX_RANKS   = 8;
+    unsigned long now = nowMs();
+    unsigned int rankHand[MAX_RANKS][5];
+    unsigned int nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
+    for (unsigned int r = 0; r < nRanks; ++r) {
+        // Own-tabs only (the same partition rule as publishOwned's entity filter).
+        bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
+        if (!owned || rankHand[r][0] == 0xFFFFFFFFu) continue;
+        int money = -1;
+        if (!engine::readWalletByHand(rankHand[r], &money) || money < 0) continue;
+        MoneyPub& mp = moneyPub_[r];
+        if (mp.lastSendMs != 0 && (now - mp.lastSendMs) < MIN_SEND_MS) continue;
+        if (money == mp.lastSent && (now - mp.lastSendMs) < RESEND_MS) continue;
+        bool changed = (money != mp.lastSent);
+        mp.lastSent = money; mp.lastSendMs = now;
+        MoneyPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_MONEY;
+        pkt.ownerId = ownerId;
+        pkt.tabRank = r;
+        pkt.money   = money;
+        net.queueMoney(pkt);
+        if (changed) { // resends stay silent; the change is the signal
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "[money] SEND rank=%u cats=%d", r, money);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyMoney(GameWorld* gw, Inbound& in) {
+    std::deque<InboundMoney> got;
+    in.drainMoney(got);
+    if (got.empty()) return;
+    if (!moneySync_) return;
+    const unsigned int MAX_RANKS = 8;
+    unsigned int rankHand[MAX_RANKS][5];
+    unsigned int nRanks = 0;
+    bool haveRanks = false;
+    for (std::deque<InboundMoney>::iterator it = got.begin(); it != got.end(); ++it) {
+        const MoneyPacket& p = it->pkt;
+        unsigned int r = p.tabRank;
+        // Never write a tab we own - our engine is that wallet's authority.
+        bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
+        if (owned || p.money < 0) continue;
+        if (!haveRanks) { // one census per drain (cheap; usually 1 packet anyway)
+            nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
+            haveRanks = true;
+        }
+        if (r >= nRanks || rankHand[r][0] == 0xFFFFFFFFu) continue;
+        int cur = -1;
+        engine::readWalletByHand(rankHand[r], &cur);
+        if (cur == p.money) continue; // already converged (resend or echo)
+        bool ok = engine::writeWalletByHand(rankHand[r], p.money);
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "[money] RECV rank=%u cats=%d was=%d ok=%d",
+                  r, p.money, cur, ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    if (!recruitSync_) return; // hook is only installed when the sync is on
+    engine::RecruitEdge edges[8];
+    unsigned int n = engine::drainRecruitEdges(edges, 8);
+    for (unsigned int i = 0; i < n; ++i) {
+        // Pin ownership BEFORE the wire: from this tick publishOwned streams
+        // the new hand no matter which tab rank its container maps to.
+        Key nk; nk.t = edges[i].after[0]; nk.c = edges[i].after[1];
+        nk.cs = edges[i].after[2]; nk.i = edges[i].after[3]; nk.s = edges[i].after[4];
+        recruitOwned_.insert(nk);
+        EventPacket ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type    = (u8)PKT_EVENT;
+        ev.event   = EVT_RECRUIT;
+        ev.ownerId = ownerId;
+        ev.eventId = nextEventId_++;
+        ev.sType = edges[i].before[0]; ev.sContainer = edges[i].before[1];
+        ev.sContainerSerial = edges[i].before[2];
+        ev.sIndex = edges[i].before[3]; ev.sSerial = edges[i].before[4];
+        ev.aType = edges[i].after[0]; ev.aContainer = edges[i].after[1];
+        ev.aContainerSerial = edges[i].after[2];
+        ev.aIndex = edges[i].after[3]; ev.aSerial = edges[i].after[4];
+        net.queueEvent(ev);
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "[recruit] EVT send old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u",
+                  ev.sType, ev.sContainer, ev.sContainerSerial, ev.sIndex, ev.sSerial,
+                  ev.aType, ev.aContainer, ev.aContainerSerial, ev.aIndex, ev.aSerial);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::publishStealth(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    if (!stealthSync_) return;
+    unsigned long now = nowMs();
+    // Subjects: DRIVEN copies only (tracked hands we do NOT own). Our OWN
+    // sneakers' indicators are already native on our screen; what the peer
+    // cannot compute is what OUR world's detection says about ITS characters.
+    for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
+        const Key& k = it->first;
+        if (ownHands_.find(k) != ownHands_.end()) continue;
+        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        if (!c) continue;
+        engine::StealthRead sr;
+        if (!engine::readStealth(c, &sr) || !sr.valid) continue;
+        bool active = sr.sneaking && sr.nSeers > 0;
+        std::map<Key, StealthPub>::iterator pit = stealthPub_.find(k);
+        if (!active && (pit == stealthPub_.end() || !pit->second.active)) {
+            // Quiet body and the last snapshot already said so (or we never
+            // sent one) - nothing to author.
+            continue;
+        }
+        StealthPub& sp = stealthPub_[k];
+        // Fingerprint the visible map (entries + coarse progress) so an
+        // unchanged stare-down doesn't re-send every 250 ms.
+        u32 h = 2166136261u;
+        for (unsigned int i = 0; i < sr.nSeers; ++i) {
+            h = (h ^ sr.seers[i].npc[3]) * 16777619u;
+            h = (h ^ sr.seers[i].npc[4]) * 16777619u;
+            h = (h ^ (u32)sr.seers[i].see) * 16777619u;
+            h = (h ^ (u32)(sr.seers[i].prog * 4.0f)) * 16777619u;
+        }
+        h = (h ^ (u32)sr.unseen) * 16777619u;
+        if (active) {
+            if (sp.lastSendMs != 0 && (now - sp.lastSendMs) < STEALTH_SEND_MS) continue;
+            if (h == sp.hash && (now - sp.lastSendMs) < STEALTH_RESEND_MS) continue;
+        }
+        // else: falling edge - send ONE empty snapshot immediately (clears the
+        // owner's stale arrows), then go quiet.
+        sp.hash = h; sp.lastSendMs = now; sp.active = active;
+        StealthPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_STEALTH;
+        pkt.ownerId = ownerId;
+        pkt.sType = k.t; pkt.sContainer = k.c; pkt.sContainerSerial = k.cs;
+        pkt.sIndex = k.i; pkt.sSerial = k.s;
+        pkt.unseen = sr.unseen;
+        unsigned int n = active ? sr.nSeers : 0;
+        if (n > STEALTH_SEER_MAX) n = STEALTH_SEER_MAX;
+        pkt.nSeers = (u8)n;
+        for (unsigned int i = 0; i < n; ++i) {
+            pkt.seers[i].nType            = sr.seers[i].npc[0];
+            pkt.seers[i].nContainer       = sr.seers[i].npc[1];
+            pkt.seers[i].nContainerSerial = sr.seers[i].npc[2];
+            pkt.seers[i].nIndex           = sr.seers[i].npc[3];
+            pkt.seers[i].nSerial          = sr.seers[i].npc[4];
+            pkt.seers[i].see              = sr.seers[i].see;
+            pkt.seers[i].prog             = sr.seers[i].prog;
+        }
+        net.queueStealth(pkt);
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[sneak] DETECT SEND hand=%u,%u seers=%u unseen=%u map=%u",
+            k.i, k.s, n, (unsigned)sr.unseen, sr.mapSize);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    // Age out publish state for hands no longer tracked (peer left, save cycle).
+    for (std::map<Key, StealthPub>::iterator sit = stealthPub_.begin(); sit != stealthPub_.end(); ) {
+        if (targets_.find(sit->first) == targets_.end()) stealthPub_.erase(sit++);
+        else ++sit;
+    }
+}
+
+void Replicator::applyStealthFeedback(GameWorld* gw, Inbound& in) {
+    std::deque<InboundStealth> got;
+    in.drainStealth(got);
+    if (!stealthSync_ || got.empty()) return;
+    for (std::deque<InboundStealth>::iterator it = got.begin(); it != got.end(); ++it) {
+        const StealthPacket& p = it->pkt;
+        Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
+        k.i = p.sIndex; k.s = p.sSerial;
+        // Only replay onto a body WE own: the feedback stream exists to light
+        // up the OWNER's indicators. A driven copy already has its own local
+        // map (it IS the detection authority's copy elsewhere) - writing to it
+        // would double-count.
+        if (ownHands_.find(k) == ownHands_.end()) continue;
+        Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+        if (!c) continue;
+        unsigned int applied = 0;
+        unsigned int n = p.nSeers; if (n > STEALTH_SEER_MAX) n = STEALTH_SEER_MAX;
+        for (unsigned int i = 0; i < n; ++i) {
+            unsigned int npcHand[5] = {
+                p.seers[i].nType, p.seers[i].nContainer, p.seers[i].nContainerSerial,
+                p.seers[i].nIndex, p.seers[i].nSerial
+            };
+            // Seers that don't resolve locally (outside interest / suppressed-
+            // hidden) are skipped - they wouldn't be detecting here anyway.
+            if (engine::applyStealthSeer(gw, c, npcHand, p.seers[i].see,
+                                         p.seers[i].prog))
+                ++applied;
+        }
+        // An EMPTY snapshot is the authority saying "no one sees you anymore";
+        // nothing to replay - the local map's entries age out on their own once
+        // the notifies stop (spike-verified decay).
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[sneak] DETECT RECV hand=%u,%u seers=%u applied=%u unseen=%u",
+            k.i, k.s, n, applied, (unsigned)p.unseen);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                            bool isHost) {
     const unsigned long RESEND_MS        = 3000; // safety resend (late join / lost state)
@@ -816,35 +1226,35 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         speedMyCombat_ = fighting;
     }
 
-    // Local click detector: the engine's current state differing from what WE
-    // last applied means the USER acted (the treatment detector's own-write-vs-
-    // user-intent pattern) - that becomes our new request. Pause requests as
-    // speed 0. First read seeds the baseline (the save's starting speed).
-    float mult = 0.0f; bool paused = false;
-    if (!engine::readGameSpeed(gw, &mult, &paused)) return;
-    float cur = paused ? 0.0f : mult;
+    // Local vote capture: the engine-setter hooks (setGameSpeed / userPause /
+    // togglePause) record every REAL user action - UI clicks, keyboard pause,
+    // RE_Kenshi controls, and the scenario's simulated writeGameSpeed clicks -
+    // INCLUDING clicks equal to the current effective, which the old state-diff
+    // detector could never see (the stuck-vote bug). Our own quiet applies are
+    // reentrancy-guarded and never register. Pause requests as speed 0; the
+    // requested multiplier survives a pause (the engine's own model), so
+    // unpausing restores the player's request, not the arbitrated effective.
     bool userActed = false;
-    if (speedLastApplied_ < 0.0f) {
-        speedLastApplied_ = cur;
-        speedMyReq_       = cur;
-        userActed = true; // announce the initial request so the peer's state seeds
-    } else if (fabs(cur - speedLastApplied_) > EPS) {
-        speedMyReq_       = cur;
-        speedLastApplied_ = cur;
+    {
+        float im = 0.0f; bool ip = false;
+        while (engine::consumeSpeedIntent(gw, &im, &ip)) {
+            speedMyReq_ = ip ? 0.0f : im;
+            userActed = true;
+        }
+    }
+    if (speedMyReq_ < 0.0f) {
+        // First tick (or hooks unavailable): seed the request from the live
+        // engine state and announce it so the peer's arbitration seeds.
+        float mult = 0.0f; bool paused = false;
+        if (!engine::readGameSpeed(gw, &mult, &paused)) return;
+        speedMyReq_ = paused ? 0.0f : mult;
         userActed = true;
+    }
+    if (userActed) {
         char b[112]; _snprintf(b, sizeof(b) - 1,
             "[speed] REQ mult=%.2f paused=%d combat=%d",
             speedMyReq_, (speedMyReq_ <= EPS) ? 1 : 0, speedMyCombat_ ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        // A click is a REQUEST, not a local override: snap the join's engine
-        // back to the arbitrated effective right away (the host re-applies in
-        // its arbitration block below). Without this a DENIED raise would run
-        // this engine fast for up to the 3 s resend - silent divergence.
-        if (!isHost && speedLastSet_ >= 0.0f &&
-            fabs(cur - speedLastSet_) > EPS) {
-            if (engine::writeGameSpeed(gw, speedLastSet_, speedLastSet_ <= EPS))
-                speedLastApplied_ = speedLastSet_;
-        }
     }
 
     // Drain peer speed packets: the host keeps the join's latest REQUEST; the
@@ -871,8 +1281,10 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
             speedPeerReq_    = req;
             speedPeerCombat_ = cmb;
         } else if (p.type == (u8)PKT_SPEED_SET && !isHost) {
+            // QUIET apply: drives the sim to the arbitrated effective without
+            // touching the UI buttons - they keep showing this player's VOTE.
             float eff = pkPaused ? 0.0f : p.speed;
-            if (engine::writeGameSpeed(gw, eff, pkPaused)) {
+            if (engine::writeGameSpeedQuiet(gw, eff, pkPaused)) {
                 speedLastApplied_ = eff;
                 bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
                 speedLastSet_ = eff;
@@ -898,11 +1310,11 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
         // userActed with an UNCHANGED effective = a denied raise (consensus
         // holdback): re-apply immediately so the host engine doesn't run fast
-        // until the safety resend - a click is a request, not an override.
+        // until the enforcement below - a click is a request, not an override.
         if (changed || userActed || speedLastSendMs_ == 0 ||
             (now - speedLastSendMs_) >= RESEND_MS) {
             bool effPaused = (eff <= EPS);
-            if (engine::writeGameSpeed(gw, eff, effPaused))
+            if (engine::writeGameSpeedQuiet(gw, eff, effPaused))
                 speedLastApplied_ = eff;
             SpeedPacket pkt;
             memset(&pkt, 0, sizeof(pkt));
@@ -937,6 +1349,187 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
                           (speedMyCombat_ ? SPEED_IN_COMBAT : 0);
             net.queueSpeed(pkt);
             speedLastSendMs_ = now;
+        }
+    }
+
+    // Continuous enforcement (replaces the old snap-back): a REAL user click
+    // passes through the hooked setters, so the engine briefly leaves the
+    // effective (e.g. a denied raise runs fast for one tick, a local unpause
+    // resumes while the peer still holds pause). Re-assert the effective
+    // quietly whenever the engine diverges - the click stays captured as a
+    // VOTE above, the sim never keeps a non-arbitrated speed, and the buttons
+    // keep showing the vote.
+    if (speedLastSet_ >= 0.0f) {
+        float mult = 0.0f; bool paused = false;
+        if (engine::readGameSpeed(gw, &mult, &paused)) {
+            float cur = paused ? 0.0f : mult;
+            if (fabs(cur - speedLastSet_) > EPS) {
+                if (engine::writeGameSpeedQuiet(gw, speedLastSet_, speedLastSet_ <= EPS))
+                    speedLastApplied_ = speedLastSet_;
+            }
+        }
+    }
+}
+
+void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
+                            bool isHost) {
+    // Request pacing: per-hand debounce (the reliable channel guarantees
+    // delivery, so a resend only covers "asked before the reply landed"),
+    // a hard retry cap, and a long backoff after a NEGATIVE reply (the host
+    // couldn't resolve it either - e.g. the squad despawned - or the local
+    // proxy spawn failed; neither improves in seconds).
+    const unsigned long REQ_DEBOUNCE_MS  = 2000;
+    const unsigned int  REQ_MAX_SENDS    = 5;
+    const unsigned long DENIED_RETRY_MS  = 30000;
+    // Host reply throttle: a re-request inside this window is a duplicate in
+    // flight, not a new question.
+    const unsigned long REPLY_THROTTLE_MS = 2000;
+    // Proximity gate: only ask about unresolved hands streamed NEAR our own
+    // squad (the interest capture radius is 200u). A far unresolved hand is
+    // usually a BAKED NPC in a world block this client hasn't loaded yet -
+    // minting a proxy for it would create a DUPLICATE once the block loads.
+    const float SPAWN_REQ_RADIUS = 250.0f;
+    unsigned long now = nowMs();
+    (void)isHost; // protocol 23: the channel is BIDIRECTIONAL - a join RECRUIT
+                  // of a runtime-born NPC mints a hand the HOST cannot resolve,
+                  // so BOTH sides answer requests AND author them.
+
+    // ---- Answering side (both clients) ---------------------------------------
+    {
+        std::deque<InboundSpawnReq> got;
+        in.drainSpawnReqs(got);
+        for (std::deque<InboundSpawnReq>::iterator it = got.begin();
+             it != got.end(); ++it) {
+            const SpawnReqPacket& rq = it->pkt;
+            Key k; k.t = rq.hType; k.c = rq.hContainer; k.cs = rq.hContainerSerial;
+            k.i = rq.hIndex; k.s = rq.hSerial;
+            std::map<Key, unsigned long>::iterator rt = spawnReplyMs_.find(k);
+            if (rt != spawnReplyMs_.end() && (now - rt->second) < REPLY_THROTTLE_MS)
+                continue;
+            spawnReplyMs_[k] = now;
+
+            SpawnInfoPacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type    = (u8)PKT_SPAWN_INFO;
+            pkt.ownerId = ownerId;
+            pkt.hType = rq.hType; pkt.hContainer = rq.hContainer;
+            pkt.hContainerSerial = rq.hContainerSerial;
+            pkt.hIndex = rq.hIndex; pkt.hSerial = rq.hSerial;
+            Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            bool dead = false;
+            bool found = c && engine::describeCharacter(
+                c, pkt.charSid, sizeof(pkt.charSid), pkt.facSid, sizeof(pkt.facSid),
+                &pkt.x, &pkt.y, &pkt.z, &pkt.heading, &dead);
+            pkt.found = found ? 1 : 0;
+            pkt.dead  = dead ? 1 : 0;
+            net.queueSpawnInfo(pkt);
+            char b[224]; _snprintf(b, sizeof(b) - 1,
+                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d sid='%s' fac='%s'",
+                k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead,
+                pkt.charSid, pkt.facSid);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // ---- Requesting side (both clients) ---------------------------------------
+    // Land replies first (a proxy bound this tick is driven this same frame).
+    std::deque<InboundSpawnInfo> got;
+    in.drainSpawnInfos(got);
+    for (std::deque<InboundSpawnInfo>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const SpawnInfoPacket& p = it->pkt;
+        Key k; k.t = p.hType; k.c = p.hContainer; k.cs = p.hContainerSerial;
+        k.i = p.hIndex; k.s = p.hSerial;
+        SpawnReqState& rq = spawnReq_[k];
+        if (!p.found) {
+            rq.deniedMs = now;
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[spawn] INFO negative hand=%u,%u,%u,%u,%u (host can't resolve)",
+                k.t, k.c, k.cs, k.i, k.s);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+        if (proxyByKey_.find(k) != proxyByKey_.end()) continue; // duplicate reply
+        Character* proxy = engine::spawnProxyNpc(gw, p.charSid, p.facSid,
+                                                 p.x, p.y, p.z, p.heading);
+        if (!proxy) {
+            // Local mint failed (template/faction absent here - modded host?).
+            // Back off hard; retrying in seconds cannot succeed.
+            rq.deniedMs = now;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[spawn] proxy FAILED hand=%u,%u,%u,%u,%u sid='%s'",
+                k.t, k.c, k.cs, k.i, k.s, p.charSid);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+        proxyByKey_[k] = proxy;
+        // Dead on arrival: latch the down state now (the same reliable-latch
+        // path an EVT_DEATH would take) so the proxy spawns INTO ragdoll
+        // instead of standing up for a frame. Latched entries never age out.
+        if (p.dead) targets_[k].deathLatched = true;
+        char b[192]; _snprintf(b, sizeof(b) - 1,
+            "[spawn] proxy BOUND hand=%u,%u,%u,%u,%u sid='%s' fac='%s' dead=%d "
+            "pos=%.1f,%.1f,%.1f (proxies=%u)",
+            k.t, k.c, k.cs, k.i, k.s, p.charSid, p.facSid, p.dead ? 1 : 0,
+            p.x, p.y, p.z, (unsigned)proxyByKey_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Author requests for the hands applyTargets recorded unresolved last
+    // tick, proximity-gated to our own squad members.
+    if (!unresolvedHands_.empty()) {
+        const unsigned int MAX_SQUAD = 32;
+        static EntityState squad[MAX_SQUAD]; // main-thread only
+        unsigned int nSquad = engine::captureSquad(gw, false, squad, MAX_SQUAD);
+        for (std::map<Key, UnresolvedHand>::iterator it = unresolvedHands_.begin();
+             it != unresolvedHands_.end(); ++it) {
+            const Key& k = it->first;
+            if (proxyByKey_.find(k) != proxyByKey_.end()) continue;
+            SpawnReqState& rq = spawnReq_[k];
+            if (rq.deniedMs != 0) {
+                if ((now - rq.deniedMs) < DENIED_RETRY_MS) continue;
+                rq.deniedMs = 0; rq.sends = 0; // cooldown over: ask again
+            }
+            if (rq.sends >= REQ_MAX_SENDS) continue;
+            if (rq.lastSendMs != 0 && (now - rq.lastSendMs) < REQ_DEBOUNCE_MS) continue;
+            bool nearSquad = false;
+            for (unsigned int i = 0; i < nSquad && !nearSquad; ++i) {
+                nearSquad = dist3(it->second.x, it->second.y, it->second.z,
+                                  squad[i].x, squad[i].y, squad[i].z) <= SPAWN_REQ_RADIUS;
+            }
+            if (!nearSquad) continue;
+            SpawnReqPacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type    = (u8)PKT_SPAWN_REQ;
+            pkt.ownerId = ownerId;
+            pkt.hType = k.t; pkt.hContainer = k.c; pkt.hContainerSerial = k.cs;
+            pkt.hIndex = k.i; pkt.hSerial = k.s;
+            net.queueSpawnReq(pkt);
+            rq.lastSendMs = now;
+            ++rq.sends;
+            char b[144]; _snprintf(b, sizeof(b) - 1,
+                "[spawn] REQ hand=%u,%u,%u,%u,%u send=%u",
+                k.t, k.c, k.cs, k.i, k.s, rq.sends);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    unresolvedHands_.clear();
+
+    // Proxy telemetry (~2 Hz while proxies live): the STREAMED key plus the
+    // proxy body's ACTUAL local position, in the SCENARIO series shape (hand
+    // order i,s,t,c,cs like MEMBER/RECV lines) so the spawn_sync oracle can
+    // time-pair it with the host's MEMBER series per hand.
+    if (!proxyByKey_.empty() && (now - spawnPosLogMs_) >= 500) {
+        spawnPosLogMs_ = now;
+        for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
+             it != proxyByKey_.end(); ++it) {
+            float x = 0, y = 0, z = 0;
+            if (!engine::readPos(it->second, &x, &y, &z)) continue;
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO PROXY hand=%u,%u,%u,%u,%u pos=%.2f,%.2f,%.2f",
+                it->first.i, it->first.s, it->first.t, it->first.c, it->first.cs,
+                x, y, z);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
 }
@@ -1389,7 +1982,7 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
     }
 }
 
-void Replicator::applyEvents(Inbound& in) {
+void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
     std::deque<InboundEvent> got;
     in.drainEvents(got);
     for (std::deque<InboundEvent>::iterator it = got.begin(); it != got.end(); ++it) {
@@ -1462,6 +2055,95 @@ void Replicator::applyEvents(Inbound& in) {
                 cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
                 break;
             }
+            case EVT_ENTER_FURNITURE: {
+                // Furniture occupancy (protocol 19): subject = the OCCUPANT,
+                // actor = the FURNITURE's save-stable hand (both clients loaded
+                // the same save, so it resolves locally). Run the engine's own
+                // setBedMode/setPrisonMode between the LOCAL pair - the in-bed/
+                // in-cage pose and transform are engine-native here. Never on a
+                // body we own (our engine already executed the real placement).
+                if (!furnSync_) break;
+                if (ownHands_.find(k) != ownHands_.end()) break;
+                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
+                                       ev.aIndex, ev.aSerial };
+                int kind = (int)ev.arg;
+                bool ok = occ && engine::applyFurniture(0, occ, fh, kind, true);
+                char fb[160]; _snprintf(fb, sizeof(fb) - 1,
+                    "[furn] RECV ENTER id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
+                    ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,
+                    kind, ok ? 1 : 0);
+                fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
+                break;
+            }
+            case EVT_EXIT_FURNITURE: {
+                // The inverse: release the local occupant. Idempotent - a copy
+                // that never entered locally (lost/late enter) is a no-op success.
+                if (!furnSync_) break;
+                if (ownHands_.find(k) != ownHands_.end()) break;
+                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
+                                       ev.aIndex, ev.aSerial };
+                int kind = (int)ev.arg;
+                bool ok = occ && engine::applyFurniture(0, occ, fh, kind, false);
+                char fb[160]; _snprintf(fb, sizeof(fb) - 1,
+                    "[furn] RECV EXIT id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
+                    ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,
+                    kind, ok ? 1 : 0);
+                fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
+                break;
+            }
+            case EVT_RECRUIT: {
+                // Protocol 23: the sender recruited subject (OLD hand) into its
+                // squad as actor (NEW hand). RE-KEY our local copy of the old
+                // hand to the new stream key - the body it already has IS the
+                // recruit, so binding it in proxyByKey_ makes the whole driven-
+                // NPC path (AI-suspend, damage guard, latches) inherit it with
+                // no duplicate proxy mint. If the old hand doesn't resolve here
+                // (runtime-born subject), the bidirectional describe/mint
+                // channel covers it instead.
+                if (!recruitSync_) break;
+                Key nk; nk.t = ev.aType; nk.c = ev.aContainer;
+                nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
+                // A hand WE recruited must never enter peerRecruit_ (that set
+                // vetoes publishing): an echo - or both sides recruiting the
+                // SAME baked NPC, which lands on the SAME new hand (run
+                // 120738) - would otherwise silence our own recruit's stream.
+                if (recruitOwned_.count(nk) || ownHands_.count(nk)) break;
+                // Never ours to drive again: the recruiter owns this hand even
+                // if a local tab census would rank it into a tab we own.
+                peerRecruit_.insert(nk);
+                if (proxyByKey_.find(nk) != proxyByKey_.end()) break; // rebound
+                Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                if (!c) {
+                    // The old hand may itself be a MINTED proxy (the sender
+                    // recruited a runtime NPC we were already driving as a
+                    // proxy - the mid-fight ambusher case). Migrate the
+                    // binding to the new key instead of orphaning the body.
+                    std::map<Key, Character*>::iterator pit = proxyByKey_.find(k);
+                    if (pit != proxyByKey_.end()) {
+                        c = pit->second;
+                        proxyByKey_.erase(pit);
+                    }
+                }
+                if (c) {
+                    // Host-authority suppression may have already hidden the
+                    // old copy (its hand left the peer's stream the moment the
+                    // recruit re-containered it) - bring the body back first.
+                    std::map<Key, Character*>::iterator sit = suppressed_.find(k);
+                    if (sit != suppressed_.end()) {
+                        engine::restoreNpc(gw, c);
+                        suppressed_.erase(sit);
+                    }
+                    proxyByKey_[nk] = c;
+                }
+                char rb[192]; _snprintf(rb, sizeof(rb) - 1,
+                    "[recruit] REKEY old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u ok=%d",
+                    k.t, k.c, k.cs, k.i, k.s,
+                    nk.t, nk.c, nk.cs, nk.i, nk.s, c ? 1 : 0);
+                rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+                break;
+            }
             default: break;
         }
         char b[200]; _snprintf(b, sizeof(b) - 1,
@@ -1506,7 +2188,36 @@ void Replicator::applyTargets(GameWorld* gw) {
         d.fresh = true;
 
         Character* c = engine::resolve(out);
-        if (!c) continue;
+        // Protocol 21: a streamed hand with NO local body is a host RUNTIME
+        // spawn (roaming squad, dialog ambush - its hand exists only in the
+        // host's session). If a proxy was already minted for it, drive THAT
+        // body - this single translation point makes the proxy inherit the
+        // entire world-NPC path below (AI-suspend, damage guard, combat,
+        // down/death latches).
+        // (Protocol 23 reuses the same translation point for RE-KEYED recruit
+        // bodies, so the lookup also runs when only recruit sync is on.)
+        if (!c && (spawnSync_ || recruitSync_)) {
+            std::map<Key, Character*>::iterator pit = proxyByKey_.find(it->first);
+            if (pit != proxyByKey_.end()) c = pit->second;
+        }
+        if (!c) {
+            // Unresolved-hand telemetry (Phase 0 diagnostics; logged even with
+            // spawnSync off - spawn_probe baselines this failure mode). Once
+            // per hand: these repeat every frame while the host fights an
+            // enemy the join can't see.
+            if (spawnLogged_.insert(it->first).second) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] unresolved hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f",
+                    it->first.t, it->first.c, it->first.cs, it->first.i,
+                    it->first.s, out.x, out.y, out.z);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (spawnSync_) {
+                UnresolvedHand& u = unresolvedHands_[it->first];
+                u.x = out.x; u.y = out.y; u.z = out.z;
+            }
+            continue;
+        }
         drivenChars_.insert(c);
 
         // Every driven body is damage-guarded (locally-simulated hits must not
@@ -1562,6 +2273,64 @@ void Replicator::applyTargets(GameWorld* gw) {
                 continue;
             }
         }
+        // ---- Furniture carve-out + self-heal (protocol 19) ----------------------
+        // A body in a bed/cage (streamed BODY_IN_BED/BODY_IN_CAGE, or LOCALLY
+        // occupying - the local placement may lead/trail the stream by a beat) is
+        // transform-owned by its furniture attach: the down override and any
+        // locomotion driving would rip it out onto the floor. Skip both.
+        // Scoped AWAY from conscious bed poses (USE_BED / USE_BED_ORDER /
+        // SLEEP_ON_FLOOR): those ride the validated L3 fixture-pose path
+        // (bed_pose) - a sleeper streams the bed TASK, walks to the bed and
+        // climbs in engine-natively; occupancy owns the task-less (unconscious
+        // placement) case. The reliable enter/exit edges do the work; this
+        // repairs the losses:
+        //   * bit streamed but not locally occupied -> throttled enter into the
+        //     nearest matching fixture at the streamed position (the continuous
+        //     bit carries no furniture hand),
+        //   * locally occupied after the stream stopped reporting the bit ->
+        //     debounced local exit (a 1-batch blip must not eject a valid
+        //     occupant - the carry-drop lesson).
+        if (furnSync_ && !engine::taskIsBedPose((int)out.task)) {
+            int streamKind = (out.bodyState & BODY_IN_BED) ? 1
+                           : ((out.bodyState & BODY_IN_CAGE) ? 2 : 0);
+            engine::FurnitureRead lfr;
+            bool haveFr = engine::readFurniture(c, &lfr);
+            int localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
+            if (streamKind != 0) {
+                d.furnNoSeeTick = 0;
+                if (haveFr && localKind != streamKind &&
+                    (now - d.furnHealTick) >= FURN_HEAL_MS) {
+                    d.furnHealTick = now;
+                    bool ok = engine::enterFurnitureNearPos(
+                        gw, c, streamKind, out.x, out.y, out.z, FURN_MATCH_DIST);
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[furn] HEAL ENTER occ=%u,%u kind=%d ok=%d",
+                        out.hIndex, out.hSerial, streamKind, ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                d.parked = false; d.haveDest = false;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                continue;
+            } else if (localKind != 0) {
+                if (d.furnNoSeeTick == 0) {
+                    d.furnNoSeeTick = now;
+                } else if ((now - d.furnNoSeeTick) > FURN_EXIT_MS) {
+                    d.furnNoSeeTick = 0;
+                    bool ok = engine::applyFurniture(gw, c, lfr.furn, localKind, false);
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[furn] HEAL EXIT occ=%u,%u kind=%d ok=%d",
+                        out.hIndex, out.hSerial, localKind, ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                // Still locally attached this tick: hold off all driving until
+                // the debounced exit (or a fresh stream bit) resolves it.
+                d.parked = false; d.haveDest = false;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                continue;
+            } else {
+                d.furnNoSeeTick = 0;
+            }
+        }
         if (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched) {
             unsigned short localBs = engine::readBodyState(c);
             if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
@@ -1580,6 +2349,29 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (d.downApplied) {
             engine::knockDown(c, false); // host says upright again -> stand back up
             d.downApplied = false;
+        }
+
+        // ---- Stealth posture (protocol 20) -------------------------------------
+        // Continuous mode apply: the streamed BODY_SNEAK bit IS Character::
+        // stealthMode on the owner, so a difference on the local copy just
+        // re-runs the engine's own setStealthMode (sneak-walk + stealthUpdate
+        // scanning, all native). Reached only by an upright, un-carried,
+        // un-occupied body (the branches above continue out), so a KO'd or
+        // bedridden copy is never stealth-toggled. Throttled: a copy whose
+        // engine keeps clearing the mode (combat) re-applies at 1 Hz, not per
+        // frame.
+        if (stealthSync_) {
+            bool want  = coop::bodySneaking(out.bodyState);
+            int  local = engine::readStealthMode(c);
+            if (local >= 0 && ((local != 0) != want) &&
+                (d.sneakTick == 0 || (now - d.sneakTick) >= SNEAK_APPLY_MS)) {
+                d.sneakTick = now;
+                bool ok = engine::applyStealth(c, want);
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[sneak] APPLY hand=%u,%u on=%d ok=%d",
+                    out.hIndex, out.hSerial, want ? 1 : 0, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
         }
 
         // ---- Stage 3c: combat override (melee) --------------------------------
@@ -1723,14 +2515,20 @@ void Replicator::applyTargets(GameWorld* gw) {
 
         // ---- Carried-body sync (protocol 18): carrier self-heal ----------------
         // The reliable pickup/drop edges do the work; this repairs the losses.
-        // A driven SQUAD carrier streaming TASK_CARRY_BODY whose local copy is
-        // not carrying that body gets a throttled local pickup (a lost/failed
-        // pickup event, or the carried body resolved late). A local copy still
-        // carrying after the stream stopped reporting the carry (debounced -
-        // stance samples ride the lossy batch) gets a local drop. The carrier
-        // itself then falls through to the ordinary locomotion drive: it walks
-        // like any squad member; the carried body follows its local attach.
-        if (carrySync_ && isSquad) {
+        // ANY driven carrier (squad member or host-streamed world NPC) streaming
+        // TASK_CARRY_BODY whose local copy is not carrying that body gets a
+        // throttled local pickup (a lost/failed pickup event, or the carried
+        // body resolved late). A local copy still carrying after the stream
+        // stopped reporting the carry (debounced - stance samples ride the lossy
+        // batch) gets a local drop. A SQUAD carrier then falls through to the
+        // ordinary locomotion drive: it walks like any squad member; the carried
+        // body follows its local attach. An NPC carrier with an ACTIVE local
+        // carry instead ends its tick here (early continue): the kinematic
+        // walk-drive/park/rest/trust paths below applyRaw-teleport and pose-
+        // inject, which rips the shoulder attach apart - its local AI keeps
+        // running (never reaches the AI-suspend add) so the carry walk animates,
+        // and a graded position band below keeps it tracking the host's path.
+        if (carrySync_) {
             if (coop::taskIsCarry(out.task)) {
                 d.carryNoSeeTick = 0;
                 engine::CarryRead lcr;
@@ -1750,6 +2548,34 @@ void Replicator::applyTargets(GameWorld* gw) {
                         out.hIndex, out.hSerial, out.sIndex, out.sSerial,
                         ok ? 1 : 0);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    // Refresh the read: a pickup that just landed must take the
+                    // NPC early-continue below THIS tick, not after one more
+                    // pass through the kinematic drive (which would rip it off).
+                    if (ok) haveCr = engine::readCarry(c, &lcr);
+                }
+                if (!isSquad && haveCr && lcr.carrying) {
+                    // NPC carrier with a live local attach: position band only.
+                    // Under the soft band the local carry walk owns the feet;
+                    // drifted past it, converge with a real walk (walkTo keeps
+                    // the carried body on the shoulder - move orders don't
+                    // release a carry); far gone, snap once on a cooldown.
+                    if (haveActual) {
+                        float drift = dist3(ax, ay, az, out.x, out.y, out.z);
+                        if (drift > COMBAT_SNAP_DIST &&
+                            (now - d.combatSnapTick) >= COMBAT_SNAP_COOL_MS) {
+                            engine::applyRaw(c, out);
+                            d.combatSnapTick = now;
+                            { char b[128]; _snprintf(b, sizeof(b) - 1,
+                                "[carry] npc snap hand=%u,%u drift=%.1f",
+                                out.hIndex, out.hSerial, drift);
+                              b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                        } else if (drift > COMBAT_SOFT_DIST) {
+                            engine::walkTo(c, out.x, out.y, out.z, 0.0f);
+                        }
+                    }
+                    d.parked = false; d.haveDest = false;
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    continue;
                 }
             } else {
                 engine::CarryRead lcr;
@@ -1938,7 +2764,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // INJECT the seat via applyRest->applyTask. AI-suspend (set above for
                 // this NPC) is what stops the local AI from standing it back up - the
                 // thrash that broke this on the non-suspend path.
-                applyRest(c, d, out, haveActual, ax, ay, az, now);
+                applyRest(c, d, out, haveActual, ax, ay, az, now, /*isSquad*/false);
                 d.haveDest = false;
             }
         } else if (hostMoving && haveActual && haveNewest && gapNewest > SNAP_DIST) {
@@ -1983,7 +2809,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             // Squad member at rest: reproduce the host's pose (e.g. seated on the
             // same chair) at the same fixture, else quiet + park (Stage 5). This is
             // what makes a join squad-mate sit instead of standing on the chair.
-            applyRest(c, d, out, haveActual, ax, ay, az, now);
+            applyRest(c, d, out, haveActual, ax, ay, az, now, /*isSquad*/true);
             d.haveDest = false;
         }
 
@@ -2059,25 +2885,39 @@ void Replicator::applyTargets(GameWorld* gw) {
 }
 
 void Replicator::sweepCarries(GameWorld* gw) {
-    (void)gw;
-    if (!carrySync_) return;
-    // The departed peer's stream will never author its drop edges, so any
-    // driven (non-owned) copy still carrying gets a local ragdoll drop here;
-    // the carried body then returns to the ordinary KO/down channels.
+    if (!carrySync_ && !furnSync_) return;
+    // The departed peer's stream will never author its drop/exit edges, so any
+    // driven (non-owned) copy still carrying gets a local ragdoll drop here
+    // (the carried body then returns to the ordinary KO/down channels), and
+    // any driven copy still occupying furniture (protocol 19) gets a local
+    // release the same way.
     for (std::map<Key, Driven>::iterator it = targets_.begin();
          it != targets_.end(); ++it) {
         const Key& k = it->first;
         if (ownHands_.find(k) != ownHands_.end()) continue;
         Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
         if (!c) continue;
-        engine::CarryRead cr;
-        if (engine::readCarry(c, &cr) && cr.carrying) {
-            bool ok = engine::applyDrop(c, true);
-            char b[128]; _snprintf(b, sizeof(b) - 1,
-                "[carry] SWEEP DROP carrier=%u,%u ok=%d", k.i, k.s, ok ? 1 : 0);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (carrySync_) {
+            engine::CarryRead cr;
+            if (engine::readCarry(c, &cr) && cr.carrying) {
+                bool ok = engine::applyDrop(c, true);
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[carry] SWEEP DROP carrier=%u,%u ok=%d", k.i, k.s, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            it->second.carryNoSeeTick = 0;
         }
-        it->second.carryNoSeeTick = 0;
+        if (furnSync_) {
+            engine::FurnitureRead fr;
+            if (engine::readFurniture(c, &fr) && fr.valid && fr.kind != 0) {
+                bool ok = engine::applyFurniture(gw, c, fr.furn, fr.kind, false);
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[furn] SWEEP EXIT occ=%u,%u kind=%d ok=%d",
+                    k.i, k.s, fr.kind, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            it->second.furnNoSeeTick = 0;
+        }
     }
 }
 
@@ -2143,22 +2983,56 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
             // local AI can't run a divergent (standing) copy on top of the
             // host-driven world.
             if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
-                engine::suppressNpc(gw, chars[i]);
-                suppressed_[k] = chars[i];
-                ++authSuppresses_;
-                { char b[128]; _snprintf(b, sizeof(b) - 1,
-                    "[authority] suppress NPC hand=%u,%u (streamed=%u local=%u supp=%u churn=%lu/%lu)",
-                    states[i].hIndex, states[i].hSerial, (unsigned)keep.size(), n,
-                    (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
-                  b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                // Phase 2 hardening: only RECORD the suppression when the engine
+                // call actually landed. A faulted hide used to be booked as done,
+                // leaving the body visible forever with no evidence - the silent
+                // version of the join-only-enemies field report. On failure the
+                // unstreamed streak keeps climbing, so this retries every frame;
+                // log the miss once at the threshold crossing.
+                if (engine::suppressNpc(gw, chars[i])) {
+                    suppressed_[k] = chars[i];
+                    ++authSuppresses_;
+                    { char b[128]; _snprintf(b, sizeof(b) - 1,
+                        "[authority] suppress NPC hand=%u,%u (streamed=%u local=%u supp=%u churn=%lu/%lu)",
+                        states[i].hIndex, states[i].hSerial, (unsigned)keep.size(), n,
+                        (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                } else if (ac.unstreamed == SUPPRESS_AFTER_FRAMES) {
+                    char b[96]; _snprintf(b, sizeof(b) - 1,
+                        "[authority] suppress MISS hand=%u,%u (engine call failed; retrying)",
+                        states[i].hIndex, states[i].hSerial);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
             }
+        }
+    }
+
+    // Phase 2 hardening: RE-ASSERT the hide on a ~2 s cadence. suppressNpc is a
+    // one-shot (remove-from-update + clearGoals + setVisible(false)), but the
+    // engine can undo it on its own: an ambush squad's dialog/combat package
+    // re-tasks the body and zone streaming can re-add it to the update list -
+    // exactly the field report ("join-only enemies started dialog then attacked
+    // and stayed visible"). The call is idempotent, so re-applying to a body the
+    // engine never touched is a no-op; keys the host started streaming again are
+    // skipped (the restore dwell owns those).
+    unsigned long now = nowMs();
+    if (!suppressed_.empty() && (now - authReassertMs_) >= 2000) {
+        authReassertMs_ = now;
+        for (std::map<Key, Character*>::iterator it = suppressed_.begin();
+             it != suppressed_.end(); ++it) {
+            if (keep.find(it->first) != keep.end()) continue;
+            // A combat-detached body is driven under a DIFFERENT streamed key
+            // (pointer identity survives the re-containering); never re-hide a
+            // body applyTargets drove this tick.
+            if (drivenChars_.find(it->second) != drivenChars_.end()) continue;
+            engine::suppressNpc(gw, it->second);
         }
     }
 }
 
 void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
                            bool haveActual, float ax, float ay, float az,
-                           unsigned long now) {
+                           unsigned long now, bool isSquad) {
     // Re-arm only when the host adopts a genuinely NEW non-NONE rest pose (stood up
     // then sat somewhere else). Crucially we IGNORE transient host->NONE frames: the
     // host capture intermittently reads currentAction==NONE for an otherwise-seated
@@ -2175,10 +3049,14 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
         { char b[96]; _snprintf(b, sizeof(b) - 1,
             "[pose] rest re-arm task %u -> %u", (unsigned)d.issuedTask,
             (unsigned)out.task); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-        d.taskApplied = false; d.taskBad = false; d.issuedTask = out.task;
+        d.taskApplied = false; d.taskBad = false; d.taskRetries = 0;
+        d.issuedTask = out.task;
     }
     // Commit a reproducible pose (sit/operate) at the SAME fixture, once.
-    if (!syntheticCarry && out.task != TASK_NONE && !d.taskBad && !d.taskApplied) {
+    // Attempts are throttled (TASK_RETRY_MS) so a retried far-fixture apply
+    // doesn't clearGoals every frame.
+    if (!syntheticCarry && out.task != TASK_NONE && !d.taskBad && !d.taskApplied &&
+        (d.taskRetries == 0 || (now - d.taskTick) >= TASK_RETRY_MS)) {
         // I9: detach from the town-AI FIRST (once) so nothing auto-tasks this NPC,
         // then reproduce the pose via the PLAYER-ORDER path (explicit seat location)
         // so it pins THIS stool instead of running SIT_AROUND's own seat search.
@@ -2188,7 +3066,11 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
         // hand-identity hazard - it re-containers the body) may be redundant.
         // detachUses_ measures how often this fires; KENSHICOOP_NO_DETACH=1 skips
         // it for a manual A/B before any deletion.
-        if (!d.detached && !noDetach_) {
+        // NEVER detach a player-squad member: separateIntoMyOwnSquad re-containers
+        // the body into a NEW platoon (a new hand), destroying the save-stable
+        // identity every hand-keyed protocol relies on. Squad members have no
+        // town-AI re-tasker anyway (they are player-controlled + peer-driven).
+        if (!d.detached && !noDetach_ && !isSquad) {
             d.detached = engine::detachFromTownAI(c);
             if (d.detached) ++detachUses_;
         }
@@ -2196,12 +3078,20 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
         ++sitOrders_;
         d.taskTick = now;
         { char b[176]; _snprintf(b, sizeof(b) - 1,
-            "[pose] applyOrder hand=%u,%u task=%u subj=%u,%u,%u det=%d r=%d",
+            "[pose] applyOrder hand=%u,%u task=%u subj=%u,%u,%u det=%d r=%d try=%u",
             out.hIndex, out.hSerial, (unsigned)out.task,
-            out.sIndex, out.sSerial, out.sType, d.detached ? 1 : 0, r);
+            out.sIndex, out.sSerial, out.sType, d.detached ? 1 : 0, r,
+            d.taskRetries);
           b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-        if (r == 2)              d.taskApplied = true; // resolved at host xform + posed
-        else if (r == 1 || r == 3) d.taskBad   = true; // not loaded / WRONG far seat -> park
+        if (r == 2) { d.taskApplied = true; d.taskRetries = 0; } // posed at the fixture
+        else if (r == 1) d.taskBad = true; // fixture not loaded here -> park
+        else if (r == 3) {
+            // Far fixture: usually the interp target lagging a snap-into-fixture
+            // on the owner (bed entry teleports the body instantly). The park
+            // drive converges the body meanwhile; retry until the gate passes,
+            // latch bad only when the mismatch persists (genuinely wrong fixture).
+            if (++d.taskRetries >= TASK_FAR_RETRY_MAX) d.taskBad = true;
+        }
         // r <= 0 / -1: leave unapplied this frame; fall through to park.
     }
     // Drift guard: a committed pose that wandered off the host transform (the

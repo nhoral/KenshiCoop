@@ -207,7 +207,7 @@ function Set-CoopEnv {
     $env:KENSHICOOP_LOG          = $Log
     $env:KENSHICOOP_SCENARIO     = $Scenario
     # Reconcile/world-item trace gate (diagnostic scenarios need the [recon]/[wi] traces).
-    $env:KENSHICOOP_INV_DUMP     = if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -like "world_item_*") { "1" } else { "" }
+    $env:KENSHICOOP_INV_DUMP     = if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -eq "world_armor_drop" -or $Scenario -like "world_item_*") { "1" } else { "" }
     # Join-only AI-suspend probe.
     $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
     # Host-only setup/re-arm scene.

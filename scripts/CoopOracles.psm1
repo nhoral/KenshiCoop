@@ -479,6 +479,83 @@ function Test-NpcPoseState {
     return (Add-GateResult -Name "pose_state" -Status $v -Metrics @{ pairs = $judged; matched = $matched; ratio = $ratio; npcs = $npcJudged } -Detail $detail.Trim())
 }
 
+# bed_pose oracle (protocol 19 phase 1, conscious bed use). Anchors on the
+# host's "SCENARIO BED ORDER issued" marker (which carries the subject hand and
+# the ACCEPTED bed TaskType ids, so nothing is hardcoded), then gates:
+#   1. host committed: the host's post-order MEMBER series for L0 holds a bed
+#      task for >= MinCommit samples (the order actually landed + streamed),
+#   2. join committed: the join's RECV series for the same hand holds the same
+#      accepted task for >= MinCommit samples (the driven copy took the pose),
+#   3. co-located: median time-aligned host<->join gap over the join's bed-task
+#      samples <= PosTol (same bed, not a different fixture).
+# Pelvis agreement over the same aligned pairs is reported as a metric (the
+# generic pose_state oracle owns skeleton-level gating).
+function Test-BedPose {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$PosTol = 3.0, [int]$MinCommit = 6, [int]$MaxDt = 800)
+    $m = Select-String -Path $HostFile -Pattern "SCENARIO BED ORDER issued hand=(\d+),(\d+) task=(\d+) accept=(\d+),(\d+) ok=1" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $m) {
+        Write-Host "  BED-POSE FAIL - host never issued the bed order (ok=1 marker missing)"
+        return (Add-GateResult -Name "bed_pose" -Status FAIL -Detail "no BED ORDER ok=1 marker")
+    }
+    $g = $m.Matches[0].Groups
+    $keyPrefix = "$($g[1].Value),$($g[2].Value),"
+    $accept = @([int]$g[4].Value, [int]$g[5].Value)
+    $t0 = Get-MarkerTimeMs -File $HostFile -Pattern "SCENARIO BED ORDER issued"
+
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $hKey = $H.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
+    $jKey = $J.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
+    if ($null -eq $hKey -or $null -eq $jKey) {
+        Write-Host "  BED-POSE FAIL - subject series missing (host=$([bool]$hKey) join=$([bool]$jKey))"
+        return (Add-GateResult -Name "bed_pose" -Status FAIL -Detail "subject series missing")
+    }
+    $hPost = @($H[$hKey] | Where-Object { $_.t -ge $t0 })
+    $jPost = @($J[$jKey] | Where-Object { $_.t -ge $t0 })
+    $hBed  = @($hPost | Where-Object { $accept -contains $_.task })
+    $jBed  = @($jPost | Where-Object { $accept -contains $_.task })
+
+    # Co-location + pelvis agreement over the join's bed-task samples.
+    $gaps = New-Object System.Collections.ArrayList
+    $pelvisPairs = 0; $pelvisOk = 0
+    foreach ($js in $jBed) {
+        $best = [double]::MaxValue; $bh = $null
+        foreach ($hs in $hPost) {
+            $dt = [Math]::Abs($hs.t - $js.t)
+            if ($dt -lt $best) { $best = $dt; $bh = $hs }
+        }
+        if ($best -le $MaxDt -and $null -ne $bh) {
+            $dx = $js.p[0]-$bh.p[0]; $dy = $js.p[1]-$bh.p[1]; $dz = $js.p[2]-$bh.p[2]
+            [void]$gaps.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+            if ($js.pelvis -gt 0.5 -and $bh.pelvis -gt 0.5) {
+                $pelvisPairs++
+                if ([Math]::Abs($js.pelvis - $bh.pelvis) -le 1.5) { $pelvisOk++ }
+            }
+        }
+    }
+    $medGap = -1.0
+    if ($gaps.Count -gt 0) {
+        $sorted = @($gaps | Sort-Object)
+        $medGap = [Math]::Round($sorted[[int][Math]::Floor($sorted.Count / 2)], 2)
+    }
+
+    $hostCommit = ($hBed.Count -ge $MinCommit)
+    $joinCommit = ($jBed.Count -ge $MinCommit)
+    $colocated  = ($gaps.Count -gt 0 -and $medGap -le $PosTol)
+    $ok = ($hostCommit -and $joinCommit -and $colocated)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $why = @()
+    if (-not $hostCommit) { $why += "host bed-task samples $($hBed.Count) < $MinCommit (order never committed on host)" }
+    if (-not $joinCommit) { $why += "join bed-task samples $($jBed.Count) < $MinCommit (driven copy never took the pose)" }
+    if (-not $colocated)  { $why += "median gap $medGap > $PosTol (or no aligned pairs)" }
+    $detail = $why -join "; "
+    Write-Host "  BED-POSE $v - hostBed=$($hBed.Count) joinBed=$($jBed.Count) medGap=$medGap pelvisOk=$pelvisOk/$pelvisPairs $detail"
+    return (Add-GateResult -Name "bed_pose" -Status $v `
+                -Metrics @{ hostBed = $hBed.Count; joinBed = $jBed.Count; medGap = $medGap;
+                            pelvisPairs = $pelvisPairs; pelvisOk = $pelvisOk } -Detail $detail)
+}
+
 # Stage 2 body-state oracle: every host-DOWN sample must be down on the join's
 # time-aligned sample too. Inconclusive (no host-down samples) -> SKIP.
 function Test-NpcBodyState {
@@ -1056,6 +1133,272 @@ function Get-CarrySeries {
     return ,$list
 }
 
+# Parse the 2 Hz "SCENARIO FURN hand=i,s t=ms in=<0|1|2> furn=i,s pos=x,y,z bs=n"
+# series (protocol 19 furniture occupancy) for one subject hand, timestamps
+# CLOCKSYNC-corrected like every other cross-log series.
+function Get-FurnSeries {
+    param([string]$File, [string]$HandIS)
+    $list = New-Object System.Collections.ArrayList
+    if (-not (Test-Path $File)) { return ,$list }
+    $off = Get-LogClockOffsetMs -File $File
+    $pat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO FURN hand=' + [regex]::Escape($HandIS) +
+           ' t=(\d+) in=(-?\d+) furn=(\d+),(\d+)' +
+           ' pos=(-?[\d\.]+),(-?[\d\.]+),(-?[\d\.]+) bs=(\d+)'
+    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+        $e = [pscustomobject]@{
+            t    = $t
+            rawT = [long]$g[5].Value
+            in   = [int]$g[6].Value
+            furn = ($g[7].Value + ',' + $g[8].Value)
+            x = [double]$g[9].Value; y = [double]$g[10].Value; z = [double]$g[11].Value
+            bs = [int]$g[12].Value
+        }
+        [void]$list.Add($e)
+    }
+    return ,$list
+}
+
+# bed_put / cage_put (protocol 19, unconscious furniture placement): two
+# owner-side windows against the same baked fixture - A (host puts its KO'd M2
+# in, later takes it out), B (the join does the same with its L1). Gates per
+# window:
+#   enter-crossed - the PEER's local copy reads in=<kind> within MaxLatencyMs
+#                   of the author's put marker (the reliable ENTER edge or the
+#                   self-heal landed engine-native on the peer)
+#   held-in-place - while occupied on the peer, the copy sits at the author's
+#                   copy position (same-tick median gap <= PosTol; the fixture
+#                   owns the transform on both machines)
+#   exit-crossed  - the peer's copy leaves the furniture (in=0) within budget
+#                   of the author's out marker
+function Test-FurnPut {
+    param([string]$HostFile, [string]$JoinFile, [int]$Kind = 1,
+          [int]$MaxLatencyMs = 12000, [double]$PosTol = 3.0)
+    $gate = if ($Kind -eq 2) { "cage_put" } else { "bed_put" }
+    $tagU = $gate.ToUpper()
+    # Subject hands from the latch lines (each side latches both subjects; take
+    # each window's subject from its AUTHOR's log).
+    $roles = @{}
+    foreach ($r in @(@{ who = "M2"; log = $HostFile }, @{ who = "L1"; log = $JoinFile })) {
+        $mk = Select-String -Path $r.log -Pattern ('SCENARIO FURN ' + $r.who + ' hand=(\d+),(\d+)') -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $mk) {
+            Write-Host "  $tagU FAIL - $($r.who) never latched"
+            return (Add-GateResult -Name $gate -Status FAIL -Detail "no $($r.who) latch")
+        }
+        $roles[$r.who] = ($mk.Matches[0].Groups[1].Value + ',' + $mk.Matches[0].Groups[2].Value)
+    }
+    $dirs = @(
+        @{ tag = "A"; authorLog = $HostFile; peerLog = $JoinFile; subject = $roles.M2 },
+        @{ tag = "B"; authorLog = $JoinFile; peerLog = $HostFile; subject = $roles.L1 }
+    )
+    $m = @{}; $bad = @()
+    foreach ($d in $dirs) {
+        $t = $d.tag
+        # Author-side markers (ok=1 - the local engine call must have landed).
+        $pk = Select-String -Path $d.authorLog -Pattern ('SCENARIO FURNACT ' + $t + ' put hand=[\d,]+ kind=' + $Kind + ' ok=1') -ErrorAction SilentlyContinue | Select-Object -First 1
+        $ok2 = Select-String -Path $d.authorLog -Pattern ('SCENARIO FURNACT ' + $t + ' out hand=[\d,]+ kind=' + $Kind + ' ok=1') -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $pk) { $bad += "${t}: author put never landed (no ok=1 marker)"; continue }
+        if ($null -eq $ok2) { $bad += "${t}: author out never landed (no ok=1 marker)"; continue }
+        $Tp = Get-MarkerTimeMs -File $d.authorLog -Pattern ('SCENARIO FURNACT ' + $t + ' put ')
+        $Td = Get-MarkerTimeMs -File $d.authorLog -Pattern ('SCENARIO FURNACT ' + $t + ' out ')
+        # Author ground truth: its own local subject really entered the furniture.
+        $Aall = Get-FurnSeries -File $d.authorLog -HandIS $d.subject
+        $aIn = @($Aall | Where-Object { $_.t -ge $Tp -and $_.t -le ($Td + 1500) -and $_.in -eq $Kind })
+        if ($aIn.Count -lt 1) { $bad += "${t}: subject never read in=$Kind on the AUTHOR (engine put failed?)"; continue }
+        # 1. Enter crossed: the peer's local copy reads the occupancy.
+        $Pall = Get-FurnSeries -File $d.peerLog -HandIS $d.subject
+        if ($Pall.Count -lt 3) { $bad += "${t}: peer furn series too short ($($Pall.Count))"; continue }
+        $pIn = @($Pall | Where-Object { $_.t -ge $Tp -and $_.in -eq $Kind })
+        if ($pIn.Count -lt 1) { $bad += "${t}: enter never crossed to the peer"; continue }
+        $enterLat = [int]($pIn[0].t - $Tp)
+        $m["${t}EnterLatMs"] = $enterLat
+        if ($enterLat -gt $MaxLatencyMs) { $bad += "${t}: enter latency ${enterLat}ms > $MaxLatencyMs" }
+        # 2. Held in place: same-tick author<->peer distance while occupied (the
+        # fixture owns the transform on both machines, so the copies must agree).
+        $gaps = New-Object System.Collections.ArrayList
+        foreach ($s in @($pIn | Where-Object { $_.t -le ($Td + 1500) })) {
+            $as = @($aIn | Where-Object { $_.rawT -eq $s.rawT })
+            if ($as.Count -lt 1) { continue }
+            $dx = $s.x - $as[0].x; $dy = $s.y - $as[0].y; $dz = $s.z - $as[0].z
+            [void]$gaps.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+        }
+        if ($gaps.Count -ge 2) {
+            $sorted = @($gaps | Sort-Object)
+            $med = [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
+            $m["${t}FurnGapMed"] = [Math]::Round($med, 2)
+            if ($med -gt $PosTol) { $bad += "${t}: occupied copy sits off the fixture (median gap $([Math]::Round($med,2)) > $PosTol)" }
+        } else {
+            $m["${t}FurnGapMed"] = -1
+        }
+        # 3. Exit crossed: the peer's copy leaves the furniture after the out.
+        $pOut = @($Pall | Where-Object { $_.t -ge $Td -and $_.in -eq 0 })
+        if ($pOut.Count -lt 1) { $bad += "${t}: exit never crossed to the peer"; continue }
+        $exitLat = [int]($pOut[0].t - $Td)
+        $m["${t}ExitLatMs"] = $exitLat
+        if ($exitLat -gt $MaxLatencyMs) { $bad += "${t}: exit latency ${exitLat}ms > $MaxLatencyMs" }
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  $tagU FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name $gate -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  $tagU PASS - A: enter $($m.AEnterLatMs)ms exit $($m.AExitLatMs)ms gap $($m.AFurnGapMed); " +
+                "B: enter $($m.BEnterLatMs)ms exit $($m.BExitLatMs)ms gap $($m.BFurnGapMed)")
+    return (Add-GateResult -Name $gate -Status PASS -Metrics $m)
+}
+
+# sneak_probe (protocol 20 phase 0, host-side spike): the host forced
+# stealthMode on a DRIVEN copy near NPCs. Gates: the engine call landed
+# (SNEAKACT on ok=1), the mode read back 1 on the copy, and the copy's
+# whoSeesMeSneaking accumulated at least one seer entry while the mode was on
+# (detection fires against driven copies). Log-only spike - no cross-client
+# assertion yet.
+function Test-SneakProbe {
+    param([string]$HostFile)
+    $on = Select-String -Path $HostFile -Pattern 'SCENARIO SNEAKACT on hand=[\d,]+ ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $on) {
+        Write-Host "  SNEAK-PROBE FAIL - stealth-on never landed (no SNEAKACT on ok=1)"
+        return (Add-GateResult -Name "sneak_probe" -Status FAIL -Detail "no SNEAKACT on ok=1")
+    }
+    $lines = @(Select-String -Path $HostFile -Pattern 'SCENARIO SNEAKPROBE hand=[\d,]+ t=(\d+) mode=(\d) unseen=(\d+) map=(\d+)' -ErrorAction SilentlyContinue)
+    $modeOn = 0; $withSeers = 0; $maxMap = 0
+    foreach ($l in $lines) {
+        $g = $l.Matches[0].Groups
+        if ([int]$g[2].Value -eq 1) {
+            $modeOn++
+            $m = [int]$g[4].Value
+            if ($m -gt 0) { $withSeers++ }
+            if ($m -gt $maxMap) { $maxMap = $m }
+        }
+    }
+    $ok = ($modeOn -ge 6 -and $withSeers -ge 2)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $why = @()
+    if ($modeOn -lt 6) { $why += "driven copy read mode=1 in only $modeOn sample(s) (setStealthMode didn't stick?)" }
+    if ($withSeers -lt 2) { $why += "only $withSeers sample(s) with detection entries (NPCs never noticed the driven sneaker)" }
+    $detail = $why -join "; "
+    Write-Host "  SNEAK-PROBE $v - modeOn=$modeOn withSeers=$withSeers maxMap=$maxMap $detail"
+    return (Add-GateResult -Name "sneak_probe" -Status $v `
+                -Metrics @{ modeOn = $modeOn; withSeers = $withSeers; maxMap = $maxMap } -Detail $detail)
+}
+
+# Parse "SCENARIO SNEAK hand=i,s t=ms mode=d bs=n" lines into per-hand series
+# (mirrors Get-FurnSeries). Returns hashtable hand -> list of @{T; Mode; Bs}.
+function Get-SneakSeries {
+    param([string]$File)
+    $series = @{}
+    $rx = 'SCENARIO SNEAK hand=(\d+),(\d+) t=(\d+) mode=(-?\d+) bs=(\d+)'
+    foreach ($l in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $l.Matches[0].Groups
+        $hand = "$($g[1].Value),$($g[2].Value)"
+        if (-not $series.ContainsKey($hand)) { $series[$hand] = New-Object System.Collections.ArrayList }
+        [void]$series[$hand].Add(@{ T = [long]$g[3].Value; Mode = [int]$g[4].Value; Bs = [int]$g[5].Value })
+    }
+    return $series
+}
+
+# sneak_pose (protocol 20): stealth posture crossing, both directions. For each
+# window (A: host L0 10-35 s, B: join L1 45-70 s) assert the PEER's driven copy
+# read mode=1 while the owner sneaked (>= MinOn samples, within budget of the
+# owner's SNEAKACT edge) and mode=0 again after the off edge.
+function Test-SneakPose {
+    param([string]$HostFile, [string]$JoinFile, [double]$BudgetS = 6.0)
+    $whys = @(); $metrics = @{}
+    # Window A: owner = host (L0), peer = join. Window B: owner = join (L1), peer = host.
+    $legs = @(
+        @{ Name = "A"; OwnerFile = $HostFile; PeerFile = $JoinFile; OnAct = 'A-on'; OffAct = 'A-off' },
+        @{ Name = "B"; OwnerFile = $JoinFile; PeerFile = $HostFile; OnAct = 'B-on'; OffAct = 'B-off' }
+    )
+    foreach ($leg in $legs) {
+        $n = $leg.Name
+        # The owner's SNEAKACT lines carry the subject hand + define the window edges.
+        $onLine = Select-String -Path $leg.OwnerFile -Pattern ('SCENARIO SNEAKACT ' + $leg.OnAct + ' hand=(\d+),(\d+) ok=(\d)') -ErrorAction SilentlyContinue | Select-Object -First 1
+        $offLine = Select-String -Path $leg.OwnerFile -Pattern ('SCENARIO SNEAKACT ' + $leg.OffAct + ' hand=[\d,]+ ok=(\d)') -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $onLine -or $onLine.Matches[0].Groups[3].Value -ne '1') {
+            $whys += "$($n): owner never toggled stealth on (no $($leg.OnAct) ok=1)"; continue
+        }
+        if ($null -eq $offLine -or $offLine.Matches[0].Groups[1].Value -ne '1') {
+            $whys += "$($n): owner never toggled stealth off (no $($leg.OffAct) ok=1)"; continue
+        }
+        $hand = "$($onLine.Matches[0].Groups[1].Value),$($onLine.Matches[0].Groups[2].Value)"
+        # Owner-side series brackets the window in the owner's scenario clock;
+        # both clocks arm off the same peer-ready moment (aligned to ~1 s).
+        $ownSeries = (Get-SneakSeries -File $leg.OwnerFile)[$hand]
+        $peerSeries = (Get-SneakSeries -File $leg.PeerFile)[$hand]
+        if ($null -eq $ownSeries -or $null -eq $peerSeries) {
+            $whys += "$($n): missing SNEAK series for $hand (own=$($null -ne $ownSeries) peer=$($null -ne $peerSeries))"; continue
+        }
+        $tOn  = ($ownSeries | Where-Object { $_.Mode -eq 1 } | Select-Object -First 1)
+        $tOffCandidates = @($ownSeries | Where-Object { $_.Mode -eq 1 })
+        if ($null -eq $tOn -or $tOffCandidates.Count -eq 0) {
+            $whys += "$($n): owner's own copy never read mode=1 (setStealthMode failed on the owner)"; continue
+        }
+        $tOnMs  = $tOn.T
+        $tOffMs = ($tOffCandidates | Select-Object -Last 1).T
+        # Peer: mode=1 samples inside [on+budget, off] and mode=0 after off+budget.
+        $budgetMs = [long]($BudgetS * 1000)
+        $peerOn = @($peerSeries | Where-Object { $_.Mode -eq 1 -and $_.T -ge $tOnMs -and $_.T -le ($tOffMs + $budgetMs) })
+        $firstPeerOn = $peerOn | Select-Object -First 1
+        $onLatency = if ($null -ne $firstPeerOn) { ($firstPeerOn.T - $tOnMs) / 1000.0 } else { -1 }
+        $peerAfterOff = @($peerSeries | Where-Object { $_.T -ge ($tOffMs + $budgetMs) })
+        $stillOn = @($peerAfterOff | Where-Object { $_.Mode -eq 1 })
+        $metrics["$($n)_peerOnSamples"] = $peerOn.Count
+        $metrics["$($n)_onLatencyS"]   = [math]::Round($onLatency, 2)
+        if ($peerOn.Count -lt 4) { $whys += "$($n): peer's driven copy read mode=1 in only $($peerOn.Count) samples (posture never crossed)" }
+        elseif ($onLatency -gt $BudgetS) { $whys += "$($n): peer flipped mode=1 only after $onLatency s (> $BudgetS s budget)" }
+        if ($peerAfterOff.Count -ge 2 -and $stillOn.Count -gt 0) { $whys += "$($n): peer still read mode=1 in $($stillOn.Count) samples after the off edge (+budget)" }
+    }
+    $v = if ($whys.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $whys -join "; "
+    Write-Host "  SNEAK-POSE $v - $(($metrics.Keys | Sort-Object | ForEach-Object { "$($_)=$($metrics[$_])" }) -join ' ') $detail"
+    return (Add-GateResult -Name "sneak_pose" -Status $v -Metrics $metrics -Detail $detail)
+}
+
+# sneak_detect (protocol 20): detection-indicator feedback. The JOIN's leader
+# sneaks near the bar NPCs; the HOST's world detects its driven copy and
+# streams the map back. Gates: the host authored DETECT SEND snapshots, the
+# join applied entries between its local pair (DETECT RECV applied>=1), the
+# join's local map accumulated entries while sneaking, and it cleared after
+# the sneak ended.
+function Test-SneakDetect {
+    param([string]$HostFile, [string]$JoinFile, [double]$BudgetS = 8.0)
+    $whys = @(); $metrics = @{}
+    $rxDetect = 'SCENARIO DETECT hand=(\d+),(\d+) t=(\d+) mode=(\d) unseen=(\d+) map=(\d+)'
+    $joinLines = @(Select-String -Path $JoinFile -Pattern $rxDetect -ErrorAction SilentlyContinue)
+    $hostLines = @(Select-String -Path $HostFile -Pattern $rxDetect -ErrorAction SilentlyContinue)
+    if ($joinLines.Count -eq 0) { $whys += "no join DETECT series" }
+    if ($hostLines.Count -eq 0) { $whys += "no host DETECT series (driven copy unreadable)" }
+    # Host authored snapshots + join applied them (the channel itself).
+    $sends = @(Select-String -Path $HostFile -Pattern '\[sneak\] DETECT SEND hand=[\d,]+ seers=(\d+)' -ErrorAction SilentlyContinue | Where-Object { [int]$_.Matches[0].Groups[1].Value -gt 0 })
+    $recvs = @(Select-String -Path $JoinFile -Pattern '\[sneak\] DETECT RECV hand=[\d,]+ seers=\d+ applied=(\d+)' -ErrorAction SilentlyContinue | Where-Object { [int]$_.Matches[0].Groups[1].Value -gt 0 })
+    $metrics.hostSends   = $sends.Count
+    $metrics.joinApplied = $recvs.Count
+    if ($sends.Count -lt 2) { $whys += "host authored only $($sends.Count) non-empty DETECT SEND snapshots (its NPCs never detected the driven sneaker)" }
+    if ($recvs.Count -lt 2) { $whys += "join applied entries from only $($recvs.Count) snapshots (feedback channel dead)" }
+    if ($joinLines.Count -gt 0) {
+        $series = $joinLines | ForEach-Object { $g = $_.Matches[0].Groups; @{ T = [long]$g[3].Value; Mode = [int]$g[4].Value; Map = [int]$g[6].Value } }
+        $sneakOn = @($series | Where-Object { $_.Mode -eq 1 })
+        $withMap = @($sneakOn | Where-Object { $_.Map -gt 0 })
+        $metrics.joinSneakSamples = $sneakOn.Count
+        $metrics.joinMapSamples   = $withMap.Count
+        if ($sneakOn.Count -lt 4) { $whys += "join's own leader read mode=1 in only $($sneakOn.Count) samples" }
+        if ($withMap.Count -lt 2) { $whys += "join's local detection map stayed empty while sneaking ($($withMap.Count) samples with entries)" }
+        # After the sneak ends the map must drain (engine ages entries out).
+        $offT = ($sneakOn | Select-Object -Last 1).T
+        $tail = @($series | Where-Object { $_.T -gt ($offT + [long]($BudgetS * 1000)) })
+        if ($tail.Count -ge 2) {
+            $lastMaps = @($tail | Select-Object -Last 3 | ForEach-Object { $_.Map })
+            if (($lastMaps | Where-Object { $_ -gt 0 }).Count -eq $lastMaps.Count) {
+                $whys += "join's detection map never cleared after the sneak ended (last maps: $($lastMaps -join ','))"
+            }
+        }
+    }
+    $v = if ($whys.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $whys -join "; "
+    Write-Host "  SNEAK-DETECT $v - $(($metrics.Keys | Sort-Object | ForEach-Object { "$($_)=$($metrics[$_])" }) -join ' ') $detail"
+    return (Add-GateResult -Name "sneak_detect" -Status $v -Metrics $metrics -Detail $detail)
+}
+
 # carry_order (protocol 18): three carry legs - A own-tab (host L0 carries the
 # host's downed M2), B cross-tab (join L1 carries the host-owned M2), C
 # cross-tab the other direction (host L0 carries the join's downed L1). Gates
@@ -1152,6 +1495,98 @@ function Test-CarryOrder {
                 "B: pick $($m.BPickLatMs)ms drop $($m.BDropLatMs)ms gap $($m.BCarryGapMed); " +
                 "C: pick $($m.CPickLatMs)ms drop $($m.CDropLatMs)ms gap $($m.CCarryGapMed)")
     return (Add-GateResult -Name "carry_order" -Status PASS -Metrics $m)
+}
+
+# npc_carry (protocol 18, world-NPC carrier extension): the HOST directs a world
+# NPC to carry its downed M2; the JOIN must execute the pickup on its LOCAL NPC
+# copy. Single window, same three gates as a carry_order direction:
+#   pickup-crossed - the join's M2 copy reads beingCarried within budget, AND
+#                    the join DETECTED a local carrier (its own NPC latch line -
+#                    the join only latches an NPC it finds carrying M2 locally)
+#   tracks-carrier - median join-side carrier<->carried distance stays small
+#   drop-crossed   - the join's M2 copy leaves the carried state within budget
+#                    of the host's drop and still reads DOWN
+function Test-NpcCarry {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MaxLatencyMs = 12000, [double]$MaxCarryGap = 5.0)
+    $mk = Select-String -Path $HostFile -Pattern 'SCENARIO CARRY M2 hand=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mk) {
+        Write-Host "  NPC-CARRY FAIL - host never latched M2"
+        return (Add-GateResult -Name "npc_carry" -Status FAIL -Detail "no M2 latch")
+    }
+    $m2 = ($mk.Matches[0].Groups[1].Value + ',' + $mk.Matches[0].Groups[2].Value)
+    $nk = Select-String -Path $HostFile -Pattern 'SCENARIO CARRY NPC hand=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $nk) {
+        Write-Host "  NPC-CARRY FAIL - host never latched a world-NPC carrier"
+        return (Add-GateResult -Name "npc_carry" -Status FAIL -Detail "no host NPC latch")
+    }
+    $m = @{}; $bad = @()
+    # Author-side markers (ok=1 - the local engine call must have landed).
+    $pk = Select-String -Path $HostFile -Pattern 'SCENARIO CARRYACT N pickup hand=[\d,]+ ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $dk = Select-String -Path $HostFile -Pattern 'SCENARIO CARRYACT N drop hand=[\d,]+ ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $pk) { $bad += "host NPC pickup never landed (no ok=1 marker)" }
+    if ($null -eq $dk) { $bad += "host NPC drop never landed (no ok=1 marker)" }
+    if ($bad.Count -eq 0) {
+        $Tp = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO CARRYACT N pickup '
+        $Td = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO CARRYACT N drop '
+        # Author ground truth: the host's local pair really entered the carried state.
+        $Aall = Get-CarrySeries -File $HostFile -HandIS $m2
+        $aIn = @($Aall | Where-Object { $_.t -ge $Tp -and $_.t -le ($Td + 1500) -and $_.beingCarried })
+        if ($aIn.Count -lt 1) { $bad += "M2 never read beingCarried on the HOST (engine pickup failed?)" }
+        # 1. Pickup crossed: the join's M2 copy enters the carried state, and the
+        # join detected the carrier locally (its own NPC latch line).
+        $Pall = Get-CarrySeries -File $JoinFile -HandIS $m2
+        if ($bad.Count -eq 0 -and $Pall.Count -lt 3) { $bad += "join M2 carry series too short ($($Pall.Count))" }
+        if ($bad.Count -eq 0) {
+            $pIn = @($Pall | Where-Object { $_.t -ge $Tp -and $_.beingCarried })
+            if ($pIn.Count -lt 1) { $bad += "pickup never crossed to the join" }
+            else {
+                $pickLat = [int]($pIn[0].t - $Tp)
+                $m.PickLatMs = $pickLat
+                if ($pickLat -gt $MaxLatencyMs) { $bad += "pickup latency ${pickLat}ms > $MaxLatencyMs" }
+                # 2. Tracks carrier: the join's OWN carrier latch (its local hand may
+                # legitimately differ from the host key), same-tick paired distances.
+                $jk = Select-String -Path $JoinFile -Pattern 'SCENARIO CARRY NPC hand=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($null -eq $jk) { $bad += "join never detected a local NPC carrying M2" }
+                else {
+                    $jnpc = ($jk.Matches[0].Groups[1].Value + ',' + $jk.Matches[0].Groups[2].Value)
+                    $m.JoinCarrier = $jnpc
+                    $Call = Get-CarrySeries -File $JoinFile -HandIS $jnpc
+                    $gaps = New-Object System.Collections.ArrayList
+                    foreach ($s in @($pIn | Where-Object { $_.t -le ($Td + 1500) })) {
+                        $cs = @($Call | Where-Object { $_.rawT -eq $s.rawT })
+                        if ($cs.Count -lt 1) { continue }
+                        $dx = $s.x - $cs[0].x; $dy = $s.y - $cs[0].y; $dz = $s.z - $cs[0].z
+                        [void]$gaps.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+                    }
+                    if ($gaps.Count -ge 2) {
+                        $sorted = @($gaps | Sort-Object)
+                        $med = [double]$sorted[[int][Math]::Floor($sorted.Count / 2)]
+                        $m.CarryGapMed = [Math]::Round($med, 2)
+                        if ($med -gt $MaxCarryGap) { $bad += "carried copy trails its carrier (median gap $([Math]::Round($med,2)) > $MaxCarryGap)" }
+                    } else {
+                        $m.CarryGapMed = -1
+                    }
+                }
+                # 3. Drop crossed: leaves the carried state after the host's drop,
+                # still DOWN (bs & 7: DOWN|RAGDOLL|DEAD) - dropped, not stood.
+                $pOut = @($Pall | Where-Object { $_.t -ge $Td -and (-not $_.beingCarried) })
+                if ($pOut.Count -lt 1) { $bad += "drop never crossed to the join" }
+                else {
+                    $dropLat = [int]($pOut[0].t - $Td)
+                    $m.DropLatMs = $dropLat
+                    if ($dropLat -gt $MaxLatencyMs) { $bad += "drop latency ${dropLat}ms > $MaxLatencyMs" }
+                    if (($pOut[0].bs -band 7) -eq 0) { $bad += "dropped body not DOWN on the join (bs=$($pOut[0].bs))" }
+                }
+            }
+        }
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  NPC-CARRY FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "npc_carry" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  NPC-CARRY PASS - pick $($m.PickLatMs)ms drop $($m.DropLatMs)ms gap $($m.CarryGapMed) carrier=$($m.JoinCarrier)")
+    return (Add-GateResult -Name "npc_carry" -Status PASS -Metrics $m)
 }
 
 # player_combat BIDIRECTIONAL (armed NPC strikers vs the two tab leaders): the
@@ -1473,13 +1908,44 @@ function Test-SpeedSync {
         }
     }
 
+    # Same-value vote (the stuck-vote fix): the join clicks 1x while the
+    # effective is ALREADY 1x (its own stale vote is 3x). Engine state doesn't
+    # change, so only hook-captured intent can see it - the host must log a
+    # REQ RECV mult=1.00 shortly after, and the host's later re-raise click
+    # must NOT produce a 3x SET before the join's own second 3x click.
+    $tSame = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO SPEEDSYNC join click mult=1\.0 ok=1 tag=samevalue'
+    if ($null -ne $tSame) {
+        $gotVote = $false
+        $rp = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[speed\] REQ RECV owner=\d+ mult=1\.00'
+        foreach ($mi in (Select-String -Path $HostFile -Pattern $rp -ErrorAction SilentlyContinue)) {
+            $tt = Convert-StampToMs -Groups $mi.Matches[0].Groups -OffsetMs $hoff
+            if ($tt -ge ($tSame - 500) -and $tt -le ($tSame + 4000)) { $gotVote = $true; break }
+        }
+        if (-not $gotVote) { $bad += "same-value 1x click never arrived as a vote (no host REQ RECV mult=1.00 within 4s - stuck-vote bug back)" }
+        else { $m.sameValueVote = $true }
+        $tReraise = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO SPEEDSYNC host click mult=3\.0 ok=1 tag=reraise'
+        $tRaise2  = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO SPEEDSYNC join click mult=3\.0 ok=1 tag=raise2'
+        if ($null -ne $tReraise) {
+            $limit = if ($null -ne $tRaise2) { [double]$tRaise2 - 1000 } else { [double]::MaxValue }
+            $leak = @($sets | Where-Object { [Math]::Abs([double]$_.mult - 3.0) -le 0.01 -and
+                                             [double]$_.t -ge [double]$tReraise -and [double]$_.t -lt $limit }) | Select-Object -First 1
+            if ($null -ne $leak) { $bad += "host re-raise propagated to 3x at t=$([long]$leak.t) despite the join's lowered vote (min arbitration ignored the same-value vote)" }
+            else { $m.reraiseDenied = $true }
+        }
+    }
+
     # Follow latency: after each transition the join must render the new mult.
-    # Transitions before the join started logging (the pre-arm 1x seed) skip.
+    # Transitions OUTSIDE the join's logging window skip: before it started
+    # (the pre-arm 1x seed) and too close to / after its end (the host's tail
+    # runs longer; a post-combat re-raise landing after the join's last sample
+    # is unjudgeable - 2026-07-08 flake).
     $joinT0 = [double]$J[0].t
+    $joinT1 = [double]$J[$J.Count - 1].t
     $lats = @()
     for ($i = 0; $i -lt $sets.Count; $i++) {
         $st = $sets[$i]
         if ([double]$st.t -lt $joinT0) { continue }
+        if ([double]$st.t -gt ($joinT1 - $MaxFollowMs)) { continue }
         $tNext = if ($i + 1 -lt $sets.Count) { [double]$sets[$i + 1].t } else { [double]::MaxValue }
         $win = @($J | Where-Object { [double]$_.t -ge [double]$st.t -and [double]$_.t -lt $tNext })
         $hit = @($win | Where-Object { [Math]::Abs([double]$_.mult - [double]$st.mult) -le 0.01 }) | Select-Object -First 1
@@ -1537,6 +2003,112 @@ function Test-SpeedSync {
     Write-Host ("  SPEED-SYNC PASS - $($sets.Count) transitions (max follow $($m.maxFollowMs)ms, lone raise denied), " +
                 "match $frac over $consider samples, combat window 1x host=$($m.hostCombat1x) join=$($m.joinCombat1x)")
     return (Add-GateResult -Name "speed_sync" -Status PASS -Metrics $m)
+}
+
+# speed_probe (vote-decoupling phase-0 spike, HOST log only): proves the three
+# claims the decoupled speed design rests on (speedSync forced off in the run):
+#   quiet drives  - after the quiet 3x write the sim multiplier sits at 3.0 and
+#                   STICKS (nothing re-syncs it from the buttons) until loud2
+#   quiet is quiet- the buttons= series is UNCHANGED across every quiet act
+#                   (3x / 1x / pause / resume), while the loud 2x click MOVES it
+#   intent capture- the loud click produces an INTENT line (~2.0) within 2 s;
+#                   no quiet act produces one (reentrancy guard holds)
+function Test-SpeedProbe {
+    param([string]$HostFile)
+    $S = New-Object System.Collections.ArrayList  # periodic samples
+    $pat = 'SCENARIO SPEEDPROBE t=(\d+) mult=([\d\.]+) paused=(\d) nbtn=(-?\d+) buttons=(\S+)'
+    foreach ($mi in (Select-String -Path $HostFile -Pattern $pat -ErrorAction SilentlyContinue)) {
+        $gg = $mi.Matches[0].Groups
+        [void]$S.Add([pscustomobject]@{
+            t = [long]$gg[1].Value; mult = [double]$gg[2].Value
+            paused = [int]$gg[3].Value; nbtn = [int]$gg[4].Value
+            btn = $gg[5].Value })
+    }
+    $acts = @{}
+    foreach ($mi in (Select-String -Path $HostFile -Pattern 'SCENARIO SPEEDPROBE act=(\w+) t=(\d+) ok=(\d)' -ErrorAction SilentlyContinue)) {
+        $gg = $mi.Matches[0].Groups
+        $acts[$gg[1].Value] = [pscustomobject]@{ t = [long]$gg[2].Value; ok = [int]$gg[3].Value }
+    }
+    $I = New-Object System.Collections.ArrayList  # captured intent
+    foreach ($mi in (Select-String -Path $HostFile -Pattern 'SCENARIO SPEEDPROBE INTENT t=(\d+) mult=([\d\.]+) paused=(\d)' -ErrorAction SilentlyContinue)) {
+        $gg = $mi.Matches[0].Groups
+        [void]$I.Add([pscustomobject]@{
+            t = [long]$gg[1].Value; mult = [double]$gg[2].Value; paused = [int]$gg[3].Value })
+    }
+    $m = @{ samples = $S.Count; intents = $I.Count; acts = $acts.Count }
+    $bad = @()
+    foreach ($a in @('quiet3', 'loud2', 'quiet1', 'quietpause', 'quietresume')) {
+        if (-not $acts.ContainsKey($a))   { $bad += "act $a missing" }
+        elseif ($acts[$a].ok -ne 1)       { $bad += "act $a FAILED (writer returned 0)" }
+    }
+    if ($S.Count -lt 20) { $bad += "only $($S.Count) probe samples" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  SPEED-PROBE FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "speed_probe" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    # Button probe must actually be reading buttons (nbtn >= 1 on the samples).
+    $withBtn = @($S | Where-Object { $_.nbtn -ge 1 })
+    $m.buttonSamples = $withBtn.Count
+    if ($withBtn.Count -lt [Math]::Floor($S.Count * 0.5)) {
+        $bad += "button probe unavailable (nbtn>=1 on only $($withBtn.Count)/$($S.Count) samples)"
+    }
+    $tq3 = $acts['quiet3'].t;     $tl2 = $acts['loud2'].t
+    $tq1 = $acts['quiet1'].t;     $tp  = $acts['quietpause'].t
+    $tr  = $acts['quietresume'].t
+    $lastBtnBefore = {
+        param($t)
+        $pre = @($withBtn | Where-Object { $_.t -lt $t }) | Select-Object -Last 1
+        if ($null -ne $pre) { $pre.btn } else { $null }
+    }
+    # Claim 1: quiet 3x drives the sim and sticks until the loud click.
+    $w3 = @($S | Where-Object { $_.t -ge ($tq3 + 1500) -and $_.t -le ($tl2 - 500) })
+    $at3 = @($w3 | Where-Object { [Math]::Abs($_.mult - 3.0) -le 0.05 -and $_.paused -eq 0 }).Count
+    $m.quiet3Samples = $w3.Count; $m.quiet3At3 = $at3
+    if ($w3.Count -lt 5)            { $bad += "only $($w3.Count) samples in the quiet3 window" }
+    elseif ($at3 -lt $w3.Count)     { $bad += "quiet 3x did not stick: $at3/$($w3.Count) samples at 3.0 (re-synced from buttons?)" }
+    # Claim 2a: buttons unchanged across quiet3.
+    $base = & $lastBtnBefore $tq3
+    $b3 = @($withBtn | Where-Object { $_.t -ge ($tq3 + 500) -and $_.t -le ($tl2 - 500) })
+    $moved3 = @($b3 | Where-Object { $_.btn -ne $base }).Count
+    $m.quiet3BtnMoved = $moved3
+    if ($null -eq $base)   { $bad += "no button baseline before quiet3" }
+    elseif ($moved3 -gt 0) { $bad += "quiet 3x MOVED the buttons ($moved3 samples differ from '$base')" }
+    # Claim 2b: the loud 2x click moves the buttons.
+    $bl = @($withBtn | Where-Object { $_.t -ge ($tl2 + 500) -and $_.t -le ($tq1 - 500) })
+    $movedLoud = @($bl | Where-Object { $_.btn -ne $base }).Count
+    $m.loud2BtnMoved = $movedLoud
+    if ($bl.Count -ge 2 -and $movedLoud -eq 0) { $bad += "loud 2x click did NOT move the buttons (probe can't see clicks)" }
+    # Loud window sanity: mult reaches ~2.
+    $at2 = @($S | Where-Object { $_.t -ge ($tl2 + 1000) -and $_.t -le ($tq1 - 500) -and [Math]::Abs($_.mult - 2.0) -le 0.05 }).Count
+    if ($at2 -lt 2) { $bad += "loud 2x did not drive the sim to 2.0" }
+    # Quiet pause/resume: paused flag flips, buttons stay where the click left them.
+    $preP = & $lastBtnBefore $tp
+    $wp = @($S | Where-Object { $_.t -ge ($tp + 1500) -and $_.t -le ($tr - 500) })
+    $pOk = @($wp | Where-Object { $_.paused -eq 1 }).Count
+    $pBtnMoved = @($wp | Where-Object { $_.nbtn -ge 1 -and $_.btn -ne $preP }).Count
+    $m.pauseSamples = $wp.Count; $m.pausedOk = $pOk
+    if ($wp.Count -lt 3)          { $bad += "only $($wp.Count) samples in the quiet-pause window" }
+    elseif ($pOk -lt $wp.Count)   { $bad += "quiet pause did not hold ($pOk/$($wp.Count) paused)" }
+    if ($pBtnMoved -gt 0)         { $bad += "quiet pause MOVED the buttons" }
+    $wr = @($S | Where-Object { $_.t -ge ($tr + 1500) })
+    $rOk = @($wr | Where-Object { $_.paused -eq 0 }).Count
+    if ($wr.Count -ge 2 -and $rOk -lt $wr.Count) { $bad += "quiet resume did not unpause ($rOk/$($wr.Count))" }
+    # Claim 3: intent capture - loud click seen, quiet writes silent.
+    $loudIntent = @($I | Where-Object { $_.t -ge ($tl2 - 200) -and $_.t -le ($tl2 + 2000) -and [Math]::Abs($_.mult - 2.0) -le 0.05 })
+    if ($loudIntent.Count -lt 1) { $bad += "loud 2x click produced NO captured intent (hooks not seeing clicks)" }
+    $quietIntents = @()
+    foreach ($tq in @($tq3, $tq1, $tp, $tr)) {
+        $quietIntents += @($I | Where-Object { $_.t -ge ($tq - 200) -and $_.t -le ($tq + 1500) })
+    }
+    $m.quietIntentLeaks = $quietIntents.Count
+    if ($quietIntents.Count -gt 0) { $bad += "$($quietIntents.Count) INTENT line(s) during quiet writes (reentrancy guard leaking)" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  SPEED-PROBE FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "speed_probe" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  SPEED-PROBE PASS - quiet 3x stuck ($at3/$($w3.Count) samples), buttons still ('$base') across quiet acts, " +
+                "loud click moved buttons + captured as intent, pause window $pOk/$($wp.Count)")
+    return (Add-GateResult -Name "speed_probe" -Status PASS -Metrics $m)
 }
 
 # combat_crowd (waiting-attacker stance conformance): the host orders ~5 bar NPCs
@@ -2136,9 +2708,12 @@ function Test-WpnRelocate {
                 -Metrics @{ host = $h; joinAdvisory = $j })
 }
 
-# world_weapon_drop (W2): host drops; join relocates its own copy to the ground.
+# world_weapon_drop / world_armor_drop (W2): host drops gear; join relocates its own
+# copy to the ground. Both scenario variants emit the same WDROP log contract, so one
+# oracle serves both - $GateName picks the verdict label (weapon_drop / armor_drop).
 function Test-WeaponDrop {
-    param([string]$HostFile, [string]$JoinFile)
+    param([string]$HostFile, [string]$JoinFile, [string]$GateName = "weapon_drop")
+    $tag = $GateName.ToUpper().Replace("_", "-")   # WEAPON-DROP / ARMOR-DROP
     $rxHost = 'WDROP verdict role=host pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invAfter=(-?\d+) grndAfter=(-?\d+)'
     $rxJoin = 'WDROP verdict role=join pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invMin=(-?\d+) grndMax=(-?\d+) relocated=(\d+)'
     $hostOk = $false
@@ -2148,9 +2723,9 @@ function Test-WeaponDrop {
             $g = $hl.Matches[0].Groups
             $invBase = [int]$g[3].Value; $invAfter = [int]$g[4].Value; $grnd = [int]$g[5].Value
             $hostOk = ($invBase -ge 1) -and ($invAfter -le $invBase - 1) -and ($grnd -ge 1)
-            Write-Host ("  WEAPON-DROP [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
-                        " - dropped weapon to ground (invBase=$invBase invAfter=$invAfter ground=$grnd)")
-        } else { Write-Host "  WEAPON-DROP [host] FAIL - no host WDROP verdict" }
+            Write-Host ("  $tag [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - dropped gear to ground (invBase=$invBase invAfter=$invAfter ground=$grnd)")
+        } else { Write-Host "  $tag [host] FAIL - no host WDROP verdict" }
     }
     $joinOk = $false
     if (Test-Path $JoinFile) {
@@ -2159,20 +2734,599 @@ function Test-WeaponDrop {
             $g = $jl.Matches[0].Groups
             $invBase = [int]$g[3].Value; $invMin = [int]$g[4].Value; $grndMax = [int]$g[5].Value
             $joinOk = ($invBase -ge 1) -and ($invMin -le $invBase - 1) -and ($grndMax -ge 1)
-            Write-Host ("  WEAPON-DROP [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+            Write-Host ("  $tag [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
                         " - relocated own copy to ground (invBase=$invBase invMin=$invMin grndMax=$grndMax)")
             if (-not $joinOk -and $invMin -le $invBase - 1 -and $grndMax -lt 1) {
                 Write-Host "    NOTE: weapon LEFT the bag but never appeared on the ground => destroyed by inv-reconcile, not conserved"
             }
-        } else { Write-Host "  WEAPON-DROP [join] FAIL - no join WDROP verdict" }
+        } else { Write-Host "  $tag [join] FAIL - no join WDROP verdict" }
     }
     $authored = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] DROP id=' -Quiet)
     $applied  = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wd\] APPLY id=\d+ .* moved=1' -Quiet)
-    Write-Host ("  WEAPON-DROP trace: host authored DROP=$authored, join APPLY moved=1=$applied")
+    Write-Host ("  $tag trace: host authored DROP=$authored, join APPLY moved=1=$applied")
     $ok = $hostOk -and $joinOk
-    Write-Host ("  WEAPON-DROP " + $(if ($ok) { "PASS" } else { "FAIL" }))
-    return (Add-GateResult -Name "weapon_drop" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+    Write-Host ("  $tag " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
                 -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; authored = $authored; applied = $applied })
+}
+
+# ---- Runtime-spawn sync oracles (protocol 21) ---------------------------------------
+
+# Parse "SCENARIO SPAWN leg=<leg> hand=t,c,cs,i,s" lines from $File into a
+# hashtable leg -> list of hand strings (readObjectHand order, matching the
+# replicator's "[spawn] ..." log keys).
+function Get-SpawnHands {
+    param([string]$File)
+    $legs = @{}
+    if (-not (Test-Path $File)) { return $legs }
+    foreach ($m in @(Select-String -Path $File -Pattern 'SCENARIO SPAWN leg=(\w+) hand=([\d,]+)' -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        if (-not $legs.ContainsKey($g[1].Value)) { $legs[$g[1].Value] = New-Object System.Collections.ArrayList }
+        [void]$legs[$g[1].Value].Add($g[2].Value)
+    }
+    return $legs
+}
+
+# Convert a t,c,cs,i,s hand string (readObjectHand / [spawn] log order) into the
+# i,s,t,c,cs order the SCENARIO MEMBER/RECV/PROXY series lines use.
+function Convert-SpawnHandToSeriesKey {
+    param([string]$Hand)
+    $p = $Hand.Split(',')
+    if ($p.Count -ne 5) { return $null }
+    return "$($p[3]),$($p[4]),$($p[0]),$($p[1]),$($p[2])"
+}
+
+# How many of the join-local spawned hands (t,c,cs,i,s strings) drew an
+# "[authority] suppress NPC hand=i,s" line in the join log?
+function Measure-JoinSpawnSuppression {
+    param([string]$JoinFile, $JoinHands)
+    $supp = @{}
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern '\[authority\] suppress NPC hand=(\d+,\d+)' -ErrorAction SilentlyContinue)) {
+        $supp[$m.Matches[0].Groups[1].Value] = $true
+    }
+    $n = 0
+    foreach ($h in $JoinHands) {
+        $p = $h.Split(',')
+        if ($p.Count -eq 5 -and $supp.ContainsKey("$($p[3]),$($p[4])")) { $n++ }
+    }
+    return $n
+}
+
+# spawn_probe (protocol 21 phase 0, spawnSync FORCED OFF): baseline the two
+# runtime-spawn failure modes with evidence.
+#   * mechanism proof (gates): the host spawned runtime squads in BOTH legs,
+#     the join spawned its local squad, and the JOIN logged
+#     "[spawn] unresolved hand=..." for at least one host near-spawn hand -
+#     the host-only-enemies desync, observed rather than assumed.
+#   * finding (metrics only, never gates): whether enforceHostAuthority
+#     suppressed the join-local spawns ([authority] suppress) - measuring
+#     that gap is the probe's PURPOSE, so both outcomes are a valid result.
+function Test-SpawnProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $hostLegs = Get-SpawnHands -File $HostFile
+    $joinLegs = Get-SpawnHands -File $JoinFile
+    $near = if ($hostLegs.ContainsKey('near')) { @($hostLegs['near']) } else { @() }
+    $far  = if ($hostLegs.ContainsKey('far'))  { @($hostLegs['far'])  } else { @() }
+    $jsp  = if ($joinLegs.ContainsKey('join')) { @($joinLegs['join']) } else { @() }
+    $why = @()
+    if ($near.Count -eq 0) { $why += "host never spawned the near leg" }
+    if ($far.Count -eq 0)  { $why += "host never spawned the far leg" }
+    if ($jsp.Count -eq 0)  { $why += "join never spawned its local squad" }
+
+    # Failure mode 1 evidence: join couldn't resolve the host's runtime hands.
+    $unres = @{}
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern '\[spawn\] unresolved hand=([\d,]+)' -ErrorAction SilentlyContinue)) {
+        $unres[$m.Matches[0].Groups[1].Value] = $true
+    }
+    $nearUnres = @($near | Where-Object { $unres.ContainsKey($_) }).Count
+    $farUnres  = @($far  | Where-Object { $unres.ContainsKey($_) }).Count
+    if ($near.Count -gt 0 -and $nearUnres -eq 0) {
+        $why += "join logged no [spawn] unresolved line for any near-spawn hand (hand collision? stream gap?)"
+    }
+
+    # Failure mode 2 finding: did suppression catch the join-local spawns?
+    $jSupp = Measure-JoinSpawnSuppression -JoinFile $JoinFile -JoinHands $jsp
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  SPAWN-PROBE $v - near=$($near.Count) far=$($far.Count) joinLocal=$($jsp.Count) nearUnresolved=$nearUnres farUnresolved=$farUnres joinSuppressed=$jSupp/$($jsp.Count) $detail"
+    if ($jsp.Count -gt 0 -and $jSupp -lt $jsp.Count) {
+        Write-Host "    FINDING: $($jsp.Count - $jSupp) join-local runtime spawn(s) were NEVER suppressed - the phase-2 suppression gap, now measured"
+    }
+    return (Add-GateResult -Name "spawn_probe" -Status $v `
+                -Metrics @{ near = $near.Count; far = $far.Count; joinLocal = $jsp.Count
+                            nearUnresolved = $nearUnres; farUnresolved = $farUnres
+                            joinSuppressed = $jSupp } -Detail $detail)
+}
+
+# shop_probe (protocol 22 phase 0): money + vendor-trading EVIDENCE gate.
+# Gates only that the probe produced its evidence:
+#   1. the host enumerated at least one vendor (SCENARIO VENDOR),
+#   2. both sides logged a readable per-tab WALLET series (money >= 0),
+#   3. both sides logged their scripted SHOPBUY attempt (any res - the result
+#      is a finding, not a gate).
+# Everything else - did the host's purchase cross (wallet/vendor stock deltas
+# on the join), did the join-side buy against a driven vendor copy work at all
+# - is MEASURED and reported as FINDINGs; those findings gate the 1b/1c design,
+# not this oracle.
+function Get-WalletSeries {
+    param([string]$File)
+    # rank -> ordered list of @{ t; money }
+    $out = @{}
+    if (-not (Test-Path $File)) { return $out }
+    foreach ($m in @(Select-String -Path $File -Pattern 'SCENARIO WALLET rank=(\d+) money=(-?\d+) t=(\d+)' -ErrorAction SilentlyContinue)) {
+        $r = [int]$m.Matches[0].Groups[1].Value
+        if (-not $out.ContainsKey($r)) { $out[$r] = New-Object System.Collections.ArrayList }
+        [void]$out[$r].Add(@{ t = [long]$m.Matches[0].Groups[3].Value
+                              money = [int]$m.Matches[0].Groups[2].Value })
+    }
+    return $out
+}
+function Test-ShopProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    # 1. Vendor enumeration (host side is the authority for "a vendor exists").
+    # Vendors are keyed by the trader CHARACTER's save-stable hand (thand): the
+    # ShopTrader wrapper's own serial is runtime-minted and never matches across
+    # clients (run 103018 finding).
+    $vendorRegex = 'SCENARIO VENDOR hand=[\d,]+ money=(-?\d+) stock=(-?\d+) qty=(-?\d+) src=(-?\d+) thand=([\d,]+)'
+    $hostVendorLines = @(Select-String -Path $HostFile -Pattern $vendorRegex -ErrorAction SilentlyContinue)
+    $joinVendorLines = @(Select-String -Path $JoinFile -Pattern $vendorRegex -ErrorAction SilentlyContinue)
+    if ($hostVendorLines.Count -eq 0) { $why += "host enumerated no vendor (save has none in range?)" }
+
+    # 2. Wallet series readable on both sides.
+    $hw = Get-WalletSeries -File $HostFile
+    $jw = Get-WalletSeries -File $JoinFile
+    $hostWalletOk = $false
+    foreach ($r in $hw.Keys) { foreach ($s in $hw[$r]) { if ($s.money -ge 0) { $hostWalletOk = $true } } }
+    $joinWalletOk = $false
+    foreach ($r in $jw.Keys) { foreach ($s in $jw[$r]) { if ($s.money -ge 0) { $joinWalletOk = $true } } }
+    if (-not $hostWalletOk) { $why += "host wallet series unreadable (accessors unresolved?)" }
+    if (-not $joinWalletOk) { $why += "join wallet series unreadable" }
+
+    # 3. Both scripted buy attempts logged.
+    $hostBuy = Select-String -Path $HostFile -Pattern 'SCENARIO SHOPBUY who=host res=(-?\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinBuy = Select-String -Path $JoinFile -Pattern 'SCENARIO SHOPBUY who=join res=(-?\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $hostBuyRes = if ($hostBuy) { [int]$hostBuy.Matches[0].Groups[1].Value } else { -9 }
+    $joinBuyRes = if ($joinBuy) { [int]$joinBuy.Matches[0].Groups[1].Value } else { -9 }
+    if ($null -eq $hostBuy) { $why += "host never logged its SHOPBUY attempt" }
+    if ($null -eq $joinBuy) { $why += "join never logged its SHOPBUY attempt" }
+
+    # 4. Both scripted wallet writes logged (the 1b apply-primitive check + the
+    #    decisive crossing lever: side-distinct sentinels, host 5000 / join 7000).
+    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=(\d+) target=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
+    $hostSet = Select-String -Path $HostFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinSet = Select-String -Path $JoinFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostSet) { $why += "host never logged its WALLETSET" }
+    if ($null -eq $joinSet) { $why += "join never logged its WALLETSET" }
+    $hostSetOk = $false; $joinSetOk = $false
+    if ($hostSet) { $hostSetOk = ($hostSet.Matches[0].Groups[4].Value -eq '1') -and ($hostSet.Matches[0].Groups[6].Value -eq $hostSet.Matches[0].Groups[3].Value) }
+    if ($joinSet) { $joinSetOk = ($joinSet.Matches[0].Groups[4].Value -eq '1') -and ($joinSet.Matches[0].Groups[6].Value -eq $joinSet.Matches[0].Groups[3].Value) }
+
+    # FINDING A: final wallet divergence per rank (does anything cross today?).
+    $rankDiv = @{}
+    foreach ($r in $hw.Keys) {
+        if (-not $jw.ContainsKey($r)) { continue }
+        $hEnd = $hw[$r][$hw[$r].Count - 1].money
+        $jEnd = $jw[$r][$jw[$r].Count - 1].money
+        if ($hEnd -ge 0 -and $jEnd -ge 0) { $rankDiv[$r] = ($hEnd - $jEnd) }
+    }
+    # FINDING B: vendor money/stock end-state per trader hand, host vs join.
+    $vend = @{}
+    foreach ($pair in @(@('host', $hostVendorLines), @('join', $joinVendorLines))) {
+        $side = $pair[0]
+        foreach ($m in $pair[1]) {
+            $hand = $m.Matches[0].Groups[5].Value
+            if ($hand -eq '0,0,0,0,0') { continue } # trader hand unread
+            if (-not $vend.ContainsKey($hand)) { $vend[$hand] = @{} }
+            $vend[$hand][$side] = @{ money = [int]$m.Matches[0].Groups[1].Value
+                                     stock = [int]$m.Matches[0].Groups[2].Value }
+        }
+    }
+    $vendorDiverged = 0; $vendorShared = 0
+    foreach ($hand in $vend.Keys) {
+        if ($vend[$hand].ContainsKey('host') -and $vend[$hand].ContainsKey('join')) {
+            $vendorShared++
+            $h = $vend[$hand]['host']; $j = $vend[$hand]['join']
+            if (($h.money -ne $j.money) -or ($h.stock -ne $j.stock)) { $vendorDiverged++ }
+        }
+    }
+
+    # FINDING C: did either sentinel CROSS? (host sets its rank to 5000, join
+    # sets its rank to 7000; the peer's final money for that rank tells us.)
+    $crossToJoin = $null; $crossToHost = $null
+    if ($hostSet -and $hostSetOk) {
+        $hr = [int]$hostSet.Matches[0].Groups[2].Value
+        $ht = [int]$hostSet.Matches[0].Groups[3].Value
+        if ($jw.ContainsKey($hr)) { $crossToJoin = ($jw[$hr][$jw[$hr].Count - 1].money -eq $ht) }
+    }
+    if ($joinSet -and $joinSetOk) {
+        $jr = [int]$joinSet.Matches[0].Groups[2].Value
+        $jt = [int]$joinSet.Matches[0].Groups[3].Value
+        if ($hw.ContainsKey($jr)) { $crossToHost = ($hw[$jr][$hw[$jr].Count - 1].money -eq $jt) }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  SHOP-PROBE $v - hostVendors=$($hostVendorLines.Count) joinVendors=$($joinVendorLines.Count) hostBuyRes=$hostBuyRes joinBuyRes=$joinBuyRes hostSetOk=$hostSetOk joinSetOk=$joinSetOk $detail"
+    foreach ($r in ($rankDiv.Keys | Sort-Object)) {
+        $tag = if ($rankDiv[$r] -eq 0) { "converged" } else { "DIVERGED by $($rankDiv[$r])" }
+        Write-Host "    FINDING: tab rank $r final wallet host-join = $tag"
+    }
+    if ($null -ne $crossToJoin) {
+        Write-Host ("    FINDING: host wallet sentinel " + $(if ($crossToJoin) { "CROSSED to the join (something syncs money today!)" } else { "did NOT cross to the join (the 1b gap, as predicted)" }))
+    }
+    if ($null -ne $crossToHost) {
+        Write-Host ("    FINDING: join wallet sentinel " + $(if ($crossToHost) { "CROSSED to the host" } else { "did NOT cross to the host" }))
+    }
+    if ($vendorShared -gt 0) {
+        Write-Host "    FINDING: $vendorDiverged/$vendorShared cross-visible vendor(s) ended with diverged money/stock"
+    }
+    if ($joinBuyRes -eq 1) { Write-Host "    FINDING: join-side buyItem against its local vendor copy SUCCEEDED (engine allows it)" }
+    elseif ($joinBuyRes -eq 0) { Write-Host "    FINDING: join-side buyItem refused/no-stock (res=0)" }
+    elseif ($joinBuy) { Write-Host "    FINDING: join-side buy attempt failed hard (res=$joinBuyRes) - 1c must redesign around host-forwarded purchase" }
+    $rankDivMetric = @{}
+    foreach ($r in $rankDiv.Keys) { $rankDivMetric["rank$r"] = $rankDiv[$r] }
+    return (Add-GateResult -Name "shop_probe" -Status $v `
+                -Metrics @{ hostVendors = $hostVendorLines.Count; joinVendors = $joinVendorLines.Count
+                            hostBuyRes = $hostBuyRes; joinBuyRes = $joinBuyRes
+                            hostSetOk = $hostSetOk; joinSetOk = $joinSetOk
+                            crossToJoin = $crossToJoin; crossToHost = $crossToHost
+                            vendorShared = $vendorShared; vendorDiverged = $vendorDiverged
+                            walletDiv = $rankDivMetric } -Detail $detail)
+}
+
+# money_sync (protocol 22, moneySync ON): the wallet-channel gate. Same script
+# as shop_probe minus the vendor legs: each side writes a side-distinct wallet
+# sentinel into the tab it OWNS (host rank0=5000, join rank1=7000) and the
+# channel must carry it across - the gate is CONVERGENCE:
+#   1. both WALLETSET writes succeeded (apply primitive works);
+#   2. the peer's WALLET series ends at the sender's sentinel for that rank
+#      (a "[money] RECV" landed and stuck);
+#   3. every rank readable on both sides ends converged (no drift elsewhere).
+function Test-MoneySync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    $hw = Get-WalletSeries -File $HostFile
+    $jw = Get-WalletSeries -File $JoinFile
+    if ($hw.Keys.Count -eq 0) { $why += "host logged no WALLET series" }
+    if ($jw.Keys.Count -eq 0) { $why += "join logged no WALLET series" }
+
+    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=(\d+) target=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
+    $hostSet = Select-String -Path $HostFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinSet = Select-String -Path $JoinFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostSet) { $why += "host never logged its WALLETSET" }
+    if ($null -eq $joinSet) { $why += "join never logged its WALLETSET" }
+    foreach ($pair in @(@('host', $hostSet), @('join', $joinSet))) {
+        $side = $pair[0]; $s = $pair[1]
+        if ($s -and (($s.Matches[0].Groups[4].Value -ne '1') -or
+                     ($s.Matches[0].Groups[6].Value -ne $s.Matches[0].Groups[3].Value))) {
+            $why += "$side WALLETSET write failed (ok/after mismatch)"
+        }
+    }
+
+    # Crossing: the peer's final money at the sender's rank equals the sentinel.
+    $crossed = 0; $expected = 0
+    foreach ($leg in @(@($hostSet, $jw, 'host->join'), @($joinSet, $hw, 'join->host'))) {
+        $s = $leg[0]; $peer = $leg[1]; $tag = $leg[2]
+        if ($null -eq $s) { continue }
+        $rank = [int]$s.Matches[0].Groups[2].Value
+        $tgt  = [int]$s.Matches[0].Groups[3].Value
+        $expected++
+        if (-not $peer.ContainsKey($rank)) { $why += "$tag rank $rank absent from peer WALLET series"; continue }
+        $end = $peer[$rank][$peer[$rank].Count - 1].money
+        if ($end -eq $tgt) { $crossed++ }
+        else { $why += "$tag sentinel did not cross (peer rank $rank ended $end, want $tgt)" }
+    }
+
+    # No drift on any co-visible rank.
+    $diverged = @()
+    foreach ($r in $hw.Keys) {
+        if (-not $jw.ContainsKey($r)) { continue }
+        $hEnd = $hw[$r][$hw[$r].Count - 1].money
+        $jEnd = $jw[$r][$jw[$r].Count - 1].money
+        if ($hEnd -ge 0 -and $jEnd -ge 0 -and $hEnd -ne $jEnd) { $diverged += "rank$r($hEnd/$jEnd)" }
+    }
+    if ($diverged.Count -gt 0) { $why += ("final wallets diverged: " + ($diverged -join ", ")) }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  MONEY-SYNC $v - crossed=$crossed/$expected $detail"
+    return (Add-GateResult -Name "money_sync" -Status $v `
+                -Metrics @{ crossed = $crossed; expected = $expected
+                            diverged = $diverged.Count } -Detail $detail)
+}
+
+# recruit_probe (protocol 23 phase 0): mid-session recruitment evidence.
+# Gates only that the script RAN (both legs logged a RECRUIT line + the TABS
+# census series exists on both sides); the design-shaping findings are:
+#   * per side/leg: did recruit() succeed, did the hand CONTAINER change, did
+#     index/serial survive?
+#   * did the recruit mint a NEW tab (container census grew) - and did the
+#     PRE-EXISTING containers keep their sorted order (rank stability)?
+#   * peer visibility: does the recruiter's new hand show up in the peer's
+#     [spawn] unresolved/REQ/proxy stream (the accidental-proxy hazard)?
+function Test-RecruitProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $rRegex = 'SCENARIO RECRUIT who=(host|join) leg=(baked|runtime) res=(-?\d+) before=([\d,]+) after=([\d,]+)'
+    $legs = @{}
+    foreach ($pair in @(@('host', $HostFile), @('join', $JoinFile))) {
+        $side = $pair[0]
+        foreach ($m in @(Select-String -Path $pair[1] -Pattern $rRegex -ErrorAction SilentlyContinue)) {
+            $legs["$side/$($m.Matches[0].Groups[2].Value)"] = @{
+                res    = [int]$m.Matches[0].Groups[3].Value
+                before = $m.Matches[0].Groups[4].Value
+                after  = $m.Matches[0].Groups[5].Value
+            }
+        }
+    }
+    foreach ($k in @('host/baked', 'host/runtime', 'join/baked', 'join/runtime')) {
+        if (-not $legs.ContainsKey($k)) { $why += "$k never logged its RECRUIT" }
+    }
+
+    # TABS census series (both sides).
+    function Get-TabsSeries([string]$File) {
+        $out = New-Object System.Collections.ArrayList
+        foreach ($m in @(Select-String -Path $File -Pattern 'SCENARIO TABS n=(\d+) squad=(\d+) list=(\S*) t=(\d+)' -ErrorAction SilentlyContinue)) {
+            [void]$out.Add(@{ n = [int]$m.Matches[0].Groups[1].Value
+                              squad = [int]$m.Matches[0].Groups[2].Value
+                              list = $m.Matches[0].Groups[3].Value
+                              t = [long]$m.Matches[0].Groups[4].Value })
+        }
+        return $out
+    }
+    $hTabs = Get-TabsSeries $HostFile
+    $jTabs = Get-TabsSeries $JoinFile
+    if ($hTabs.Count -eq 0) { $why += "host logged no TABS census" }
+    if ($jTabs.Count -eq 0) { $why += "join logged no TABS census" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  RECRUIT-PROBE $v - $detail"
+
+    # FINDINGS per leg.
+    foreach ($k in ($legs.Keys | Sort-Object)) {
+        $l = $legs[$k]
+        $b = $l.before -split ','; $a = $l.after -split ','
+        $contChanged = ($b[1] -ne $a[1]) -or ($b[2] -ne $a[2])
+        $idxSurvived = ($b[3] -eq $a[3]) -and ($b[4] -eq $a[4])
+        Write-Host "    FINDING: $k res=$($l.res) containerChanged=$contChanged indexSerialSurvived=$idxSurvived (before=$($l.before) after=$($l.after))"
+    }
+    # FINDING: tab census growth + pre-existing order stability per side.
+    foreach ($pair in @(@('host', $hTabs), @('join', $jTabs))) {
+        $side = $pair[0]; $s = $pair[1]
+        if ($s.Count -lt 2) { continue }
+        $first = $s[0]; $last = $s[$s.Count - 1]
+        $stable = $last.list.StartsWith($first.list)
+        Write-Host "    FINDING: $side tabs $($first.n)->$($last.n) squad $($first.squad)->$($last.squad) preexistingOrderStable=$stable (first=$($first.list) last=$($last.list))"
+    }
+    # FINDING: peer spawn-channel reaction to each recruiter's AFTER hand.
+    foreach ($k in ($legs.Keys | Sort-Object)) {
+        $l = $legs[$k]
+        if ($l.res -ne 1) { continue }
+        $peerFile = if ($k.StartsWith('host')) { $JoinFile } else { $HostFile }
+        $hand = [regex]::Escape($l.after)
+        $unres = @(Select-String -Path $peerFile -Pattern "\[spawn\] (unresolved|REQ) hand=$hand" -ErrorAction SilentlyContinue).Count
+        $proxy = @(Select-String -Path $peerFile -Pattern "\[spawn\] proxy BOUND hand=$hand" -ErrorAction SilentlyContinue).Count
+        Write-Host "    FINDING: $k peer saw unresolved/REQ=$unres proxyBound=$proxy for the recruited hand"
+    }
+    return (Add-GateResult -Name "recruit_probe" -Status $v `
+                -Metrics @{ legs = $legs.Count } -Detail $detail)
+}
+
+# recruit_sync (protocol 23): the gated recruitment-convergence oracle. Each
+# side recruits a BAKED world NPC and a RUNTIME spawn; the gate is that every
+# recruited hand CONVERGED on the peer:
+#   1. all four RECRUIT legs res=1 (the local recruits succeeded);
+#   2. each recruiter authored its reliable edge ("[recruit] EVT send" x2);
+#   3. for each leg the PEER bound ONE local body to the new hand - a
+#      "[recruit] REKEY ... ok=1" (its existing copy re-keyed; the baked path)
+#      or a "[spawn] proxy BOUND" (minted via the bidirectional describe
+#      channel; the runtime path);
+#   4. the peer then TRACKED the hand (a SCENARIO PROXY series exists for it -
+#      the bound body is actually driven, not just registered).
+# Duplicate-mint evidence (REKEY ok=1 AND proxy BOUND for the same hand) fails
+# the gate: the whole point over the probe baseline is ONE body per recruit.
+function Test-RecruitSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $rRegex = 'SCENARIO RECRUIT who=(host|join) leg=(baked|runtime) res=(-?\d+) before=([\d,]+) after=([\d,]+)'
+    $legs = @{}
+    foreach ($pair in @(@('host', $HostFile), @('join', $JoinFile))) {
+        $side = $pair[0]
+        foreach ($m in @(Select-String -Path $pair[1] -Pattern $rRegex -ErrorAction SilentlyContinue)) {
+            $legs["$side/$($m.Matches[0].Groups[2].Value)"] = @{
+                res   = [int]$m.Matches[0].Groups[3].Value
+                after = $m.Matches[0].Groups[5].Value
+            }
+        }
+    }
+    foreach ($k in @('host/baked', 'host/runtime', 'join/baked', 'join/runtime')) {
+        if (-not $legs.ContainsKey($k)) { $why += "$k never logged its RECRUIT" }
+        elseif ($legs[$k].res -ne 1)    { $why += "$k recruit failed locally (res=$($legs[$k].res))" }
+    }
+    foreach ($pair in @(@('host', $HostFile), @('join', $JoinFile))) {
+        $sent = @(Select-String -Path $pair[1] -Pattern '\[recruit\] EVT send' -ErrorAction SilentlyContinue).Count
+        if ($sent -lt 2) { $why += "$($pair[0]) authored only $sent/2 EVT_RECRUIT edges" }
+    }
+
+    $converged = 0
+    foreach ($k in ($legs.Keys | Sort-Object)) {
+        $l = $legs[$k]
+        if ($l.res -ne 1) { continue }
+        $peerFile = if ($k.StartsWith('host')) { $JoinFile } else { $HostFile }
+        $hand = [regex]::Escape($l.after)                       # t,c,cs,i,s
+        $a = $l.after -split ','
+        $handIS = [regex]::Escape("$($a[3]),$($a[4]),$($a[0]),$($a[1]),$($a[2])") # i,s,t,c,cs (PROXY line order)
+        $rekey = @(Select-String -Path $peerFile -Pattern "\[recruit\] REKEY .* new=$hand ok=1" -ErrorAction SilentlyContinue).Count
+        $bound = @(Select-String -Path $peerFile -Pattern "\[spawn\] proxy BOUND hand=$hand" -ErrorAction SilentlyContinue).Count
+        $track = @(Select-String -Path $peerFile -Pattern "SCENARIO PROXY hand=$handIS" -ErrorAction SilentlyContinue).Count
+        if (($rekey + $bound) -eq 0) { $why += "$k never converged on the peer (no REKEY, no proxy BOUND)" }
+        elseif ($rekey -ge 1 -and $bound -ge 1) { $why += "$k DUPLICATED on the peer (rekeyed AND minted a proxy)" }
+        else {
+            if ($track -eq 0) { $why += "$k bound on the peer but never tracked (no PROXY series)" }
+            else { $converged++ }
+        }
+        Write-Host "    FINDING: $k peer rekey=$rekey proxyBound=$bound proxyTrack=$track"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  RECRUIT-SYNC $v - converged=$converged/4 $detail"
+    return (Add-GateResult -Name "recruit_sync" -Status $v `
+                -Metrics @{ converged = $converged } -Detail $detail)
+}
+
+# vendor_trade (protocol 22 phase 1c): the buyer-side purchase composite gate.
+# Each side performed the two buyer-side mutations of one purchase (wallet
+# debit + item into the tab leader's inventory) on the tab it OWNS; the gate is
+# that BOTH effects converged on the peer:
+#   1. both TRADE lines ok=1 (the local mutations succeeded);
+#   2. the peer's final WALLET for the traded rank equals the trader's wAfter
+#      (the debit crossed on PKT_MONEY);
+#   3. the final TINV content hash for the traded rank matches host-vs-join
+#      (the item crossed on the inventory snapshot channel).
+function Test-VendorTrade {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $tradeRegex = 'SCENARIO TRADE who=(host|join) rank=(\d+) ok=(\d) sid=''([^'']*)'' price=(-?\d+) wBefore=(-?\d+) wAfter=(-?\d+)'
+    $hostTrade = Select-String -Path $HostFile -Pattern $tradeRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinTrade = Select-String -Path $JoinFile -Pattern $tradeRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostTrade) { $why += "host never logged its TRADE" }
+    elseif ($hostTrade.Matches[0].Groups[3].Value -ne '1') { $why += "host TRADE failed locally" }
+    if ($null -eq $joinTrade) { $why += "join never logged its TRADE" }
+    elseif ($joinTrade.Matches[0].Groups[3].Value -ne '1') { $why += "join TRADE failed locally" }
+
+    $hw = Get-WalletSeries -File $HostFile
+    $jw = Get-WalletSeries -File $JoinFile
+
+    # Final TINV hash per rank per side.
+    function Get-TinvFinal([string]$File) {
+        $out = @{}
+        foreach ($m in @(Select-String -Path $File -Pattern 'SCENARIO TINV rank=(\d+) count=(\d+) hash=(\d+)' -ErrorAction SilentlyContinue)) {
+            $out[[int]$m.Matches[0].Groups[1].Value] = @{ count = [int]$m.Matches[0].Groups[2].Value
+                                                          hash  = [long]$m.Matches[0].Groups[3].Value }
+        }
+        return $out
+    }
+    $hInv = Get-TinvFinal $HostFile
+    $jInv = Get-TinvFinal $JoinFile
+
+    $crossed = 0
+    foreach ($leg in @(@($hostTrade, $jw, 'host->join'), @($joinTrade, $hw, 'join->host'))) {
+        $t = $leg[0]; $peerW = $leg[1]; $tag = $leg[2]
+        if ($null -eq $t -or $t.Matches[0].Groups[3].Value -ne '1') { continue }
+        $rank   = [int]$t.Matches[0].Groups[2].Value
+        $wAfter = [int]$t.Matches[0].Groups[7].Value
+        # 2. wallet debit crossed.
+        if (-not $peerW.ContainsKey($rank)) { $why += "$tag rank $rank absent from peer WALLET series" }
+        else {
+            $end = $peerW[$rank][$peerW[$rank].Count - 1].money
+            if ($end -eq $wAfter) { $crossed++ }
+            else { $why += "$tag wallet debit did not cross (peer rank $rank ended $end, want $wAfter)" }
+        }
+        # 3. inventory content converged.
+        if (-not ($hInv.ContainsKey($rank) -and $jInv.ContainsKey($rank))) {
+            $why += "$tag rank $rank TINV series missing on a side"
+        } elseif ($hInv[$rank].hash -ne $jInv[$rank].hash) {
+            $why += "$tag rank $rank inventory hash diverged (host $($hInv[$rank].hash) join $($jInv[$rank].hash))"
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  VENDOR-TRADE $v - walletCrossed=$crossed/2 $detail"
+    return (Add-GateResult -Name "vendor_trade" -Status $v `
+                -Metrics @{ walletCrossed = $crossed } -Detail $detail)
+}
+
+# spawn_sync (protocol 21, spawnSync ON): the full proxy-replication gate.
+#   1. BIND: the join minted a proxy ("[spawn] proxy BOUND hand=...") for at
+#      least half the host's near spawns AND at least one far spawn (the
+#      teleport-far leg - interest + proxy channel working at distance).
+#   2. TRACK: the join's PROXY position series (streamed key + actual proxy
+#      body position) follows the host's MEMBER series per hand - time-aligned
+#      median within tolerance for at least half the bound hands.
+#   3. SUPPRESS: the join's own local runtime spawns still get hidden
+#      ([authority] suppress) - proxies must not have broken host authority.
+function Test-SpawnSync {
+    param([string]$HostFile, [string]$JoinFile, [double]$Tol)
+    $hostLegs = Get-SpawnHands -File $HostFile
+    $joinLegs = Get-SpawnHands -File $JoinFile
+    $near = if ($hostLegs.ContainsKey('near')) { @($hostLegs['near']) } else { @() }
+    $far  = if ($hostLegs.ContainsKey('far'))  { @($hostLegs['far'])  } else { @() }
+    $jsp  = if ($joinLegs.ContainsKey('join')) { @($joinLegs['join']) } else { @() }
+    if ($near.Count -eq 0 -or $far.Count -eq 0) {
+        Write-Host "  SPAWN-SYNC FAIL - host spawn legs missing (near=$($near.Count) far=$($far.Count))"
+        return (Add-GateResult -Name "spawn_sync" -Status FAIL -Detail "host spawn legs missing")
+    }
+
+    # 1. BIND coverage per leg.
+    $bound = @{}
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern '\[spawn\] proxy BOUND hand=([\d,]+)' -ErrorAction SilentlyContinue)) {
+        $bound[$m.Matches[0].Groups[1].Value] = $true
+    }
+    $nearBound = @($near | Where-Object { $bound.ContainsKey($_) }).Count
+    $farBound  = @($far  | Where-Object { $bound.ContainsKey($_) }).Count
+    $needNear  = [Math]::Ceiling($near.Count / 2.0)
+    $bindOk = ($nearBound -ge $needNear) -and ($farBound -ge 1)
+    Write-Host ("  SPAWN-SYNC bind " + $(if ($bindOk) { "PASS" } else { "FAIL" }) +
+                " - near $nearBound/$($near.Count) (need >= $needNear), far $farBound/$($far.Count) (need >= 1)")
+
+    # 2. TRACK: PROXY series (join) vs MEMBER series (host) for the bound hands.
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $P = Get-ScenarioSeries -File $JoinFile -Kind "PROXY"
+    $judged = 0; $tracked = 0; $worst = 0.0
+    foreach ($hand in ($near + $far)) {
+        if (-not $bound.ContainsKey($hand)) { continue }
+        $key = Convert-SpawnHandToSeriesKey -Hand $hand
+        if ($null -eq $key -or -not $H.ContainsKey($key) -or -not $P.ContainsKey($key)) { continue }
+        $dists = New-Object System.Collections.ArrayList
+        foreach ($ps in $P[$key]) {
+            $best = [double]::MaxValue; $bp = $null
+            foreach ($hs in $H[$key]) {
+                $dt = [Math]::Abs($hs.t - $ps.t)
+                if ($dt -lt $best) { $best = $dt; $bp = $hs.p }
+            }
+            if ($best -le 800 -and $bp) {
+                $dx = $bp[0]-$ps.p[0]; $dy = $bp[1]-$ps.p[1]; $dz = $bp[2]-$ps.p[2]
+                [void]$dists.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+            }
+        }
+        if ($dists.Count -lt 5) { continue }
+        $sorted = $dists | Sort-Object
+        $med = $sorted[[int]($sorted.Count/2)]
+        $judged++
+        if ($med -le $Tol) { $tracked++ }
+        if ($med -gt $worst) { $worst = $med }
+    }
+    $trackOk = ($judged -ge 1) -and ($tracked -ge [Math]::Ceiling($judged / 2.0))
+    Write-Host ("  SPAWN-SYNC track " + $(if ($trackOk) { "PASS" } else { "FAIL" }) +
+                " - $tracked/$judged bound proxies within $Tol (worstMedian=$([Math]::Round($worst,1)))")
+
+    # 3. SUPPRESS: join-local spawns still hidden by host authority.
+    $jSupp = Measure-JoinSpawnSuppression -JoinFile $JoinFile -JoinHands $jsp
+    $suppOk = ($jsp.Count -ge 1) -and ($jSupp -ge [Math]::Ceiling($jsp.Count / 2.0))
+    Write-Host ("  SPAWN-SYNC suppress " + $(if ($suppOk) { "PASS" } else { "FAIL" }) +
+                " - $jSupp/$($jsp.Count) join-local spawns suppressed")
+
+    $ok = $bindOk -and $trackOk -and $suppOk
+    $why = @()
+    if (-not $bindOk)  { $why += "proxy bind coverage below gate" }
+    if (-not $trackOk) { $why += "bound proxies not tracking the host bodies" }
+    if (-not $suppOk)  { $why += "join-local spawns not suppressed" }
+    $detail = $why -join "; "
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  SPAWN-SYNC $v $detail"
+    return (Add-GateResult -Name "spawn_sync" -Status $v `
+                -Metrics @{ near = $near.Count; nearBound = $nearBound
+                            far = $far.Count; farBound = $farBound
+                            judged = $judged; tracked = $tracked
+                            worstMedian = [Math]::Round($worst, 2)
+                            joinLocal = $jsp.Count; joinSuppressed = $jSupp } -Detail $detail)
 }
 
 # ---- Locomotion-quality oracles ----------------------------------------------------
@@ -2263,6 +3417,19 @@ function Invoke-OneOracle {
         "coop_presence" { return (Test-CoopPresence    -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "pose"          { return (Test-NpcPose         -HostFile $HostLog -JoinFile $JoinLog) }
         "pose_state"    { return (Test-NpcPoseState    -HostFile $HostLog -JoinFile $JoinLog) }
+        "bed_pose"      { return (Test-BedPose         -HostFile $HostLog -JoinFile $JoinLog) }
+        "bed_put"       { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 1) }
+        "cage_put"      { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 2) }
+        "sneak_probe"   { return (Test-SneakProbe      -HostFile $HostLog) }
+        "spawn_probe"   { return (Test-SpawnProbe      -HostFile $HostLog -JoinFile $JoinLog) }
+        "shop_probe"    { return (Test-ShopProbe       -HostFile $HostLog -JoinFile $JoinLog) }
+        "money_sync"    { return (Test-MoneySync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "vendor_trade"  { return (Test-VendorTrade     -HostFile $HostLog -JoinFile $JoinLog) }
+        "recruit_probe" { return (Test-RecruitProbe    -HostFile $HostLog -JoinFile $JoinLog) }
+        "recruit_sync"  { return (Test-RecruitSync     -HostFile $HostLog -JoinFile $JoinLog) }
+        "spawn_sync"    { return (Test-SpawnSync       -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
+        "sneak_pose"    { return (Test-SneakPose       -HostFile $HostLog -JoinFile $JoinLog) }
+        "sneak_detect"  { return (Test-SneakDetect     -HostFile $HostLog -JoinFile $JoinLog) }
         "body_state"    { return (Test-NpcBodyState    -HostFile $HostLog -JoinFile $JoinLog) }
         "craft_order"   { return (Test-CraftOrder      -HostFile $HostLog -JoinFile $JoinLog) }
         "down_order"    { return (Test-DownOrder       -HostFile $HostLog -JoinFile $JoinLog) }
@@ -2277,8 +3444,10 @@ function Invoke-OneOracle {
         "limb_loss"     { return (Test-LimbLoss        -HostFile $HostLog -JoinFile $JoinLog) }
         "stats_sync"    { return (Test-StatsSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "carry_order"   { return (Test-CarryOrder      -HostFile $HostLog -JoinFile $JoinLog) }
+        "npc_carry"     { return (Test-NpcCarry        -HostFile $HostLog -JoinFile $JoinLog) }
         "npc_vitals"    { return (Test-NpcVitals       -HostFile $HostLog -JoinFile $JoinLog) }
         "speed_sync"    { return (Test-SpeedSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "speed_probe"   { return (Test-SpeedProbe      -HostFile $HostLog) }
         "combat_crowd"  { return (Test-CombatCrowd     -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "split_interest" { return (Test-SplitInterest  -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "inv_sync"      { return (Test-InventorySync   -HostFile $HostLog -JoinFile $JoinLog) }
@@ -2290,6 +3459,7 @@ function Invoke-OneOracle {
         "wi_sync"       { return (Test-WorldItemSync   -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "wpn_relocate"  { return (Test-WpnRelocate     -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_drop"   { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog) }
+        "armor_drop"    { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "armor_drop") }
         "smoothness"    { return (Test-Smoothness      -File $JoinLog) }
         "anim_truth"    { return (Test-AnimTruth       -File $JoinLog) }
         "march"         { return (Test-MarchInPlace    -File $JoinLog) }
@@ -2435,14 +3605,21 @@ Export-ModuleMember -Function @(
     "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs",
     "Test-LogHealth", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
     "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence",
-    "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState",
+    "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose",
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",
     "Test-CombatProbe", "Test-CombatOrder", "Test-CombatKill", "Test-DamageGuard",
     "Get-VitalsSeries", "Test-PlayerCombat", "Test-PlayerKo", "Test-MedicOrder",
     "Test-LimbLoss", "Test-NpcVitals",
     "Get-StatsSeries", "Test-StatsSync",
-    "Get-CarrySeries", "Test-CarryOrder",
+    "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry",
+    "Get-FurnSeries", "Test-FurnPut",
+    "Test-SneakProbe",
+    "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync",
+    "Get-WalletSeries", "Test-ShopProbe", "Test-MoneySync", "Test-VendorTrade",
+    "Test-RecruitProbe", "Test-RecruitSync",
+    "Get-SneakSeries", "Test-SneakPose", "Test-SneakDetect",
     "Test-SpeedSync",
+    "Test-SpeedProbe",
     "Test-CombatCrowd",
     "Test-SplitInterest",
     "Test-InventorySync", "Test-InventoryBidir", "Test-InventoryEquip",

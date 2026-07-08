@@ -2088,26 +2088,30 @@ private:
     int          invAfterPick_, grndAfterPick_, invPersist_;
 };
 
-// world_weapon_drop (Phase W2 oracle): CROSS-CLIENT conservation drop. The HOST owns the
-// leader (tab 0) and DROPS its weapon (the real action a player performs); the conservation
-// channel authors a DROP intent and the JOIN - which does NOT own the leader - must RELOCATE
-// its own copy of that weapon to the ground (Inventory::dropItem), NOT destroy it. The join
-// asserts the weapon both LEFT its leader's bag AND APPEARED as a free ground weapon (proving
-// it crossed over by conservation, not by the inv-reconcile deleting an unreconstructable
-// weapon). Roles split on isHost; both load the same save so they target the same leader.
-class WorldWeaponDropScenario : public Scenario {
+// world_weapon_drop / world_armor_drop (Phase W2 oracle): CROSS-CLIENT conservation drop.
+// The HOST owns the leader (tab 0) and DROPS a piece of its gear (the real action a player
+// performs - for the armor variant an EQUIPPED piece, mirroring the 2026-07-07 session's
+// "drag equipped pants to ground"); the conservation channel authors a DROP intent and the
+// JOIN - which does NOT own the leader - must RELOCATE its own copy of that gear to the
+// ground (Inventory::dropItem), NOT destroy it. The join asserts the gear both LEFT its
+// leader's bag AND APPEARED as a free ground item (proving it crossed over by conservation,
+// not by the inv-reconcile deleting an unreconstructable item). Roles split on isHost; both
+// load the same save so they target the same leader. Parameterized on the gear category
+// (2 = WEAPON, 3 = ARMOUR); both variants share the WDROP log contract and oracle.
+class WorldGearDropScenario : public Scenario {
 public:
-    WorldWeaponDropScenario()
+    WorldGearDropScenario(const char* scenarioName, unsigned int gearCat)
         : passed_(false), have_(false), isHost_(false), baseType_(0), step_(0),
-          invBase_(0), invAfter_(-1), grndAfter_(-1), invMin_(999), grndMax_(0) {
+          invBase_(0), invAfter_(-1), grndAfter_(-1), invMin_(999), grndMax_(0),
+          scenarioName_(scenarioName), gearCat_(gearCat) {
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
         baseSid_[0] = '\0';
     }
-    virtual const char* name() const { return "world_weapon_drop"; }
+    virtual const char* name() const { return scenarioName_; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         isHost_ = ctx.isHost;
-        have_ = findLeaderWeapon(ctx.gw, hand_, baseSid_, sizeof(baseSid_), &baseType_);
+        have_ = findLeaderGear(ctx.gw, gearCat_, hand_, baseSid_, sizeof(baseSid_), &baseType_);
         if (have_) {
             invBase_ = invCount(ctx.gw);
             invMin_  = invBase_;
@@ -2182,11 +2186,12 @@ private:
             if (it[i].itemType == baseType_ && strcmp(it[i].stringID, baseSid_) == 0) ++c;
         return c;
     }
-    // The squad LEADER (index 0 = tab 0, host-owned) and its first WEAPON. Deterministic
-    // across clients (same save), so host (owner) drops it and join (non-owner) mirrors.
-    static bool findLeaderWeapon(GameWorld* gw, unsigned int out[5], char* outSid,
-                                 unsigned int outLen, unsigned int* outType) {
-        const unsigned int WEAPON_CAT = 2;
+    // The squad LEADER (index 0 = tab 0, host-owned) and its first gear item of the
+    // requested category (2 = WEAPON, 3 = ARMOUR), preferring an EQUIPPED piece.
+    // Deterministic across clients (same save), so host (owner) drops it and join
+    // (non-owner) mirrors.
+    static bool findLeaderGear(GameWorld* gw, unsigned int gearCat, unsigned int out[5],
+                               char* outSid, unsigned int outLen, unsigned int* outType) {
         EntityState sq[MAX_SQUAD];
         unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ true, sq, MAX_SQUAD);
         if (n == 0) return false;
@@ -2196,8 +2201,8 @@ private:
         unsigned int cnt = engine::captureContainerContents(gw, h, it, INV_ITEMS_MAX, 0);
         for (unsigned int pass = 0; pass < 2; ++pass) {
             for (unsigned int i = 0; i < cnt; ++i) {
-                if (it[i].itemType != WEAPON_CAT) continue;
-                if (pass == 0 && !it[i].equipped) continue; // prefer an equipped weapon
+                if (it[i].itemType != gearCat) continue;
+                if (pass == 0 && !it[i].equipped) continue; // prefer an equipped piece
                 for (int k = 0; k < 5; ++k) out[k] = h[k];
                 strncpy(outSid, it[i].stringID, outLen - 1); outSid[outLen - 1] = '\0';
                 if (outType) *outType = it[i].itemType;
@@ -2216,6 +2221,8 @@ private:
     int          step_;
     int          invBase_, invAfter_, grndAfter_;
     int          invMin_, grndMax_;
+    const char*  scenarioName_;
+    unsigned int gearCat_;
 };
 
 // drop_probe (Phase W0, DIAGNOSTIC): characterize what a player DROP produces, with no
@@ -3548,6 +3555,910 @@ private:
     unsigned int  l1Hand_[5];
 };
 
+// npc_carry (protocol 18, world-NPC carrier extension): the 2026-07-07 remote
+// session's third gap - a HOST-side world NPC hauling a downed player character
+// never replicated to the join. One window: the host KO's its second member
+// (M2), then DIRECTS the nearest world NPC to pick it up, walk a leg, and drop
+// it (carrySubject/dropSubject run the same engine calls the NPC AI does). The
+// NPC is host-owned world state, so the edge events now ride publishOwned's NPC
+// extension and the join's replicator must execute the pickup on its LOCAL
+// NPC copy. The join is a passive observer: it never knows a priori which NPC
+// the host chose - it DETECTS the carrier from its own local world (the NPC
+// copy whose readCarry.carried == M2's hand) and latches it, which is itself
+// evidence the pickup applied locally. Both sides log the same "SCENARIO CARRY"
+// series as carry_order; Test-NpcCarry gates pickup-crossed / tracks-carrier /
+// drop-crossed on the M2 + NPC series.
+class NpcCarryScenario : public Scenario {
+public:
+    NpcCarryScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          haveL0_(false), haveM2_(false), haveNpc_(false),
+          nDown_(false), nPick_(false), nWalk_(false), nDrop_(false),
+          lastHoldMs_(0) {}
+
+    virtual const char* name() const { return "npc_carry"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveL0_ || !haveM2_) latchSubjects(ctx);
+
+        // Host: pick the carrier - the world NPC nearest L0 (upright ones only;
+        // a KO'd body can't carry). Latched once, logged as the NPC role line.
+        if (ctx.isHost && haveL0_ && !haveNpc_ && ctx.elapsedMs >= NPC_LATCH_AT_MS)
+            latchHostNpc(ctx);
+        // Join: detect the carrier - the local NPC copy that reads carrying=M2.
+        // Finding one IS the feature working (the join executed the pickup).
+        if (!ctx.isHost && haveM2_ && !haveNpc_) detectJoinCarrier(ctx);
+
+        // ---- Window N (host): down M2, NPC carries it, walks, drops ----------
+        if (ctx.isHost && haveM2_ && !nDown_ && ctx.elapsedMs >= N_DOWN_AT_MS) {
+            bool ok = engine::orderDownSubject(ctx.gw, m2Hand_);
+            logAct("N down", m2Hand_, ok); nDown_ = true;
+        }
+        if (ctx.isHost && haveNpc_ && haveM2_ && !nPick_ && ctx.elapsedMs >= N_PICK_AT_MS) {
+            bool ok = engine::carrySubject(ctx.gw, npcHand_, m2Hand_);
+            logAct("N pickup", m2Hand_, ok); nPick_ = true;
+        }
+        if (ctx.isHost && haveNpc_ && !nWalk_ && ctx.elapsedMs >= N_WALK_AT_MS) {
+            nWalk_ = walkLeg(npcHand_, "N");
+        }
+        if (ctx.isHost && haveNpc_ && !nDrop_ && ctx.elapsedMs >= N_DROP_AT_MS) {
+            bool ok = engine::dropSubject(ctx.gw, npcHand_, /*ragdoll*/true);
+            logAct("N drop", npcHand_, ok); nDrop_ = true;
+        }
+
+        // Keep M2 KO'd through the carry leg (the scaffold KO timer expires
+        // mid-carry otherwise - the carry_order lesson). Host-owned, so the
+        // host re-tops it; timer-only, never a fresh knockout on the shoulder.
+        if (ctx.isHost && haveM2_ && nDown_ && ctx.elapsedMs < HOLD_M2_UNTIL_MS &&
+            ctx.elapsedMs - lastHoldMs_ >= 2000) {
+            lastHoldMs_ = ctx.elapsedMs;
+            holdSubject(m2Hand_);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+            if (haveM2_)  logCarryLine(m2Hand_, ctx.elapsedMs);
+            if (haveNpc_) logCarryLine(npcHand_, ctx.elapsedMs);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (haveNpc_ && nDown_ && nPick_ && nDrop_)
+                                 : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long NPC_LATCH_AT_MS  = 6000;
+    static const unsigned long N_DOWN_AT_MS     = 8000;
+    static const unsigned long N_PICK_AT_MS     = 12000;
+    static const unsigned long N_WALK_AT_MS     = 14000;
+    static const unsigned long N_DROP_AT_MS     = 24000;
+    static const unsigned long HOLD_M2_UNTIL_MS = 30000;
+    static const unsigned long HOST_DURATION_MS = 40000;
+    static const unsigned long JOIN_DURATION_MS = 36000;
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const unsigned int  MAX_NPCS         = 96;
+
+    void logAct(const char* what, const unsigned int h[5], bool ok) {
+        char b[144];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CARRYACT %s hand=%u,%u ok=%d",
+                  what, h[3], h[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void holdSubject(const unsigned int h[5]) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (c) engine::holdDown(c);
+    }
+
+    bool walkLeg(const unsigned int h[5], const char* wTag) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return false;
+        float x, y, z;
+        if (!engine::readPos(c, &x, &y, &z)) return false;
+        bool ok = engine::orderMoveTo(c, x + 10.0f, y, z);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CARRYACT %s walk hand=%u,%u ok=%d",
+                  wTag, h[3], h[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return true;
+    }
+
+    void logCarryLine(const unsigned int h[5], unsigned long t) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return;
+        engine::CarryRead cr;
+        if (!engine::readCarry(c, &cr) || !cr.valid) return;
+        float x = 0, y = 0, z = 0;
+        engine::readPos(c, &x, &y, &z);
+        unsigned short bs = engine::readBodyState(c);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CARRY hand=%u,%u t=%lu carrying=%d carried=%u,%u "
+                  "beingCarried=%d pos=%.2f,%.2f,%.2f bs=%u",
+                  h[3], h[4], t, cr.carrying ? 1 : 0,
+                  cr.carried[3], cr.carried[4], cr.beingCarried ? 1 : 0,
+                  x, y, z, (unsigned)bs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchSubjects(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveL0_) {
+            int idx = tabLeaderIdx(sq, n, 0);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], l0Hand_);
+                haveL0_ = true;
+                logSubject("L0", l0Hand_);
+            }
+        }
+        if (haveL0_ && !haveM2_) {
+            int best = -1;
+            for (unsigned int i = 0; i < n; ++i) {
+                if (tabRankOf(sq, n, i) != 0) continue;
+                unsigned int h[5]; handFromEntity(sq[i], h);
+                if (h[3] == l0Hand_[3] && h[4] == l0Hand_[4]) continue;
+                if (best < 0 || tabHandLess(sq[i], sq[best])) best = (int)i;
+            }
+            if (best >= 0) {
+                handFromEntity(sq[best], m2Hand_);
+                haveM2_ = true;
+                logSubject("M2", m2Hand_);
+            }
+        }
+    }
+
+    // Host: nearest UPRIGHT world NPC to L0 becomes the directed carrier.
+    void latchHostNpc(const ScenarioContext& ctx) {
+        Character* l0 = engine::resolveCharByHand(l0Hand_[3], l0Hand_[4],
+                                                  l0Hand_[0], l0Hand_[1], l0Hand_[2]);
+        float lx, ly, lz;
+        if (!l0 || !engine::readPos(l0, &lx, &ly, &lz)) return;
+        static Character*  chars[MAX_NPCS]; // main-thread only
+        static EntityState states[MAX_NPCS];
+        unsigned int n = engine::listNpcs(ctx.gw, chars, states, MAX_NPCS);
+        int best = -1; float bestD2 = 1e18f;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (coop::bodyIsDown(states[i].bodyState) ||
+                (states[i].bodyState & BODY_DEAD) != 0) continue;
+            float dx = states[i].x - lx, dy = states[i].y - ly, dz = states[i].z - lz;
+            float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 < bestD2) { bestD2 = d2; best = (int)i; }
+        }
+        if (best < 0) return;
+        npcHand_[0] = states[best].hType;
+        npcHand_[1] = states[best].hContainer;
+        npcHand_[2] = states[best].hContainerSerial;
+        npcHand_[3] = states[best].hIndex;
+        npcHand_[4] = states[best].hSerial;
+        haveNpc_ = true;
+        logSubject("NPC", npcHand_);
+    }
+
+    // Join: the carrier reveals itself - the local NPC copy carrying M2.
+    void detectJoinCarrier(const ScenarioContext& ctx) {
+        static Character*  chars[MAX_NPCS]; // main-thread only
+        static EntityState states[MAX_NPCS];
+        unsigned int n = engine::listNpcs(ctx.gw, chars, states, MAX_NPCS);
+        for (unsigned int i = 0; i < n; ++i) {
+            engine::CarryRead cr;
+            if (!engine::readCarry(chars[i], &cr) || !cr.carrying) continue;
+            if (cr.carried[3] != m2Hand_[3] || cr.carried[4] != m2Hand_[4]) continue;
+            npcHand_[0] = states[i].hType;
+            npcHand_[1] = states[i].hContainer;
+            npcHand_[2] = states[i].hContainerSerial;
+            npcHand_[3] = states[i].hIndex;
+            npcHand_[4] = states[i].hSerial;
+            haveNpc_ = true;
+            logSubject("NPC", npcHand_);
+            return;
+        }
+    }
+
+    void logSubject(const char* who, const unsigned int h[5]) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CARRY %s hand=%u,%u", who, h[3], h[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveL0_, haveM2_, haveNpc_;
+    bool          nDown_, nPick_, nWalk_, nDrop_;
+    unsigned long lastHoldMs_;
+    unsigned int  l0Hand_[5];
+    unsigned int  m2Hand_[5];
+    unsigned int  npcHand_[5];
+};
+
+// bed_pose (protocol 19 phase 1, conscious bed use): USE_BED / USE_BED_ORDER
+// have been on the reproducible-pose allowlist since the fixture-pose work but
+// were never runtime-validated (spike 24 PARTIAL). Save 'bedcage1' bakes a Camp
+// Bed + Prisoner Cage with save-stable hands next to the squad. The HOST orders
+// its own leader (L0) to USE_BED_ORDER at the baked bed via the player-order
+// path; the stream carries the committed bed task + fixture subject hand and
+// the JOIN's driven L0 copy must commit the same pose at the same bed. Both
+// sides log the standard MEMBER/RECV series (task= + pelvis=); Test-BedPose
+// anchors on the "SCENARIO BED ORDER" marker and gates host-committed /
+// join-committed / co-located.
+class BedPoseScenario : public Scenario {
+public:
+    BedPoseScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), haveL0_(false),
+          orderLogged_(false), lastOrderMs_(0), orderOk_(false) {}
+
+    virtual const char* name() const { return "bed_pose"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveL0_) latchLeader(ctx);
+
+        // HOST, order phase: send L0 to the baked bed. orderUseBed is GUARDED
+        // (no-op once L0 is on a bed task), so the throttled re-issue recovers
+        // a failed first order without ever standing the sleeper back up.
+        if (ctx.isHost && haveL0_ && ctx.elapsedMs >= ORDER_AT_MS &&
+            (!orderLogged_ || (!orderOk_ && ctx.elapsedMs - lastOrderMs_ >= 4000))) {
+            lastOrderMs_ = ctx.elapsedMs;
+            int ordered = 0, useBed = 0;
+            orderOk_ = engine::orderUseBed(ctx.gw, l0Hand_, &ordered, &useBed);
+            if (!orderLogged_) {
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO BED ORDER issued hand=%u,%u task=%d accept=%d,%d ok=%d",
+                          l0Hand_[3], l0Hand_[4], ordered, ordered, useBed,
+                          orderOk_ ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                orderLogged_ = true;
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (orderLogged_ && orderOk_) : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ORDER_AT_MS      = 14000; // join logs standing baseline first
+    static const unsigned long HOST_DURATION_MS = 60000; // approach + in-bed observation
+    static const unsigned long JOIN_DURATION_MS = 54000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    void latchLeader(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, 0); // host tab's leader on BOTH sides
+        if (idx >= 0) {
+            handFromEntity(sq[idx], l0Hand_);
+            haveL0_ = true;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO BED L0 hand=%u,%u",
+                      l0Hand_[3], l0Hand_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveL0_;
+    bool          orderLogged_;
+    unsigned long lastOrderMs_;
+    bool          orderOk_;
+    unsigned int  l0Hand_[5];
+};
+
+// bed_put / cage_put (protocol 19 phase 3, unconscious placement): save
+// 'bedcage1' again. Two sequential owner-side windows against the SAME baked
+// fixture (one occupant at a time):
+//   Window A (host own-tab):  KO M2 (host tab's second member), place it in
+//     the fixture via the putSubjectInFurniture scaffold, hold it there, then
+//     take it back out. The JOIN's driven M2 copy must mirror enter + exit.
+//   Window B (join own-tab):  same shape with the join's leader L1 - the
+//     reverse ownership direction over the identical machinery.
+// The KO is held down by its OWNER's holdDown re-top every 2 s (timer-only,
+// the carry_order lesson) so the scaffold KO can't expire mid-occupancy.
+// Both sides log the standard MEMBER/RECV series plus a per-subject
+// "SCENARIO FURN hand=i,s t=ms in=<0|1|2> furn=i,s pos=x,y,z bs=n" line at
+// 2 Hz reading the LOCAL character (on the peer that is the driven copy -
+// exactly what must have entered). Test-FurnPut gates on both windows.
+class FurnPutScenario : public Scenario {
+public:
+    explicit FurnPutScenario(int kind)
+        : kind_(kind), passed_(false), recvCount_(0), lastLogMs_(0),
+          haveM2_(false), haveL1_(false), lastHoldMs_(0),
+          aDown_(false), aPut_(false), aOut_(false),
+          bDown_(false), bPut_(false), bOut_(false),
+          aPutOk_(false), bPutOk_(false), lastPutMs_(0) {}
+
+    virtual const char* name() const { return kind_ == 2 ? "cage_put" : "bed_put"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveM2_ || !haveL1_) latchSubjects(ctx);
+
+        // ---- Window A (host, own-tab): KO M2, put it in, take it out -------
+        if (ctx.isHost && haveM2_ && !aDown_ && ctx.elapsedMs >= A_DOWN_AT_MS) {
+            bool ok = engine::orderDownSubject(ctx.gw, m2Hand_);
+            logAct("A down", m2Hand_, ok); aDown_ = true;
+        }
+        if (ctx.isHost && haveM2_ && ctx.elapsedMs >= A_PUT_AT_MS &&
+            ctx.elapsedMs < A_OUT_AT_MS &&
+            (!aPut_ || (!aPutOk_ && ctx.elapsedMs - lastPutMs_ >= 3000))) {
+            // Throttled re-issue until the engine accepts (the bed_pose lesson:
+            // never give up on the first frame's transient failure).
+            lastPutMs_ = ctx.elapsedMs;
+            aPutOk_ = engine::putSubjectInFurniture(ctx.gw, m2Hand_, kind_, true);
+            if (!aPut_) { logAct("A put", m2Hand_, aPutOk_); aPut_ = true; }
+        }
+        if (ctx.isHost && haveM2_ && !aOut_ && ctx.elapsedMs >= A_OUT_AT_MS) {
+            bool ok = engine::putSubjectInFurniture(ctx.gw, m2Hand_, kind_, false);
+            logAct("A out", m2Hand_, ok); aOut_ = true;
+        }
+
+        // ---- Window B (join, own-tab): the same over L1 ---------------------
+        if (!ctx.isHost && haveL1_ && !bDown_ && ctx.elapsedMs >= B_DOWN_AT_MS) {
+            bool ok = engine::orderDownSubject(ctx.gw, l1Hand_);
+            logAct("B down", l1Hand_, ok); bDown_ = true;
+        }
+        if (!ctx.isHost && haveL1_ && ctx.elapsedMs >= B_PUT_AT_MS &&
+            ctx.elapsedMs < B_OUT_AT_MS &&
+            (!bPut_ || (!bPutOk_ && ctx.elapsedMs - lastPutMs_ >= 3000))) {
+            lastPutMs_ = ctx.elapsedMs;
+            bPutOk_ = engine::putSubjectInFurniture(ctx.gw, l1Hand_, kind_, true);
+            if (!bPut_) { logAct("B put", l1Hand_, bPutOk_); bPut_ = true; }
+        }
+        if (!ctx.isHost && haveL1_ && !bOut_ && ctx.elapsedMs >= B_OUT_AT_MS) {
+            bool ok = engine::putSubjectInFurniture(ctx.gw, l1Hand_, kind_, false);
+            logAct("B out", l1Hand_, ok); bOut_ = true;
+        }
+
+        // Owner-side KO hold (timer-only re-top) through each subject's window.
+        if (ctx.elapsedMs - lastHoldMs_ >= 2000) {
+            lastHoldMs_ = ctx.elapsedMs;
+            if (ctx.isHost && haveM2_ && aDown_ && ctx.elapsedMs < A_HOLD_UNTIL_MS)
+                holdSubject(m2Hand_);
+            if (!ctx.isHost && haveL1_ && bDown_ && ctx.elapsedMs < B_HOLD_UNTIL_MS)
+                holdSubject(l1Hand_);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+            if (haveM2_) logFurnLine(m2Hand_, ctx.elapsedMs);
+            if (haveL1_) logFurnLine(l1Hand_, ctx.elapsedMs);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (aDown_ && aPut_ && aPutOk_ && aOut_)
+                                 : (bDown_ && bPut_ && bPutOk_ && bOut_ && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Shared timeline (peer-armed clock on both sides): KO settles 6 s before
+    // the put; ~16 s in the furniture; 6 s of settle between the windows.
+    static const unsigned long A_DOWN_AT_MS    = 8000;
+    static const unsigned long A_PUT_AT_MS     = 14000;
+    static const unsigned long A_OUT_AT_MS     = 30000;
+    static const unsigned long A_HOLD_UNTIL_MS = 34000;
+    static const unsigned long B_DOWN_AT_MS    = 36000;
+    static const unsigned long B_PUT_AT_MS     = 42000;
+    static const unsigned long B_OUT_AT_MS     = 58000;
+    static const unsigned long B_HOLD_UNTIL_MS = 62000;
+    static const unsigned long HOST_DURATION_MS = 70000;
+    static const unsigned long JOIN_DURATION_MS = 66000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    void logAct(const char* what, const unsigned int h[5], bool ok) {
+        char b[144];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO FURNACT %s hand=%u,%u kind=%d ok=%d",
+                  what, h[3], h[4], kind_, ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void holdSubject(const unsigned int h[5]) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (c) engine::holdDown(c);
+    }
+
+    // One "SCENARIO FURN" line: this body's LOCAL occupancy + position.
+    void logFurnLine(const unsigned int h[5], unsigned long t) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return;
+        engine::FurnitureRead fr;
+        if (!engine::readFurniture(c, &fr) || !fr.valid) return;
+        float x = 0, y = 0, z = 0;
+        engine::readPos(c, &x, &y, &z);
+        unsigned short bs = engine::readBodyState(c);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO FURN hand=%u,%u t=%lu in=%d furn=%u,%u pos=%.2f,%.2f,%.2f bs=%u",
+                  h[3], h[4], t, fr.kind, fr.furn[3], fr.furn[4], x, y, z,
+                  (unsigned)bs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchSubjects(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveM2_) {
+            // Host tab's SECOND member (the lowest non-leader hand of rank 0).
+            int lidx = tabLeaderIdx(sq, n, 0);
+            if (lidx >= 0) {
+                unsigned int lh[5]; handFromEntity(sq[lidx], lh);
+                int best = -1;
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (tabRankOf(sq, n, i) != 0) continue;
+                    unsigned int h[5]; handFromEntity(sq[i], h);
+                    if (h[3] == lh[3] && h[4] == lh[4]) continue;
+                    if (best < 0 || tabHandLess(sq[i], sq[best])) best = (int)i;
+                }
+                if (best >= 0) {
+                    handFromEntity(sq[best], m2Hand_);
+                    haveM2_ = true;
+                    logSubject("M2", m2Hand_);
+                }
+            }
+        }
+        if (!haveL1_) {
+            int idx = tabLeaderIdx(sq, n, 1);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], l1Hand_);
+                haveL1_ = true;
+                logSubject("L1", l1Hand_);
+            }
+        }
+    }
+
+    void logSubject(const char* who, const unsigned int h[5]) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO FURN %s hand=%u,%u kind=%d",
+                  who, h[3], h[4], kind_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    int           kind_;
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveM2_, haveL1_;
+    unsigned long lastHoldMs_;
+    bool          aDown_, aPut_, aOut_;
+    bool          bDown_, bPut_, bOut_;
+    bool          aPutOk_, bPutOk_;
+    unsigned long lastPutMs_;
+    unsigned int  m2Hand_[5];
+    unsigned int  l1Hand_[5];
+};
+
+// sneak_probe (protocol 20 phase 0, host-side spike): does the engine's stealth
+// detection fire against a DRIVEN copy, and is whoSeesMeSneaking safely
+// readable? The HOST directly sets stealthMode on its driven copy of the
+// join's leader (L1) near the bar NPCs (save 'sync'), then logs the copy's
+// readStealth series at 2 Hz: mode / unseen / map size / top seer entries.
+// The JOIN logs the same series off its OWN L1 (baseline: mode stays off
+// locally - nothing streams stealth yet in this spike). Log-only; the oracle
+// just gates "host saw detection entries while the mode was on".
+class SneakProbeScenario : public Scenario {
+public:
+    SneakProbeScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), haveL1_(false),
+          onDone_(false), offDone_(false), onOk_(false), lastActMs_(0),
+          sawSeer_(false) {}
+
+    virtual const char* name() const { return "sneak_probe"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveL1_) latchL1(ctx);
+
+        // HOST: force stealth mode on the DRIVEN L1 copy (throttled re-issue
+        // until the engine call lands), then release it near the end.
+        if (ctx.isHost && haveL1_ && ctx.elapsedMs >= ON_AT_MS &&
+            ctx.elapsedMs < OFF_AT_MS &&
+            (!onDone_ || (!onOk_ && ctx.elapsedMs - lastActMs_ >= 3000))) {
+            lastActMs_ = ctx.elapsedMs;
+            onOk_ = engine::sneakSubject(ctx.gw, l1Hand_, true);
+            if (!onDone_) { logAct("on", onOk_); onDone_ = true; }
+        }
+        if (ctx.isHost && haveL1_ && !offDone_ && ctx.elapsedMs >= OFF_AT_MS) {
+            bool ok = engine::sneakSubject(ctx.gw, l1Hand_, false);
+            logAct("off", ok); offDone_ = true;
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+            if (haveL1_) logSneakLine(ctx.elapsedMs);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (onDone_ && onOk_ && sawSeer_)
+                                 : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ON_AT_MS         = 8000;
+    static const unsigned long OFF_AT_MS        = 40000;
+    static const unsigned long HOST_DURATION_MS = 50000;
+    static const unsigned long JOIN_DURATION_MS = 46000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    void logAct(const char* what, bool ok) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAKACT %s hand=%u,%u ok=%d",
+                  what, l1Hand_[3], l1Hand_[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // One "SCENARIO SNEAKPROBE" line: L1's LOCAL stealth state + top seers.
+    void logSneakLine(unsigned long t) {
+        Character* c = engine::resolveCharByHand(l1Hand_[3], l1Hand_[4],
+                                                 l1Hand_[0], l1Hand_[1], l1Hand_[2]);
+        if (!c) return;
+        engine::StealthRead sr;
+        if (!engine::readStealth(c, &sr) || !sr.valid) {
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAKPROBE t=%lu readfail", t);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return;
+        }
+        if (sr.nSeers > 0) sawSeer_ = true;
+        char b[288]; int off = _snprintf(b, sizeof(b) - 1,
+            "SCENARIO SNEAKPROBE hand=%u,%u t=%lu mode=%d unseen=%u map=%u",
+            l1Hand_[3], l1Hand_[4], t, sr.sneaking ? 1 : 0,
+            (unsigned)sr.unseen, sr.mapSize);
+        for (unsigned int i = 0; i < sr.nSeers && i < 4 && off > 0 &&
+                                 off < (int)sizeof(b) - 48; ++i) {
+            off += _snprintf(b + off, sizeof(b) - 1 - off,
+                             " seer=%u,%u:%u:%.2f",
+                             sr.seers[i].npc[3], sr.seers[i].npc[4],
+                             (unsigned)sr.seers[i].see, sr.seers[i].prog);
+        }
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchL1(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, 1); // join tab's leader on BOTH sides
+        if (idx >= 0) {
+            handFromEntity(sq[idx], l1Hand_);
+            haveL1_ = true;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAK L1 hand=%u,%u",
+                      l1Hand_[3], l1Hand_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveL1_;
+    bool          onDone_, offDone_, onOk_;
+    unsigned long lastActMs_;
+    bool          sawSeer_;
+    unsigned int  l1Hand_[5];
+};
+
+// sneak_pose (protocol 20 phase 4): stealth POSTURE crossing, both ownership
+// directions. Window A: the HOST toggles stealth on its own leader (L0) ON at
+// T+10 s, OFF at T+35 s - the join's driven copy must follow via the streamed
+// BODY_SNEAK bit. Window B: the JOIN does the same with its leader (L1) at
+// T+45/T+70 - the host's copy must follow. Both sides log a 2 Hz
+// "SCENARIO SNEAK hand=i,s t=ms mode=0|1 bs=n" series for BOTH subjects; the
+// oracle asserts the PEER's copy flips mode within budget on all four edges.
+class SneakPoseScenario : public Scenario {
+public:
+    SneakPoseScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          haveL0_(false), haveL1_(false),
+          aOnDone_(false), aOffDone_(false), bOnDone_(false), bOffDone_(false) {}
+
+    virtual const char* name() const { return "sneak_pose"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveL0_ || !haveL1_) latchLeaders(ctx);
+
+        // Window A: HOST toggles ITS OWN leader. Window B: JOIN toggles its own.
+        if (ctx.isHost && haveL0_) {
+            if (!aOnDone_ && ctx.elapsedMs >= A_ON_MS) {
+                aOnDone_ = true; logAct("A-on", engine::sneakSubject(ctx.gw, l0Hand_, true), l0Hand_);
+            }
+            if (!aOffDone_ && ctx.elapsedMs >= A_OFF_MS) {
+                aOffDone_ = true; logAct("A-off", engine::sneakSubject(ctx.gw, l0Hand_, false), l0Hand_);
+            }
+        }
+        if (!ctx.isHost && haveL1_) {
+            if (!bOnDone_ && ctx.elapsedMs >= B_ON_MS) {
+                bOnDone_ = true; logAct("B-on", engine::sneakSubject(ctx.gw, l1Hand_, true), l1Hand_);
+            }
+            if (!bOffDone_ && ctx.elapsedMs >= B_OFF_MS) {
+                bOffDone_ = true; logAct("B-off", engine::sneakSubject(ctx.gw, l1Hand_, false), l1Hand_);
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+            if (haveL0_) logSneakLine(ctx.elapsedMs, l0Hand_);
+            if (haveL1_) logSneakLine(ctx.elapsedMs, l1Hand_);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (aOnDone_ && aOffDone_) : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long A_ON_MS  = 10000;
+    static const unsigned long A_OFF_MS = 35000;
+    static const unsigned long B_ON_MS  = 45000;
+    static const unsigned long B_OFF_MS = 70000;
+    static const unsigned long HOST_DURATION_MS = 85000;
+    static const unsigned long JOIN_DURATION_MS = 80000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    void logAct(const char* what, bool ok, const unsigned int h[5]) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAKACT %s hand=%u,%u ok=%d",
+                  what, h[3], h[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void logSneakLine(unsigned long t, const unsigned int h[5]) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return;
+        int mode = engine::readStealthMode(c);
+        unsigned short bs = engine::readBodyState(c);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAK hand=%u,%u t=%lu mode=%d bs=%u",
+                  h[3], h[4], t, mode, (unsigned)bs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchLeaders(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveL0_) {
+            int idx = tabLeaderIdx(sq, n, 0);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], l0Hand_); haveL0_ = true;
+                char b[96]; _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAK L0 hand=%u,%u",
+                                      l0Hand_[3], l0Hand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!haveL1_) {
+            int idx = tabLeaderIdx(sq, n, 1);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], l1Hand_); haveL1_ = true;
+                char b[96]; _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAK L1 hand=%u,%u",
+                                      l1Hand_[3], l1Hand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveL0_, haveL1_;
+    bool          aOnDone_, aOffDone_, bOnDone_, bOffDone_;
+    unsigned int  l0Hand_[5];
+    unsigned int  l1Hand_[5];
+};
+
+// sneak_detect (protocol 20 phase 4): DETECTION-INDICATOR crossing. The JOIN
+// toggles stealth on its own leader (L1) near the bar NPCs (save 'sync'). The
+// host's world is the detection authority: its NPCs fill whoSeesMeSneaking on
+// its DRIVEN copy of L1 (spike-proven), publishStealth streams it back, and
+// the join replays it onto its OWN L1 - both sides log a 2 Hz "SCENARIO
+// DETECT hand=i,s t=ms mode=d map=n see=..." series off their local L1. The
+// oracle asserts the join accumulated entries while sneaking (via the
+// feedback channel - "[sneak] DETECT RECV ... applied>=1" proves the path)
+// and that they cleared after the sneak ended.
+class SneakDetectScenario : public Scenario {
+public:
+    SneakDetectScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), haveL1_(false),
+          onDone_(false), offDone_(false) {}
+
+    virtual const char* name() const { return "sneak_detect"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveL1_) latchL1(ctx);
+
+        // The JOIN owns the sneaker: it performs the toggles.
+        if (!ctx.isHost && haveL1_) {
+            if (!onDone_ && ctx.elapsedMs >= ON_AT_MS) {
+                onDone_ = true;
+                bool ok = engine::sneakSubject(ctx.gw, l1Hand_, true);
+                logAct("on", ok);
+            }
+            if (!offDone_ && ctx.elapsedMs >= OFF_AT_MS) {
+                offDone_ = true;
+                bool ok = engine::sneakSubject(ctx.gw, l1Hand_, false);
+                logAct("off", ok);
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+            if (haveL1_) logDetectLine(ctx.elapsedMs);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? true : (recvCount_ >= 1 && onDone_ && offDone_);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ON_AT_MS         = 10000;
+    static const unsigned long OFF_AT_MS        = 45000;
+    static const unsigned long HOST_DURATION_MS = 62000;
+    static const unsigned long JOIN_DURATION_MS = 58000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    void logAct(const char* what, bool ok) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAKACT %s hand=%u,%u ok=%d",
+                  what, l1Hand_[3], l1Hand_[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void logDetectLine(unsigned long t) {
+        Character* c = engine::resolveCharByHand(l1Hand_[3], l1Hand_[4],
+                                                 l1Hand_[0], l1Hand_[1], l1Hand_[2]);
+        if (!c) return;
+        engine::StealthRead sr;
+        if (!engine::readStealth(c, &sr) || !sr.valid) return;
+        char b[288]; int off = _snprintf(b, sizeof(b) - 1,
+            "SCENARIO DETECT hand=%u,%u t=%lu mode=%d unseen=%u map=%u",
+            l1Hand_[3], l1Hand_[4], t, sr.sneaking ? 1 : 0,
+            (unsigned)sr.unseen, sr.mapSize);
+        for (unsigned int i = 0; i < sr.nSeers && i < 4 && off > 0 &&
+                                 off < (int)sizeof(b) - 48; ++i) {
+            off += _snprintf(b + off, sizeof(b) - 1 - off,
+                             " seer=%u,%u:%u:%.2f",
+                             sr.seers[i].npc[3], sr.seers[i].npc[4],
+                             (unsigned)sr.seers[i].see, sr.seers[i].prog);
+        }
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchL1(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, 1);
+        if (idx >= 0) {
+            handFromEntity(sq[idx], l1Hand_);
+            haveL1_ = true;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO SNEAK L1 hand=%u,%u",
+                      l1Hand_[3], l1Hand_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveL1_;
+    bool          onDone_, offDone_;
+    unsigned int  l1Hand_[5];
+};
+
 // speed_sync (consensus game-speed validation): both clients run the default-on
 // speed-sync module; the scenario SIMULATES user speed clicks by writing the
 // engine's speed directly (writeGameSpeed != the replicator's lastApplied ->
@@ -3570,6 +4481,7 @@ public:
     SpeedSyncScenario()
         : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
           haveOwn_(false), haveStriker_(false), hostClicked_(false),
+          hostClicked1_(false), hostClicked3b_(false),
           joinClicked3a_(false), joinClicked1_(false), joinClicked3b_(false),
           combatIssued_(false) {}
 
@@ -3582,26 +4494,45 @@ public:
         if (!haveOwn_) latchLeader(ctx, ownRank);
 
         // Simulated user clicks. writeGameSpeed goes through the engine's own
-        // setters, so the replicator's detector sees state != lastApplied and
-        // registers a genuine request - the same path a real UI click takes.
+        // (hooked) setters, so each call registers as captured USER INTENT -
+        // the same path a real UI click takes. The middle legs exercise the
+        // previously-impossible case: a click EQUAL to the current effective
+        // (join lowers its stale 3x vote by clicking 1x while the effective is
+        // already 1x), which the old state-diff detector could never see.
         if (ctx.isHost && !hostClicked_ && ctx.elapsedMs >= HOST_3X_AT_MS) {
             bool ok = engine::writeGameSpeed(ctx.gw, 3.0f, false);
-            logClick("host", 3.0f, ok);
+            logClick("host", 3.0f, ok, "");
             hostClicked_ = true;
         }
         if (!ctx.isHost && !joinClicked3a_ && ctx.elapsedMs >= JOIN_3XA_AT_MS) {
             bool ok = engine::writeGameSpeed(ctx.gw, 3.0f, false);
-            logClick("join", 3.0f, ok);
+            logClick("join", 3.0f, ok, "");
             joinClicked3a_ = true;
         }
-        if (!ctx.isHost && !joinClicked1_ && ctx.elapsedMs >= JOIN_1X_AT_MS) {
+        // Host lowers to 1x: effective drops to 1x but the JOIN's 3x vote is
+        // now stale-high (the stuck-vote setup).
+        if (ctx.isHost && !hostClicked1_ && ctx.elapsedMs >= HOST_1X_AT_MS) {
             bool ok = engine::writeGameSpeed(ctx.gw, 1.0f, false);
-            logClick("join", 1.0f, ok);
+            logClick("host", 1.0f, ok, " tag=lower");
+            hostClicked1_ = true;
+        }
+        // The SAME-VALUE click: join clicks 1x while the effective is already
+        // 1x. Engine state doesn't change - only the intent hooks can see it.
+        if (!ctx.isHost && !joinClicked1_ && ctx.elapsedMs >= JOIN_1X_SAME_AT_MS) {
+            bool ok = engine::writeGameSpeed(ctx.gw, 1.0f, false);
+            logClick("join", 1.0f, ok, " tag=samevalue");
             joinClicked1_ = true;
+        }
+        // Host re-raises to 3x: must be DENIED (join's vote is now 1x) - the
+        // assertion that the same-value click actually landed as a vote.
+        if (ctx.isHost && !hostClicked3b_ && ctx.elapsedMs >= HOST_3XB_AT_MS) {
+            bool ok = engine::writeGameSpeed(ctx.gw, 3.0f, false);
+            logClick("host", 3.0f, ok, " tag=reraise");
+            hostClicked3b_ = true;
         }
         if (!ctx.isHost && !joinClicked3b_ && ctx.elapsedMs >= JOIN_3XB_AT_MS) {
             bool ok = engine::writeGameSpeed(ctx.gw, 3.0f, false);
-            logClick("join", 3.0f, ok);
+            logClick("join", 3.0f, ok, " tag=raise2");
             joinClicked3b_ = true;
         }
 
@@ -3666,7 +4597,8 @@ public:
 
         unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
         if (ctx.elapsedMs >= dur) {
-            passed_ = ctx.isHost ? (hostClicked_ && combatIssued_)
+            passed_ = ctx.isHost ? (hostClicked_ && hostClicked1_ &&
+                                    hostClicked3b_ && combatIssued_)
                                  : (joinClicked3a_ && joinClicked1_ &&
                                     joinClicked3b_ && recvCount_ >= 1);
             return true;
@@ -3677,20 +4609,22 @@ public:
     virtual bool passed() const { return passed_; }
 
 private:
-    // Shared (peer-ready-armed) timeline; the combat window runs 52 s -> end.
-    static const unsigned long HOST_3X_AT_MS    = 10000;
-    static const unsigned long JOIN_3XA_AT_MS   = 22000;
-    static const unsigned long JOIN_1X_AT_MS    = 34000;
-    static const unsigned long JOIN_3XB_AT_MS   = 44000;
-    static const unsigned long COMBAT_AT_MS     = 52000;
-    static const unsigned long HOST_DURATION_MS = 75000;
-    static const unsigned long JOIN_DURATION_MS = 68000;
-    static const unsigned int  MAX_SQUAD        = 32;
+    // Shared (peer-ready-armed) timeline; the combat window runs 62 s -> end.
+    static const unsigned long HOST_3X_AT_MS      = 10000;
+    static const unsigned long JOIN_3XA_AT_MS     = 22000;
+    static const unsigned long HOST_1X_AT_MS      = 30000;
+    static const unsigned long JOIN_1X_SAME_AT_MS = 38000;
+    static const unsigned long HOST_3XB_AT_MS     = 46000;
+    static const unsigned long JOIN_3XB_AT_MS     = 54000;
+    static const unsigned long COMBAT_AT_MS       = 62000;
+    static const unsigned long HOST_DURATION_MS   = 85000;
+    static const unsigned long JOIN_DURATION_MS   = 78000;
+    static const unsigned int  MAX_SQUAD          = 32;
 
-    static void logClick(const char* who, float mult, bool ok) {
-        char b[96];
-        _snprintf(b, sizeof(b) - 1, "SCENARIO SPEEDSYNC %s click mult=%.1f ok=%d",
-                  who, mult, ok ? 1 : 0);
+    static void logClick(const char* who, float mult, bool ok, const char* tag) {
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SPEEDSYNC %s click mult=%.1f ok=%d%s",
+                  who, mult, ok ? 1 : 0, tag);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
@@ -3714,12 +4648,126 @@ private:
     bool          haveOwn_;
     bool          haveStriker_;
     bool          hostClicked_;
+    bool          hostClicked1_;
+    bool          hostClicked3b_;
     bool          joinClicked3a_;
     bool          joinClicked1_;
     bool          joinClicked3b_;
     bool          combatIssued_;
     unsigned int  ownHand_[5];
     unsigned int  striker_[5];
+};
+
+// speed_probe (vote-decoupling phase-0 spike, HOST-side, log-only): prove the
+// three claims the decoupled design rests on, with speedSync forced OFF so the
+// replicator can't fight the probe:
+//   1. QUIET writes (setFrameSpeedMultiplier + guarded userPause) drive the
+//      sim multiplier and it STICKS - nothing re-syncs it from the buttons.
+//   2. QUIET writes leave the UI speed buttons untouched (the buttons=...
+//      series stays constant across quiet acts), while a LOUD writeGameSpeed
+//      (a simulated real click) moves them.
+//   3. The intent hooks capture the loud click as a vote (INTENT line) and
+//      stay silent for quiet writes.
+// The join idles and logs its own series (harness anchor only).
+class SpeedProbeScenario : public Scenario {
+public:
+    SpeedProbeScenario()
+        : passed_(false), lastLogMs_(0), quiet3_(false), loud2_(false),
+          quiet1_(false), quietPause_(false), quietResume_(false),
+          actsOk_(true) {}
+
+    virtual const char* name() const { return "speed_probe"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Drain captured intent every tick (both clients): quiet acts must NOT
+        // produce INTENT lines; the loud click at 16 s must.
+        float im = 0.0f; bool ip = false;
+        while (engine::consumeSpeedIntent(ctx.gw, &im, &ip)) {
+            char b[96];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO SPEEDPROBE INTENT t=%lu mult=%.2f paused=%d",
+                      ctx.elapsedMs, im, ip ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.isHost) {
+            if (!quiet3_ && ctx.elapsedMs >= QUIET3_AT_MS) {
+                quiet3_ = true;
+                act("quiet3", engine::writeGameSpeedQuiet(ctx.gw, 3.0f, false), ctx);
+            }
+            if (!loud2_ && ctx.elapsedMs >= LOUD2_AT_MS) {
+                loud2_ = true;
+                act("loud2", engine::writeGameSpeed(ctx.gw, 2.0f, false), ctx);
+            }
+            if (!quiet1_ && ctx.elapsedMs >= QUIET1_AT_MS) {
+                quiet1_ = true;
+                act("quiet1", engine::writeGameSpeedQuiet(ctx.gw, 1.0f, false), ctx);
+            }
+            if (!quietPause_ && ctx.elapsedMs >= QPAUSE_AT_MS) {
+                quietPause_ = true;
+                act("quietpause", engine::writeGameSpeedQuiet(ctx.gw, 1.0f, true), ctx);
+            }
+            if (!quietResume_ && ctx.elapsedMs >= QRESUME_AT_MS) {
+                quietResume_ = true;
+                act("quietresume", engine::writeGameSpeedQuiet(ctx.gw, 1.0f, false), ctx);
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            float mult = 0.0f; bool paused = false;
+            char btn[16]; btn[0] = '\0';
+            int nBtn = engine::readSpeedButtons(btn, sizeof(btn));
+            if (engine::readGameSpeed(ctx.gw, &mult, &paused)) {
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO SPEEDPROBE t=%lu mult=%.2f paused=%d nbtn=%d buttons=%s",
+                          ctx.elapsedMs, mult, paused ? 1 : 0, nBtn,
+                          (nBtn > 0) ? btn : "?");
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost
+                ? (quiet3_ && loud2_ && quiet1_ && quietPause_ &&
+                   quietResume_ && actsOk_)
+                : true; // join is a passive anchor; the oracle judges the host series
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long QUIET3_AT_MS     = 8000;
+    static const unsigned long LOUD2_AT_MS      = 16000;
+    static const unsigned long QUIET1_AT_MS     = 24000;
+    static const unsigned long QPAUSE_AT_MS     = 32000;
+    static const unsigned long QRESUME_AT_MS    = 40000;
+    static const unsigned long HOST_DURATION_MS = 48000;
+    static const unsigned long JOIN_DURATION_MS = 44000;
+
+    void act(const char* what, bool ok, const ScenarioContext& ctx) {
+        if (!ok) actsOk_ = false;
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SPEEDPROBE act=%s t=%lu ok=%d",
+                  what, ctx.elapsedMs, ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    bool          passed_;
+    unsigned long lastLogMs_;
+    bool          quiet3_;
+    bool          loud2_;
+    bool          quiet1_;
+    bool          quietPause_;
+    bool          quietResume_;
+    bool          actsOk_;
 };
 
 // combat_crowd (waiting-attacker stance validation): the HOST orders a CROWD of
@@ -3888,6 +4936,664 @@ private:
     EntityState   seen_[MAX_REMEMBER]; // JOIN: hands ever captured (resolve fallback)
 };
 
+// spawn_probe / spawn_sync (runtime NPC spawn sync, protocol 21).
+//
+// Both scenarios run the SAME script; what differs is the plugin config:
+//   * spawn_probe - spawnSync FORCED OFF (Config): baselines the two failure
+//     modes with evidence. The join must log "[spawn] unresolved hand=..."
+//     for the host's runtime spawns (failure mode 1: host-only enemies), and
+//     the join's own local spawns must (or must not - that is the finding)
+//     draw "[authority] suppress" lines (failure mode 2: join-only enemies).
+//   * spawn_sync - spawnSync ON (default): the join must instead log
+//     "[spawn] proxy BOUND" for the host's runtime spawns and the PROXY
+//     position series must track the host's MEMBER series per hand.
+//
+// Script (host):  t=6s   spawn 4 runtime NPCs near the leader (leg=near)
+//                 t=32s  teleport-park the rank-0 tab 600u away (the user's
+//                        "roam far then get ambushed" reproduction)
+//                 t=36s  spawn 4 more runtime NPCs there (leg=far)
+// Script (join):  t=20s  spawn 4 runtime NPCs LOCALLY (the suppression leg)
+//                        + log per-second JVIS visibility for those hands
+// Both sides: MEMBER/RECV NPC series (npc_sync pattern) + 1 Hz CENSUS counts.
+class SpawnSyncScenario : public Scenario {
+public:
+    SpawnSyncScenario(bool probe)
+        : probe_(probe), passed_(false), lastLogMs_(0), lastCensusMs_(0),
+          lastJvisMs_(0), nearSpawned_(false), farMoved_(false),
+          farSpawned_(false), joinSpawned_(false),
+          nNear_(0), nFar_(0), nJoin_(0),
+          haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
+
+    virtual const char* name() const { return probe_ ? "spawn_probe" : "spawn_sync"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        Character* ld = engine::leader(ctx.gw);
+        if (ld && engine::readPos(ld, &ax_, &ay_, &az_)) haveAnchor_ = true;
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SPAWNPROBE anchor=%.1f,%.1f,%.1f have=%d probe=%d",
+                  ax_, ay_, az_, haveAnchor_ ? 1 : 0, probe_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Standard NPC series (npc_sync pattern): the host's spawned squad
+        // appears in its MEMBER capture set; whether it appears in the join's
+        // world at all is exactly what the oracles judge.
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+        }
+        // 1 Hz world-NPC census on both sides: the coarse "does the join's
+        // world hold as many bodies as the host's" spawn-frequency telemetry.
+        if (ctx.elapsedMs - lastCensusMs_ >= 1000 || lastCensusMs_ == 0) {
+            lastCensusMs_ = ctx.elapsedMs;
+            static Character*  cc[MAX_CENSUS];
+            static EntityState cs[MAX_CENSUS];
+            unsigned int n = engine::listNpcs(ctx.gw, cc, cs, MAX_CENSUS);
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO CENSUS t=%lu n=%u", ctx.elapsedMs, n);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.isHost) {
+            // Leg 1 (near): runtime squad beside the co-located leaders.
+            if (!nearSpawned_ && ctx.elapsedMs >= NEAR_SPAWN_AT_MS) {
+                nearSpawned_ = true;
+                nNear_ = engine::spawnRuntimeSquad(ctx.gw, SQUAD_N, nearHands_);
+                logSpawns("near", nearHands_, nNear_);
+            }
+            // Leg 2 (far): the user's reproduction - roam far, then meet a
+            // runtime squad there. Teleport-park the whole rank-0 tab (the
+            // split_interest pattern) so the move is deterministic.
+            if (!farMoved_ && ctx.elapsedMs >= FAR_MOVE_AT_MS) {
+                farMoved_ = true;
+                parkRank0Far(ctx);
+            }
+            if (farMoved_ && !farSpawned_ && ctx.elapsedMs >= FAR_SPAWN_AT_MS) {
+                farSpawned_ = true;
+                nFar_ = engine::spawnRuntimeSquad(ctx.gw, SQUAD_N, farHands_);
+                logSpawns("far", farHands_, nFar_);
+            }
+        } else {
+            // Suppression leg: the JOIN's own engine spawns a runtime squad
+            // (the join-only-enemies failure mode). enforceHostAuthority
+            // should hide these within ~1 s; the [authority] suppress lines
+            // (keyed hand=index,serial) are the oracle's anchor.
+            if (!joinSpawned_ && ctx.elapsedMs >= JOIN_SPAWN_AT_MS) {
+                joinSpawned_ = true;
+                nJoin_ = engine::spawnRuntimeSquad(ctx.gw, SQUAD_N, joinHands_);
+                logSpawns("join", joinHands_, nJoin_);
+            }
+            // Per-second visibility trace for the join-local spawns: do the
+            // hands still resolve, and where are the bodies?
+            if (joinSpawned_ && ctx.elapsedMs - lastJvisMs_ >= 1000) {
+                lastJvisMs_ = ctx.elapsedMs;
+                for (unsigned int i = 0; i < nJoin_; ++i) {
+                    Character* c = engine::resolveCharByHand(
+                        joinHands_[i][3], joinHands_[i][4], joinHands_[i][0],
+                        joinHands_[i][1], joinHands_[i][2]);
+                    float x = 0, y = 0, z = 0;
+                    bool havePos = c && engine::readPos(c, &x, &y, &z);
+                    char b[144];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO JVIS hand=%u,%u t=%lu res=%d pos=%.2f,%.2f,%.2f",
+                              joinHands_[i][3], joinHands_[i][4], ctx.elapsedMs,
+                              c ? 1 : 0, x, y, z);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    (void)havePos;
+                }
+            }
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // The scenario verdict only asserts the SCRIPT ran (spawns
+            // happened); the sync mechanism itself is judged by the
+            // Test-SpawnProbe / Test-SpawnSync oracles over the log evidence.
+            if (ctx.isHost) passed_ = (nNear_ > 0) && (nFar_ > 0);
+            else            passed_ = (nJoin_ > 0);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // One "SCENARIO SPAWN leg=<leg> hand=t,c,cs,i,s" line per spawned body.
+    // Hand order matches readObjectHand (and the replicator's [spawn] logs),
+    // so the oracle keys host spawns and join telemetry identically.
+    void logSpawns(const char* leg, unsigned int (*hands)[5], unsigned int n) {
+        for (unsigned int i = 0; i < n; ++i) {
+            char b[144];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO SPAWN leg=%s hand=%u,%u,%u,%u,%u",
+                      leg, hands[i][0], hands[i][1], hands[i][2], hands[i][3],
+                      hands[i][4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SPAWNED leg=%s n=%u", leg, n);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void parkRank0Far(const ScenarioContext& ctx) {
+        if (!haveAnchor_) return;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        unsigned int moved = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (tabRankOf(sq, n, i) != 0) continue;
+            Character* c = engine::resolve(sq[i]);
+            if (!c) continue;
+            engine::park(c, ax_ + FAR_DIST + (float)moved * 3.0f, ay_, az_, 0.0f);
+            ++moved;
+        }
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SPAWNFAR moved=%u to=%.1f,%.1f,%.1f",
+                  moved, ax_ + FAR_DIST, ay_, az_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const unsigned long NEAR_SPAWN_AT_MS = 6000;
+    static const unsigned long JOIN_SPAWN_AT_MS = 20000;
+    static const unsigned long FAR_MOVE_AT_MS   = 32000;
+    static const unsigned long FAR_SPAWN_AT_MS  = 36000;
+    static const unsigned long JOIN_DURATION_MS = 56000;
+    static const unsigned long HOST_DURATION_MS = 70000;
+    static const unsigned int  SQUAD_N          = 4;
+    static const unsigned int  MAX_LOG          = 40;
+    static const unsigned int  MAX_CENSUS       = 128;
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const float         FAR_DIST; // rank-0 relocation distance (units)
+
+    bool          probe_;
+    bool          passed_;
+    unsigned long lastLogMs_;
+    unsigned long lastCensusMs_;
+    unsigned long lastJvisMs_;
+    bool          nearSpawned_, farMoved_, farSpawned_, joinSpawned_;
+    unsigned int  nNear_, nFar_, nJoin_;
+    unsigned int  nearHands_[4][5];
+    unsigned int  farHands_[4][5];
+    unsigned int  joinHands_[4][5];
+    bool          haveAnchor_;
+    float         ax_, ay_, az_;
+};
+const float SpawnSyncScenario::FAR_DIST = 600.0f;
+
+// shop_probe (protocol 22 phase 0, probe tier): money + vendor-trading evidence.
+//
+// Kenshi facts under test (spikes 28-30): the wallet is per-Platoon (Ownerships::
+// money - no global player wallet), vendors are ShopTrader RootObjects with
+// save-stable hands, and Inventory::buyItem mutates vendor stock + wallet LOCALLY
+// on one client only. Nothing about money is on the wire today.
+//
+// Script:
+//   * both sides, 1 Hz: enumerate nearby vendors ("SCENARIO VENDOR hand=..
+//     money=.. stock=.. thand=..") and read every squad tab's wallet
+//     ("SCENARIO WALLET rank=.. money=..") - the divergence series.
+//   * host t=10s / join t=22s: each side (1) SETS its OWNED tab's wallet to a
+//     side-distinct sentinel via Ownerships::setMoney (host rank0=5000, join
+//     rank1=7000) - validates the 1b apply primitive AND, on the peer's WALLET
+//     series, decisively answers "does any wallet state cross today"; then
+//     (2) attempts ONE programmatic Inventory::buyItem against the nearest
+//     stocked vendor ([shop] BUY-BEFORE/AFTER evidence). Vendor inventories
+//     are lazy (built on shop-open), so the stock is forced first.
+// The verdict only asserts the script ran (wallet series + the scripted action
+// logged on each side); what crossed is judged/recorded by Test-ShopProbe.
+// The SAME script also runs as "money_sync" (probe=false): with the protocol
+// 22 wallet channel LEFT ON, the sentinel writes must CROSS - each side's
+// WALLET series must converge to the peer's sentinel. Test-MoneySync gates on
+// that convergence (the shop_probe run gates only on the evidence existing).
+class ShopProbeScenario : public Scenario {
+public:
+    explicit ShopProbeScenario(bool probe)
+        : probe_(probe), passed_(false), lastEvidenceMs_(0), actDone_(false),
+          buyRes_(-9), walletReads_(0), sawVendor_(false) {}
+
+    virtual const char* name() const { return probe_ ? "shop_probe" : "money_sync"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SHOPPROBE start host=%d probe=%d",
+                  ctx.isHost ? 1 : 0, probe_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // 1 Hz evidence: vendor census + per-tab wallet series (both sides).
+        // The money_sync leg skips the vendor census (wallet-only gate).
+        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
+            lastEvidenceMs_ = ctx.elapsedMs;
+            if (probe_) logVendors(ctx);
+            logWallets(ctx);
+        }
+        // One scripted action window per side, staggered so the logs separate
+        // the host crossing window from the join one. Each side (1) RAISES the
+        // wallet of the tab it OWNS via Ownerships::setMoney - the decisive
+        // "does money cross today" divergence lever plus the 1b apply-primitive
+        // validation - then (2) attempts the programmatic vendor purchase
+        // (records the vendor-stock findings).
+        unsigned long actAt = ctx.isHost ? HOST_ACT_AT_MS : JOIN_ACT_AT_MS;
+        if (!actDone_ && ctx.elapsedMs >= actAt) {
+            actDone_ = true;
+            doWalletSet(ctx);
+            if (probe_) doBuy(ctx);
+        }
+        if (ctx.elapsedMs >= DURATION_MS) {
+            // Script-ran gate only: wallets were readable and both scripted
+            // actions were logged (any result - the RESULTS are findings).
+            passed_ = (walletReads_ > 0) && actDone_;
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    void logVendors(const ScenarioContext& ctx) {
+        engine::VendorRead v[MAX_VENDORS];
+        unsigned int n = engine::listVendorsNear(ctx.gw, v, MAX_VENDORS, VENDOR_RADIUS);
+        for (unsigned int i = 0; i < n; ++i) {
+            // Keyed by the trader CHARACTER's save-stable hand (thand) - the
+            // ShopTrader wrapper's own serial is runtime-minted and differs
+            // per client/run (run 103018 finding), so thand is what the oracle
+            // uses to match vendors across the two logs.
+            char b[288];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO VENDOR hand=%u,%u,%u,%u,%u money=%d stock=%d qty=%d "
+                      "src=%d thand=%u,%u,%u,%u,%u sid='%s' t=%lu",
+                      v[i].hand[0], v[i].hand[1], v[i].hand[2], v[i].hand[3],
+                      v[i].hand[4], v[i].money, v[i].stock, v[i].qty, v[i].src,
+                      v[i].traderHand[0], v[i].traderHand[1], v[i].traderHand[2],
+                      v[i].traderHand[3], v[i].traderHand[4], v[i].sid, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (n > 0) sawVendor_ = true;
+        char c[64];
+        _snprintf(c, sizeof(c) - 1, "SCENARIO VENDORS n=%u t=%lu", n, ctx.elapsedMs);
+        c[sizeof(c) - 1] = '\0'; coop::logLine(c);
+    }
+
+    // One WALLET line per distinct squad tab (keyed by RANK, the cross-client
+    // stable tab identity): the money series the oracle diffs host-vs-join.
+    void logWallets(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        for (unsigned int rank = 0; rank < 4; ++rank) {
+            int li = tabLeaderIdx(sq, n, rank);
+            if (li < 0) continue;
+            unsigned int h[5];
+            handFromEntity(sq[li], h);
+            int money = -1;
+            if (engine::readWalletByHand(h, &money)) ++walletReads_;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WALLET rank=%u money=%d t=%lu",
+                      rank, money, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // Wallet-write leg: set the OWNED tab's wallet to a side-distinct sentinel
+    // via the engine accessor (host 5000, join 7000). Proves writeWallet works
+    // (the 1b apply primitive) and, on the peer's WALLET series, whether ANY
+    // wallet state crosses today (expected: it does not - the 1b gap evidence).
+    void doWalletSet(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        unsigned int rank = ctx.isHost ? 0u : 1u;
+        int li = tabLeaderIdx(sq, n, rank);
+        if (li < 0) { li = tabLeaderIdx(sq, n, 0u); rank = 0u; }
+        int before = -1, after = -1, ok = 0;
+        int target = ctx.isHost ? 5000 : 7000;
+        if (li >= 0) {
+            unsigned int h[5];
+            handFromEntity(sq[li], h);
+            engine::readWalletByHand(h, &before);
+            ok = engine::writeWalletByHand(h, target) ? 1 : 0;
+            engine::readWalletByHand(h, &after);
+        }
+        char b[144];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO WALLETSET who=%s rank=%u target=%d ok=%d before=%d after=%d t=%lu",
+                  ctx.isHost ? "host" : "join", rank, target, ok, before, after,
+                  ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void doBuy(const ScenarioContext& ctx) {
+        // Vendor inventories are LAZY (built when the trade UI first opens - run
+        // 101952: every enumerated vendor read stock=-1), so force the engine's
+        // own stock build on each candidate until one holds items, then re-read.
+        engine::VendorRead v[MAX_VENDORS];
+        unsigned int nv = engine::listVendorsNear(ctx.gw, v, MAX_VENDORS, VENDOR_RADIUS);
+        int pick = -1;
+        for (unsigned int i = 0; i < nv; ++i) {
+            if (v[i].stock <= 0) {
+                int r = engine::ensureVendorStock(ctx.gw, v[i].hand);
+                char eb[112];
+                _snprintf(eb, sizeof(eb) - 1, "SCENARIO SHOPSTOCK vendor=%u,%u ensure=%d",
+                          v[i].hand[3], v[i].hand[4], r);
+                eb[sizeof(eb) - 1] = '\0'; coop::logLine(eb);
+            }
+        }
+        nv = engine::listVendorsNear(ctx.gw, v, MAX_VENDORS, VENDOR_RADIUS);
+        for (unsigned int i = 0; i < nv; ++i)
+            if (v[i].stock > 0) { pick = (int)i; break; }
+        // Buyer = the tab THIS side owns (host rank 0, join rank 1; fall back to
+        // rank 0 when the save has a single tab).
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int li = tabLeaderIdx(sq, n, ctx.isHost ? 0u : 1u);
+        if (li < 0) li = tabLeaderIdx(sq, n, 0u);
+        char sid[48]; sid[0] = '\0';
+        if (pick < 0 || li < 0) {
+            buyRes_ = -2; // no vendor / no buyer - recorded, judged by the oracle
+        } else {
+            unsigned int bh[5];
+            handFromEntity(sq[li], bh);
+            buyRes_ = engine::probeVendorBuy(ctx.gw, v[pick].hand, bh, sid, sizeof(sid));
+        }
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO SHOPBUY who=%s res=%d sid='%s' vendor=%u,%u t=%lu",
+                  ctx.isHost ? "host" : "join", buyRes_, sid,
+                  pick >= 0 ? v[pick].hand[3] : 0u, pick >= 0 ? v[pick].hand[4] : 0u,
+                  ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const unsigned long HOST_ACT_AT_MS = 10000;
+    static const unsigned long JOIN_ACT_AT_MS = 22000;
+    static const unsigned long DURATION_MS    = 40000;
+    static const unsigned int  MAX_VENDORS    = 8;
+    static const unsigned int  MAX_SQUAD      = 32;
+    static const float         VENDOR_RADIUS;
+
+    bool          probe_;
+    bool          passed_;
+    unsigned long lastEvidenceMs_;
+    bool          actDone_;
+    int           buyRes_;
+    unsigned int  walletReads_;
+    bool          sawVendor_;
+};
+const float ShopProbeScenario::VENDOR_RADIUS = 100.0f;
+
+// vendor_trade (protocol 22 phase 1c): the buyer-side purchase COMPOSITE gate.
+//
+// A real Inventory::buyItem is unreachable in automation (vendor inventories
+// are lazy and the test save's SHOP_TRADER_CLASS objects carry no bound trader
+// - shop_probe runs 103018-104036), so the scenario performs the exact buyer-
+// side mutations ONE purchase makes - a wallet debit and the bought item
+// landing in the buyer's personal inventory, same tick - on the tab each side
+// OWNS, and gates that BOTH effects converge on the peer through the two
+// existing channels (PKT_MONEY + the bidirectional inventory snapshots). The
+// VENDOR-side mutation (stock shrink, register cash) intentionally stays local
+// for now: the engine regenerates vendor stock per client anyway, and the
+// [shop] BUY-LOCAL detour is gathering the field evidence for that mirror.
+//
+// Script (mirrors money_sync's stagger):
+//   * both sides, 1 Hz: every tab's WALLET line + a TINV line (count + content
+//     hash) for every tab leader's personal container.
+//   * host t=6s: seed its rank-0 wallet to 5000; t=10s: TRADE - one test item
+//     into the rank-0 leader's inventory + wallet -= 250 (-> 4750).
+//   * join t=18s/t=22s: same on its rank-1 tab with 7000 -> 6750.
+class VendorTradeScenario : public Scenario {
+public:
+    VendorTradeScenario()
+        : passed_(false), lastEvidenceMs_(0), seeded_(false), traded_(false),
+          tradeOk_(false), walletReads_(0) {}
+
+    virtual const char* name() const { return "vendor_trade"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO VENDORTRADE start host=%d",
+                  ctx.isHost ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
+            lastEvidenceMs_ = ctx.elapsedMs;
+            logSeries(ctx);
+        }
+        unsigned long seedAt  = ctx.isHost ? HOST_SEED_AT_MS  : JOIN_SEED_AT_MS;
+        unsigned long tradeAt = ctx.isHost ? HOST_TRADE_AT_MS : JOIN_TRADE_AT_MS;
+        if (!seeded_ && ctx.elapsedMs >= seedAt)  { seeded_ = true; doSeed(ctx); }
+        if (!traded_ && ctx.elapsedMs >= tradeAt) { traded_ = true; doTrade(ctx); }
+        if (ctx.elapsedMs >= DURATION_MS) {
+            passed_ = (walletReads_ > 0) && traded_ && tradeOk_;
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // One WALLET + one TINV line per distinct squad tab (keyed by rank).
+    void logSeries(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        for (unsigned int rank = 0; rank < 4; ++rank) {
+            int li = tabLeaderIdx(sq, n, rank);
+            if (li < 0) continue;
+            unsigned int h[5];
+            handFromEntity(sq[li], h);
+            int money = -1;
+            if (engine::readWalletByHand(h, &money)) ++walletReads_;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WALLET rank=%u money=%d t=%lu",
+                      rank, money, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            InvItemEntry items[INV_ITEMS_MAX];
+            unsigned int hash = 0;
+            unsigned int cnt = engine::captureContainerContents(
+                ctx.gw, h, items, INV_ITEMS_MAX, &hash);
+            char c[112];
+            _snprintf(c, sizeof(c) - 1, "SCENARIO TINV rank=%u count=%u hash=%u t=%lu",
+                      rank, cnt, hash, ctx.elapsedMs);
+            c[sizeof(c) - 1] = '\0'; coop::logLine(c);
+        }
+    }
+
+    // The tab this side owns: host rank 0, join rank 1 (leader fallback).
+    bool ownLeaderHand(const ScenarioContext& ctx, unsigned int h[5],
+                       unsigned int* outRank) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        unsigned int rank = ctx.isHost ? 0u : 1u;
+        int li = tabLeaderIdx(sq, n, rank);
+        if (li < 0) { li = tabLeaderIdx(sq, n, 0u); rank = 0u; }
+        if (li < 0) return false;
+        handFromEntity(sq[li], h);
+        if (outRank) *outRank = rank;
+        return true;
+    }
+
+    void doSeed(const ScenarioContext& ctx) {
+        unsigned int h[5]; unsigned int rank = 0;
+        int ok = 0, target = ctx.isHost ? SEED_HOST : SEED_JOIN;
+        if (ownLeaderHand(ctx, h, &rank))
+            ok = engine::writeWalletByHand(h, target) ? 1 : 0;
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO TRADESEED who=%s rank=%u target=%d ok=%d t=%lu",
+                  ctx.isHost ? "host" : "join", rank, target, ok, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void doTrade(const ScenarioContext& ctx) {
+        unsigned int h[5]; unsigned int rank = 0;
+        int w0 = -1, w1 = -1, added = 0;
+        unsigned int cnt0 = 0, cnt1 = 0, hash = 0;
+        char sid[48]; sid[0] = '\0';
+        if (ownLeaderHand(ctx, h, &rank)) {
+            InvItemEntry items[INV_ITEMS_MAX];
+            engine::readWalletByHand(h, &w0);
+            cnt0 = engine::captureContainerContents(ctx.gw, h, items, INV_ITEMS_MAX, &hash);
+            // The two buyer-side mutations of one purchase, same tick.
+            added = engine::addTestItemsToContainer(ctx.gw, h, 1, sid, sizeof(sid));
+            if (w0 >= PRICE) engine::writeWalletByHand(h, w0 - PRICE);
+            engine::readWalletByHand(h, &w1);
+            cnt1 = engine::captureContainerContents(ctx.gw, h, items, INV_ITEMS_MAX, &hash);
+        }
+        tradeOk_ = (added > 0) && (w1 >= 0) && (w0 - w1 == PRICE);
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO TRADE who=%s rank=%u ok=%d sid='%s' price=%d "
+                  "wBefore=%d wAfter=%d cntBefore=%u cntAfter=%u t=%lu",
+                  ctx.isHost ? "host" : "join", rank, tradeOk_ ? 1 : 0, sid, PRICE,
+                  w0, w1, cnt0, cnt1, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const unsigned long HOST_SEED_AT_MS  = 6000;
+    static const unsigned long HOST_TRADE_AT_MS = 10000;
+    static const unsigned long JOIN_SEED_AT_MS  = 18000;
+    static const unsigned long JOIN_TRADE_AT_MS = 22000;
+    static const unsigned long DURATION_MS      = 40000;
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const int           SEED_HOST        = 5000;
+    static const int           SEED_JOIN        = 7000;
+    static const int           PRICE            = 250;
+
+    bool          passed_;
+    unsigned long lastEvidenceMs_;
+    bool          seeded_;
+    bool          traded_;
+    bool          tradeOk_;
+    unsigned int  walletReads_;
+};
+
+// recruit_probe (protocol 23 phase 0, probe tier): mid-session recruitment
+// evidence. No recruit sync exists - a recruit exists on the recruiting client
+// only - and the DESIGN questions are identity-shaped:
+//   * does PlayerInterface::recruit work programmatically on both sides?
+//   * what happens to the subject's HAND - the container MUST change (it moves
+//     into a player platoon); do index/serial survive (peer could re-key) or
+//     is the identity fully broken?
+//   * does the recruit land in an EXISTING tab (rank stable) or mint a NEW
+//     platoon (the sorted-container rank partition could RESHUFFLE mid-session
+//     - the ownership hazard)?
+//   * what does the PEER see? For the BAKED leg its copy of the subject still
+//     stands (now unstreamed by the recruiter -> authority suppression?); the
+//     recruiter streams an unresolvable new hand (spawn-sync REQ/proxy?). The
+//     oracle cross-references the [spawn]/[authority] logs for both.
+// Script: 1 Hz TABS census (distinct sorted containers + squad size) on both
+// sides; host t=10s recruits the nearest BAKED world NPC, t=14s a RUNTIME
+// spawn; join the same at t=22s/26s. Verdict gates only that the script ran
+// (both legs logged + census series present); everything else is FINDINGs.
+//
+// The same script doubles as recruit_sync (probe=false, full tier): recruit
+// sync stays ON (protocol 23) and every leg must actually SUCCEED locally
+// (res=1); the Test-RecruitSync oracle then gates the cross-machine half from
+// the logs - the peer re-keyed its local body to each recruited hand (baked
+// legs, no duplicate proxy) or minted one via the bidirectional describe
+// channel (runtime legs), and tracked it (SCENARIO PROXY series).
+class RecruitProbeScenario : public Scenario {
+public:
+    explicit RecruitProbeScenario(bool probe)
+        : probe_(probe), passed_(false), lastEvidenceMs_(0),
+          bakedDone_(false), runtimeDone_(false),
+          bakedRes_(-9), runtimeRes_(-9), tabsLogged_(0) {}
+
+    virtual const char* name() const { return probe_ ? "recruit_probe" : "recruit_sync"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO RECRUITPROBE start host=%d",
+                  ctx.isHost ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
+            lastEvidenceMs_ = ctx.elapsedMs;
+            logTabs(ctx);
+        }
+        unsigned long bakedAt   = ctx.isHost ? HOST_ACT_AT_MS : JOIN_ACT_AT_MS;
+        unsigned long runtimeAt = bakedAt + 4000;
+        if (!bakedDone_ && ctx.elapsedMs >= bakedAt) {
+            bakedDone_ = true;
+            bakedRes_ = doRecruit(ctx, /*runtime=*/false);
+        }
+        if (!runtimeDone_ && ctx.elapsedMs >= runtimeAt) {
+            runtimeDone_ = true;
+            runtimeRes_ = doRecruit(ctx, /*runtime=*/true);
+        }
+        if (ctx.elapsedMs >= DURATION_MS) {
+            passed_ = bakedDone_ && runtimeDone_ && (tabsLogged_ > 0);
+            // The gated variant requires the recruits to have actually happened
+            // (the probe only requires the script to have run - failure IS data).
+            if (!probe_) passed_ = passed_ && (bakedRes_ == 1) && (runtimeRes_ == 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Distinct sorted squad-tab containers + squad size: the rank-partition
+    // census whose REORDERING mid-series is the ownership-reshuffle finding.
+    void logTabs(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        std::vector<std::pair<unsigned int, unsigned int> > ctnrs;
+        for (unsigned int i = 0; i < n; ++i)
+            ctnrs.push_back(std::make_pair(sq[i].hContainer, sq[i].hContainerSerial));
+        std::sort(ctnrs.begin(), ctnrs.end());
+        ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
+        char list[128]; list[0] = '\0';
+        unsigned int used = 0;
+        for (unsigned int i = 0; i < ctnrs.size() && used + 24 < sizeof(list); ++i) {
+            used += (unsigned int)_snprintf(list + used, sizeof(list) - used - 1,
+                                            "%s%u:%u", i ? "|" : "",
+                                            ctnrs[i].first, ctnrs[i].second);
+        }
+        list[sizeof(list) - 1] = '\0';
+        char b[208];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO TABS n=%u squad=%u list=%s t=%lu",
+                  (unsigned int)ctnrs.size(), n, list, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        ++tabsLogged_;
+    }
+
+    int doRecruit(const ScenarioContext& ctx, bool runtime) {
+        unsigned int hb[5], ha[5];
+        int res = engine::probeRecruit(ctx.gw, runtime, hb, ha);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO RECRUIT who=%s leg=%s res=%d "
+                  "before=%u,%u,%u,%u,%u after=%u,%u,%u,%u,%u t=%lu",
+                  ctx.isHost ? "host" : "join", runtime ? "runtime" : "baked", res,
+                  hb[0], hb[1], hb[2], hb[3], hb[4],
+                  ha[0], ha[1], ha[2], ha[3], ha[4], ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return res;
+    }
+
+    static const unsigned long HOST_ACT_AT_MS = 10000;
+    static const unsigned long JOIN_ACT_AT_MS = 22000;
+    static const unsigned long DURATION_MS    = 40000;
+    static const unsigned int  MAX_SQUAD      = 48;
+
+    bool          probe_;
+    bool          passed_;
+    unsigned long lastEvidenceMs_;
+    bool          bakedDone_;
+    bool          runtimeDone_;
+    int           bakedRes_;
+    int           runtimeRes_;
+    unsigned int  tabsLogged_;
+};
+
 Scenario* makeScenario(const std::string& name) {
     if (name == "spike")        return new SpikeScenario();
     if (name == "leader_move")  return new LeaderMoveScenario();
@@ -3907,6 +5613,7 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "stats_sync")   return new StatsSyncScenario();
     if (name == "carry_order")  return new CarryOrderScenario();
     if (name == "speed_sync")   return new SpeedSyncScenario();
+    if (name == "speed_probe")  return new SpeedProbeScenario();
     if (name == "combat_crowd") return new CombatCrowdScenario();
     if (name == "inv_order")    return new InventorySyncScenario();
     if (name == "inv_bidir")    return new InventoryBidirScenario();
@@ -3917,7 +5624,22 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "drop_probe")   return new DropProbeScenario();
     if (name == "world_item_sync") return new WorldItemSyncScenario();
     if (name == "wpn_relocate") return new WeaponRelocateScenario();
-    if (name == "world_weapon_drop") return new WorldWeaponDropScenario();
+    if (name == "npc_carry")    return new NpcCarryScenario();
+    if (name == "world_weapon_drop") return new WorldGearDropScenario("world_weapon_drop", 2);
+    if (name == "world_armor_drop")  return new WorldGearDropScenario("world_armor_drop", 3);
+    if (name == "bed_pose")     return new BedPoseScenario();
+    if (name == "bed_put")      return new FurnPutScenario(1);
+    if (name == "cage_put")     return new FurnPutScenario(2);
+    if (name == "sneak_probe")  return new SneakProbeScenario();
+    if (name == "sneak_pose")   return new SneakPoseScenario();
+    if (name == "sneak_detect") return new SneakDetectScenario();
+    if (name == "spawn_probe")  return new SpawnSyncScenario(/*probe=*/true);
+    if (name == "spawn_sync")   return new SpawnSyncScenario(/*probe=*/false);
+    if (name == "shop_probe")   return new ShopProbeScenario(/*probe=*/true);
+    if (name == "money_sync")   return new ShopProbeScenario(/*probe=*/false);
+    if (name == "vendor_trade") return new VendorTradeScenario();
+    if (name == "recruit_probe") return new RecruitProbeScenario(true);
+    if (name == "recruit_sync")  return new RecruitProbeScenario(false);
     return 0;
 }
 

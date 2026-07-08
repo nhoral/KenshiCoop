@@ -525,10 +525,363 @@ does not have this shape. Not a sync bug: pickups, tracking and drops all
 crossed green in that same run.
 
 Known limitations (documented follow-ups, out of scope): world-NPC carry
-(kidnap/bounty/rescue) needs the NPC-authority/suppression interplay;
+(kidnap/bounty/rescue) needs the NPC-authority/suppression interplay -
+CLOSED 2026-07-07, see the "Real-session sync gaps" addendum below;
 placing a carried body into beds/cages (`PUT_SOMEONE_IN_BED`/`PUT_IN_CAGE`)
 is unreplicated - after a plain drop the existing KO/medical channels own
 the state.
+
+## Steam P2P transport (2026-07-07, addendum)
+
+Remote sessions failed on network plumbing (UPnP refused by the router,
+suspected CGNAT on the join side), not on sync. New OPT-IN transport: the
+unchanged ENet protocol tunnelled over the legacy `ISteamNetworking` P2P API
+in Kenshi's own `steam_api64.dll` (flat exports bound at runtime via
+`GetProcAddress` - no SDK, no import lib, no new DLLs in the kit). Steam
+brokers the connection BY STEAMID: UDP NAT punch first, silent Valve-relay
+fallback - IPs, port forwarding and CGNAT leave the conversation. Wire
+protocol untouched (`PROTOCOL_VERSION` stays 18); patch 0002 adds a
+socket-hooks seam to the vendored ENet (`enet_set_socket_hooks`; NULL hooks
+= byte-for-byte stock UDP path); host MTU clamps to Steam's 1200-byte
+unreliable ceiling; sends are buffered-unreliable so the ENet handshake
+survives session brokering. Two-code exchange: each side sets
+`KENSHICOOP_TRANSPORT=steam` + `KENSHICOOP_STEAM_PEER=<other player's
+steamid64>`; the receive path drops any other sender. Falls back to UDP
+loudly on any init failure. Doctrine 29 in INTENT_REPLICATION.md.
+
+| Check | Result | Key values |
+|---|---|---|
+| prototest | PASS | 98/98 - wire contract untouched by the transport layer |
+| coop_presence (UDP, hooks compiled in but dormant) | PASS | run 091858 (build stamp verified fresh): presence 2/2 + 1/1 ratio=1.0, march 0, clock_sync 0 ms, smoothness 0.023 - stock path regression-clean. (The first citation, run 002909, had silently run a STALE DLL - the anti-stale build-stamp line is what caught it; always check it.) |
+| Live-game bindings spike (single machine, self-ping) | PASS | run steam_spike_091731: `[steam] id=76561197970261979 loggedOn=1 iface=SteamNetworking005`; hooks installed + ENet host created over the fake socket; self-session went connecting=1 -> active=1; 19 pings round-tripped at 62-437 ms (Steam client IPC loopback), relay=0. Proves the hand-declared flat ABI, interface version, P2PSessionState layout, and the send/read path against the REAL Steam client. |
+| tunneltest (in-process ENet-over-hooks) | PASS | 17/17: handshake, unreliable ch0, reliable ch1 8000-byte packet fragmented + reassembled byte-for-byte under 15% simulated loss, ZERO datagrams over the 1200-byte Steam cap (max seen exactly 1200), clean disconnect. `scripts\build_tunneltest.cmd` compiles the same patched ENet sources the plugin ships. |
+| Steam spike (remote) | PASS (2026-07-07) | live two-account session: direct NAT punch (relay=0), RTT ~33 ms |
+| Steam co-op session (remote) | PASS (2026-07-07) | full remote playtest over Steam P2P - positions, combat, health, speed all crossed; the session's three sync gaps (dropped items, equipment, NPC carry) are closed in the "Real-session sync gaps" addendum below |
+
+Loopback note: a full steam-transport loopback run (both game clients on this
+machine) is NOT possible - both processes share one Steam account/SteamID and
+would race each other's ReadP2PPacket queue. The two single-machine spikes
+above box that gap in from both sides: the self-ping proves everything from
+the flat ABI down to real packet delivery through the Steam client, and
+tunneltest proves everything from the ENet protocol down to the hook seam
+under Steam's datagram constraints. The ONLY untested layer left for the
+remote attempt is Valve's session brokering between two different accounts
+(NAT punch / relay selection) - which is Valve-operated infrastructure, not
+our code. Script support: `host_session.ps1 -PeerSteamId`,
+`join_session.ps1/friend_join.ps1 -HostSteamId`, `friend_host.ps1
+-PeerSteamId` (all accept short friend codes), `make_remote_kit.ps1
+-Transport steam -MySteamId <id>` bakes the counterpart id into kit.json.
+
+## Real-session sync gaps (2026-07-07, addendum)
+
+The first successful remote playtest (Steam P2P, direct punch) surfaced three
+gaps: dropped items never appeared on the other client, equipment changes
+never crossed, and a host-side NPC carrying a downed PC never replicated.
+Root causes and fixes (wire unchanged, protocol stays 18):
+
+1. **Session defaults (bugs 1+2)**: `invSync` and `worldSync` were
+   scenario-gated test flags, default-OFF in free play - the channels were
+   implemented and validated but DORMANT in the real session. Both now
+   default ON for `scenario == ""` (free play), aligned with
+   `medSync`/`statsSync`/`carrySync`; `KENSHICOOP_INV_SYNC` /
+   `KENSHICOOP_WORLD_SYNC` `"0"`/`"1"` are the escape hatches; scripted test
+   scenarios outside the auto-on lists keep their old default. Doctrine 30.
+2. **Equipped-armor drop coverage**: the session's exact action (drag
+   equipped pants to ground) had no scenario - `world_weapon_drop` covers
+   weapons only, though the W2 conservation channel always handled ARMOUR.
+   New `world_armor_drop` scenario (prefers an EQUIPPED piece) shares the
+   `WDROP` log contract and the (now parameterized) `Test-WeaponDrop`
+   oracle.
+3. **World-NPC carriers (bug 3)**: carry edges were authored for player-
+   squad carriers only, and the join self-heal was `isSquad`-gated. The
+   host now authors `EVT_PICKUP_BODY`/`EVT_DROP_BODY` for its streamed NPCs
+   too; the join self-heals any driven carrier streaming `TASK_CARRY_BODY`
+   and early-continues an NPC carrier with an active local attach (its
+   local AI animates the carry walk; a graded soft-walk/cooldown-snap band
+   keeps it on the host's path). A carrier that leaves the interest sphere
+   mid-carry authors its drop from ABSENCE (3 s debounce) - found live:
+   the NPC hauled the body out of interest and the transition detector
+   never fired. Doctrine 28 amendment.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| world_armor_drop (new) | squad1 | PASS | host dropped EQUIPPED armor (invBase=1 -> 0, ground=1); join relocated its own copy (invMin=0, grndMax=1); `[wd]` DROP authored + APPLY moved=1 |
+| npc_carry (new) | squad1 | PASS | pickup crossed in 140 ms; join detected the carrier from its own local world (`RECV PICKUP ok=1`); carried copy rode at 0 median same-tick gap; out-of-interest drop crossed via the absence path (~3 s) |
+| inv_equip | squad1 | PASS | default-flip regression |
+| inv_bidir | squad1 | PASS | default-flip regression |
+| world_weapon_drop | squad1 | PASS | oracle parameterization regression |
+| world_item_sync | squad1 | PASS | default-flip regression |
+| carry_order | squad1 | PASS | NPC-carry extension regression (all 3 windows) |
+| player_ko | squad1 | PASS | KO-hold path regression |
+| coop_presence | squad1 | PASS | plain-session regression (x2: after the default flip and after the carry extension) |
+
+## Bed & cage occupancy sync (2026-07-07, addendum)
+
+Protocol 18 -> 19. Two halves (doctrine 31): the CONSCIOUS bed path
+(`USE_BED`/`USE_BED_ORDER`/`SLEEP_ON_FLOOR`) was already on the
+reproducible-pose allowlist but never runtime-validated (spike 24 PARTIAL);
+UNCONSCIOUS placement into beds/prison cages was not replicated at all (the
+doctrine-28 known limitation). New machinery, the carry shape applied to a
+stateful attach: `BODY_IN_BED`/`BODY_IN_CAGE` bodyState bits + reliable
+`EVT_ENTER_FURNITURE`/`EVT_EXIT_FURNITURE` (furniture hand rides the event;
+`hostBody_` remembers it for the EXIT), engine-native
+`setBedMode`/`setPrisonMode` between each machine's local pair, a carve-out
+above the down branch scoped away from conscious bed TASKS, 1.5 s/3 s
+self-heal, absence-authored exits, and a peer-left sweep.
+`KENSHICOOP_FURN_SYNC=0` is the escape hatch.
+
+New fixtures/tooling: `bedcage` setup scene (Camp Bed + Prisoner Cage spawned
+by hand next to the squad) baked into save `bedcage1` by the new
+`scripts/bake_scene.ps1` + `KENSHICOOP_BAKESAVE` deferred `SaveManager::save`
+auto-bake - no manual save-menu round-trip.
+
+Two transferred lessons found by `bed_pose`: (1) a fixture task that
+TELEPORTS the body in (bed enter) fails `applyTaskOrder`'s proximity check
+while the driven copy's interpolation still lags - the far-fixture result is
+now RETRYABLE (throttled 1.5 s, `taskBad` only after 8 attempts) instead of a
+permanent latch; (2) `detachFromTownAI` must never touch player-squad members
+(it re-containers them, changing their hand identity mid-session) - now
+`isSquad`-guarded.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| bed_pose (new) | bedcage1 | PASS | host + join commit the bed task at the same fixture (hostBed/joinBed >= 6 samples, medGap 0, matching pelvis ~2.5 vs standing ~9.6) |
+| bed_put (new) | bedcage1 | PASS | A (host puts KO'd M2): enter 467 ms / exit 466 ms, gap 0; B (join puts L1): enter 65 ms / exit 62 ms, gap 0 |
+| cage_put (new) | bedcage1 | PASS | A: enter 499 ms / exit 501 ms, gap 0; B: enter 29 ms / exit 533 ms, gap 0 |
+| carry_order | squad1 | PASS | all 3 windows (one boundary-flake rerun: first sample at the drop marker read pre-drop) |
+| npc_carry | squad1 | PASS | pick 489 ms, drop 483 ms, gap 0 (two reruns: the wandering world NPCs were outside interest twice - availability flake, suppresses=0 on BOTH sides those runs) |
+| player_ko | squad1 | PASS | KO lat 13/12 ms, revive lat 30/31 ms both directions |
+| down_order | squad1 | PASS | upright-before 38/38, down-after 23/23 |
+| coop_presence | squad1 | PASS | bidirectional presence, tol=6 |
+| prototest | - | PASS | 107/107, protocol 19, new occupancy-bit + event-constant checks |
+
+## Stealth & detection-indicator sync (2026-07-07, addendum)
+
+Protocol 19 -> 20. Two halves (doctrine 32): stealth POSTURE was streamed
+half-way (`BODY_CRAWL` carried `isStealthModeOrCrawling` on the wire but no
+receive path applied it - the peer saw a normal walk), and detection
+indicators for a peer-owned sneaker existed nowhere (the owner's local NPCs
+are suppressed copies that compute nothing; the host computes but cannot
+render them). New machinery: a `BODY_SNEAK` bit streaming
+`Character::stealthMode` exactly, applied to driven copies via the engine's
+own `setStealthMode` (continuous idempotent state, 1 s throttle, placed after
+the carried/furniture/down carve-outs); and `PKT_STEALTH` - the first
+owner-directed FEEDBACK stream - carrying the driven sneaker's
+`whoSeesMeSneaking` map (host-authored ~4 Hz change-gated UNRELIABLE
+snapshots, one empty snapshot on the falling edge) back to the owner, who
+replays each entry between its LOCAL pair via `notifyICanSeeYouSneaking`.
+`KENSHICOOP_STEALTH_SYNC=0` is the escape hatch.
+
+Phase-0 spike (`sneak_probe`, kept as a probe-tier scenario): host NPC vision
+DOES fire against a driven (non-local-player) sneaker - the map filled within
+1 s of `setStealthMode` on the driven copy, progress climbed continuously,
+and entries aged out on their own when a seer looked away (no clear-on-leave
+machinery needed). SEH-guarded boost-1.60 `unordered_map` iteration is
+layout-correct against the game's in-tree boost.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| sneak_probe (new, probe tier) | sync | PASS | modeOn=64 samples, withSeers=40, detection entries with climbing progress on the driven copy |
+| sneak_pose (new) | squad1 | PASS | both directions: peer copy mode=1 within 0.5 s (A) / same sample (B), 50 on-samples each window, off edges clean |
+| sneak_detect (new) | sync | PASS | hostSends=21, joinApplied=21/21, join map fills through the channel (MAYBE prog rising -> YES) and drains after off |
+| coop_presence | squad1 | PASS | plain-session regression |
+| bed_put | squad1/bedcage1 | PASS | bodyState-bit neighbor regression |
+| down_order | squad1 | PASS | upright/down enforcement regression |
+| carry_order | squad1 | PASS | all 3 windows (pick/drop < 460 ms, gap 0) |
+| prototest | - | PASS | 116/116, protocol 20, BODY_SNEAK bit + StealthPacket size/round-trip checks |
+
+## Speed vote decoupled from the UI buttons (2026-07-08, addendum)
+
+Wire protocol UNCHANGED (still 20) - this is a client-side rework of doctrine
+24's capture/apply mechanics. The old state-diff click detector could never
+show a vote (the arbitrated apply went through `setGameSpeed`, snapping the
+buttons back to the min) and could never LOWER a stale vote with a click equal
+to the current effective (stuck vote). Now the buttons express the local
+player's REQUEST and stay where clicked; the sim runs at the arbitrated
+min(host, join) underneath. Votes are captured by `KenshiLib::AddHook` detours
+on `setGameSpeed`/`userPause`/`togglePause` (reentrancy-guarded against our own
+writes) PLUS a poll fallback: manual sessions (2026-07-08) proved the MainBar
+click handler writes the speed INLINE (real UI clicks never reach the detours).
+The poll detects (a) the engine leaving the last quietly-written state (real
+click / keyboard pause - engine state IS the request) and (b) the button
+highlight moving while the engine did NOT: the same-value click AND the
+speed-click-while-paused, where the vote's pause state is decoded from WHICH
+button lit (pause button = pause vote; any speed button = UNPAUSE vote at that
+speed - reading the engine's pause flag instead kept both clients stuck voting
+pause). The effective is applied by `writeGameSpeedQuiet` =
+`setFrameSpeedMultiplier` (bare, UI-silent) + guarded `userPause` +
+vote-highlight restore. A continuous enforcement tick re-asserts the effective
+when a pass-through click diverges the engine (replaces the same-tick
+snap-back).
+
+Phase-0 spike (`speed_probe`, kept as a probe-tier scenario, speedSync forced
+off): `setFrameSpeedMultiplier` drives the sim and STICKS (12/12 samples at
+3.0, buttons untouched); `userPause` DOES re-highlight the buttons from the
+effective (first probe run FAILed on "quiet pause MOVED the buttons") - hence
+the snapshot/restore fallback from the plan, which the second run proved
+clean (12/12 pause samples, highlight restored).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| speed_probe (new, probe tier) | sync | PASS | quiet 3x stuck 12/12, buttons '0100' constant across quiet acts, loud click moved buttons + INTENT mult=2.00 captured, 0 intent leaks |
+| speed_sync (reworked: + same-value vote-lowering leg) | sync | PASS | 5 transitions, max follow 490 ms, lone raise denied, sameValueVote=true, reraiseDenied=true, match 1.00/123, combat window 1x both sides |
+| coop_presence | squad1 | PASS | plain-session regression |
+
+Manual two-instance session (2026-07-08): 1x/2x votes shown per-client, speed
+changes only when both agree, pause from either client pauses both, speed
+clicks while paused unpause once both vote (the poll decodes the lit button;
+the pause-flag read had left the session permanently paused - fixed same day).
+Oracle hardening from the fix run: `Test-SpeedSync` skips host SET transitions
+landing after the join's sampling window (host tail outlives the join; a
+post-combat re-raise there is unjudgeable - was a flake).
+
+## Runtime NPC spawn sync (2026-07-08, addendum)
+
+Protocol 20 -> 21 (`PKT_SPAWN_REQ`, `PKT_SPAWN_INFO`). Root cause of the
+2026-07-07 field report ("host fought enemies the join couldn't see; another
+squad appeared only on the join"): NPC sync resolves bodies by save-stable
+hand, so a squad the host's spawn manager mints at RUNTIME (roaming bandits,
+dialog ambushes) has a host-only hand the join can never resolve - no
+replication channel existed. Fix is pull-based proxy replication (doctrine 33):
+the join sends `PKT_SPAWN_REQ` for streamed hands it cannot resolve (debounced,
+retry-capped, proximity-gated to 250 u of its own squad), the host replies with
+the spawn's DESCRIPTION (template stringID + faction stringID + transform +
+dead flag), and the join mints a local proxy through the engine's own factory.
+The hand->proxy translation lives at the single `applyTargets` resolve choke
+point, so proxies inherit the entire world-NPC drive path (AI-suspend, damage
+guard, combat, death latches, authority hysteresis). The join-only-enemies half
+is suppression hardening: `enforceHostAuthority` now re-asserts the hide every
+2 s (dialog/combat packages and zone streaming can undo a one-shot
+`suppressNpc`), only books suppressions the engine confirmed, and logs
+`suppress MISS` otherwise. `KENSHICOOP_SPAWN_SYNC=0` is the escape hatch.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| spawn_probe (new, probe tier; spawnSync forced OFF) | sync | PASS | evidence baseline: 8/8 host runtime hands (near + far legs) logged `[spawn] unresolved` on the join; 4/4 join-local runtime spawns suppressed in ~1.2 s |
+| spawn_sync (new, full tier) | sync | PASS | proxies bound 8/8 (near 4/4, teleport-600u far 4/4), PROXY-vs-MEMBER median tracking 0.7-0.8 u (tol 6), join-local spawns suppressed 4/4 |
+| coop_presence | squad1 | PASS | plain-session regression |
+| combat_probe | c | PASS | runtime-spawned duelists regression (spawn path adjacency) |
+| split_interest | sync | PASS | dual-sphere interest regression |
+| npc_sync | sync | npc_track PASS | position/pose gates green; the `smoothness` gate flaked under tonight's machine load - the CONTROL (protocol-20 kit DLL) run failed it identically (zeroFrac 0.938 vs 0.912 new), so it is environmental, not protocol-21 |
+
+Suppression finding (phase 0, for the record): the probe could NOT reproduce
+the reported "join-only enemies stayed visible" gap in a clean scenario -
+`enforceHostAuthority` caught all 4 join-local runtime spawns within ~1.2 s
+(hysteresis working as designed). The field report's likeliest mechanism is
+the engine UNDOING the one-shot hide afterwards (ambush dialog re-tasks the
+body; zone streaming re-adds it to the update list) - hence the 2 s re-assert
+hardening, which is cheap and idempotent either way.
+
+Accepted limitations: proxy appearance/equipment approximate the host's body
+(template + faction, randomized gear - cosmetic; combat outcomes stay
+host-authoritative + damage-guarded); ambush dialog is not synced; host/join
+runtime-hand collision is theoretically possible (both engines mint sequential
+runtime ids) but unobserved - the join's own runtime spawns are suppressed
+within ~1 s.
+
+## Money / economy sync, phase 1 (2026-07-08, addendum)
+
+Protocol 21 -> 22 (`PKT_MONEY`). Kenshi's wallet is per-`Platoon`
+(`Ownerships::money` via the tab's Platoon - no global player wallet, spike
+29) and NOTHING about money was on the wire: the shop_probe baseline proved a
+sentinel `Ownerships::setMoney` write on one side never moved the peer's
+series (host rank0=5000 / join rank1=7000, both "did NOT cross"). The channel
+is owner-authoritative by squad-tab RANK (the same sorted-distinct-containers
+partition positional/inventory sync own): each client publishes the wallet of
+every tab it owns on the reliable channel (change-gated, ~1 Hz floor, 5 s
+safety resend - the `PKT_STATS` pacing), and the receiver writes peer tabs via
+`Ownerships::setMoney`. `KENSHICOOP_MONEY_SYNC=0` is the escape hatch;
+`shop_probe` forces it off to keep the unsynced baseline measurable.
+
+Probe findings that REFRAMED the planned vendor-stock half (shop_probe runs
+101952/103018/103547/104036):
+- a `ShopTrader`'s aggregated `Inventory` is LAZY - null until the trade UI
+  first opens (every enumerated vendor read stock=-1; forcing
+  `ActivePlatoon::refreshInventory` couldn't help because...)
+- ...the SHOP_TRADER_CLASS objects near the leader carry NO bound trader
+  (`trader` member AND `getTrader()` both null; sids are building/furniture
+  GameData ids), and
+- the wrapper hands are RUNTIME-minted (index stable, serial differs per
+  client/run) - a hand-keyed vendor snapshot can never match cross-client.
+Vendor stock is regenerated per client by the engine anyway, so the vendor-
+side mirror is deferred: the `[shop] BUY-LOCAL` detour on `Inventory::buyItem`
+(installed with money sync) now logs every REAL purchase (seller identity +
+register money, item sid, buyer) so manual field sessions accumulate the
+evidence for a shop-open-scoped design keyed by the trader Character's
+save-stable hand. The buyer-side effects of a purchase - wallet debit + item
+into the buyer's bag - already converge over PKT_MONEY + the phase-4a
+inventory channel, which `vendor_trade` gates as a composite (`invSync`
+auto-on for it, like the inv_* family).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| shop_probe (new, probe tier; moneySync forced OFF) | sync | PASS | baseline: sentinel wallets diverged by exactly +5000/-7000 (nothing crosses); 320+ vendor reads all stock=-1 / trader-null; both buy attempts res=-2 (no reachable stocked vendor) |
+| money_sync (new, full tier) | sync | PASS | crossed=2/2 - host 5000 -> join rank0, join 7000 -> host rank1; `[money] SEND/RECV` pairs ~30 ms apart; no drift on co-visible ranks |
+| vendor_trade (new, full tier) | sync | PASS | walletCrossed=2/2 (4750/6750 after the 250 debit) + TINV content hash converged both ranks (the bought item crossed) |
+| inv_bidir | inv | PASS | regression (first run red: stray kenshi_x64 from an earlier session tripped the 3-player guard + join crash; clean rerun green both directions) |
+| world_item_sync | sync | PASS | regression |
+| combat_kill | c | PASS | regression |
+| coop_presence | squad1 | PASS | plain-session regression |
+
+prototest: 128/128 (adds `sizeof(MoneyPacket)`=13 + PKT_MONEY round-trip).
+
+Accepted limitations: vendor register cash / stock stay per-client until the
+shop-open-scoped mirror (divergence is cosmetic; the engine re-rolls stock on
+its own refresh cadence); sell-side money flows are covered by the same wallet
+stream (the credit lands on the seller's owned tab and crosses), but the SOLD
+item entering vendor stock stays local like any vendor stock.
+
+## Recruitment sync (2026-07-08, addendum)
+
+Protocol 22 -> 23 (`EVT_RECRUIT` + bidirectional describe/mint). The
+recruit_probe baseline (run 114151, recruitSync forced off) established the
+gap's exact shape: `PlayerInterface::recruit` works programmatically on both
+sides for both subject classes; the recruit RE-CONTAINERS the body (baked
+subjects keep their SERIAL, index changes; runtime subjects spawned into the
+player container keep the whole tail); host recruits reached the join only as
+DUPLICATE proxies (spawn-sync minted a second body while the local baked copy
+still stood); join recruits reached the host NOT AT ALL (the describe channel
+was join-pull only); and a join recruit landed in the HOST-owned rank-0
+container - the rank partition alone would misattribute ownership.
+
+The channel: a detour on `PlayerInterface::recruit` records every successful
+LOCAL recruit's before/after hand pair ("[recruit] LOCAL"); `publishRecruits`
+drains the queue into reliable `EVT_RECRUIT` events (subject = old hand,
+actor = new hand) and pins the new hand into `recruitOwned_` (publishOwned
+streams it regardless of tab rank; the receiver's `peerRecruit_` pin vetoes
+the inverse). The receiver RE-KEYS its existing local copy of the old hand
+into `proxyByKey_` under the new key - the protocol-21 translation point -
+so the recruit inherits the whole driven-body path (AI-suspend, damage guard,
+latches) with ONE body and no duplicate mint; a suppressed copy is restored
+first, and an already-proxied old hand migrates its binding. Runtime-born
+recruits (old hand unresolvable on the peer) ride the describe/mint channel,
+now BIDIRECTIONAL (both sides answer PKT_SPAWN_REQ and author them).
+`KENSHICOOP_RECRUIT_SYNC=0` is the escape hatch; recruit_probe forces it off.
+
+One fix out of the first gated run (120738): both sides' deterministic
+nearest-NPC pick recruited the SAME bar NPC (the join's copy was already
+peer-driven), colliding both ownership pins on one hand. probeRecruit now
+skips AI-suspended (peer-driven) bodies; a REAL double-recruit of the same
+NPC remains a documented race (the second recruiter's EVT is a no-op on the
+first's machine since the hand is already recruitOwned_ there).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| recruit_probe (probe tier; recruitSync forced OFF) | sync | PASS | baseline run 114151: 4/4 legs res=1; baked serial survives / index+container change; join tabs 2->4 (new platoons sort AFTER - preexisting rank order stable); host recruits duplicated on join (proxyBound=1 beside the standing baked copy); join recruits invisible on host (unresolved/REQ=0) |
+| recruit_sync (new, full tier) | sync | PASS | converged=4/4 - baked legs re-keyed (peer rekey=1, proxyBound=0), runtime legs minted over the bidirectional channel (proxyBound=1), every hand position-tracked (proxyTrack 35-68 samples); no duplicates |
+| coop_presence | squad1 | PASS | plain-session regression |
+| npc_sync | c | PASS | regression |
+| spawn_sync | sync | PASS | regression (join-pull half of the now-bidirectional channel unchanged) |
+| split_interest | squad1 | PASS | regression (rank partition + recruit pins coexist) |
+
+prototest: 129/129 (adds EVT_RECRUIT distinctness; EventPacket shape unchanged).
+
+Accepted limitations: the recruit appears on the peer as a DRIVEN body, not in
+the peer's squad UI (peer-side platoon placement deferred - it would recruit
+the copy locally and re-partition ownership); recruits are session-state (save
+/load coordination is gap 8); two players recruiting the SAME NPC in the same
+instant keeps one body per machine but ownership resolves to whoever's EVT
+lands second on each side (benign for position sync, unmeasured for control).
 
 ## Known limitations (honest edges)
 

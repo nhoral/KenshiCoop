@@ -27,6 +27,7 @@
     #   combat_kill       - reliable event channel + attribution + outcome
     #   inv_bidir         - inventory snapshot/reconcile (both directions)
     #   world_weapon_drop - world-item conservation channel
+    #   world_armor_drop  - same channel, EQUIPPED armor piece (real-session repro)
     # ---------------------------------------------------------------------------
 
     # Harness timeout profiles. 'loopback' matches the historical defaults;
@@ -268,6 +269,207 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
         }
+        npc_carry = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'npc_carry'
+            Gating   = @('npc_carry', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
+        # bed_pose: conscious bed use (protocol 19 phase 1). The host orders its
+        # leader to USE_BED_ORDER at the baked Camp Bed (save 'bedcage1'); the
+        # join's driven copy must commit the same bed task at the same fixture.
+        # Closes the "reproducible-pose allowlist covers beds but was never
+        # runtime-validated" gap (spike 24 PARTIAL).
+        bed_pose = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'bed_pose'
+            Gating   = @('bed_pose', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'pose_state')
+            Tier = 'full'; WanVariant = $true
+        }
+
+        # bed_put: unconscious placement (protocol 19 phase 3). Window A: the
+        # host KO's its M2 (holdDown re-topped) and places it in the baked Camp
+        # Bed via the putSubjectInFurniture scaffold, then takes it back out;
+        # window B: the join does the same with its L1. The peer's driven copy
+        # must mirror enter + exit (reliable EVT_ENTER/EXIT_FURNITURE edges +
+        # BODY_IN_BED self-heal), engine-native via setBedMode.
+        bed_put = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'bed_put'
+            Gating   = @('bed_put', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
+        # cage_put: same two windows against the baked Prisoner Cage
+        # (setPrisonMode / BODY_IN_CAGE).
+        cage_put = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'cage_put'
+            Gating   = @('cage_put', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
+        # sneak_probe: protocol-20 phase-0 spike (host-side, log-only). The host
+        # forces stealthMode on its DRIVEN copy of the join's leader near the bar
+        # NPCs and logs the copy's whoSeesMeSneaking series - proves the engine's
+        # detection fires against driven copies and the map read is safe.
+        sneak_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'sneak_probe'
+            Gating   = @('sneak_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # sneak_pose: stealth POSTURE crossing, both ownership directions
+        # (window A host L0, window B join L1). The peer's driven copy must
+        # flip Character::stealthMode (BODY_SNEAK / setStealthMode) within
+        # budget on all four edges.
+        sneak_pose = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'sneak_pose'
+            Gating   = @('sneak_pose', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
+        # sneak_detect: detection-indicator feedback. The join's leader sneaks
+        # near the bar NPCs (save 'sync' - guaranteed NPC availability, dodging
+        # the squad1 wandering-NPC flake); the host's world detects its driven
+        # copy, streams PKT_STEALTH back, and the join replays the entries onto
+        # its local pair.
+        sneak_detect = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'sneak_detect'
+            Gating   = @('sneak_detect', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
+        # spawn_probe: runtime-spawn phase-0 diagnostic (spawnSync FORCED OFF by
+        # Config). Host runtime-spawns squads near + far, join spawns its own
+        # squad locally; gates on the failure-mode EVIDENCE (join logs
+        # "[spawn] unresolved" for host runtime hands) and RECORDS whether
+        # enforceHostAuthority caught the join-local spawns (the phase-2 gap
+        # measurement - a finding, not a gate). Save 'sync': a live town gives
+        # findNearbyNonPlayerFaction real factions to mint squads in.
+        spawn_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'spawn_probe'
+            Gating   = @('spawn_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # shop_probe: money/vendor-trading phase-0 diagnostic (protocol 22 - no
+        # money sync exists yet, nothing is forced off). Both sides log nearby
+        # vendors (money+stock) and every squad tab's wallet at 1 Hz; the host
+        # then drives one programmatic Inventory::buyItem, and the join tries
+        # the same against its driven vendor copy. Gates only on the EVIDENCE
+        # (vendor enumerated, wallet series readable, both buy attempts
+        # logged); wallet/vendor divergence and the join-buy outcome are
+        # recorded as FINDINGs that gate the 1b/1c design. Save 'sync': the
+        # bar town puts real ShopTraders in range.
+        shop_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'shop_probe'
+            Gating   = @('shop_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # money_sync: protocol-22 per-tab wallet sync (moneySync ON - the
+        # default). Same script as shop_probe minus the vendor legs: host
+        # writes 5000 into its rank-0 tab wallet, join writes 7000 into its
+        # rank-1 tab, and the PKT_MONEY channel must carry both across.
+        # Gates on CONVERGENCE (each sentinel present in the peer's final
+        # WALLET series + no drift on any co-visible rank).
+        money_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'money_sync'
+            Gating   = @('money_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # vendor_trade: protocol-22 phase 1c - the buyer-side purchase
+        # COMPOSITE. Each side performs the exact buyer-side mutations of one
+        # Inventory::buyItem (wallet debit + bought item into the tab leader's
+        # personal inventory, same tick) on the tab it owns; gates that BOTH
+        # effects converge on the peer (PKT_MONEY + the inventory snapshot
+        # channel). The vendor-side mutation stays local by design (the engine
+        # regenerates vendor stock per client; the [shop] BUY-LOCAL detour is
+        # collecting field evidence for that mirror).
+        vendor_trade = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'vendor_trade'
+            Gating   = @('vendor_trade', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # recruit_probe: mid-session recruitment phase-0 diagnostic (protocol
+        # 23 - no recruit sync exists, nothing is forced off). Each side
+        # recruits the nearest BAKED world NPC and then a RUNTIME spawn via
+        # the engine's own PlayerInterface::recruit, logging the subject's
+        # hand BEFORE/AFTER (container change = the identity break) and a 1 Hz
+        # distinct-container TABS census (rank-reshuffle evidence). Gates only
+        # that the script ran; the identity/tab/peer-reaction findings gate
+        # the 2b design. Save 'sync': the bar town has world NPCs in range.
+        recruit_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'recruit_probe'
+            Gating   = @('recruit_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # recruit_sync: protocol-23 recruitment sync (recruitSync ON). Same
+        # script as recruit_probe; gates that every recruited hand CONVERGED on
+        # the peer with exactly ONE body - the baked legs by "[recruit] REKEY"
+        # (the peer's existing copy re-keyed to the new stream hand, no
+        # duplicate proxy), the runtime legs by "[spawn] proxy BOUND" over the
+        # now-BIDIRECTIONAL describe channel - and that the peer then TRACKED
+        # each hand (SCENARIO PROXY series). All four local recruits must
+        # succeed (res=1), unlike the probe where failure is data.
+        recruit_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'recruit_sync'
+            Gating   = @('recruit_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # spawn_sync: protocol-21 runtime-spawn proxy replication (spawnSync ON).
+        # Same script as spawn_probe; gates that the join minted proxies for the
+        # host's runtime spawns (near half + far >= 1), the PROXY position series
+        # tracks the host MEMBER series per hand, and the join's own local
+        # runtime spawns still get suppressed by host authority.
+        spawn_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'spawn_sync'
+            Gating   = @('spawn_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # speed_probe: vote-decoupling phase-0 spike (host-side, log-only;
+        # speedSync forced OFF by Config). Quiet writes (setFrameSpeedMultiplier
+        # + guarded userPause) must drive the sim WITHOUT moving the UI speed
+        # buttons; a loud simulated click must move them AND register as
+        # captured intent (the hook-based vote source).
+        speed_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'speed_probe'
+            Gating   = @('speed_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
 
         # speed_sync: consensus game-speed (pause/1x/2x/3x). Scenario-simulated
         # clicks (host 3x -> join 1x -> join 3x) exercise min-arbitration both
@@ -367,6 +569,13 @@
             Gating   = @('weapon_drop', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $true
+        }
+        world_armor_drop = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'armor_drop'
+            Gating   = @('armor_drop', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
         }
 
         # ---- diagnostics (never in a tier) --------------------------------------------

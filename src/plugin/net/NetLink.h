@@ -87,11 +87,35 @@ public:
     // (protocol 17, player-squad only). Change-gated by the caller.
     void queueStats(const StatsPacket& pkt);
 
+    // MAIN thread: queue a reliable owner-authoritative per-tab wallet snapshot
+    // (protocol 22). Change-gated by the caller (the PKT_STATS pacing).
+    void queueMoney(const MoneyPacket& pkt);
+
+    // MAIN thread: queue an UNRELIABLE stealth detection-map snapshot (protocol
+    // 20, host -> the sneaker's owner). Latest wins; change-gated + throttled by
+    // the caller, so loss just delays an arrow update one snapshot.
+    void queueStealth(const StealthPacket& pkt);
+
+    // MAIN thread: queue a reliable runtime-spawn query (protocol 21, join ->
+    // host). Debounced per hand by the caller.
+    void queueSpawnReq(const SpawnReqPacket& pkt);
+
+    // MAIN thread: queue a reliable runtime-spawn description (protocol 21,
+    // host -> join). Reply-cached by the caller.
+    void queueSpawnInfo(const SpawnInfoPacket& pkt);
+
     // Debug WAN simulation. When delayMs > 0, received entity batches are held in a
     // net-thread queue and delivered to the game thread only after delayMs +/- jitter
     // has elapsed (lossPct of them are dropped outright). Must be called before
     // startHost/startClient. All-zero = disabled (immediate delivery). See Config.
     void setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned int lossPct);
+
+    // Steam P2P transport: tunnel the ENet protocol over Steam P2P to 'peerSteamId'
+    // (steamid64) instead of UDP. The wire protocol, channels, reliability and
+    // reconnect logic are unchanged - only the datagram pipe differs (ENet socket
+    // hooks installed on the net thread; MTU clamped to Steam's 1200-byte
+    // unreliable ceiling). Must be called before startHost/startClient. 0 = UDP.
+    void setSteamTransport(unsigned long long peerSteamId);
 
     bool isRunning() const { return running_ != 0; }
     u32  localId()   const { return myId_; } // host = 0; client = id from WELCOME
@@ -146,11 +170,22 @@ private:
     std::vector<SpeedPacket>     outSpeed_;
     // Reliable character-stats snapshots (protocol 17). Guarded by outCs_.
     std::vector<StatsPacket>     outStats_;
+    // Reliable per-tab wallet snapshots (protocol 22). Guarded by outCs_.
+    std::vector<MoneyPacket>     outMoney_;
+    // Unreliable stealth detection-map snapshots (protocol 20). Guarded by outCs_.
+    std::vector<StealthPacket>   outStealth_;
+    // Reliable runtime-spawn query/description packets (protocol 21). Guarded by outCs_.
+    std::vector<SpawnReqPacket>  outSpawnReq_;
+    std::vector<SpawnInfoPacket> outSpawnInfo_;
 
     HANDLE        thread_;
     volatile LONG running_;
     volatile LONG stopFlag_;
     u32           myId_;
+
+    // Steam P2P transport (set before launch; read-only on the net thread
+    // thereafter). 0 = stock UDP transport.
+    unsigned long long steamPeer_;
 
     // WAN sim config (set before launch; read-only on the net thread thereafter).
     unsigned int  simDelayMs_;

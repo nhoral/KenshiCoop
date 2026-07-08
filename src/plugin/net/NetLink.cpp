@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS 1 // _snprintf is fine here; silence VC10 C4996
 
 #include "NetLink.h"
+#include "SteamP2P.h"
 #include "../CoopLog.h"
 
 #include <cstring>
@@ -41,6 +42,7 @@ NetLink::NetLink()
       enetHost_(0), serverPeer_(0), inbound_(0),
       outOwner_(0), haveOut_(false),
       thread_(0), running_(0), stopFlag_(0), myId_(0),
+      steamPeer_(0),
       simDelayMs_(0), simJitterMs_(0), simLossPct_(0) {
     InitializeCriticalSection(&outCs_);
 }
@@ -155,6 +157,30 @@ void NetLink::queueStats(const StatsPacket& pkt) {
     LeaveCriticalSection(&outCs_);
 }
 
+void NetLink::queueMoney(const MoneyPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outMoney_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueStealth(const StealthPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outStealth_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueSpawnReq(const SpawnReqPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outSpawnReq_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outSpawnInfo_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
 void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) {
     EnterCriticalSection(&outCs_);
     outWorldPickups_.push_back(pkt);
@@ -165,6 +191,10 @@ void NetLink::setNetSim(unsigned int delayMs, unsigned int jitterMs, unsigned in
     simDelayMs_  = delayMs;
     simJitterMs_ = jitterMs;
     simLossPct_  = (lossPct > 100) ? 100 : lossPct;
+}
+
+void NetLink::setSteamTransport(unsigned long long peerSteamId) {
+    steamPeer_ = peerSteamId;
 }
 
 // Deliver one received entity to the game thread, applying the WAN sim if enabled.
@@ -211,6 +241,19 @@ DWORD WINAPI NetLink::threadEntry(LPVOID self) {
 void NetLink::threadLoop() {
     InterlockedExchange(&running_, 1);
 
+    // Steam P2P transport: redirect ENet's socket layer through the Steam tunnel
+    // BEFORE the host is created (the fake socket is handed out at create time).
+    // The tunnel is addressless; ENet still needs an ENetAddress for its peer
+    // routing, so both sides use the fabricated "1.0.0.1:port".
+    const bool steam = (steamPeer_ != 0);
+    if (steam) {
+        if (steamp2p::installEnetHooks(port_)) {
+            netLog("transport=steam (ENet tunnelled over Steam P2P)");
+        } else {
+            netErr("steam transport requested but hooks failed; falling back to UDP");
+        }
+    }
+
     if (isHost_) {
         ENetAddress addr;
         addr.host = ENET_HOST_ANY;
@@ -222,11 +265,20 @@ void NetLink::threadLoop() {
         enetHost_ = enet_host_create(0, 1, 2, 0, 0);
         if (!enetHost_) { netErr("client create failed"); InterlockedExchange(&running_, 0); return; }
         ENetAddress addr;
-        enet_address_set_host(&addr, ip_.c_str());
+        if (steam) enet_address_set_host_ip(&addr, "1.0.0.1");
+        else       enet_address_set_host(&addr, ip_.c_str());
         addr.port = (enet_uint16)port_;
         serverPeer_ = enet_host_connect(enetHost_, &addr, 2, 0);
         if (!serverPeer_) netErr("connect failed");
         else              netLog("connecting");
+    }
+
+    // Steam's unreliable P2P packets cap at 1200 bytes; clamp the MTU so every
+    // ENet datagram (including fragments of large reliable packets) fits one
+    // P2P packet. Set before any peer negotiates its own MTU from ours.
+    if (steam && enetHost_ && enetHost_->mtu > 1200) {
+        enetHost_->mtu = 1200;
+        if (serverPeer_) serverPeer_->mtu = 1200;
     }
 
     u32   nextId = 1;
@@ -245,6 +297,10 @@ void NetLink::threadLoop() {
     const long    HALF_DAY_MS   = 12l * 3600l * 1000l;
 
     while (!stopFlag_) {
+        // Steam heartbeat: spike ping/echo + session-state change logging.
+        // Cheap no-op when Steam isn't initialised (pure-UDP sessions).
+        steamp2p::tick();
+
         // Client reconnect: if we have no live connection, retry every 2 s so
         // dropping/relaunching the host re-establishes.
         if (!isHost_) {
@@ -257,9 +313,11 @@ void NetLink::threadLoop() {
                 lastConnectAttempt = now;
                 if (serverPeer_) { enet_peer_reset(serverPeer_); serverPeer_ = 0; }
                 ENetAddress addr;
-                enet_address_set_host(&addr, ip_.c_str());
+                if (steam) enet_address_set_host_ip(&addr, "1.0.0.1");
+                else       enet_address_set_host(&addr, ip_.c_str());
                 addr.port = (enet_uint16)port_;
                 serverPeer_ = enet_host_connect(enetHost_, &addr, 2, 0);
+                if (steam && serverPeer_) serverPeer_->mtu = 1200;
                 netLog(serverPeer_ ? "reconnecting" : "reconnect failed");
             }
         }
@@ -467,6 +525,37 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &stp)
                             && inbound_) {
                             inbound_->pushStats(stp.ownerId, stp);
+                        }
+                    } else if (type == PKT_MONEY) {
+                        // Reliable owner-authoritative per-tab wallet snapshot
+                        // (protocol 22). Delivered immediately like the others.
+                        MoneyPacket mo;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &mo)
+                            && inbound_) {
+                            inbound_->pushMoney(mo.ownerId, mo);
+                        }
+                    } else if (type == PKT_STEALTH) {
+                        // Unreliable stealth detection-map snapshot (protocol 20).
+                        // Delivered immediately; the game thread keeps latest-wins
+                        // per subject.
+                        StealthPacket slp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &slp)
+                            && inbound_) {
+                            inbound_->pushStealth(slp.ownerId, slp);
+                        }
+                    } else if (type == PKT_SPAWN_REQ) {
+                        // Reliable runtime-spawn query (protocol 21, join -> host).
+                        SpawnReqPacket srp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &srp)
+                            && inbound_) {
+                            inbound_->pushSpawnReq(srp.ownerId, srp);
+                        }
+                    } else if (type == PKT_SPAWN_INFO) {
+                        // Reliable runtime-spawn description (protocol 21, host -> join).
+                        SpawnInfoPacket sip;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sip)
+                            && inbound_) {
+                            inbound_->pushSpawnInfo(sip.ownerId, sip);
                         }
                     } else if (type == PKT_TIME_PING) {
                         // Wall-clock sync probe: echo immediately (host side). Answered
@@ -763,6 +852,79 @@ void NetLink::threadLoop() {
             }
         }
 
+        // Drain + send any queued per-tab wallet snapshots on CH_RELIABLE
+        // (protocol 22). Fixed-size PODs; change-gated by the Replicator so a
+        // settled economy is silent. A lost wallet write would diverge cats
+        // until the safety resend, so reliable is the right channel.
+        std::vector<MoneyPacket> moneyPkts;
+        EnterCriticalSection(&outCs_);
+        moneyPkts.swap(outMoney_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < moneyPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&moneyPkts[i], sizeof(MoneyPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued stealth detection-map snapshots on
+        // CH_UNRELIABLE (protocol 20). Latest-wins continuous state: loss just
+        // delays an arrow refresh until the next throttled snapshot.
+        std::vector<StealthPacket> stealthPkts;
+        EnterCriticalSection(&outCs_);
+        stealthPkts.swap(outStealth_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < stealthPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&stealthPkts[i], sizeof(StealthPacket),
+                                                 0 /*unreliable*/);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_UNRELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_UNRELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued runtime-spawn packets on CH_RELIABLE
+        // (protocol 21). Requests are debounced per hand and replies are
+        // cache-throttled by the Replicator, so the reliable channel stays
+        // quiet; a lost request would strand an invisible enemy on the join,
+        // so reliable is mandatory.
+        std::vector<SpawnReqPacket>  spawnReqs;
+        std::vector<SpawnInfoPacket> spawnInfos;
+        EnterCriticalSection(&outCs_);
+        spawnReqs.swap(outSpawnReq_);
+        spawnInfos.swap(outSpawnInfo_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < spawnReqs.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&spawnReqs[i], sizeof(SpawnReqPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        for (size_t i = 0; i < spawnInfos.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&spawnInfos[i], sizeof(SpawnInfoPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
         // Transmit this peer's owned entities (latest snapshot), chunked so each
         // batch fits one datagram. Unreliable: the newest batch supersedes loss.
         std::vector<EntityState> ents;
@@ -797,6 +959,7 @@ void NetLink::threadLoop() {
     }
 
     if (enetHost_) { enet_host_destroy(enetHost_); enetHost_ = 0; }
+    if (steam) steamp2p::removeEnetHooks();
     InterlockedExchange(&running_, 0);
 }
 

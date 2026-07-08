@@ -20,6 +20,12 @@
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\host_session.ps1 -Scenario free -Save squad1
+
+.EXAMPLE
+  # Steam P2P transport: no UPnP, no port forwarding, no public IPs. Pass the
+  # FRIEND's steamid64 (or short friend code); they join with -HostSteamId set
+  # to YOURS (printed by this script once the game is up).
+  powershell -ExecutionPolicy Bypass -File scripts\host_session.ps1 -Scenario free -Save squad1 -PeerSteamId 76561198000000000
 #>
 [CmdletBinding()]
 param(
@@ -31,12 +37,24 @@ param(
     [switch]$SkipBuild,
     [int]$FreePlayMinutes = 0,
     # Skip the automatic UPnP router mapping (manual port forward only).
-    [switch]$NoUpnp
+    [switch]$NoUpnp,
+    # Steam P2P transport: the JOINING player's steamid64 (or short friend code).
+    # When set, Steam brokers the connection (NAT punch / Valve relay) and the
+    # whole UPnP / port-forward / public-IP checklist is skipped.
+    [string]$PeerSteamId = ""
 )
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
+
+# Short Steam friend codes are steamid64 minus the account-universe base.
+function ConvertTo-SteamId64([string]$id) {
+    $v = [uint64]$id
+    if ($v -lt 76561197960265728) { $v += 76561197960265728 }
+    return $v
+}
+$useSteam = ($PeerSteamId -ne "")
 
 Import-Module (Join-Path $scriptDir "CoopOracles.psm1") -Force
 $manifest = Get-ScenarioManifest
@@ -60,9 +78,23 @@ if (-not $SkipBuild) {
 }
 
 # ---- Pre-flight checklist -------------------------------------------------------
+$upnp = $null
+if ($useSteam) {
+    $peerId64 = ConvertTo-SteamId64 $PeerSteamId
+    Write-Host ""
+    Write-Host "=================== REMOTE SESSION PRE-FLIGHT (STEAM P2P) ==================="
+    Write-Host " Transport: Steam P2P - no router setup, no port forwarding, no public IPs."
+    Write-Host " 1. Both machines: Steam RUNNING and ONLINE (not offline mode)."
+    Write-Host " 2. This host will peer with the friend's SteamID: $peerId64"
+    Write-Host " 3. Your own SteamID is printed below once the game is up - read it to the"
+    Write-Host "    friend; they run: friend_join.ps1 -HostSteamId <your id>"
+    Write-Host " 4. Session plan: start with coop_presence, then escalate through the"
+    Write-Host "    smoke set (npc_sync, combat_kill, inv_bidir, world_weapon_drop)."
+    Write-Host "============================================================================="
+    Write-Host ""
+} else {
 . (Join-Path $scriptDir "upnp_portmap.ps1")
 
-$upnp = $null
 if (-not $NoUpnp) {
     Write-Host ""
     Write-Host "Asking the router to forward UDP $Port automatically (UPnP) ..."
@@ -95,6 +127,7 @@ Write-Host " 4. Session plan: start with coop_presence, then escalate through th
 Write-Host "    smoke set (npc_sync, combat_kill, inv_bidir, world_weapon_drop)."
 Write-Host "=================================================================="
 Write-Host ""
+}
 
 # ---- Launch host -----------------------------------------------------------------
 $stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -116,6 +149,13 @@ $env:KENSHICOOP_FAKE_CLOCK_SKEW_MS = "0"
 # Peer-ready arming: the host's scenario clock starts when the friend's stream
 # arrives, so scripted actions never fire before the friend is in-game.
 $env:KENSHICOOP_ARM_TIMEOUT_MS = "240000"
+if ($useSteam) {
+    $env:KENSHICOOP_TRANSPORT  = "steam"
+    $env:KENSHICOOP_STEAM_PEER = "$(ConvertTo-SteamId64 $PeerSteamId)"
+} else {
+    $env:KENSHICOOP_TRANSPORT  = "udp"
+    $env:KENSHICOOP_STEAM_PEER = "0"
+}
 
 try {
     Write-Host "Launching HOST (save '$Save', scenario '$Scenario', port $Port) ..."
@@ -125,6 +165,27 @@ try {
     $line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -First 1
     if ($line -and ("$line" -match "GAMEPID=(\d+)")) { $gamePid = [int]$Matches[1] }
     if ($gamePid -eq 0) { throw "Host failed to get past the launcher." }
+
+    # Steam transport: surface our own SteamID (the plugin logs "[steam] id=...")
+    # so the user can read it to the friend for their -HostSteamId.
+    if ($useSteam) {
+        $deadline = (Get-Date).AddSeconds(120)
+        $myId = $null
+        while ((Get-Date) -lt $deadline -and $null -eq $myId) {
+            if (Test-Path $hostLog) {
+                $hit = Select-String -Path $hostLog -Pattern "\[steam\] id=(\d+)" -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($null -ne $hit) { $myId = $hit.Matches[0].Groups[1].Value }
+            }
+            if ($null -eq $myId) { Start-Sleep -Milliseconds 500 }
+        }
+        Write-Host ""
+        if ($null -ne $myId) {
+            Write-Host ">>> YOUR SteamID: $myId  - the friend joins with:" -ForegroundColor Green
+            Write-Host ">>>   powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId $myId" -ForegroundColor Green
+        } else {
+            Write-Warning "No '[steam] id=' line in host.log yet - check that Steam is running/online."
+        }
+    }
 
     Write-Host ""
     Write-Host "Host is up (PID $gamePid). Waiting for it to exit (scenario self-exit / you close it) ..."

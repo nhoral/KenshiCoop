@@ -20,9 +20,12 @@ struct Config {
     std::string   logPath;         // KENSHICOOP_LOG
     std::string   scenario;        // KENSHICOOP_SCENARIO (empty = normal tick)
     unsigned long autoLoadDelayMs; // KENSHICOOP_AUTOLOAD_DELAY_MS
-    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft"/"down"/"downhold"/"duel"/"squad")
+    std::string   setupScene;      // KENSHICOOP_SETUP ("" = off; "chair"/"npc"/"craft"/"down"/"downhold"/"duel"/"squad"/"inventory"/"bedcage")
                                    // host-only one-shot world spawn to bake a
                                    // deterministic test scene into a save.
+    std::string   bakeSave;        // KENSHICOOP_BAKESAVE ("" = manual save): after
+                                   // a setup scene spawns, auto-write the fixture
+                                   // save under this name (SaveManager::save).
     bool          probeRecruit;    // KENSHICOOP_PROBE_RECRUIT == "1" (join only):
                                    // recruit diverged NPCs into the player squad
                                    // to validate the AI-gating "inhabit" lever.
@@ -92,17 +95,22 @@ struct Config {
     // each. On a single-tab save the join owns nothing (one-directional, as before).
     std::set<unsigned int> ownRanks;
 
-    // Phase 4a inventory sync (KENSHICOOP_INV_SYNC == "1"). When on, the HOST registers
-    // the baked storage container nearest the leader (else the leader's own inventory)
-    // as an owned container and streams its contents; the JOIN reconciles its local
-    // copy. Default off so unrelated tests are unaffected; auto-enabled when the
-    // 'inventory' setup scene or the 'inv_order' scenario is active.
+    // Phase 4a inventory sync (KENSHICOOP_INV_SYNC: "1" force on, "0" force off,
+    // unset = ON for real sessions [scenario == ""] and the inventory scenarios).
+    // When on, both clients stream the contents of every squad member they OWN
+    // (equipped slots included) plus the host's registered storage container; the
+    // peer reconciles its local copies. Promoted to a real-session default after
+    // the 2026-07-07 remote session: equipment changes never crossed with it off.
+    // Scripted test scenarios outside the auto-on list keep it off.
     bool          invSync;
 
-    // Phase W1 world-item sync (KENSHICOOP_WORLD_SYNC == "1"). When on, the HOST streams
-    // free GROUND items inside the players' interest sphere (host-authoritative, netId-
-    // keyed) and the JOIN spawns/updates/culls local proxies to match. Default off;
-    // auto-enabled for the world_item_* scenarios.
+    // Phase W1/W2 world-item sync (KENSHICOOP_WORLD_SYNC: "1" force on, "0" force
+    // off, unset = ON for real sessions [scenario == ""] and the world_item_* /
+    // drop / limb_loss scenarios). When on, the HOST streams free GROUND items in
+    // the interest sphere (host-authoritative, netId-keyed proxies on the join)
+    // and BOTH clients author gear drop/pickup conservation intents (W2/W3).
+    // Promoted to a real-session default after the 2026-07-07 remote session:
+    // dropped gear was invisible cross-client with it off.
     bool          worldSync;
 
     // Phase-2 medical sync (KENSHICOOP_MED_SYNC != "0"; DEFAULT ON): owner-
@@ -135,6 +143,65 @@ struct Config {
     // local pair. Without it the peer sees the KO'd body dragged/teleported
     // along the ground behind its carrier. "0" is the A/B escape hatch.
     bool          carrySync;
+
+    // KENSHICOOP_FURN_SYNC (default ON): furniture-occupancy sync (protocol 19)
+    // - reliable bed/cage enter/exit edges + self-healing occupancy state,
+    // executed engine-native (setBedMode/setPrisonMode) between each machine's
+    // local pair. "0" is the A/B escape hatch.
+    bool          furnSync;
+
+    // KENSHICOOP_STEALTH_SYNC (default ON): stealth sync (protocol 20) -
+    // continuous BODY_SNEAK posture apply on driven copies (engine-native
+    // setStealthMode) + the host-authored detection-indicator feedback stream
+    // (PKT_STEALTH -> the sneaker's owner replays notifyICanSeeYouSneaking).
+    // "0" is the A/B escape hatch.
+    bool          stealthSync;
+
+    // KENSHICOOP_MONEY_SYNC (default ON): per-tab wallet sync (protocol 22) -
+    // each client streams the Ownerships::money of every squad tab it OWNS
+    // (change-gated reliable, keyed by tab rank); the receiver writes the
+    // peer tab's wallet via Ownerships::setMoney. Without it any purchase /
+    // sale / bounty changes cats on one client only (shop_probe finding).
+    // "0" is the A/B escape hatch.
+    bool          moneySync;
+
+    // KENSHICOOP_SPAWN_SYNC (default ON): runtime-spawn proxy replication
+    // (protocol 21) - the join requests a description (PKT_SPAWN_REQ) for any
+    // streamed hand it cannot resolve (a host RUNTIME spawn: roaming squad,
+    // dialog ambush) and mints a local proxy body from the host's reply
+    // (PKT_SPAWN_INFO). Without it the host fights enemies the join can't
+    // see. Forced OFF for spawn_probe (the diagnostic baselines the failure
+    // modes). "0" is the A/B escape hatch.
+    bool          spawnSync;
+
+    // KENSHICOOP_RECRUIT_SYNC (default ON): recruitment sync (protocol 23) -
+    // a detour on PlayerInterface::recruit authors a reliable EVT_RECRUIT
+    // (old hand -> new hand) for every successful local recruit; the peer
+    // RE-KEYS its existing local copy of the recruited body to the new
+    // stream key (no duplicate proxy), and recruited hands are owned by
+    // their RECRUITER regardless of tab rank. Without it a recruit exists
+    // on the recruiting client only (recruit_probe finding). Forced OFF for
+    // recruit_probe (the diagnostic baselines the unsynced behaviour).
+    // "0" is the A/B escape hatch.
+    bool          recruitSync;
+
+    // Transport selection (KENSHICOOP_TRANSPORT): "udp" (default) or "steam".
+    // "steam" tunnels the unchanged ENet protocol over Steam P2P (legacy
+    // ISteamNetworking in the game's own steam_api64.dll): connections are
+    // made BY STEAMID with automatic NAT punching and Valve-relay fallback -
+    // no port forwarding, no public IPs, immune to CGNAT. Requires
+    // steamPeer below; falls back to UDP (loudly) when Steam is unavailable.
+    std::string   transport;
+
+    // The co-op partner's steamid64 (KENSHICOOP_STEAM_PEER). Two-code
+    // exchange: EACH side is configured with the OTHER's SteamID (sending to
+    // a SteamID implicitly accepts its session - no Steam callback plumbing).
+    unsigned long long steamPeer;
+
+    // Steam reachability spike (KENSHICOOP_STEAM_PING=<steamid64>): ping/echo
+    // that peer on P2P channel 1 every 2 s and log RTT + punch-vs-relay,
+    // independent of the transport in use. 0 = off.
+    unsigned long long steamPing;
 };
 
 // Read every KENSHICOOP_* var into 'out', applying host/join defaults.

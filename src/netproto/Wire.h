@@ -91,8 +91,61 @@ typedef float          f32;
 // SAME pickup between its LOCAL pair via the engine's own pickupObject, so
 // the shoulder attach / carry animation / transform-follow are engine-native
 // on both sides; a carried copy is exempt from the down-enforcement hold and
-// all position driving (the local attach owns its transform).
-const u16 PROTOCOL_VERSION = 18;
+// all position driving (the local attach owns its transform);
+// to 19 when FURNITURE OCCUPANCY sync was added (beds + prison cages): the
+// carry shape applied to a stateful attach. The OCCUPANT's owner authors
+// reliable EVT_ENTER_FURNITURE/EVT_EXIT_FURNITURE edges (subject = occupant,
+// actor = the furniture's save-stable hand, arg = 1 bed / 2 cage) off
+// Character::inSomething transitions; continuous BODY_IN_BED/BODY_IN_CAGE
+// bodyState bits self-heal them. Each machine executes the SAME placement
+// between its LOCAL pair via the engine's own setBedMode/setPrisonMode, so
+// the in-bed/in-cage pose and transform are engine-native on both sides; an
+// occupied copy is exempt from down-enforcement and position driving (the
+// furniture owns its transform).
+// to 20 when STEALTH sync was added: a BODY_SNEAK bodyState bit streams
+// Character::stealthMode exactly (BODY_CRAWL stays isStealthModeOrCrawling -
+// it includes injured crawl, which must never trigger setStealthMode), and
+// the receiver applies the engine's own setStealthMode to its driven copy so
+// the sneak-walk is engine-native. PKT_STEALTH streams the DETECTION map
+// (whoSeesMeSneaking: per-seer YesNoMaybe + progress) of a driven sneaker
+// back to its OWNER - the first owner-directed FEEDBACK channel: the host's
+// authoritative world computes who notices the sneaker (spike: detection DOES
+// fire against driven copies), and the owner replays each entry between its
+// LOCAL pair via notifyICanSeeYouSneaking so the marker arrows render
+// natively on the player's own screen.
+// to 21 when RUNTIME-SPAWN proxy replication was added: NPC sync resolves
+// bodies by save-stable hand, so a squad the host's spawn manager mints at
+// RUNTIME (roaming bandits, dialog ambushes) has a host-only hand the join
+// can never resolve - the host fought enemies the join couldn't see (spike
+// 01, field report 2026-07-07). PULL-based: the join sends PKT_SPAWN_REQ
+// (reliable, debounced per hand) for any streamed hand it cannot resolve;
+// the host resolves it locally and replies PKT_SPAWN_INFO (character
+// template stringID + faction stringID + transform + alive flag); the join
+// spawns a local PROXY body from that description and drives it through the
+// SAME world-NPC path as a baked NPC (AI-suspend, damage guard, combat
+// rendering all inherit - the hand->proxy translation happens at the single
+// applyTargets resolve choke point);
+// to 22 when the MONEY channel (PKT_MONEY) was added: Kenshi's wallet is
+// per-Platoon (Ownerships::money - no global player wallet, spike 29) and
+// nothing about it was on the wire (shop_probe run 104watch: sentinel writes
+// never crossed), so any purchase/sale/bounty changed cats on ONE client only.
+// Owner-authoritative by squad-tab RANK (the same partition positional/
+// inventory sync own): each client publishes the wallet of every tab it OWNS,
+// change-gated on the reliable channel with a safety resend; the receiver
+// writes the peer tab's wallet via Ownerships::setMoney;
+// to 23 when RECRUITMENT sync was added: recruiting re-containers the subject
+// into a player platoon (a NEW hand the peer can never resolve), so a recruit
+// existed on the recruiting client only (recruit_probe run 114151: the peer
+// either minted a DUPLICATE proxy next to its still-standing baked copy, or -
+// join -> host - saw nothing at all, the describe channel being join-pull
+// only). Three changes: a reliable EVT_RECRUIT edge (subject = the OLD hand,
+// actor = the NEW hand) lets the peer RE-KEY its existing local body to the
+// recruiter's new stream key instead of duplicating; the describe/mint spawn
+// channel (PKT_SPAWN_REQ/INFO) runs BIDIRECTIONALLY so a runtime-born recruit
+// resolves in either direction; and recruited hands are owned by their
+// RECRUITER regardless of which local tab rank they land in (the probe showed
+// a join recruit landing in the HOST-owned rank-0 container).
+const u16 PROTOCOL_VERSION = 23;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -112,7 +165,11 @@ enum PacketType {
     PKT_TREATMENT        = 14,// RELIABLE first-aid-on-a-driven-copy delta; TreatmentPacket
     PKT_SPEED_REQ        = 15,// RELIABLE game-speed REQUEST (join -> host); SpeedPacket
     PKT_SPEED_SET        = 16,// RELIABLE arbitrated effective speed (host -> join); SpeedPacket
-    PKT_STATS            = 17 // RELIABLE owner-authoritative CharStats snapshot; StatsPacket
+    PKT_STATS            = 17,// RELIABLE owner-authoritative CharStats snapshot; StatsPacket
+    PKT_STEALTH          = 18,// UNRELIABLE detection-map snapshot (host -> owner); StealthPacket
+    PKT_SPAWN_REQ        = 19,// RELIABLE unresolved-hand query (join -> host); SpawnReqPacket
+    PKT_SPAWN_INFO       = 20,// RELIABLE runtime-spawn description (host -> join); SpawnInfoPacket
+    PKT_MONEY            = 21 // RELIABLE owner-authoritative tab wallet (protocol 22); MoneyPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -132,7 +189,20 @@ enum EventType {
     // same pickup/drop between its LOCAL pair). arg: 0 for pickup; for drop,
     // 1 = ragdoll the body on release (the normal ground drop), 0 = gentle.
     EVT_PICKUP_BODY = 6, // carrier lifted the subject onto its shoulder
-    EVT_DROP_BODY   = 7  // carrier released the subject
+    EVT_DROP_BODY   = 7, // carrier released the subject
+    // Furniture occupancy (protocol 19). subject = the OCCUPANT, actor slots =
+    // the FURNITURE's save-stable hand (a building, not a character - both
+    // clients loaded the same save, so it resolves locally on each machine).
+    // arg: 1 = bed, 2 = prison cage.
+    EVT_ENTER_FURNITURE = 8, // occupant was placed in / climbed into the furniture
+    EVT_EXIT_FURNITURE  = 9, // occupant left / was removed from the furniture
+    // Recruitment sync (protocol 23). subject = the recruited body's OLD hand
+    // (its identity BEFORE PlayerInterface::recruit re-containered it), actor =
+    // its NEW hand (the key the recruiter streams it under from now on). The
+    // receiver re-keys its local copy of the old hand to the new key (no
+    // duplicate body); if the old hand doesn't resolve there (runtime-born
+    // subject) the bidirectional describe/mint channel covers it instead.
+    EVT_RECRUIT = 10
 };
 
 // Sentinel ownerId meaning "all remote peers" (used on local disconnect to sweep
@@ -264,12 +334,24 @@ const u16 BODY_CRAWL   = 1 << 3; // Character::isStealthModeOrCrawling()
 // EXEMPT from the down enforcement (knockDown/holdDown/co-locate snap) and all
 // position driving - its transform is owned by the local shoulder attach.
 const u16 BODY_CARRIED = 1 << 4;
+// Furniture occupancy (protocol 19): Character::inSomething (IN_BED/IN_PRISON).
+// An occupant may also read down (an unconscious body placed in a bed/cage),
+// but like BODY_CARRIED it must be EXEMPT from the down enforcement and all
+// position driving - the furniture attach owns its transform.
+const u16 BODY_IN_BED  = 1 << 5;
+const u16 BODY_IN_CAGE = 1 << 6;
+// Stealth sync (protocol 20): Character::stealthMode EXACTLY (the mode bool the
+// player toggles). Distinct from BODY_CRAWL (isStealthModeOrCrawling), which
+// also covers injured crawl - a crawler must never get setStealthMode applied.
+const u16 BODY_SNEAK   = 1 << 7;
 
 // True if the body should be treated as lying down (suppress walk-drive / parking).
-// Deliberately ignores BODY_CARRIED: the receiver checks bodyIsCarried FIRST and
-// skips the down path entirely for a carried body.
+// Deliberately ignores BODY_CARRIED (and the occupancy bits): the receiver checks
+// bodyIsCarried/bodyInFurniture FIRST and skips the down path entirely for them.
 inline bool bodyIsDown(u16 s)    { return (s & (BODY_DOWN | BODY_RAGDOLL | BODY_DEAD)) != 0; }
 inline bool bodyIsCarried(u16 s) { return (s & BODY_CARRIED) != 0; }
+inline bool bodyInFurniture(u16 s) { return (s & (BODY_IN_BED | BODY_IN_CAGE)) != 0; }
+inline bool bodySneaking(u16 s)  { return (s & BODY_SNEAK) != 0; }
 
 // An entity batch is: [EntityBatchHeader][EntityState * count]. ownerId tags the
 // streaming peer; the receiver attributes every contained hand to that owner so
@@ -609,6 +691,100 @@ struct StatsPacket {
     f32 stats[STATS_SLOT_MAX]; // by StatsEnumerated index (-1 = unreadable)
     f32 xp;                    // CharStats::xp (-1 = unreadable)
     f32 freeAttributePoints;   // CharStats::freeAttributePoints (int on wire as f32; -1 = unreadable)
+};
+
+// ---- Protocol 22: per-tab wallet snapshot -----------------------------------
+// Owner-authoritative money for ONE player squad tab, keyed by the tab's RANK
+// among the distinct sorted member containers - the same cross-client-stable
+// tab identity the ownership partition uses (a hand key would also work, but
+// rank is what both sides already agree on for "whose tab is whose"). Change-
+// gated with a floor + safety resend (the PKT_STATS pacing); the receiver
+// writes the value via Ownerships::setMoney onto the platoon of that rank's
+// tab leader. money is signed on the wire because the engine field is an int.
+struct MoneyPacket {
+    u8  type;    // = PKT_MONEY
+    u32 ownerId; // network player id of the sender (the tab's owner)
+    u32 tabRank; // squad-tab rank (0 = host-owned tab, 1 = join-owned, ...)
+    int money;   // Ownerships::money for that tab's platoon
+};
+
+// ---- Protocol 20: stealth detection-map snapshot ---------------------------
+// The host's authoritative world computes WHO NOTICES a sneaking character
+// (Character::whoSeesMeSneaking, filled by the engine's own vision checks -
+// spike-proven to fire against driven copies). For a PEER-owned sneaker that
+// map lives on the host's driven copy, but the indicators must render on the
+// OWNER's screen - so the host streams the map back to the owner, who replays
+// each entry between its LOCAL pair via notifyICanSeeYouSneaking. Continuous
+// owner-directed FEEDBACK state: unreliable, change-gated + throttled, latest
+// snapshot wins; an empty snapshot clears stale arrows (the engine ages
+// entries out itself once notifies stop).
+const u8 STEALTH_SEER_MAX = 16;
+
+struct StealthSeerEntry {
+    // seer hand (the local character who notices the sneaker)
+    u32 nType;
+    u32 nContainer;
+    u32 nContainerSerial;
+    u32 nIndex;
+    u32 nSerial;
+    u8  see;    // YesNoMaybe key: 0 = NO, 1 = YES, 2 = MAYBE
+    f32 prog;   // WhoSeesMe::progressOfMaybe (raw engine progress, can exceed 1)
+};
+
+struct StealthPacket {
+    u8  type;    // = PKT_STEALTH
+    u32 ownerId; // network player id of the SENDER (the detection authority)
+    // subject hand (the sneaker whose map this is - a member of the RECEIVER)
+    u32 sType;
+    u32 sContainer;
+    u32 sContainerSerial;
+    u32 sIndex;
+    u32 sSerial;
+    u8  unseen;  // Character::stealthUnseen (YesNoMaybe key) on the authority
+    u8  nSeers;  // filled entries
+    StealthSeerEntry seers[STEALTH_SEER_MAX];
+};
+
+// ---- Protocol 21: runtime-spawn proxy replication ---------------------------
+// The join asks about a streamed hand it cannot resolve (a host RUNTIME spawn -
+// roaming squad, dialog ambush - whose hand exists only in the host's session).
+// Debounced per hand + retry-capped by the sender so the reliable channel stays
+// quiet; the host caches replies so a retransmitted request costs one lookup.
+struct SpawnReqPacket {
+    u8  type;    // = PKT_SPAWN_REQ
+    u32 ownerId; // network player id of the sender (the join)
+    // the unresolvable streamed hand, verbatim from the entity batch
+    u32 hType;
+    u32 hContainer;
+    u32 hContainerSerial;
+    u32 hIndex;
+    u32 hSerial;
+};
+
+// The host's description of the runtime spawn: enough for the join to mint a
+// LOCAL proxy body (template + faction + transform). found=0 is the negative
+// reply ("that hand doesn't resolve here either" - e.g. the NPC despawned
+// between the request and the reply), which stops the join's retries.
+// Appearance/equipment are approximated by the template (randomized gear);
+// combat outcomes stay host-authoritative + damage-guarded, so this is
+// cosmetic (accepted limitation).
+struct SpawnInfoPacket {
+    u8  type;    // = PKT_SPAWN_INFO
+    u32 ownerId; // network player id of the sender (the host)
+    // the requested hand, echoed verbatim (the join's proxy-map key)
+    u32 hType;
+    u32 hContainer;
+    u32 hContainerSerial;
+    u32 hIndex;
+    u32 hSerial;
+    char charSid[48]; // character template GameData stringID
+    char facSid[48];  // faction GameData stringID ("" = unknown -> join fallback)
+    f32 x;            // world transform at reply time
+    f32 y;
+    f32 z;
+    f32 heading;      // radians (yaw)
+    u8  found;        // 1 = resolved + described; 0 = negative (stop retrying)
+    u8  dead;         // body was dead at reply time (join spawns + death-latches)
 };
 
 struct TimePingPacket {

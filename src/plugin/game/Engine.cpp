@@ -32,6 +32,13 @@
 #include <kenshi/Tasker.h>          // Tasker::key() -> TaskType, Tasker::subject (hand)
 #include <kenshi/util/hand.h>       // hand (5-field identity, getRootObject)
 #include <kenshi/util/lektor.h>     // lektor<T> (playerCharacters, interest query)
+#include <kenshi/Faction.h>         // Faction::getData / FactionManager::getFactionByStringID (protocol 21)
+#include <kenshi/Platoon.h>         // Platoon / ActivePlatoon / Ownerships (wallet, protocol 22)
+#include <kenshi/ShopTrader.h>      // ShopTrader (vendor stock, protocol 22)
+#include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
+#include <kenshi/gui/ForgottenGUI.h> // ForgottenGUI::mainbar
+#include <kenshi/gui/MainBarGUI.h>  // MainBarGUI::speedButtons (vote-button probe)
+#include <mygui/MyGUI_Button.h>     // MyGUI::Button::getStateSelected
 #include <ogre/OgreVector3.h>
 #include <ogre/OgreQuaternion.h>
 #include <cmath>
@@ -48,10 +55,13 @@ namespace {
 typedef SaveManager* (__fastcall* SaveMgrGetFn)();
 typedef void         (__fastcall* SaveMgrLoadNameFn)(SaveManager* self, const std::string* name);
 typedef bool         (__fastcall* SaveMgrSavesExistFn)(SaveManager* self);
+typedef void         (__fastcall* SaveMgrSaveNameFn)(SaveManager* self, const std::string* name,
+                                                     bool autosave);
 
 SaveMgrGetFn        g_getFn        = 0;
 SaveMgrLoadNameFn   g_loadFn       = 0;
 SaveMgrSavesExistFn g_savesExistFn = 0;
+SaveMgrSaveNameFn   g_saveFn       = 0;
 
 // hand::getCharacter resolves a save-stable handle back to the local Character*.
 // The 5-arg hand constructor builds a proper hand (sets the vptr) from received
@@ -162,6 +172,20 @@ typedef void      (__fastcall* StatsRecalcFn)(CharStats* self);
 typedef void      (__fastcall* PickupObjectFn)(Character* self, Character* who);
 typedef void      (__fastcall* DropCarriedFn)(Character* self, bool ragdollHim,
                                               bool removeOnly);
+// Furniture occupancy (protocol 19): setBedMode/setPrisonMode run the engine's
+// full placement chain on the OCCUPANT (in-bed/in-cage pose, furniture attach,
+// inSomething/inWhat bookkeeping). Same signature for both.
+typedef void      (__fastcall* SetFurnModeFn)(Character* self, bool on,
+                                              UseableStuff* h);
+// Stealth (protocol 20): setStealthMode runs the engine's full sneak chain on
+// the LOCAL body (sneak-walk pose, stealthUpdate scanning, stealth skill use).
+// notifyICanSeeYouSneaking updates the sneaker's whoSeesMeSneaking map + the
+// marker arrows exactly as a seer's own vision check would. YesNoMaybe has
+// user-declared constructors, so the x64 ABI passes it by hidden reference -
+// the raw binding takes an int* to its ynm key.
+typedef void      (__fastcall* SetStealthModeFn)(Character* self, bool on);
+typedef void      (__fastcall* NotifySeeSneakFn)(Character* self, Character* who,
+                                                 const int* seeingYnm, float prog01);
 
 TaskerKeyFn   g_taskerKeyFn   = 0;
 TaskerDescFn  g_taskerDescFn  = 0;
@@ -183,6 +207,10 @@ StatsGetRefFn     g_statsGetRefFn     = 0;
 StatsRecalcFn     g_statsRecalcFn     = 0;
 PickupObjectFn    g_pickupObjectFn    = 0;
 DropCarriedFn     g_dropCarriedFn     = 0;
+SetFurnModeFn     g_setBedModeFn      = 0;
+SetFurnModeFn     g_setPrisonModeFn   = 0;
+SetStealthModeFn  g_setStealthModeFn  = 0;
+NotifySeeSneakFn  g_notifySeeSneakFn  = 0;
 
 // Limb state with the engine's null policy: robotLimbs is lazily allocated, and
 // a null robotLimbs means "no limb ever lost/replaced" == ORIGINAL on all four.
@@ -193,14 +221,170 @@ static unsigned char limbStateOf(MedicalSystem* med, int limb) {
     return rl ? (unsigned char)rl->states[limb] : (unsigned char)LIMB_ORIGINAL;
 }
 
-// Consensus game-speed sync: the engine's own speed setters, so an applied
-// consensus speed updates the UI buttons/audio exactly like a real click.
-// GameWorld::setGameSpeed(speed, click) drives frameSpeedMult; userPause(p)
-// drives the user-pause flag (0x8B9) independent of the multiplier.
+// Consensus game-speed sync: the engine's own speed setters.
+// GameWorld::setGameSpeed(speed, click) drives frameSpeedMult AND updates the
+// UI speed buttons (the loud path a real click takes); userPause(p) drives the
+// user-pause flag (0x8B9) independent of the multiplier; togglePause(on) is
+// the keyboard-pause entry; setFrameSpeedMultiplier(m) is the bare multiplier
+// setter (no UI notify) - the QUIET path the arbitrated effective rides so
+// the buttons keep showing the player's VOTE.
 typedef void (__fastcall* SetGameSpeedFn)(GameWorld* self, float speed, bool click);
 typedef void (__fastcall* UserPauseFn)(GameWorld* self, bool p);
-SetGameSpeedFn g_setGameSpeedFn = 0;
-UserPauseFn    g_userPauseFn    = 0;
+typedef void (__fastcall* SetFrameSpeedMultFn)(GameWorld* self, float m);
+SetGameSpeedFn      g_setGameSpeedFn      = 0;
+UserPauseFn         g_userPauseFn         = 0;
+UserPauseFn         g_togglePauseFn       = 0;
+SetFrameSpeedMultFn g_setFrameSpeedMultFn = 0;
+
+// Speed-intent capture (the vote source). Detours on the three user-reachable
+// speed entries record every call NOT made by our own quiet writer as user
+// intent: UI button clicks, keyboard pause, RE_Kenshi speed controls and the
+// scenario's simulated writeGameSpeed clicks all funnel through these -
+// INCLUDING clicks equal to the current effective speed, which a state-diff
+// detector can never see (the stuck-vote bug). Main-thread only (the engine
+// calls these from its own tick; our writers run from the main-loop hook).
+SetGameSpeedFn g_setGameSpeedOrig = 0;
+UserPauseFn    g_userPauseOrig    = 0;
+UserPauseFn    g_togglePauseOrig  = 0;
+bool  g_speedGuardWrite   = false; // reentrancy guard: quiet writes are not intent
+bool  g_speedIntentFresh  = false; // set by the hooks, cleared by consumeSpeedIntent
+float g_speedIntentMult   = 1.0f;  // requested multiplier (pause preserves it)
+bool  g_speedIntentPaused = false; // requested pause state
+bool  g_speedIntentSeeded = false; // first consume seeds from live engine state
+
+// Last QUIET write (the arbitrated effective we applied). The poll-based
+// intent fallback compares the live engine against THIS to detect real UI
+// clicks: the MainBar click handler writes the speed inline (manual-session
+// finding 2026-07-08 - it does NOT call the hooked setGameSpeed), so an
+// unexplained engine change can only be the user.
+bool  g_quietHave   = false;
+float g_quietMult   = 1.0f;
+bool  g_quietPaused = false;
+
+// Vote-highlight snapshot. The speed_probe spike proved setFrameSpeedMultiplier
+// is silent BUT userPause re-highlights the MainBar buttons from the EFFECTIVE
+// state (pause lights the pause button; unpause re-selects the current
+// multiplier's button) - which would wipe the player's vote position on every
+// enforced pause/resume. So: right after each REAL user action (the engine has
+// just highlighted the clicked button), snapshot the button states; the quiet
+// writer restores that snapshot after its guarded userPause. The buttons then
+// always show the last thing the USER did, never the arbitrated effective.
+char g_voteBtn[15]; int g_voteBtnN = 0;
+
+void snapshotVoteButtons() {
+    char buf[16];
+    int n = readSpeedButtons(buf, sizeof(buf));
+    if (n > 0) { memcpy(g_voteBtn, buf, n); g_voteBtnN = n; }
+}
+
+void __fastcall setGameSpeed_hook(GameWorld* self, float speed, bool click) {
+    if (!g_speedGuardWrite && speed > 0.0f) {
+        g_speedIntentMult  = speed;
+        g_speedIntentFresh = true;
+    }
+    g_setGameSpeedOrig(self, speed, click);
+    if (!g_speedGuardWrite) snapshotVoteButtons();
+}
+
+void __fastcall userPause_hook(GameWorld* self, bool p) {
+    if (!g_speedGuardWrite) {
+        g_speedIntentPaused = p;
+        g_speedIntentFresh  = true;
+    }
+    g_userPauseOrig(self, p);
+    if (!g_speedGuardWrite) snapshotVoteButtons();
+}
+
+void __fastcall togglePause_hook(GameWorld* self, bool p) {
+    if (!g_speedGuardWrite) {
+        g_speedIntentPaused = p;
+        g_speedIntentFresh  = true;
+    }
+    g_togglePauseOrig(self, p);
+    if (!g_speedGuardWrite) snapshotVoteButtons();
+}
+
+// Re-apply the vote snapshot after a quiet write's userPause disturbed the
+// highlight. SEH-guarded, pure UI (setStateSelected touches no engine state).
+void restoreVoteButtons() {
+    if (g_voteBtnN <= 0) return;
+    __try {
+        if (!gui || !gui->mainbar) return;
+        Ogre::FastArray<MyGUI::Button*>& btns = gui->mainbar->speedButtons;
+        int n = (int)btns.size();
+        if (n > g_voteBtnN) n = g_voteBtnN;
+        for (int i = 0; i < n; ++i)
+            if (btns[i]) btns[i]->setStateSelected(g_voteBtn[i] == '1');
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+// Money + vendor trading (protocol 22 groundwork). Character::getPlatoon gives
+// the body's ActivePlatoon (its squad-tab container); ActivePlatoon::me is the
+// persistent Platoon whose Ownerships block holds that tab's WALLET (spike 29 -
+// there is no global player wallet). getMoney/setMoney are the engine's own
+// accessors (never raw offsets); Inventory::buyItem is the real purchase path
+// (wallet debit + vendor stock mutation + item transfer), called on the VENDOR
+// inventory with sendingTo = the buyer.
+typedef ActivePlatoon* (__fastcall* GetPlatoonFn)(const Character* self);
+typedef int   (__fastcall* OwnGetMoneyFn)(const Ownerships* self);
+typedef void  (__fastcall* OwnSetMoneyFn)(Ownerships* self, int amount);
+typedef Item* (__fastcall* BuyItemFn)(Inventory* self, Item* itemToBuy,
+                                      RootObject* sendingTo);
+// ActivePlatoon::refreshInventory(firstTime): the engine's own trader-stock
+// builder (scheduled off Platoon::traderInventoryRefreshTime). A ShopTrader's
+// Inventory member is LAZY (null until the shop UI first opens - shop_probe run
+// 101952 finding: every vendor read stock=-1), so the probe forces it via the
+// TRADER's platoon before a programmatic purchase - what opening the trade
+// window would have done. (ShopTrader::updateInventory itself is private.)
+typedef void  (__fastcall* PlatoonRefreshInvFn)(ActivePlatoon* self, bool firstTime);
+// ShopTrader::getTrader accessor - the raw `trader` member read null on every
+// enumerated vendor (run 103547), so the engine's own accessor is the fallback
+// (it may resolve the trader lazily / from a different field).
+typedef Character* (__fastcall* ShopGetTraderFn)(const ShopTrader* self);
+GetPlatoonFn  g_getPlatoonFn  = 0;
+OwnGetMoneyFn g_ownGetMoneyFn = 0;
+OwnSetMoneyFn g_ownSetMoneyFn = 0;
+BuyItemFn     g_buyItemFn     = 0;
+PlatoonRefreshInvFn g_platoonRefreshInvFn = 0;
+ShopGetTraderFn     g_shopGetTraderFn     = 0;
+
+// Purchase observability detour (protocol 22, 1c groundwork). Inventory::
+// buyItem is the engine's ONE real purchase path (a trade-UI drag lands here),
+// but automation cannot reach it in the test save (vendor inventories are lazy
+// and the enumerated SHOP_TRADER_CLASS objects carry no bound trader - shop_
+// probe runs 103018-104036). The detour makes every REAL purchase in a manual
+// field session log a "[shop] BUY-LOCAL" line (seller identity + money, item
+// sid, buyer) - the evidence that gates the eventual vendor-stock mirror. The
+// buyer-side effects (wallet debit, item into the buyer's inventory) already
+// ride the money + inventory channels; only the VENDOR-side mutation stays
+// local, which this line makes measurable.
+BuyItemFn g_buyItemOrig = 0;
+Item* __fastcall buyItem_hook(Inventory* self, Item* itemToBuy, RootObject* sendingTo) {
+    Item* got = g_buyItemOrig(self, itemToBuy, sendingTo);
+    __try {
+        char sid[48]; sid[0] = '\0';
+        if (itemToBuy) {
+            GameData* gd = itemToBuy->getGameData();
+            if (gd) { strncpy(sid, gd->stringID.c_str(), sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0'; }
+        }
+        unsigned int sh[5] = { 0, 0, 0, 0, 0 };
+        int sellerMoney = -1;
+        RootObject* seller = self ? self->owner : 0;
+        if (seller) {
+            readObjectHand(seller, sh);
+            __try { sellerMoney = seller->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        unsigned int bh[5] = { 0, 0, 0, 0, 0 };
+        if (sendingTo) readObjectHand(sendingTo, bh);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[shop] BUY-LOCAL ok=%d sid='%s' seller=%u,%u money=%d buyer=%u,%u",
+                  got ? 1 : 0, sid, sh[3], sh[4], sellerMoney, bh[3], bh[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return got;
+}
 
 // AI-gating probe lever: PlayerInterface::recruit(Character*, bool) adds an NPC
 // to the local player's squad (the "inhabit" path). A recruited body stops
@@ -208,6 +392,43 @@ UserPauseFn    g_userPauseFn    = 0;
 // drive, so we can mirror the host without replicating animation data.
 typedef bool (__fastcall* RecruitFn)(PlayerInterface* self, Character* c, bool editor);
 RecruitFn g_recruitFn = 0;
+
+// Recruitment edge detour (protocol 23). PlayerInterface::recruit is the ONE
+// engine path that turns a world NPC into a player-squad member (the dialog
+// "join me" outcome and our own programmatic recruits both land here). The
+// recruit RE-CONTAINERS the body - its hand changes (recruit_probe: container
+// always changes; baked subjects keep their serial, runtime ones keep the
+// whole tail) - so the peer can never resolve the NEW hand from its save. The
+// detour captures the before/after hand pair of every SUCCESSFUL recruit into
+// a small queue the Replicator drains once per tick into EVT_RECRUIT. Engine
+// tick and plugin tick share the main thread, so the queue needs no lock.
+struct RecruitEdgeRec { unsigned int before[5]; unsigned int after[5]; };
+static std::vector<RecruitEdgeRec> g_recruitEdges;
+RecruitFn g_recruitHookOrig = 0;
+bool __fastcall recruit_hook(PlayerInterface* self, Character* c, bool editor) {
+    unsigned int hb[5] = { 0, 0, 0, 0, 0 };
+    bool haveBefore = false;
+    __try {
+        if (c) { readObjectHand(static_cast<RootObject*>(c), hb); haveBefore = true; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    bool ok = g_recruitHookOrig(self, c, editor);
+    if (ok && haveBefore) {
+        __try {
+            RecruitEdgeRec e;
+            memcpy(e.before, hb, sizeof(hb));
+            memset(e.after, 0, sizeof(e.after));
+            readObjectHand(static_cast<RootObject*>(c), e.after);
+            if (g_recruitEdges.size() < 64) g_recruitEdges.push_back(e);
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "[recruit] LOCAL before=%u,%u,%u,%u,%u after=%u,%u,%u,%u,%u",
+                      e.before[0], e.before[1], e.before[2], e.before[3], e.before[4],
+                      e.after[0], e.after[1], e.after[2], e.after[3], e.after[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return ok;
+}
 
 // AI decision-layer detour. Character::periodicUpdate() is the per-character AI
 // "think" tick that re-scores/re-assigns autonomous town tasks (and thus keeps
@@ -312,6 +533,12 @@ typedef lektor<InventorySection*>* (__fastcall* GetAllSectionsFn)(Inventory* sel
 // from Item via a single-inheritance chain (InventoryItemBase->Item->Gear->Weapon), so
 // a Weapon* is numerically an Item* and can be used wherever an Item* is expected.
 typedef Item* (__fastcall* GetWeaponFn)(Inventory* self);
+// Protocol 21 runtime-spawn proxies: FactionManager::getFactionByStringID gives
+// the join a LIVE Faction* from the wire's faction stringID; Faction::getData
+// gives the host that stringID off a runtime spawn's live faction (both
+// non-virtual, so resolved like every other engine call).
+typedef Faction*  (__fastcall* FacBySidFn)(FactionManager* self, const std::string* sid);
+typedef GameData* (__fastcall* FacGetDataFn)(const Faction* self);
 
 CreateCharFn     g_createCharFn   = 0;
 CreateBuildingFn g_createBldgFn   = 0;
@@ -323,6 +550,8 @@ EquipItemFn      g_equipItemFn    = 0;
 GetAllSectionsFn g_getSectionsFn  = 0;
 GetWeaponFn      g_getPrimaryWeaponFn   = 0;
 GetWeaponFn      g_getSecondaryWeaponFn = 0;
+FacBySidFn       g_facBySidFn     = 0; // protocol 21 proxy spawn (join)
+FacGetDataFn     g_facGetDataFn   = 0; // protocol 21 describe (host)
 
 // Honest pose oracle. getPositionBip01 is non-virtual (no vtable), so it must be
 // resolved + called through a pointer (returns Ogre::Vector3 BY VALUE). isIdle /
@@ -384,6 +613,7 @@ void resolve() {
     g_loadFn = (SaveMgrLoadNameFn)KenshiLib::GetRealAddress(
         static_cast<void (SaveManager::*)(const std::string&)>(&SaveManager::load));
     g_savesExistFn = (SaveMgrSavesExistFn)KenshiLib::GetRealAddress(&SaveManager::savesExist);
+    g_saveFn = (SaveMgrSaveNameFn)KenshiLib::GetRealAddress(&SaveManager::save);
     if (!g_getFn || !g_loadFn)
         coop::logErrLine("engine: could not resolve SaveManager load functions");
 
@@ -452,15 +682,44 @@ void resolve() {
     if (!g_pickupObjectFn || !g_dropCarriedFn)
         coop::logErrLine("engine: could not resolve carry functions (carry sync off)");
 
+    // Furniture occupancy (protocol 19; non-fatal: unresolved -> occupancy sync off).
+    g_setBedModeFn    = (SetFurnModeFn)KenshiLib::GetRealAddress(&Character::setBedMode);
+    g_setPrisonModeFn = (SetFurnModeFn)KenshiLib::GetRealAddress(&Character::setPrisonMode);
+    if (!g_setBedModeFn || !g_setPrisonModeFn)
+        coop::logErrLine("engine: could not resolve bed/prison setters (occupancy sync off)");
+
+    // Stealth sync (protocol 20; non-fatal: unresolved -> stealth sync off).
+    g_setStealthModeFn = (SetStealthModeFn)KenshiLib::GetRealAddress(&Character::setStealthMode);
+    g_notifySeeSneakFn = (NotifySeeSneakFn)KenshiLib::GetRealAddress(&Character::notifyICanSeeYouSneaking);
+    if (!g_setStealthModeFn || !g_notifySeeSneakFn)
+        coop::logErrLine("engine: could not resolve stealth functions (stealth sync off)");
+
     // Consensus game-speed sync (non-fatal: unresolved -> speed sync off).
     g_setGameSpeedFn = (SetGameSpeedFn)KenshiLib::GetRealAddress(&GameWorld::setGameSpeed);
     g_userPauseFn    = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::userPause);
     if (!g_setGameSpeedFn || !g_userPauseFn)
         coop::logErrLine("engine: could not resolve game-speed setters (speed sync off)");
+    g_togglePauseFn = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::togglePause);
+    g_setFrameSpeedMultFn =
+        (SetFrameSpeedMultFn)KenshiLib::GetRealAddress(&GameWorld::setFrameSpeedMultiplier);
+    if (!g_setFrameSpeedMultFn)
+        coop::logErrLine("engine: could not resolve setFrameSpeedMultiplier (quiet speed apply off)");
 
     // AI-gating probe lever (non-fatal: only used when the probe is enabled).
     g_recruitFn = (RecruitFn)KenshiLib::GetRealAddress(
         static_cast<bool (PlayerInterface::*)(Character*, bool)>(&PlayerInterface::recruit));
+
+    // Money + vendor trading (protocol 22 groundwork; non-fatal: unresolved ->
+    // wallet reads return -1 and the shop_probe logs the gap).
+    g_getPlatoonFn  = (GetPlatoonFn)KenshiLib::GetRealAddress(&Character::getPlatoon);
+    g_ownGetMoneyFn = (OwnGetMoneyFn)KenshiLib::GetRealAddress(&Ownerships::getMoney);
+    g_ownSetMoneyFn = (OwnSetMoneyFn)KenshiLib::GetRealAddress(&Ownerships::setMoney);
+    g_buyItemFn     = (BuyItemFn)KenshiLib::GetRealAddress(&Inventory::buyItem);
+    g_platoonRefreshInvFn =
+        (PlatoonRefreshInvFn)KenshiLib::GetRealAddress(&ActivePlatoon::refreshInventory);
+    g_shopGetTraderFn = (ShopGetTraderFn)KenshiLib::GetRealAddress(&ShopTrader::getTrader);
+    if (!g_getPlatoonFn || !g_ownGetMoneyFn || !g_ownSetMoneyFn)
+        coop::logErrLine("engine: could not resolve wallet accessors (money sync off)");
 
     // Test-scene spawn fns (non-fatal: only used by the host-side setup step).
     g_createCharFn = (CreateCharFn)KenshiLib::GetRealAddress(
@@ -486,6 +745,10 @@ void resolve() {
     // Worn weapons are NOT in any section: read the dedicated weapon accessors directly.
     g_getPrimaryWeaponFn   = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getPrimaryWeapon);
     g_getSecondaryWeaponFn = (GetWeaponFn)KenshiLib::GetRealAddress(&Inventory::getSecondaryWeapon);
+    // Protocol 21 runtime-spawn proxies (non-fatal: unresolved -> spawn sync off).
+    g_facBySidFn   = (FacBySidFn)KenshiLib::GetRealAddress(
+        &FactionManager::getFactionByStringID);
+    g_facGetDataFn = (FacGetDataFn)KenshiLib::GetRealAddress(&Faction::getData);
 
     // Honest pose oracle reads (non-fatal).
     g_getBip01Fn   = (GetBip01Fn)KenshiLib::GetRealAddress(&Character::getPositionBip01);
@@ -540,6 +803,18 @@ bool savesReady() {
         SaveManager* mgr = g_getFn();
         if (!mgr) return false;
         return g_savesExistFn(mgr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool saveGameAs(const std::string& name) {
+    if (!g_getFn || !g_saveFn) return false;
+    __try {
+        SaveManager* mgr = g_getFn();
+        if (!mgr) return false;
+        g_saveFn(mgr, &name, /*autosave*/false);
+        return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -982,6 +1257,31 @@ bool installDamageGuardHook() {
                               (void**)&g_hitByMeleeOrig) == KenshiLib::SUCCESS;
 }
 
+bool installShopHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(&Inventory::buyItem);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&buyItem_hook,
+                              (void**)&g_buyItemOrig) == KenshiLib::SUCCESS;
+}
+
+bool installRecruitHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(
+        static_cast<bool (PlayerInterface::*)(Character*, bool)>(&PlayerInterface::recruit));
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&recruit_hook,
+                              (void**)&g_recruitHookOrig) == KenshiLib::SUCCESS;
+}
+
+unsigned int drainRecruitEdges(RecruitEdge* out, unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < g_recruitEdges.size() && n < maxOut; ++i, ++n) {
+        memcpy(out[n].before, g_recruitEdges[i].before, sizeof(out[n].before));
+        memcpy(out[n].after,  g_recruitEdges[i].after,  sizeof(out[n].after));
+    }
+    g_recruitEdges.clear();
+    return n;
+}
+
 void clearDamageGuard()           { g_damageGuarded.clear(); }
 void addDamageGuard(Character* c) { if (c) g_damageGuarded.insert(c); }
 unsigned int damageGuardCount()   { return (unsigned int)g_damageGuarded.size(); }
@@ -1231,6 +1531,40 @@ GameData* findSeatTemplate(GameWorld* gw) {
     // Ordered keyword preference; first present keyword that any template matches.
     const char* prefs[] = { "bar stool", "stool", "chair", "throne" };
     for (unsigned int k = 0; k < 4; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
+// Find a BUILDING template that is a BED (bed/cage occupancy sync). Caller holds
+// SEH. "camp bed" is the buildable outdoor bed (no walls/power needed); plain
+// "bed" is the fallback (may match indoor variants - still a UseableStuff bed).
+GameData* findBedTemplate(GameWorld* gw) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    const char* prefs[] = { "camp bed", "bedroll", "bed" };
+    for (unsigned int k = 0; k < 3; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
+// Find a BUILDING template that is a PRISON CAGE. Caller holds SEH.
+GameData* findCageTemplate(GameWorld* gw) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    const char* prefs[] = { "prisoner cage", "cage" };
+    for (unsigned int k = 0; k < 2; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
             if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
@@ -2975,6 +3309,149 @@ Character* spawnCharInFaction(GameWorld* gw, float fwd, float side, Faction* fac
     }
 }
 
+// ---- Protocol 21: runtime-spawn proxy replication ---------------------------
+
+namespace {
+// SEH shims: the public entry points below hold std::string locals (destructors
+// forbid __try in the same frame, the loadSave pattern), so the raw engine
+// touches live in these POD-only helpers.
+Faction* factionBySidGuarded(GameWorld* gw, const std::string* sid) {
+    __try {
+        if (!gw || !gw->factionMgr || !g_facBySidFn) return 0;
+        return g_facBySidFn(gw->factionMgr, sid);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+Faction* nonPlayerFactionGuarded(GameWorld* gw) {
+    __try {
+        return findNearbyNonPlayerFaction(gw);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+Character* createCharGuarded(GameWorld* gw, GameData* tmpl, Faction* fac,
+                             float x, float y, float z) {
+    __try {
+        Ogre::Vector3 pos(x, y, z);
+        RootObject* r = g_createCharFn(gw->theFactory, fac, pos, 0, tmpl, 0, 25.0f);
+        return r ? static_cast<Character*>(r) : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+} // namespace
+
+bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
+                       char* facSid, unsigned int facSidLen,
+                       float* x, float* y, float* z, float* heading, bool* dead) {
+    if (!c || !charSid || charSidLen == 0 || !facSid || facSidLen == 0) return false;
+    charSid[0] = '\0';
+    facSid[0]  = '\0';
+    __try {
+        GameData* gd = c->getGameData();
+        if (!gd) return false;
+        const char* sid = gd->stringID.c_str();
+        if (!sid || !sid[0]) return false;
+        strncpy(charSid, sid, charSidLen - 1);
+        charSid[charSidLen - 1] = '\0';
+        // Faction sid is best-effort: "" tells the join to fall back to a local
+        // non-player faction (cosmetic - combat outcomes are host-authoritative).
+        Faction* f = c->getFaction();
+        if (f && g_facGetDataFn) {
+            GameData* fd = g_facGetDataFn(f);
+            if (fd) {
+                strncpy(facSid, fd->stringID.c_str(), facSidLen - 1);
+                facSid[facSidLen - 1] = '\0';
+            }
+        }
+        Ogre::Vector3 p = c->getPosition();
+        if (x) *x = p.x;
+        if (y) *y = p.y;
+        if (z) *z = p.z;
+        if (heading) *heading = c->getOrientation().getYaw().valueRadians();
+        if (dead) *dead = (g_isDeadCharFn && g_isDeadCharFn(c));
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
+                         float x, float y, float z, float heading) {
+    if (!gw || !gw->theFactory || !g_createCharFn || !charSid || !charSid[0]) return 0;
+    // Template by CHARACTER stringID (the same category-scan lookup the
+    // inventory reconstructor uses for items).
+    GameData* tmpl = findItemTemplateImpl(gw, charSid, (unsigned int)CHARACTER);
+    if (!tmpl) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "[spawn] proxy template MISS sid='%s'", charSid);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return 0;
+    }
+    Faction* fac = 0;
+    if (facSid && facSid[0]) {
+        std::string fs(facSid);
+        fac = factionBySidGuarded(gw, &fs);
+    }
+    // Unknown faction sid (modded faction absent here / "" reply): any live
+    // non-player faction keeps the proxy a true world NPC. Cosmetic only.
+    if (!fac) fac = nonPlayerFactionGuarded(gw);
+    if (!fac) {
+        coop::logLine("[spawn] proxy faction MISS (no non-player faction loaded)");
+        return 0;
+    }
+    Character* c = createCharGuarded(gw, tmpl, fac, x, y, z);
+    if (!c) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "[spawn] proxy create FAILED sid='%s'", charSid);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return 0;
+    }
+    // Land exactly on the host transform, facing the host heading (createChar
+    // grounds/settles on its own); the stream drives it from here.
+    park(c, x, y, z, heading);
+    // Quiet its local AI immediately: the host stream is the sole task
+    // authority for a proxy (AI-suspend re-asserts this every driven tick).
+    detachFromTownAI(c);
+    clearGoals(c);
+    return c;
+}
+
+unsigned int spawnRuntimeSquad(GameWorld* gw, unsigned int count,
+                               unsigned int (*outHands)[5]) {
+    if (!gw || count == 0) return 0;
+    Faction* fac = nonPlayerFactionGuarded(gw);
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < count; ++i) {
+        // Spread the squad in a loose rank in front of the leader.
+        float fwd  = 6.0f + 2.0f * (float)(i / 2);
+        float side = (i & 1) ? 2.0f : -2.0f;
+        Character* c = fac ? spawnCharInFaction(gw, fwd, side, fac)
+                           : spawnNpcInFront(gw, fwd, side);
+        if (!c) continue;
+        // Detach from town-AI so the town scheduler doesn't immediately re-task
+        // the squad away (the same quieting the duel/craft scenes rely on).
+        detachFromTownAI(c);
+        unsigned int h[5] = { 0, 0, 0, 0, 0 };
+        bool haveHand = readObjectHand(static_cast<RootObject*>(c), h);
+        if (outHands) {
+            for (int j = 0; j < 5; ++j) outHands[n][j] = h[j];
+        }
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[spawn] runtime squad member %u/%u hand=%u,%u,%u,%u,%u haveHand=%d",
+                  n + 1, count, h[0], h[1], h[2], h[3], h[4], haveHand ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        ++n;
+    }
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[spawn] runtime squad spawned=%u/%u fac=%s",
+              n, count, fac ? "nonplayer" : "leader-fallback");
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return n;
+}
+
 bool spawnMachineInFront(GameWorld* gw, float fwd, float side, Faction* owner,
                          RootObject** spawned) {
     if (spawned) *spawned = 0;
@@ -3020,6 +3497,67 @@ bool spawnMachineInFront(GameWorld* gw, float fwd, float side, Faction* owner,
     }
 }
 
+// Internal: spawn one building from an already-chosen template at a leader-
+// relative offset (the spawnMachineInFront shape, template passed in). Caller
+// holds no SEH - this guards itself. Logs the landing position + hand.
+static RootObject* spawnTemplateInFront(GameWorld* gw, GameData* tmpl,
+                                        float fwd, float side, const char* tag) {
+    if (!gw || !gw->theFactory || !g_createBldgFn || !tmpl) return 0;
+    __try {
+        Ogre::Vector3 pos; float yaw = 0.0f;
+        if (!leaderAnchor(gw, fwd, side, &pos, &yaw)) return 0;
+        // Face the fixture back toward the leader (same as seat/machine spawns).
+        Ogre::Quaternion rot(Ogre::Radian(yaw + 3.14159265f), Ogre::Vector3::UNIT_Y);
+        Ogre::Vector3 placePos(pos.x, 0.0f, pos.z); // y=0: createBuilding re-grounds
+        Building* b = g_createBldgFn(
+            gw->theFactory, tmpl, placePos, /*town*/0, /*owner*/0, rot, /*cb*/0,
+            /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
+            /*invisible*/false, /*completed*/true, /*isFoliage*/false,
+            /*floor*/0, /*isOutsideFurniture*/false);
+        if (!b) return 0;
+        RootObject* ro = reinterpret_cast<RootObject*>(b); // Building's first base
+        Ogre::Vector3 ap = ro->getPosition();
+        unsigned int h[5] = { 0, 0, 0, 0, 0 };
+        bool haveHand = readObjectHand(ro, h);
+        char d[224];
+        _snprintf(d, sizeof(d) - 1,
+                  "SETUP(bedcage): %s '%s' pos=%.2f,%.2f,%.2f hand=%u,%u,%u,%u,%u(%d)",
+                  tag, tmpl->name.c_str(), ap.x, ap.y, ap.z,
+                  h[0], h[1], h[2], h[3], h[4], haveHand ? 1 : 0);
+        d[sizeof(d) - 1] = '\0';
+        coop::logLine(d);
+        return ro;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("SETUP(bedcage): createBuilding FAULTED");
+        return 0;
+    }
+}
+
+bool setupBedCageScene(GameWorld* gw) {
+    GameData* bedTmpl = 0;
+    GameData* cageTmpl = 0;
+    __try {
+        bedTmpl  = findBedTemplate(gw);
+        cageTmpl = findCageTemplate(gw);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("SETUP(bedcage): template lookup FAULTED");
+        return false;
+    }
+    {
+        char d[224];
+        _snprintf(d, sizeof(d) - 1, "SETUP(bedcage): bedTemplate='%s' cageTemplate='%s'",
+                  bedTmpl ? bedTmpl->name.c_str() : "(none)",
+                  cageTmpl ? cageTmpl->name.c_str() : "(none)");
+        d[sizeof(d) - 1] = '\0';
+        coop::logLine(d);
+    }
+    // Bed left of the leader, cage right - far enough apart that a body placed
+    // in one cannot ambiguously read as "at" the other in the oracles.
+    RootObject* bed  = spawnTemplateInFront(gw, bedTmpl,  7.0f, -5.0f, "bed");
+    RootObject* cage = spawnTemplateInFront(gw, cageTmpl, 7.0f,  5.0f, "cage");
+    return bed != 0 && cage != 0;
+}
+
 bool orderWorkAt(Character* c, RootObject* fixture, int task) {
     if (!c || !fixture) return false;
     if (!g_addOrderFn && !g_addJobFn) return false;
@@ -3038,6 +3576,54 @@ bool orderWorkAt(Character* c, RootObject* fixture, int task) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+// Find the BAKED bed (kind=1) or prison cage (kind=2) near the leader by
+// scanning loaded BUILDING objects by name - the bedcage1 fixture-relocation
+// path (same shape as findWorkFixtureNear: save-stable buildings are simply
+// searched for by template name after a reload).
+RootObject* findFurnitureNear(GameWorld* gw, int kind) {
+    if (!gw || !g_getObjsFn || !gw->player) return 0;
+    if (gw->player->playerCharacters.size() == 0) return 0;
+    __try {
+        Ogre::Vector3 center = gw->player->playerCharacters[0]->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, 60.0f, BUILDING, 256, 0);
+        unsigned int total = g_npcQuery.size();
+        const char* bedPrefs[]  = { "camp bed", "bedroll", "bed" };
+        const char* cagePrefs[] = { "prisoner cage", "cage" };
+        const char** prefs = (kind == 2) ? cagePrefs : bedPrefs;
+        const unsigned int nprefs = (kind == 2) ? 2u : 3u;
+        for (unsigned int k = 0; k < nprefs; ++k) {
+            for (unsigned int i = 0; i < total; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                GameData* gd = o->getGameData();
+                if (gd && ciContains(gd->name.c_str(), prefs[k])) return o;
+            }
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+bool orderUseBed(GameWorld* gw, const unsigned int subjHand[5],
+                 int* orderedTask, int* useBedTask) {
+    // Report the numeric task ids so scenarios can log them for the oracle
+    // (the oracle never hardcodes TaskType values).
+    if (orderedTask) *orderedTask = (int)USE_BED_ORDER;
+    if (useBedTask)  *useBedTask  = (int)USE_BED;
+    Character* c = resolveCharByHand(subjHand[3], subjHand[4],
+                                     subjHand[0], subjHand[1], subjHand[2]);
+    if (!c) return false;
+    // Guarded: already on a bed task -> success without re-clearing goals
+    // (re-issuing would stand the sleeper up and restart the approach).
+    int cur = readTaskKey(c);
+    if (cur == (int)USE_BED || cur == (int)USE_BED_ORDER) return true;
+    RootObject* bed = findFurnitureNear(gw, /*kind*/1);
+    if (!bed) return false;
+    return orderWorkAt(c, bed, (int)USE_BED_ORDER);
 }
 
 // Give 'c' a PERSISTENT AI GOAL (not a player order) to work 'task' at 'fixture'.
@@ -3787,6 +4373,12 @@ unsigned short readBodyState(Character* c) {
         if (g_isDeadCharFn && g_isDeadCharFn(c)) s |= BODY_DEAD;
         if (g_isCrawlFn   && g_isCrawlFn(c))   s |= BODY_CRAWL;
         if (g_isBeingCarriedFn && g_isBeingCarriedFn(c)) s |= BODY_CARRIED;
+        // Furniture occupancy (protocol 19): direct member read (0x2F8).
+        if (c->inSomething == IN_BED)         s |= BODY_IN_BED;
+        else if (c->inSomething == IN_PRISON) s |= BODY_IN_CAGE;
+        // Stealth (protocol 20): the mode bool exactly (0xD4), NOT the
+        // crawl-inclusive isStealthModeOrCrawling that feeds BODY_CRAWL.
+        if (c->stealthMode) s |= BODY_SNEAK;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
@@ -4282,6 +4874,202 @@ bool dropSubject(GameWorld* gw, const unsigned int carrierHand[5], bool ragdoll)
     return applyDrop(carrier, ragdoll);
 }
 
+// ---- Protocol 19: furniture occupancy (beds + prison cages) ------------------
+
+bool readFurniture(Character* c, FurnitureRead* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!c) return false;
+    __try {
+        if (c->inSomething == IN_BED)         out->kind = 1;
+        else if (c->inSomething == IN_PRISON) out->kind = 2;
+        else                                  out->kind = 0;
+        if (out->kind != 0) {
+            const hand& h = c->inWhat;
+            out->furn[0] = (unsigned int)h.type;
+            out->furn[1] = h.container;
+            out->furn[2] = h.containerSerial;
+            out->furn[3] = h.index;
+            out->furn[4] = h.serial;
+        }
+        out->valid = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool applyFurniture(GameWorld* gw, Character* occupant,
+                    const unsigned int furnHand[5], int kind, bool on) {
+    (void)gw;
+    if (!occupant || (kind != 1 && kind != 2)) return false;
+    SetFurnModeFn fn = (kind == 1) ? g_setBedModeFn : g_setPrisonModeFn;
+    if (!fn) return false;
+    // Resolve the furniture OUTSIDE the SEH frame (resolveObjectByHand guards
+    // itself). A null is only fatal for ENTER; an EXIT can fall back to the
+    // occupant's own inWhat below.
+    RootObject* ro = furnHand ? resolveObjectByHand(furnHand) : 0;
+    __try {
+        const int desired = on ? kind : 0;
+        int cur = 0;
+        if (occupant->inSomething == IN_BED)         cur = 1;
+        else if (occupant->inSomething == IN_PRISON) cur = 2;
+        if (cur == desired) return true;         // idempotent no-op
+        if (on && cur != 0) return false;        // already in OTHER furniture: refuse
+        // UseableStuff's first base chain starts at RootObject (offset 0), the
+        // same address-preserving reinterpret the Building spawns use.
+        UseableStuff* us = reinterpret_cast<UseableStuff*>(ro);
+        if (!on && !us) {
+            // Exit without a resolvable hand: release from whatever it is in.
+            const hand& h = occupant->inWhat;
+            unsigned int own[5];
+            own[0] = (unsigned int)h.type; own[1] = h.container;
+            own[2] = h.containerSerial;    own[3] = h.index; own[4] = h.serial;
+            us = reinterpret_cast<UseableStuff*>(resolveObjectByHand(own));
+        }
+        if (on && !us) return false;             // enter needs the real fixture
+        fn(occupant, on, us);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool putSubjectInFurniture(GameWorld* gw, const unsigned int subjHand[5], int kind, bool on) {
+    Character* c = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!c) return false;
+    RootObject* furn = findFurnitureNear(gw, kind);
+    if (!furn) return false;
+    unsigned int fh[5] = { 0, 0, 0, 0, 0 };
+    if (!readObjectHand(furn, fh)) return false;
+    return applyFurniture(gw, c, fh, kind, on);
+}
+
+bool taskIsBedPose(int t) {
+    return t == (int)USE_BED || t == (int)USE_BED_ORDER || t == (int)SLEEP_ON_FLOOR;
+}
+
+// ---- Protocol 20: stealth mode + detection indicators ----------------------
+
+bool readStealth(Character* c, StealthRead* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!c) return false;
+    __try {
+        out->sneaking = c->stealthMode;
+        out->unseen   = (unsigned char)c->stealthUnseen.key;
+        // whoSeesMeSneaking is a boost-1.60 unordered_map (kenshi/util/
+        // OgreUnordered.h) and we compile against the same in-tree boost the
+        // game shipped with, so in-process iteration is layout-correct. The
+        // iterators are raw node pointers (trivially destructible - SEH-legal).
+        ogre_unordered_map<hand, Character::WhoSeesMe>::type::iterator it =
+            c->whoSeesMeSneaking.begin();
+        ogre_unordered_map<hand, Character::WhoSeesMe>::type::iterator end =
+            c->whoSeesMeSneaking.end();
+        for (; it != end; ++it) {
+            ++out->mapSize;
+            if (out->nSeers >= 16) continue;
+            StealthSeer& s = out->seers[out->nSeers];
+            const hand& h = it->first;
+            s.npc[0] = (unsigned int)h.type;
+            s.npc[1] = h.container;
+            s.npc[2] = h.containerSerial;
+            s.npc[3] = h.index;
+            s.npc[4] = h.serial;
+            s.see  = (unsigned char)it->second.seeState.key;
+            s.prog = it->second.progressOfMaybe;
+            ++out->nSeers;
+        }
+        out->valid = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+}
+
+int readStealthMode(Character* c) {
+    if (!c) return -1;
+    __try {
+        return c->stealthMode ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+bool applyStealth(Character* c, bool on) {
+    if (!c || !g_setStealthModeFn) return false;
+    __try {
+        if (c->stealthMode == on) return true; // idempotent no-op
+        g_setStealthModeFn(c, on);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool applyStealthSeer(GameWorld* gw, Character* sneaker,
+                      const unsigned int npcHand[5], unsigned char see, float prog) {
+    (void)gw;
+    if (!sneaker || !g_notifySeeSneakFn || !npcHand) return false;
+    Character* seer = resolveCharByHand(npcHand[3], npcHand[4], npcHand[0],
+                                        npcHand[1], npcHand[2]);
+    if (!seer) return false;
+    __try {
+        int ynm = (int)see;
+        g_notifySeeSneakFn(sneaker, seer, &ynm, prog);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool sneakSubject(GameWorld* gw, const unsigned int subjHand[5], bool on) {
+    (void)gw;
+    Character* c = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!c) return false;
+    return applyStealth(c, on);
+}
+
+bool enterFurnitureNearPos(GameWorld* gw, Character* occupant, int kind,
+                           float x, float y, float z, float radius) {
+    if (!gw || !occupant || !g_getObjsFn || (kind != 1 && kind != 2)) return false;
+    RootObject* best = 0;
+    __try {
+        Ogre::Vector3 center(x, y, z);
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, BUILDING, 64, 0);
+        unsigned int total = g_npcQuery.size();
+        const char* bedPrefs[]  = { "camp bed", "bedroll", "bed" };
+        const char* cagePrefs[] = { "prisoner cage", "cage" };
+        const char** prefs = (kind == 2) ? cagePrefs : bedPrefs;
+        const unsigned int nprefs = (kind == 2) ? 2u : 3u;
+        float bestD2 = 1e18f;
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o) continue;
+            GameData* gd = o->getGameData();
+            if (!gd) continue;
+            bool match = false;
+            for (unsigned int k = 0; k < nprefs && !match; ++k)
+                if (ciContains(gd->name.c_str(), prefs[k])) match = true;
+            if (!match) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - x, dz = p.z - z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) { bestD2 = d2; best = o; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    if (!best) return false;
+    unsigned int fh[5] = { 0, 0, 0, 0, 0 };
+    if (!readObjectHand(best, fh)) return false;
+    return applyFurniture(gw, occupant, fh, kind, true);
+}
+
 // SEH-guarded: fabricate a robotic-limb item from its LIMB_REPLACEMENT template
 // stringID (blank handle - the factory owns the id; the same pattern as
 // createItemAndAdd, but the item goes to setRobotLimbItem, not an inventory).
@@ -4563,6 +5351,283 @@ bool orderAttackByHand(GameWorld* gw, const unsigned int atkHand[5],
     return orderMeleeAttack(a, v);
 }
 
+// ---- Protocol 22 groundwork: money + vendor trading -------------------------
+
+namespace {
+// Ownerships block (the wallet) of the platoon containing 'c', or 0. The chain
+// Character -> ActivePlatoon (getPlatoon) -> Platoon (::me) -> Ownerships is all
+// engine-owned pointers; caller holds SEH.
+Ownerships* walletOf(Character* c) {
+    if (!c || !g_getPlatoonFn) return 0;
+    ActivePlatoon* ap = g_getPlatoonFn(c);
+    if (!ap) return 0;
+    Platoon* p = ap->me;
+    if (!p) return 0;
+    return &p->ownerships;
+}
+
+// The vendor's trader Character: the raw member first, the engine accessor as
+// fallback (the member read null on every enumerated vendor, run 103547).
+// Caller holds SEH.
+Character* traderOf(ShopTrader* st) {
+    if (!st) return 0;
+    Character* t = st->trader;
+    if (!t && g_shopGetTraderFn) t = g_shopGetTraderFn(st);
+    return t;
+}
+} // namespace
+
+unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut,
+                             float radius) {
+    if (!gw || !gw->player || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        Character* ld = gw->player->playerCharacters[0];
+        if (!ld) return 0;
+        Ogre::Vector3 center = ld->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, radius, SHOP_TRADER_CLASS, 64, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            RootObject* o = g_npcQuery[i]; if (!o) continue;
+            VendorRead& v = out[n];
+            memset(&v, 0, sizeof(v));
+            if (!readObjectHand(o, v.hand)) continue;
+            v.money = -1; v.stock = -1; v.qty = -1; v.src = 0;
+            __try { v.money = o->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            __try {
+                Ogre::Vector3 p = o->getPosition();
+                v.x = p.x; v.y = p.y; v.z = p.z;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            __try {
+                // Two candidate stock containers (run 101952/103018 finding): the
+                // ShopTrader's own aggregated Inventory is LAZY (null until the
+                // trade UI opens), while the trader CHARACTER's inventory is a
+                // regular, always-present container. Read whichever answers; the
+                // trader's save-stable hand is also the cross-client vendor
+                // identity (the ShopTrader wrapper's serial is runtime-minted).
+                ShopTrader* st = static_cast<ShopTrader*>(o);
+                GameData* gd = 0;
+                __try { gd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
+                if (gd) {
+                    strncpy(v.sid, gd->stringID.c_str(), sizeof(v.sid) - 1);
+                    v.sid[sizeof(v.sid) - 1] = '\0';
+                }
+                Inventory* inv = 0;
+                __try { inv = o->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+                if (inv) v.src = 1;
+                Character* trader = traderOf(st);
+                if (trader) {
+                    readObjectHand(static_cast<RootObject*>(trader), v.traderHand);
+                    if (!inv) {
+                        __try { inv = trader->getInventory(); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+                        if (inv) v.src = 2;
+                    }
+                }
+                if (inv) {
+                    InvItemEntry ent[96];
+                    unsigned int ne = readInvItems(inv, ent, 0, 96);
+                    int q = 0;
+                    for (unsigned int e = 0; e < ne; ++e)
+                        q += (ent[e].quantity < 1) ? 1 : (int)ent[e].quantity;
+                    v.stock = (int)ne; v.qty = q;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+bool readWalletByHand(const unsigned int mHand[5], int* outMoney) {
+    if (outMoney) *outMoney = -1;
+    if (!mHand || !outMoney || !g_ownGetMoneyFn) return false;
+    Character* c = resolveCharByHand(mHand[3], mHand[4], mHand[0], mHand[1], mHand[2]);
+    if (!c) return false;
+    __try {
+        Ownerships* ow = walletOf(c);
+        if (!ow) return false;
+        *outMoney = g_ownGetMoneyFn(ow);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writeWalletByHand(const unsigned int mHand[5], int money) {
+    if (!mHand || money < 0 || !g_ownSetMoneyFn) return false;
+    Character* c = resolveCharByHand(mHand[3], mHand[4], mHand[0], mHand[1], mHand[2]);
+    if (!c) return false;
+    __try {
+        Ownerships* ow = walletOf(c);
+        if (!ow) return false;
+        g_ownSetMoneyFn(ow, money);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// ---- Protocol 23 phase 0: recruitment probe ---------------------------------
+
+int probeRecruit(GameWorld* gw, bool runtimeSubject,
+                 unsigned int outHandBefore[5], unsigned int outHandAfter[5]) {
+    if (outHandBefore) memset(outHandBefore, 0, 5 * sizeof(unsigned int));
+    if (outHandAfter)  memset(outHandAfter,  0, 5 * sizeof(unsigned int));
+    if (!gw || !gw->player) return -1;
+    Character* subject = 0;
+    if (runtimeSubject) {
+        // Runtime leg: a freshly-minted NPC (host-only hand - the spawn-sync
+        // regime). Offset to the side so the two legs don't stack bodies.
+        subject = spawnNpcInFront(gw, 5.0f, 2.5f);
+    } else {
+        // Baked leg: the nearest world NPC (save-stable hand both clients
+        // share - the bar-recruit regime). First non-player body in 60 u.
+        if (!g_getCharsFn) return -1;
+        __try {
+            if (gw->player->playerCharacters.size() == 0) return -1;
+            Character* ld = gw->player->playerCharacters[0];
+            if (!ld) return -1;
+            Ogre::Vector3 center = ld->getPosition();
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &center, 60.0f, 60.0f, 30.0f, 32, 32, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o || isPlayerSquad(gw, o)) continue;
+                // Never pick a PEER-DRIVEN body (it sits in the AI-suspend set
+                // every driven tick): with recruit sync on, the deterministic
+                // nearest-NPC pick would otherwise select the same bar NPC the
+                // peer already recruited - its local copy is re-keyed to the
+                // peer's stream hand here, and double-recruiting it collides
+                // both sides' ownership on one hand (run 120738).
+                if (g_aiSuspended.find(static_cast<Character*>(o)) != g_aiSuspended.end())
+                    continue;
+                subject = static_cast<Character*>(o);
+                break;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    }
+    if (!subject) {
+        coop::logLine(runtimeSubject ? "[recruit] probe no-subject (spawn failed)"
+                                     : "[recruit] probe no-subject (no world NPC in 60u)");
+        return 0;
+    }
+    __try {
+        if (outHandBefore) readObjectHand(static_cast<RootObject*>(subject), outHandBefore);
+        bool ok = recruitNpc(gw, subject);
+        // The AFTER hand is the identity evidence: recruit re-containers the
+        // body into a player platoon, so the CONTAINER fields change - the
+        // question is whether index/serial survive (peer-resolvable) or not.
+        if (outHandAfter) readObjectHand(static_cast<RootObject*>(subject), outHandAfter);
+        return ok ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[recruit] probe SEH-except");
+        return -1;
+    }
+}
+
+int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]) {
+    (void)gw;
+    if (!vHand) return -1;
+    RootObject* ro = resolveObjectByHand(vHand);
+    if (!ro) return -1;
+    __try {
+        Inventory* inv = 0;
+        __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+        if (inv) return 1;
+        if (!g_getPlatoonFn || !g_platoonRefreshInvFn) {
+            coop::logLine("[shop] ensure-stock fns-unresolved"); return 0;
+        }
+        // The hand enumerated under SHOP_TRADER_CLASS, so this IS a ShopTrader.
+        ShopTrader* st = static_cast<ShopTrader*>(ro);
+        Character* trader = traderOf(st);
+        if (!trader) { coop::logLine("[shop] ensure-stock trader-null"); return 0; }
+        ActivePlatoon* ap = g_getPlatoonFn(trader);
+        if (!ap) { coop::logLine("[shop] ensure-stock platoon-null"); return 0; }
+        g_platoonRefreshInvFn(ap, /*firstTime=*/true);
+        __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+        if (!inv) coop::logLine("[shop] ensure-stock refresh-ran inv-still-null");
+        return inv ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
+                   const unsigned int buyerHand[5],
+                   char* outSid, unsigned int sidLen) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (!gw || !vHand || !buyerHand || !g_buyItemFn) return -1;
+    RootObject* vendor = resolveObjectByHand(vHand);
+    Character*  buyer  = resolveCharByHand(buyerHand[3], buyerHand[4], buyerHand[0],
+                                           buyerHand[1], buyerHand[2]);
+    if (!vendor || !buyer) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[shop] probe-buy unresolved vendor=%d buyer=%d",
+                  vendor ? 1 : 0, buyer ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return -1;
+    }
+    __try {
+        // Same stock-container pick as listVendorsNear: the ShopTrader's own
+        // (lazy) Inventory first, else the trader CHARACTER's - whether buyItem
+        // works against the character container is itself probe evidence.
+        Inventory* vinv = 0; int src = 0;
+        __try { vinv = vendor->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { vinv = 0; }
+        if (vinv) src = 1;
+        if (!vinv) {
+            Character* trader = traderOf(static_cast<ShopTrader*>(vendor));
+            if (trader) {
+                __try { vinv = trader->getInventory(); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { vinv = 0; }
+                if (vinv) src = 2;
+            }
+        }
+        if (!vinv) { coop::logLine("[shop] probe-buy vendor-inv-null"); return -1; }
+        {
+            char sb[64];
+            _snprintf(sb, sizeof(sb) - 1, "[shop] probe-buy inv-src=%d", src);
+            sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+        }
+        // Pick the first LOOSE stack in the vendor's stock as the purchase subject.
+        InvItemEntry ent[96];
+        Item* items[96];
+        unsigned int ne = readInvItems(vinv, ent, items, 96);
+        Item* pick = 0; int pickIdx = -1;
+        for (unsigned int i = 0; i < ne; ++i) {
+            if (!items[i] || ent[i].equipped) continue;
+            pick = items[i]; pickIdx = (int)i; break;
+        }
+        if (!pick) { coop::logLine("[shop] probe-buy no-stock"); return 0; }
+        if (outSid && sidLen) {
+            strncpy(outSid, ent[pickIdx].stringID, sidLen - 1);
+            outSid[sidLen - 1] = '\0';
+        }
+        // BEFORE / AFTER evidence: vendor cash + stock, buyer tab wallet. What one
+        // local buyItem mutates (and what, if anything, crosses today) IS the probe
+        // deliverable - the oracle only requires the pair of lines to exist.
+        int vMoney0 = -1, vMoney1 = -1, w0 = -1, w1 = -1;
+        __try { vMoney0 = vendor->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Ownerships* ow = walletOf(buyer);
+        if (ow && g_ownGetMoneyFn) w0 = g_ownGetMoneyFn(ow);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[shop] BUY-BEFORE sid='%s' type=%u qty=%u vendorMoney=%d stock=%u wallet=%d",
+                  ent[pickIdx].stringID, ent[pickIdx].itemType,
+                  (unsigned int)ent[pickIdx].quantity, vMoney0, ne, w0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        Item* got = g_buyItemFn(vinv, pick, static_cast<RootObject*>(buyer));
+        unsigned int ne1 = readInvItems(vinv, ent, 0, 96);
+        __try { vMoney1 = vendor->getMoney(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (ow && g_ownGetMoneyFn) w1 = g_ownGetMoneyFn(ow);
+        _snprintf(b, sizeof(b) - 1,
+                  "[shop] BUY-AFTER ok=%d vendorMoney=%d stock=%u wallet=%d",
+                  got ? 1 : 0, vMoney1, ne1, w1);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return got ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[shop] probe-buy SEH-except");
+        return -1;
+    }
+}
+
 bool readGameSpeed(GameWorld* gw, float* mult, bool* paused) {
     if (!gw || !mult || !paused) return false;
     __try {
@@ -4585,6 +5650,161 @@ bool writeGameSpeed(GameWorld* gw, float mult, bool paused) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
+    }
+}
+
+bool writeGameSpeedQuiet(GameWorld* gw, float mult, bool paused) {
+    if (!gw || !g_setFrameSpeedMultFn || !g_userPauseFn) return false;
+    if (mult <= 0.0f) paused = true; // wire convention: speed 0 == paused
+    g_speedGuardWrite = true; // our own write: the intent hooks must not see it
+    bool ok;
+    __try {
+        g_userPauseFn(gw, paused);
+        // The bare multiplier setter: drives the sim WITHOUT the UI-button
+        // notify setGameSpeed does - the buttons keep showing the local vote.
+        if (!paused && mult > 0.0f) g_setFrameSpeedMultFn(gw, mult);
+        ok = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    g_speedGuardWrite = false;
+    if (ok) {
+        // Remember what we established: the intent poll treats any LATER
+        // deviation from this as a user action.
+        g_quietHave   = true;
+        g_quietPaused = paused;
+        if (!paused && mult > 0.0f) g_quietMult = mult;
+    }
+    // userPause re-highlights the buttons from the EFFECTIVE state (spike
+    // finding); put the player's VOTE highlight back.
+    restoreVoteButtons();
+    return ok;
+}
+
+bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused) {
+    if (!mult || !paused) return false;
+    // 1) Hook-captured intent (simulated writeGameSpeed clicks and any code
+    //    path that does route through the public setters).
+    if (g_speedIntentFresh) {
+        g_speedIntentFresh = false;
+        *mult   = g_speedIntentMult;
+        *paused = g_speedIntentPaused;
+        // Mark the current engine state EXPLAINED so the poll below doesn't
+        // re-report this same action next tick.
+        float em = 0.0f; bool ep = false;
+        if (readGameSpeed(gw, &em, &ep)) {
+            g_quietHave = true; g_quietPaused = ep;
+            if (!ep && em > 0.0f) g_quietMult = em;
+        }
+        snapshotVoteButtons();
+        return true;
+    }
+    // 2) Poll fallback (manual-session finding 2026-07-08: the MainBar click
+    //    handler writes the speed INLINE - real UI clicks never reach the
+    //    setGameSpeed detour). Two complementary signals:
+    //      engine diff - the engine left the state WE last wrote: a click, a
+    //        keyboard pause, or RE_Kenshi acted. The engine state IS the
+    //        user's request.
+    //      button diff - the highlight moved but the engine DIDN'T: a click
+    //        on the speed equal to the current effective (the same-value
+    //        vote). Its value also equals the engine state, by definition.
+    float em = 0.0f; bool ep = false;
+    if (!readGameSpeed(gw, &em, &ep)) return false;
+    bool engineDiff = g_quietHave &&
+        (ep != g_quietPaused ||
+         (!ep && em > 0.0f && fabsf(em - g_quietMult) > 0.01f));
+    bool btnDiff = false;
+    char btn[16]; btn[0] = '\0';
+    int nBtn = readSpeedButtons(btn, sizeof(btn));
+    if (nBtn > 0 && g_voteBtnN == nBtn && memcmp(btn, g_voteBtn, nBtn) != 0)
+        btnDiff = true;
+    if (!engineDiff && !btnDiff) return false;
+    if (engineDiff) {
+        // Which multiplier is the request? A moved engine mult = the user
+        // picked a new speed. A pause-only flip (space bar) PRESERVES the
+        // requested mult - the engine's own model - so unpausing restores
+        // the vote, not the effective.
+        bool multMoved = (!ep && em > 0.0f && fabsf(em - g_quietMult) > 0.01f);
+        *mult   = multMoved ? em : g_speedIntentMult;
+        *paused = ep;
+    } else {
+        // Button-only diff: the engine state did NOT move, so the click's
+        // meaning comes from WHICH button lit up. A speed click while PAUSED
+        // is the big one (manual finding 2026-07-08): the click doesn't flip
+        // the engine's pause flag, so reading *paused = engine would keep
+        // voting pause forever (both clients stuck paused). Button 0 is the
+        // pause button (probe-verified '1000' while paused); any other
+        // selection is an UNPAUSE vote at that speed.
+        int newIdx = -1;
+        for (int i = 0; i < nBtn; ++i)
+            if (btn[i] == '1' && g_voteBtn[i] != '1') { newIdx = i; break; }
+        if (newIdx == 0) {
+            *paused = true;
+            *mult   = g_speedIntentMult; // pause preserves the requested mult
+        } else if (newIdx > 0) {
+            *paused = false;
+            // The clicked speed: the engine mult when it equals the click (the
+            // same-value case), else the best value the engine holds.
+            *mult   = (em > 0.0f) ? em : g_speedIntentMult;
+        } else {
+            // Selection only turned OFF (shouldn't happen) - engine state wins.
+            *paused = ep;
+            *mult   = (em > 0.0f) ? em : g_speedIntentMult;
+        }
+    }
+    g_speedIntentMult   = *mult;
+    g_speedIntentPaused = ep;
+    // Explain the state + adopt the clicked highlight as the new vote display.
+    g_quietHave = true; g_quietPaused = ep;
+    if (!ep && em > 0.0f) g_quietMult = em;
+    if (nBtn > 0) { memcpy(g_voteBtn, btn, nBtn); g_voteBtnN = nBtn; }
+    return true;
+}
+
+bool installSpeedIntentHooks(GameWorld* gw) {
+    // Seed the intent state from the live engine BEFORE hooking, so the first
+    // consume reflects the save's starting speed instead of the defaults.
+    float m = 0.0f; bool p = false;
+    if (readGameSpeed(gw, &m, &p)) {
+        if (m > 0.0f) g_speedIntentMult = m;
+        g_speedIntentPaused = p;
+    }
+    // Baseline vote highlight = the save's starting button state, so the first
+    // quiet apply has something to restore before any real click happens.
+    snapshotVoteButtons();
+    intptr_t aSet    = KenshiLib::GetRealAddress(&GameWorld::setGameSpeed);
+    intptr_t aPause  = KenshiLib::GetRealAddress(&GameWorld::userPause);
+    intptr_t aToggle = KenshiLib::GetRealAddress(&GameWorld::togglePause);
+    if (!aSet || !aPause || !aToggle) return false;
+    if (KenshiLib::AddHook(aSet, (void*)&setGameSpeed_hook,
+                           (void**)&g_setGameSpeedOrig) != KenshiLib::SUCCESS)
+        return false;
+    if (KenshiLib::AddHook(aPause, (void*)&userPause_hook,
+                           (void**)&g_userPauseOrig) != KenshiLib::SUCCESS)
+        return false;
+    if (KenshiLib::AddHook(aToggle, (void*)&togglePause_hook,
+                           (void**)&g_togglePauseOrig) != KenshiLib::SUCCESS)
+        return false;
+    return true;
+}
+
+int readSpeedButtons(char* out, int n) {
+    if (!out || n < 2) return -1;
+    out[0] = '\0';
+    __try {
+        if (!gui || !gui->mainbar) return -1;
+        Ogre::FastArray<MyGUI::Button*>& btns = gui->mainbar->speedButtons;
+        int cnt = (int)btns.size();
+        if (cnt > n - 1) cnt = n - 1;
+        for (int i = 0; i < cnt; ++i) {
+            MyGUI::Button* b = btns[i];
+            out[i] = (b && b->getStateSelected()) ? '1' : '0';
+        }
+        out[cnt] = '\0';
+        return cnt;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = '\0';
+        return -1;
     }
 }
 

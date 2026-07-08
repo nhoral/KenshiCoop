@@ -65,6 +65,10 @@ static void testSizes() {
     CHECK_EQ("sizeof(TreatmentPacket)",         sizeof(TreatmentPacket),         77);
     CHECK_EQ("sizeof(SpeedPacket)",             sizeof(SpeedPacket),             14);
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
+    CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
+    CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          25);
+    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         139);
+    CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -99,6 +103,52 @@ static void testSizes() {
     CHECK("EVT_DROP_BODY distinct",
           EVT_DROP_BODY != EVT_PICKUP_BODY && EVT_DROP_BODY != EVT_NONE &&
           EVT_DROP_BODY != EVT_CRUSH);
+
+    // Furniture occupancy (protocol 19): the new bodyState bits are distinct
+    // and EXCLUDED from bodyIsDown (the receiver checks bodyInFurniture FIRST,
+    // like the carried carve-out).
+    CHECK("BODY_IN_BED distinct bit",
+          BODY_IN_BED != BODY_DOWN && BODY_IN_BED != BODY_RAGDOLL &&
+          BODY_IN_BED != BODY_DEAD && BODY_IN_BED != BODY_CRAWL &&
+          BODY_IN_BED != BODY_CARRIED);
+    CHECK("BODY_IN_CAGE distinct bit",
+          BODY_IN_CAGE != BODY_IN_BED && BODY_IN_CAGE != BODY_DOWN &&
+          BODY_IN_CAGE != BODY_RAGDOLL && BODY_IN_CAGE != BODY_DEAD &&
+          BODY_IN_CAGE != BODY_CRAWL && BODY_IN_CAGE != BODY_CARRIED);
+    CHECK("bodyIsDown excludes occupancy",   !bodyIsDown(BODY_IN_BED | BODY_IN_CAGE));
+    CHECK("bodyInFurniture(BODY_IN_BED)",    bodyInFurniture(BODY_IN_BED));
+    CHECK("bodyInFurniture(BODY_IN_CAGE)",   bodyInFurniture(BODY_IN_CAGE));
+    CHECK("!bodyInFurniture(down|carried)",  !bodyInFurniture(BODY_DOWN | BODY_CARRIED));
+    CHECK("occupant+down still reads down",  bodyIsDown(BODY_IN_CAGE | BODY_DOWN));
+    // The new reliable events are distinct from the whole existing set.
+    CHECK("EVT_ENTER_FURNITURE distinct",
+          EVT_ENTER_FURNITURE != EVT_NONE && EVT_ENTER_FURNITURE != EVT_KNOCKOUT &&
+          EVT_ENTER_FURNITURE != EVT_DEATH && EVT_ENTER_FURNITURE != EVT_REVIVE &&
+          EVT_ENTER_FURNITURE != EVT_AMPUTATE && EVT_ENTER_FURNITURE != EVT_CRUSH &&
+          EVT_ENTER_FURNITURE != EVT_PICKUP_BODY && EVT_ENTER_FURNITURE != EVT_DROP_BODY);
+    CHECK("EVT_EXIT_FURNITURE distinct",
+          EVT_EXIT_FURNITURE != EVT_ENTER_FURNITURE && EVT_EXIT_FURNITURE != EVT_NONE &&
+          EVT_EXIT_FURNITURE != EVT_PICKUP_BODY && EVT_EXIT_FURNITURE != EVT_DROP_BODY);
+
+    // Stealth sync (protocol 20).
+    CHECK("BODY_SNEAK distinct bit",
+          BODY_SNEAK != BODY_DOWN && BODY_SNEAK != BODY_RAGDOLL &&
+          BODY_SNEAK != BODY_DEAD && BODY_SNEAK != BODY_CRAWL &&
+          BODY_SNEAK != BODY_CARRIED && BODY_SNEAK != BODY_IN_BED &&
+          BODY_SNEAK != BODY_IN_CAGE);
+    CHECK("bodyIsDown excludes BODY_SNEAK", !bodyIsDown(BODY_SNEAK));
+    CHECK("bodySneaking(BODY_SNEAK)",       bodySneaking(BODY_SNEAK));
+    CHECK("!bodySneaking(BODY_CRAWL)",      !bodySneaking(BODY_CRAWL));
+    CHECK("sneak+crawl still reads sneak",  bodySneaking((u16)(BODY_SNEAK | BODY_CRAWL)));
+
+    // Recruitment sync (protocol 23): the new reliable event is distinct from
+    // the whole existing set (it rides the EventPacket shape unchanged).
+    CHECK("EVT_RECRUIT distinct",
+          EVT_RECRUIT != EVT_NONE && EVT_RECRUIT != EVT_KNOCKOUT &&
+          EVT_RECRUIT != EVT_DEATH && EVT_RECRUIT != EVT_REVIVE &&
+          EVT_RECRUIT != EVT_AMPUTATE && EVT_RECRUIT != EVT_CRUSH &&
+          EVT_RECRUIT != EVT_PICKUP_BODY && EVT_RECRUIT != EVT_DROP_BODY &&
+          EVT_RECRUIT != EVT_ENTER_FURNITURE && EVT_RECRUIT != EVT_EXIT_FURNITURE);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -146,6 +196,10 @@ static void testRoundTrips() {
     roundTrip<SpeedPacket>("SpeedPacket(REQ)", (u8)PKT_SPEED_REQ);
     roundTrip<SpeedPacket>("SpeedPacket(SET)", (u8)PKT_SPEED_SET);
     roundTrip<StatsPacket>("StatsPacket", (u8)PKT_STATS);
+    roundTrip<MoneyPacket>("MoneyPacket", (u8)PKT_MONEY);
+    roundTrip<StealthPacket>("StealthPacket", (u8)PKT_STEALTH);
+    roundTrip<SpawnReqPacket>("SpawnReqPacket", (u8)PKT_SPAWN_REQ);
+    roundTrip<SpawnInfoPacket>("SpawnInfoPacket", (u8)PKT_SPAWN_INFO);
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };

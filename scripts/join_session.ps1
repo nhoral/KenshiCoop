@@ -18,10 +18,20 @@
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\join_session.ps1 -HostIp 203.0.113.7 -Scenario free -Save squad1
+
+.EXAMPLE
+  # Steam P2P transport: no IPs, no port forwarding. -HostSteamId is the host's
+  # steamid64 (or short friend code); they must launch with YOUR SteamID as
+  # -PeerSteamId (two-code exchange).
+  powershell -ExecutionPolicy Bypass -File scripts\join_session.ps1 -HostSteamId 76561198000000000 -Scenario free -Save squad1
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$HostIp,
+    [string]$HostIp = "",
+    # Steam P2P transport: the HOST's steamid64 (or short friend code). When set,
+    # the connection is brokered by Steam (NAT punch / Valve relay) and -HostIp
+    # is ignored entirely.
+    [string]$HostSteamId = "",
     [string]$Scenario = "coop_presence",
     # Save to load (defaults from the scenario manifest; must match the kit's).
     [string]$Save = "",
@@ -34,6 +44,16 @@ param(
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
+
+# Short Steam friend codes are steamid64 minus the account-universe base.
+function ConvertTo-SteamId64([string]$id) {
+    $v = [uint64]$id
+    if ($v -lt 76561197960265728) { $v += 76561197960265728 }
+    return $v
+}
+
+$useSteam = ($HostSteamId -ne "")
+if (-not $useSteam -and $HostIp -eq "") { throw "Pass -HostIp <ip> (UDP) or -HostSteamId <steamid64> (Steam P2P)." }
 
 Import-Module (Join-Path $scriptDir "CoopOracles.psm1") -Force
 $manifest = Get-ScenarioManifest
@@ -77,8 +97,19 @@ $env:KENSHICOOP_TEST_SECONDS = if (-not $isFree) { "600" }
                                else { "0" }
 $env:KENSHICOOP_FAKE_CLOCK_SKEW_MS = "0"
 $env:KENSHICOOP_ARM_TIMEOUT_MS     = "$($prof.ArmTimeoutMs)"
+if ($useSteam) {
+    $hostId64 = ConvertTo-SteamId64 $HostSteamId
+    $env:KENSHICOOP_TRANSPORT  = "steam"
+    $env:KENSHICOOP_STEAM_PEER = "$hostId64"
+    Write-Host "Transport: STEAM P2P -> host SteamID $hostId64 (no IP / port forwarding)."
+    Write-Host "Reminder: the host must launch with YOUR SteamID as -PeerSteamId."
+} else {
+    $env:KENSHICOOP_TRANSPORT  = "udp"
+    $env:KENSHICOOP_STEAM_PEER = "0"
+}
 
-Write-Host "Launching JOIN -> ${HostIp}:$Port (save '$Save', scenario '$Scenario') ..."
+$target = if ($useSteam) { "steam:$(ConvertTo-SteamId64 $HostSteamId)" } else { "${HostIp}:$Port" }
+Write-Host "Launching JOIN -> $target (save '$Save', scenario '$Scenario') ..."
 $out = & (Join-Path $scriptDir "start_kenshi.ps1") -ExePath $joinExe -WorkDir $JoinDir -TimeoutSec $prof.StartTimeoutSec 6>&1
 $out | ForEach-Object { Write-Host "    $_" }
 $gamePid = 0
@@ -101,6 +132,8 @@ function Wait-ForLogLine {
 
 if (Wait-ForLogLine -File $joinLog -Pattern "peer connected" -TimeoutSec 300) {
     Write-Host "CONNECTED to the host."
+} elseif ($useSteam) {
+    Write-Warning "No connection after 5 min - is the host up, in Steam-online mode, and launched with YOUR SteamID as -PeerSteamId?"
 } else {
     Write-Warning "No connection after 5 min - is the host up + port-forwarded?"
 }

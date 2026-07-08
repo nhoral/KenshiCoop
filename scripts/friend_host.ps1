@@ -9,6 +9,11 @@
   One command:
     powershell -ExecutionPolicy Bypass -File friend_host.ps1
 
+  Steam P2P (no port forwarding / router setup at all):
+    powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <joining player's steamid64>
+  Your own SteamID is printed once the game is up - read it to the joining
+  player (they pass it as -HostSteamId). The kit may pre-bake -PeerSteamId.
+
   Installs the bundled mod + save into the local Kenshi, adds the Windows
   Firewall rule, asks the router to forward the UDP port automatically via
   UPnP (falling back to the manual port-forward checklist if the router
@@ -41,11 +46,22 @@ param(
     # Preflight only: firewall rule + UPnP + public-IP check, then exit.
     # Installs nothing, launches nothing. Run this the day before a scheduled
     # session so router problems surface off the clock.
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    # Steam P2P transport: the JOINING player's steamid64 (or short friend code).
+    # When set, Steam brokers the connection - the firewall / UPnP / public-IP
+    # checklist is skipped entirely. The kit may pre-bake this (kit.json).
+    [string]$PeerSteamId = ""
 )
 
 $ErrorActionPreference = "Stop"
 $kitDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Short Steam friend codes are steamid64 minus the account-universe base.
+function ConvertTo-SteamId64([string]$id) {
+    $v = [uint64]$id
+    if ($v -lt 76561197960265728) { $v += 76561197960265728 }
+    return $v
+}
 
 # ---- Kit defaults --------------------------------------------------------------
 $kit = Get-Content (Join-Path $kitDir "kit.json") -Raw | ConvertFrom-Json
@@ -53,6 +69,11 @@ $save = $kit.save
 if ($Scenario -eq "") { $Scenario = $kit.scenario }
 if ($Scenario -eq "free") { $Scenario = "" }
 if ($Port -eq 0) { $Port = [int]$kit.port }
+# The kit can pre-bake the Steam transport (kit.json: transport + peerSteamId).
+if ($PeerSteamId -eq "" -and $kit.PSObject.Properties["peerSteamId"] -and "$($kit.peerSteamId)" -ne "" -and "$($kit.peerSteamId)" -ne "0") {
+    $PeerSteamId = "$($kit.peerSteamId)"
+}
+$useSteam = ($PeerSteamId -ne "")
 
 # ---- Connectivity helpers ----------------------------------------------------------
 . (Join-Path $kitDir "upnp_portmap.ps1")
@@ -81,6 +102,16 @@ function Get-PublicIp {
 }
 
 # ---- Preflight-only mode (-CheckOnly) ------------------------------------------------
+if ($CheckOnly -and $useSteam) {
+    Write-Host ""
+    Write-Host "=== PRE-SESSION CHECK (Steam P2P transport) ==="
+    Write-Host " Steam brokers the connection by SteamID - no firewall rule, router"
+    Write-Host " forwarding or public IP needed. Just make sure that on session day:"
+    Write-Host "   1. Steam is RUNNING and ONLINE (not offline mode) on both machines."
+    Write-Host "   2. You and the other player have exchanged SteamIDs."
+    Write-Host " READY."
+    exit 0
+}
 if ($CheckOnly) {
     Write-Host ""
     Write-Host "=== PRE-SESSION CONNECTIVITY CHECK (installs nothing, launches nothing) ==="
@@ -161,9 +192,24 @@ foreach ($destBase in @($saveRoot, (Join-Path $KenshiDir "save"))) {
 Write-Host "Save '$save' installed."
 
 # ---- Firewall (local) + router mapping + checklist --------------------------------------
+$upnp = $null
+$upnpNote = "n/a (steam transport)"
+$publicIp = "(n/a - steam transport)"
+if ($useSteam) {
+    $peerId64 = ConvertTo-SteamId64 $PeerSteamId
+    Write-Host ""
+    Write-Host "=============== HOST CHECKLIST (STEAM P2P) ==============="
+    Write-Host " 1. Steam connects you BY STEAMID - no router setup, no port"
+    Write-Host "    forwarding, no public IPs. Keep Steam ONLINE."
+    Write-Host " 2. Peering with the joining player's SteamID: $peerId64"
+    Write-Host " 3. YOUR SteamID is printed after launch - read it to them."
+    Write-Host " 4. Leave this window open; the game closes itself when the"
+    Write-Host "    test scenario finishes (free play: close the game when done)."
+    Write-Host "==========================================================="
+    Write-Host ""
+} else {
 [void](Ensure-CoopFirewallRule $Port)
 
-$upnp = $null
 $upnpNote = "disabled (-NoUpnp)"
 if (-not $NoUpnp) {
     Write-Host "Asking the router to forward UDP $Port automatically (UPnP) ..."
@@ -196,6 +242,7 @@ Write-Host " 3. Leave this window open; the game closes itself when the test"
 Write-Host "    scenario finishes (free play: close the game when done)."
 Write-Host "======================================================="
 Write-Host ""
+}
 if (-not $NoPrompt) { Read-Host "Press Enter to launch the host" | Out-Null }
 
 # ---- Output + env -----------------------------------------------------------------------
@@ -218,6 +265,13 @@ $env:KENSHICOOP_FAKE_CLOCK_SKEW_MS = "0"
 # Scenario actions arm when the joining player's stream arrives; generous
 # fallback for a slow internet connect.
 $env:KENSHICOOP_ARM_TIMEOUT_MS = "240000"
+if ($useSteam) {
+    $env:KENSHICOOP_TRANSPORT  = "steam"
+    $env:KENSHICOOP_STEAM_PEER = "$(ConvertTo-SteamId64 $PeerSteamId)"
+} else {
+    $env:KENSHICOOP_TRANSPORT  = "udp"
+    $env:KENSHICOOP_STEAM_PEER = "0"
+}
 
 function Wait-ForLogLine {
     param([string]$File, [string]$Pattern, [int]$TimeoutSec)
@@ -242,8 +296,33 @@ try {
     if ($gamePid -eq 0) { throw "Kenshi failed to get past the launcher." }
     Write-Host "Game PID: $gamePid"
 
+    # Steam transport: surface this machine's SteamID (plugin logs "[steam] id=")
+    # so the friend can read it to the joining player for their -HostSteamId.
+    if ($useSteam) {
+        $deadline = (Get-Date).AddSeconds(120)
+        $myId = $null
+        while ((Get-Date) -lt $deadline -and $null -eq $myId) {
+            if (Test-Path $hostLog) {
+                $hit = Select-String -Path $hostLog -Pattern "\[steam\] id=(\d+)" -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($null -ne $hit) { $myId = $hit.Matches[0].Groups[1].Value }
+            }
+            if ($null -eq $myId) { Start-Sleep -Milliseconds 500 }
+        }
+        Write-Host ""
+        if ($null -ne $myId) {
+            Write-Host ">>> YOUR SteamID: $myId" -ForegroundColor Green
+            Write-Host ">>> The joining player runs: join_session.ps1 -HostSteamId $myId" -ForegroundColor Green
+        } else {
+            Write-Warning "No '[steam] id=' line in host.log - is Steam running and online?"
+        }
+    }
+
     if (Wait-ForLogLine -File $hostLog -Pattern "peer connected" -TimeoutSec 300) {
         Write-Host "JOINING PLAYER CONNECTED."
+    } elseif ($useSteam) {
+        Write-Warning "No connection after 5 min - check that BOTH Steams are online and the"
+        Write-Warning "SteamIDs were exchanged correctly (each side peers with the OTHER's id)."
+        Write-Warning "Leaving the game up in case they connect late."
     } else {
         Write-Warning "No connection after 5 min - check the port forward + firewall."
         Write-Warning "Leaving the game up in case they connect late."
@@ -282,6 +361,7 @@ try {
 role:          host
 kit save:      $save
 scenario:      $Scenario
+transport:     $(if ($useSteam) { "steam (peer $(ConvertTo-SteamId64 $PeerSteamId))" } else { "udp" })
 port:          $Port
 public ip:     $publicIp
 upnp:          $upnpNote

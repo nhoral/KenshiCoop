@@ -102,6 +102,38 @@ struct InboundStats {
     StatsPacket pkt;
 };
 
+// One received per-tab wallet snapshot (protocol 22): the tab's owner streams
+// its Ownerships::money; the receiver writes it onto its local copy of that
+// tab's platoon.
+struct InboundMoney {
+    u32         ownerId;
+    MoneyPacket pkt;
+};
+
+// One received stealth detection-map snapshot (protocol 20): the detection
+// AUTHORITY (the host's world, where the sneaker is a driven copy) streams who
+// notices the sneaker; the sneaker's OWNER replays the entries between its
+// local pair so the marker arrows render natively.
+struct InboundStealth {
+    u32           ownerId;
+    StealthPacket pkt;
+};
+
+// One received runtime-spawn query (protocol 21, host side): the join names a
+// streamed hand it cannot resolve; the host describes it (PKT_SPAWN_INFO).
+struct InboundSpawnReq {
+    u32            ownerId;
+    SpawnReqPacket pkt;
+};
+
+// One received runtime-spawn description (protocol 21, join side): the host's
+// template/faction/transform for a hand the join asked about; the join mints a
+// local proxy body and binds it to the hand key.
+struct InboundSpawnInfo {
+    u32             ownerId;
+    SpawnInfoPacket pkt;
+};
+
 class Inbound {
 public:
     Inbound()  { InitializeCriticalSection(&cs_); sawRemote_ = false; }
@@ -187,6 +219,26 @@ public:
         InboundStats ist; ist.ownerId = ownerId; ist.pkt = pkt;
         EnterCriticalSection(&cs_); stats_.push_back(ist); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received per-tab wallet snapshot (protocol 22), owner-tagged.
+    void pushMoney(u32 ownerId, const MoneyPacket& pkt) {
+        InboundMoney imo; imo.ownerId = ownerId; imo.pkt = pkt;
+        EnterCriticalSection(&cs_); money_.push_back(imo); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received stealth detection-map snapshot, owner-tagged.
+    void pushStealth(u32 ownerId, const StealthPacket& pkt) {
+        InboundStealth isl; isl.ownerId = ownerId; isl.pkt = pkt;
+        EnterCriticalSection(&cs_); stealth_.push_back(isl); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received runtime-spawn query (protocol 21), owner-tagged.
+    void pushSpawnReq(u32 ownerId, const SpawnReqPacket& pkt) {
+        InboundSpawnReq sr; sr.ownerId = ownerId; sr.pkt = pkt;
+        EnterCriticalSection(&cs_); spawnReq_.push_back(sr); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received runtime-spawn description (protocol 21), owner-tagged.
+    void pushSpawnInfo(u32 ownerId, const SpawnInfoPacket& pkt) {
+        InboundSpawnInfo si; si.ownerId = ownerId; si.pkt = pkt;
+        EnterCriticalSection(&cs_); spawnInfo_.push_back(si); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
     void drainConnects(std::deque<u32>& out) {
@@ -228,6 +280,18 @@ public:
     void drainStats(std::deque<InboundStats>& out) {
         EnterCriticalSection(&cs_); out.swap(stats_); LeaveCriticalSection(&cs_);
     }
+    void drainMoney(std::deque<InboundMoney>& out) {
+        EnterCriticalSection(&cs_); out.swap(money_); LeaveCriticalSection(&cs_);
+    }
+    void drainStealth(std::deque<InboundStealth>& out) {
+        EnterCriticalSection(&cs_); out.swap(stealth_); LeaveCriticalSection(&cs_);
+    }
+    void drainSpawnReqs(std::deque<InboundSpawnReq>& out) {
+        EnterCriticalSection(&cs_); out.swap(spawnReq_); LeaveCriticalSection(&cs_);
+    }
+    void drainSpawnInfos(std::deque<InboundSpawnInfo>& out) {
+        EnterCriticalSection(&cs_); out.swap(spawnInfo_); LeaveCriticalSection(&cs_);
+    }
 
 private:
     CRITICAL_SECTION          cs_;
@@ -245,6 +309,10 @@ private:
     std::deque<InboundTreatment>   treat_;
     std::deque<InboundSpeed>       speed_;
     std::deque<InboundStats>       stats_;
+    std::deque<InboundMoney>       money_;
+    std::deque<InboundStealth>     stealth_;
+    std::deque<InboundSpawnReq>    spawnReq_;
+    std::deque<InboundSpawnInfo>   spawnInfo_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);

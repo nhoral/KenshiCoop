@@ -27,6 +27,11 @@
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\make_remote_kit.ps1 -Save squad1 -SkipBuild
+
+.EXAMPLE
+  # Steam P2P kit (no port forwarding / router setup): bake YOUR steamid64 in as
+  # the friend-host's peer so their command stays one line.
+  powershell -ExecutionPolicy Bypass -File scripts\make_remote_kit.ps1 -Save squad1 -Transport steam -MySteamId 76561198000000000
 #>
 [CmdletBinding()]
 param(
@@ -41,7 +46,17 @@ param(
     [string]$Scenario = "coop_presence",
     [int]$Port = 27800,
     [switch]$SkipBuild,
-    [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi"
+    [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi",
+    # Transport baked into kit.json: "udp" (default; IP + port forwarding) or
+    # "steam" (connect by SteamID: NAT punch + Valve relay, no router setup).
+    [ValidateSet("udp", "steam")]
+    [string]$Transport = "udp",
+    # YOUR steamid64 (or short friend code), baked into a steam kit so the friend
+    # script already knows its peer: the friend-HOST peers with you (peerSteamId);
+    # a friend-JOIN kit connects to you as the host (hostSteamId). Get it from the
+    # "[steam] id=" line of any host.log, or steamid.io. Optional: the friend can
+    # always pass the id on the command line instead.
+    [string]$MySteamId = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -86,14 +101,82 @@ if ($Role -eq "host") {
 }
 
 # Kit defaults consumed by the friend script (keeps the friend's command minimal).
-@{
-    role     = $Role
-    save     = $Save
-    scenario = $Scenario
-    port     = $Port
-} | ConvertTo-Json | Set-Content "$kitDir\kit.json" -Encoding UTF8
+# Steam kits bake YOUR steamid64 as the friend's counterpart id: the friend-HOST
+# peers with you (peerSteamId); the friend-JOIN connects to you (hostSteamId).
+function ConvertTo-SteamId64([string]$id) {
+    $v = [uint64]$id
+    if ($v -lt 76561197960265728) { $v += 76561197960265728 }
+    return $v
+}
+$myId64 = if ($MySteamId -ne "") { "$(ConvertTo-SteamId64 $MySteamId)" } else { "" }
+$kitMeta = @{
+    role      = $Role
+    save      = $Save
+    scenario  = $Scenario
+    port      = $Port
+    transport = $Transport
+}
+if ($Transport -eq "steam" -and $myId64 -ne "") {
+    if ($Role -eq "host") { $kitMeta.peerSteamId = $myId64 }
+    else                  { $kitMeta.hostSteamId = $myId64 }
+}
+$kitMeta | ConvertTo-Json | Set-Content "$kitDir\kit.json" -Encoding UTF8
 
-$howTo = if ($Role -eq "host") {
+$steamKit = ($Transport -eq "steam")
+$howTo = if ($steamKit -and $Role -eq "host") {
+@"
+This kit uses STEAM P2P: Steam connects the two of you BY STEAMID - no port
+forwarding, no router setup, no public IPs. Keep Steam RUNNING and ONLINE.
+
+When it's time to play, from PowerShell in this folder:
+
+$(if ($myId64 -ne "") {
+"  powershell -ExecutionPolicy Bypass -File friend_host.ps1
+
+(The other player's SteamID is already baked into this kit.)"
+} else {
+"  powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <the other player's steamid64>
+
+(They will read you their SteamID; steamid.io converts profile URLs.)"
+})
+
+What it does:
+  * copies the mod into your Kenshi install (mods\KenshiCoop),
+  * copies the shared test save,
+  * launches Kenshi as the HOST and prints YOUR SteamID - read it to the
+    other player so they can join you,
+  * waits for the session (the test scenario starts only when the other
+    player is in-game; the game closes itself when the scenario finishes),
+  * bundles your log + screenshots into KenshiCoop-results-<stamp>.zip
+    next to this script. Send that zip back.
+"@
+} elseif ($steamKit) {
+@"
+This kit uses STEAM P2P: Steam connects the two of you BY STEAMID - no port
+forwarding, no router setup, no public IPs. Keep Steam RUNNING and ONLINE.
+
+Then, from PowerShell in this folder:
+
+$(if ($myId64 -ne "") {
+"  powershell -ExecutionPolicy Bypass -File friend_join.ps1
+
+(The host's SteamID is already baked into this kit.)"
+} else {
+"  powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId <the host's steamid64>"
+})
+
+IMPORTANT: also tell the host YOUR SteamID (Steam > profile > Account
+details, or steamid.io) - they need it on their side before you connect.
+
+What it does:
+  * copies the mod into your Kenshi install (mods\KenshiCoop),
+  * copies the shared test save into %LOCALAPPDATA%\kenshi\save,
+  * launches Kenshi, auto-loads the save and connects to the host via Steam,
+  * runs the agreed test scenario (it exits by itself when done),
+  * bundles your log + screenshots into KenshiCoop-results-<stamp>.zip
+    next to this script. Send that zip back.
+"@
+} elseif ($Role -eq "host") {
 @"
 RECOMMENDED - the day before the session, run the connectivity check
 (takes seconds, installs nothing):
@@ -148,18 +231,29 @@ You need:
 
 $howTo
 
+In free play the full sync set is active by default: positions, combat,
+health/limbs, stats, game speed, carried bodies, AND (new) inventory +
+equipment changes + items dropped on the ground.
+
 Nothing else on your machine is touched. To remove: delete
 <Kenshi>\mods\KenshiCoop and the test save folder.
 
 Troubleshooting:
   * "protocol mismatch" in the log = your kit is older/newer than the other
     player's build; ask for a fresh kit.
-  * No connection: UDP $Port must be reachable on the HOST. friend_host.ps1
+$(if ($steamKit) {
+"  * No connection (Steam kit): both Steams must be RUNNING and ONLINE (not
+    offline mode), and each side must be launched with the OTHER player's
+    SteamID. Look for '[steam] session ... active=1' in the log - relay=1
+    just means Valve is relaying (works fine, slightly higher ping)."
+} else {
+"  * No connection: UDP $Port must be reachable on the HOST. friend_host.ps1
     handles the Windows Firewall and asks the router to open the port via
     UPnP; if the script said UPnP failed, forward UDP $Port to the host PC
     manually on the router's 'port forwarding' page. If it warned about
     carrier-grade NAT, forwarding won't help - use a VPN overlay such as
-    Tailscale and share that IP instead.
+    Tailscale and share that IP instead."
+})
 "@ | Set-Content "$kitDir\README.txt" -Encoding UTF8
 
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -174,12 +268,20 @@ if ($Role -eq "host") {
     Write-Host "Next (friend-HOSTS topology):"
     Write-Host "  1. Dress-rehearse against the LAN machine: scripts\rehearse_host_kit.ps1"
     Write-Host "  2. Send the zip to your friend; schedule the session."
-    Write-Host "  3. Your side when it starts: scripts\join_session.ps1 -HostIp <their public IP> -Scenario $Scenario"
+    if ($steamKit) {
+        Write-Host "  3. Your side when it starts: scripts\join_session.ps1 -HostSteamId <their steamid64> -Scenario $Scenario"
+    } else {
+        Write-Host "  3. Your side when it starts: scripts\join_session.ps1 -HostIp <their public IP> -Scenario $Scenario"
+    }
     Write-Host "  4. Judge: scripts\analyze_run.ps1 -HostLog <theirs> -JoinLog <yours> -Scenario $Scenario"
 } else {
     Write-Host "Next (friend-JOINS topology):"
     Write-Host "  1. Dress-rehearse locally: scripts\rehearse_remote_kit.ps1"
     Write-Host "  2. Send the zip to your friend; schedule the session."
-    Write-Host "  3. Host side: scripts\host_session.ps1 -Scenario $Scenario"
+    if ($steamKit) {
+        Write-Host "  3. Host side: scripts\host_session.ps1 -Scenario $Scenario -PeerSteamId <their steamid64>"
+    } else {
+        Write-Host "  3. Host side: scripts\host_session.ps1 -Scenario $Scenario"
+    }
     Write-Host "  4. Judge: scripts\analyze_run.ps1 -HostLog <yours> -JoinLog <theirs> -Scenario $Scenario"
 }

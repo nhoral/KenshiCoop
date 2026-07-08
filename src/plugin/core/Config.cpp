@@ -29,6 +29,7 @@ void loadConfig(Config& c) {
     c.autoLoadDelayMs = (d > 0) ? (unsigned long)d : 5000ul;
 
     c.setupScene = envOr("KENSHICOOP_SETUP", "");
+    c.bakeSave   = envOr("KENSHICOOP_BAKESAVE", "");
     c.probeRecruit = envOr("KENSHICOOP_PROBE_RECRUIT", "") == "1";
     // AI-suspend is the DEFAULT quieting layer for the join's driven world NPCs
     // (review 2026-07-05). KENSHICOOP_AI_SUSPEND=0 is the escape hatch; the legacy
@@ -43,23 +44,41 @@ void loadConfig(Config& c) {
     // retry-passed). "0" is the escape hatch.
     c.gateAuthority = envOr("KENSHICOOP_GATE_AUTHORITY", "1") != "0";
 
-    // Inventory sync (Phase 4a): explicit env, OR auto-on when the inventory bake
-    // scene / the inv_order scenario is active (so the test + manual gate just work).
-    c.invSync = (envOr("KENSHICOOP_INV_SYNC", "") == "1") ||
-                (c.setupScene == "inventory") ||
-                (c.scenario == "inv_order") || (c.scenario == "inv_bidir") ||
-                (c.scenario == "inv_equip") || (c.scenario == "inv_reequip") ||
-                (c.scenario == "world_weapon_drop"); // W2 drop must beat the inv-reconcile destroy
+    // Inventory sync (Phase 4a). Env semantics: "1" = force on, "0" = force off
+    // (escape hatch), unset = ON for REAL sessions (scenario == "" - the 2026-07-07
+    // remote session played with it off and equipment changes never crossed), and
+    // auto-on for the inventory scenarios (so the test + manual gate just work).
+    // Scripted test scenarios outside that list keep it off, as before.
+    {
+        std::string env = envOr("KENSHICOOP_INV_SYNC", "");
+        bool auto_ = (c.scenario == "") || // free play / real co-op session
+                     (c.setupScene == "inventory") ||
+                     (c.scenario == "inv_order") || (c.scenario == "inv_bidir") ||
+                     (c.scenario == "inv_equip") || (c.scenario == "inv_reequip") ||
+                     (c.scenario == "vendor_trade") || // 1c: the bought item crosses on this channel
 
-    // World-item sync (Phase W1/W2): explicit env, OR auto-on for the world_item_* family
-    // (the drop_probe diagnostic is host-only and needs no world stream), the W2
-    // conservation-drop scenario (which rides the world-drop channel), and limb_loss
-    // (protocol 16: the severed-limb GROUND item replicates via this channel - the
-    // host's real item streams as a W1 proxy, the join's local copy is deduped).
-    c.worldSync = (envOr("KENSHICOOP_WORLD_SYNC", "") == "1") ||
-                  (c.scenario.compare(0, 11, "world_item_") == 0) ||
-                  (c.scenario == "world_weapon_drop") ||
-                  (c.scenario == "limb_loss");
+                     (c.scenario == "world_weapon_drop") || // W2 drop must beat the inv-reconcile destroy
+                     (c.scenario == "world_armor_drop");
+        c.invSync = (env == "1") || (env != "0" && auto_);
+    }
+
+    // World-item sync (Phase W1/W2). Env semantics: "1" = force on, "0" = force off
+    // (escape hatch), unset = ON for REAL sessions (scenario == "" - dropped gear was
+    // invisible cross-client in the 2026-07-07 remote session with it off), and
+    // auto-on for the world_item_* family (the drop_probe diagnostic is host-only and
+    // needs no world stream), the W2 conservation-drop scenarios (which ride the
+    // world-drop channel), and limb_loss (protocol 16: the severed-limb GROUND item
+    // replicates via this channel - the host's real item streams as a W1 proxy, the
+    // join's local copy is deduped).
+    {
+        std::string env = envOr("KENSHICOOP_WORLD_SYNC", "");
+        bool auto_ = (c.scenario == "") || // free play / real co-op session
+                     (c.scenario.compare(0, 11, "world_item_") == 0) ||
+                     (c.scenario == "world_weapon_drop") ||
+                     (c.scenario == "world_armor_drop") ||
+                     (c.scenario == "limb_loss");
+        c.worldSync = (env == "1") || (env != "0" && auto_);
+    }
 
     // Medical sync (phase 2 of the player-combat/medical plan): DEFAULT ON -
     // owner-authoritative vitals for player-squad members + treatment forwarding.
@@ -69,7 +88,10 @@ void loadConfig(Config& c) {
 
     // Consensus game-speed sync: DEFAULT ON - requests min-arbitrated by the
     // host, combat caps fast-forward at 1x. "0" is the A/B escape hatch.
+    // Forced OFF for the speed_probe spike: the probe drives the quiet/loud
+    // writers directly and the replicator's enforcement would fight it.
     c.speedSync = envOr("KENSHICOOP_SPEED_SYNC", "1") != "0";
+    if (c.scenario == "speed_probe") c.speedSync = false;
 
     // Character stats sync (protocol 17): DEFAULT ON - owner-authoritative
     // CharStats stream for player-squad members. Without it a driven copy
@@ -82,6 +104,40 @@ void loadConfig(Config& c) {
     // it the peer's down-enforcement drags/teleports a carried KO'd body
     // along the ground behind its carrier. "0" is the A/B escape hatch.
     c.carrySync = envOr("KENSHICOOP_CARRY_SYNC", "1") != "0";
+
+    // Furniture occupancy sync (protocol 19, DEFAULT ON): reliable enter/exit
+    // edges + self-healing BODY_IN_BED/BODY_IN_CAGE state, executed engine-
+    // native (setBedMode/setPrisonMode) between each machine's local pair.
+    // "0" is the A/B escape hatch.
+    c.furnSync = envOr("KENSHICOOP_FURN_SYNC", "1") != "0";
+    c.stealthSync = envOr("KENSHICOOP_STEALTH_SYNC", "1") != "0";
+    c.moneySync   = envOr("KENSHICOOP_MONEY_SYNC", "1") != "0";
+    // Forced OFF for the shop_probe diagnostic - that scenario exists to
+    // measure the UNSYNCED wallet/vendor baseline (its sentinel writes must
+    // not cross), and its findings gate this channel's design.
+    if (c.scenario == "shop_probe") c.moneySync = false;
+
+    // Runtime-spawn proxy replication (protocol 21, DEFAULT ON): the join
+    // mints local proxy bodies for host runtime spawns it cannot resolve.
+    // Forced OFF for the spawn_probe diagnostic - that scenario exists to
+    // baseline the unresolved-hand + suppression failure modes, and the
+    // proxy channel would paper over them. "0" is the A/B escape hatch.
+    c.spawnSync = envOr("KENSHICOOP_SPAWN_SYNC", "1") != "0";
+    if (c.scenario == "spawn_probe") c.spawnSync = false;
+
+    c.recruitSync = envOr("KENSHICOOP_RECRUIT_SYNC", "1") != "0";
+    // Forced OFF for the recruit_probe diagnostic - it exists to measure the
+    // UNSYNCED recruit baseline (duplicate proxies, invisible join recruits),
+    // and its findings gate this channel's design.
+    if (c.scenario == "recruit_probe") c.recruitSync = false;
+
+    // Transport: "udp" (default) keeps the stock ENet/UDP path (the whole local
+    // harness runs on it); "steam" tunnels ENet over Steam P2P by SteamID (no
+    // port forwarding / CGNAT-immune). steamPeer is the OTHER player's steamid64
+    // (two-code exchange); steamPing arms the channel-1 reachability spike.
+    c.transport = envOr("KENSHICOOP_TRANSPORT", "udp");
+    c.steamPeer = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PEER", "0").c_str(), 0, 10);
+    c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
 
     int delay  = std::atoi(envOr("KENSHICOOP_NETSIM_DELAY_MS", "0").c_str());
     int jitter = std::atoi(envOr("KENSHICOOP_NETSIM_JITTER_MS", "0").c_str());

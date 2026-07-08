@@ -87,6 +87,35 @@ public:
     // carried body is released back to the ordinary KO/down channels.
     void sweepCarries(GameWorld* gw);
 
+    // Furniture occupancy sync (protocol 19, default ON): reliable enter/exit
+    // edges + self-healing BODY_IN_BED/BODY_IN_CAGE state, executed engine-
+    // native (setBedMode/setPrisonMode) on each machine's local pair.
+    // KENSHICOOP_FURN_SYNC=0 disables.
+    void setFurnSync(bool v) { furnSync_ = v; }
+
+    // Stealth sync (protocol 20, default ON): continuous BODY_SNEAK posture
+    // apply on driven copies (engine-native setStealthMode) + the detection-
+    // indicator feedback stream. KENSHICOOP_STEALTH_SYNC=0 disables.
+    void setStealthSync(bool v) { stealthSync_ = v; }
+
+    // Runtime-spawn proxy replication (protocol 21, default ON): the join
+    // requests a description for any streamed hand it cannot resolve (a host
+    // RUNTIME spawn) and mints a local proxy body bound at the applyTargets
+    // resolve choke point. KENSHICOOP_SPAWN_SYNC=0 disables (and spawn_probe
+    // forces it off to baseline the failure modes).
+    void setSpawnSync(bool v) { spawnSync_ = v; }
+
+    // BEFORE engine (protocol 21 -> 23, both clients): the describe/mint channel,
+    // BIDIRECTIONAL since protocol 23 (a join RECRUIT of a runtime-born NPC mints
+    // a hand the host cannot resolve). Each side both:
+    //  * sends debounced PKT_SPAWN_REQ for hands applyTargets recorded as
+    //    unresolved near the squad; drains PKT_SPAWN_INFO replies and mints local
+    //    proxy bodies (engine::spawnProxyNpc), binding them in proxyByKey_;
+    //  * drains PKT_SPAWN_REQ, resolves + describes the body
+    //    (engine::describeCharacter) and replies PKT_SPAWN_INFO (throttled per
+    //    hand; found=0 = negative reply, stops the peer's retries).
+    void syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
+
     // Phase 4a: register a container (by hand) this client is AUTHORITATIVE for, so
     // publishInventories streams its contents and applyInventories never reconciles
     // it back onto us. hand layout = [type, container, containerSerial, index, serial].
@@ -103,7 +132,8 @@ public:
 
     // BEFORE engine (join side): drain reliable transition events and latch them
     // onto the matching tracked body (death = held down permanently; revive clears).
-    void applyEvents(Inbound& in);
+    // gw is needed by the EVT_RECRUIT re-key (restoring a suppressed local body).
+    void applyEvents(GameWorld* gw, Inbound& in);
 
     // BEFORE engine: capture the locally-owned squad and publish it (host side).
     // Also detects per-entity bodyState transitions (KO/death/revive) and queues the
@@ -180,6 +210,46 @@ public:
     // fights accumulate locally (the owner's stream overwrites it).
     void applyStats(GameWorld* gw, Inbound& in);
 
+    // AFTER publishOwned (protocol 22, both clients): stream the WALLET
+    // (Ownerships::money) of every squad tab this client OWNS, keyed by tab
+    // RANK - change-gated on the reliable channel with a ~1 Hz floor and a
+    // periodic safety resend (the publishStats pacing). Kenshi's wallet is
+    // per-Platoon; nothing else about money is on the wire (shop_probe).
+    void publishMoney(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 22): drain received wallet snapshots and write
+    // each PEER-owned tab's money onto our local copy of that tab's platoon
+    // via Ownerships::setMoney. Never writes a rank we own.
+    void applyMoney(GameWorld* gw, Inbound& in);
+
+    // Per-tab wallet sync master enable (KENSHICOOP_MONEY_SYNC).
+    void setMoneySync(bool v) { moneySync_ = v; }
+
+    // BEFORE engine (protocol 23, both clients): drain the engine's recruit-edge
+    // queue (the PlayerInterface::recruit detour records every successful LOCAL
+    // recruit) and author one reliable EVT_RECRUIT per edge (subject = the OLD
+    // hand, actor = the NEW hand). Also pins each recruited hand into
+    // recruitOwned_ so publishOwned streams it even when the engine parked it
+    // in a tab RANK the partition says the peer owns (recruit_probe: a join
+    // recruit landed in the host's rank-0 container).
+    void publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // Recruitment sync master enable (KENSHICOOP_RECRUIT_SYNC).
+    void setRecruitSync(bool v) { recruitSync_ = v; }
+
+    // AFTER publishOwned (protocol 20, HOST only - the world-detection
+    // authority): for every DRIVEN copy currently in stealth mode, read its
+    // whoSeesMeSneaking map and stream a PKT_STEALTH snapshot back to the
+    // sneaker's OWNER (~4 Hz while active, change-gated; one final empty
+    // snapshot when the sneak ends / the map empties so stale arrows clear).
+    void publishStealth(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 20): drain received detection snapshots; each
+    // subject we OWN gets the entries replayed between the LOCAL pair via
+    // notifyICanSeeYouSneaking, so the marker arrows render natively on the
+    // owner's screen. Never applied to driven copies.
+    void applyStealthFeedback(GameWorld* gw, Inbound& in);
+
     // BEFORE engine (consensus game-speed sync, runs on BOTH clients):
     //  * detect a LOCAL user speed click (current state != what WE last applied)
     //    and turn it into a request (pause = speed 0);
@@ -243,6 +313,7 @@ private:
         bool         taskApplied;    // a fixture-resolved pose is currently held
         bool         taskBad;        // task not reproducible here (fixture missing/drift)
         unsigned long taskTick;      // when the task was issued (drift grace timer)
+        unsigned int taskRetries;    // far-fixture (r=3) attempts (interp-lag retry)
         bool         detached;       // I9: detached from town-AI (separateIntoMyOwnSquad) once
         bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
         bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
@@ -266,26 +337,38 @@ private:
         unsigned long carryNoSeeTick; // first tick a locally-carrying copy's stream
                                       //   stopped reporting TASK_CARRY_BODY (the
                                       //   debounced host-side-drop detector)
+        // Furniture occupancy sync (protocol 19):
+        unsigned long furnHealTick;   // last self-heal enter attempt (throttle)
+        unsigned long furnNoSeeTick;  // first tick a locally-occupying copy's stream
+                                      //   stopped reporting the occupancy bit (the
+                                      //   debounced owner-side-exit detector)
+        // Stealth sync (protocol 20):
+        unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), lastSeenMs(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
-                   taskTick(0), detached(false), downApplied(false),
+                   taskTick(0), taskRetries(0), detached(false), downApplied(false),
                    koLatched(false), deathLatched(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
                    combatSeenTick(0), combatSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
-                   carryHealTick(0), carryNoSeeTick(0) {}
+                   carryHealTick(0), carryNoSeeTick(0),
+                   furnHealTick(0), furnNoSeeTick(0), sneakTick(0) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
     // fixture resolves locally, commit it ONCE (seated/idle at the same object);
     // otherwise quiet the AI and park at the host transform. Drift-guarded; re-arms
     // when the host task changes. Used by both the NPC and squad at-rest branches.
+    // isSquad: player-squad members are NEVER town-AI-detached (the detach
+    // re-containers the body OUT of its squad tab - a new hand - which breaks
+    // every hand-keyed protocol on a squad member; observed on bed_pose).
     void applyRest(Character* c, Driven& d, const EntityState& out,
-                   bool haveActual, float ax, float ay, float az, unsigned long now);
+                   bool haveActual, float ax, float ay, float az, unsigned long now,
+                   bool isSquad);
 
     std::map<Key, Driven> targets_;
     // Host side: last bodyState we published per owned entity (+ when it was last
@@ -298,8 +381,15 @@ private:
         // edge exactly once per transition. carried = the carried body's hand
         // (readObjectHand layout), meaningful only while carrying.
         bool carrying; unsigned int carried[5];
-        HostBody() : bs(0), seenMs(0), carrying(false) {
+        // Furniture occupancy (protocol 19): last published occupancy of this
+        // entity (0 none / 1 bed / 2 cage) + the furniture's hand (captured
+        // from the local Character on the ENTER edge), so publishOwned can
+        // emit the reliable enter/exit edge exactly once per transition and
+        // still name the furniture on EXIT.
+        int furnKind; unsigned int furn[5];
+        HostBody() : bs(0), seenMs(0), carrying(false), furnKind(0) {
             carried[0] = carried[1] = carried[2] = carried[3] = carried[4] = 0;
+            furn[0] = furn[1] = furn[2] = furn[3] = furn[4] = 0;
         }
     };
     std::map<Key, HostBody> hostBody_;
@@ -315,6 +405,11 @@ private:
     // streaming them. Keyed by hand so we restore the exact body when it re-enters
     // the host's streamed set.
     std::map<Key, Character*> suppressed_;
+    // Phase 2 (runtime-spawn sync): last time the suppressed set was re-hidden.
+    // The engine can undo a one-shot hide on its own (ambush dialog/combat
+    // re-tasks the body, zone streaming re-adds it to the update list), so the
+    // hide is re-asserted on a ~2 s cadence while the hand stays unstreamed.
+    unsigned long authReassertMs_;
     // Bodies applyTargets actually drove this tick, by POINTER: a combat-driven
     // world NPC is detached into its own squad (container changes), so its local
     // enumeration key no longer matches the host's streamed key - the hand-keyed
@@ -456,6 +551,18 @@ private:
 
     // Carried-body sync (protocol 18): master enable (KENSHICOOP_CARRY_SYNC).
     bool                 carrySync_;
+    bool                 furnSync_;
+    // Stealth sync (protocol 20): master enable (KENSHICOOP_STEALTH_SYNC).
+    bool                 stealthSync_;
+    // Host-side detection-feedback publish state per DRIVEN sneaker: last sent
+    // map fingerprint + send time (~4 Hz change-gated), and whether the last
+    // snapshot was ACTIVE (so the end of a sneak authors exactly one clearing
+    // empty snapshot).
+    struct StealthPub {
+        u32 hash; unsigned long lastSendMs; bool active;
+        StealthPub() : hash(0), lastSendMs(0), active(false) {}
+    };
+    std::map<Key, StealthPub> stealthPub_;
 
     // Phase-2 medical channel state.
     // medPub_: per OWNED member, the last SENT quantized fingerprint + send time
@@ -494,6 +601,23 @@ private:
         StatsPub() : hash(0), lastSendMs(0) {}
     };
     std::map<Key, StatsPub> statsPub_;
+    // Protocol 22: per OWNED tab rank, the last SENT wallet value + send time
+    // (change gate + safety resend). A settled economy is silent.
+    struct MoneyPub {
+        int lastSent; unsigned long lastSendMs;
+        MoneyPub() : lastSent(-1), lastSendMs(0) {}
+    };
+    std::map<unsigned int, MoneyPub> moneyPub_;
+    bool moneySync_;
+    // Protocol 23 recruitment sync state.
+    bool recruitSync_;
+    // Hands WE recruited this session: publishOwned streams them regardless of
+    // which tab rank their container maps to (the recruiter is the authority
+    // for its recruits - the rank partition alone can misattribute them).
+    std::set<Key> recruitOwned_;
+    // Hands the PEER recruited (learned from EVT_RECRUIT): never publish them
+    // even if a local census would rank them into a tab we own.
+    std::set<Key> peerRecruit_;
     // Phase B: combat-scoped world-NPC vitals (host side). Keys of streamed
     // NPCs that are fighting / being fought / down, with last-qualified time;
     // publishMedical streams their vitals at ~1 Hz while fresh. The join's
@@ -515,6 +639,37 @@ private:
     u32           speedSeqSeen_;       // newest seq accepted from the peer (stale guard)
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
+
+    // Protocol 21 runtime-spawn proxy replication state.
+    bool spawnSync_;
+    // JOIN: streamed hand -> locally-minted proxy body. Checked at the
+    // applyTargets resolve choke point when engine::resolve fails, so a bound
+    // proxy inherits the ENTIRE world-NPC drive path (AI-suspend, damage
+    // guard, combat rendering, down/death latches). The proxy's own LOCAL
+    // hand never matches the streamed key; enforceHostAuthority recognises it
+    // by pointer via drivenChars_ (hide on stale stream / restore on return
+    // come free from the existing hysteresis).
+    std::map<Key, Character*> proxyByKey_;
+    // JOIN: per-hand request state - debounce, retry cap, negative-reply
+    // backoff (deniedMs = when the host said "can't resolve either" or the
+    // local proxy spawn failed; retried only after a long cooldown).
+    struct SpawnReqState {
+        unsigned long lastSendMs; unsigned int sends; unsigned long deniedMs;
+        SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0) {}
+    };
+    std::map<Key, SpawnReqState> spawnReq_;
+    // JOIN: hands applyTargets failed to resolve this tick, with the streamed
+    // position (the request-authoring queue; proximity-gated in syncSpawns so
+    // a far unloaded BAKED zone doesn't breed duplicate proxies).
+    struct UnresolvedHand { float x, y, z; };
+    std::map<Key, UnresolvedHand> unresolvedHands_;
+    // Phase 0 telemetry: hands already reported unresolved (log once per hand).
+    std::set<Key> spawnLogged_;
+    // HOST: per-hand reply throttle (a re-request within the window is a
+    // duplicate in flight, not a new question).
+    std::map<Key, unsigned long> spawnReplyMs_;
+    // JOIN: last "SCENARIO PROXY ..." telemetry emit (~2 Hz while proxies live).
+    unsigned long spawnPosLogMs_;
 
     // Divergence-gated authority state (step 4).
     bool                 gateAuthority_;

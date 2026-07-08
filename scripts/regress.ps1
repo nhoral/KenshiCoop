@@ -66,8 +66,9 @@ $manifest = Get-ScenarioManifest
 $preferredOrder = @(
     "leader_move", "coop_presence", "split_interest", "npc_sync", "craft_order",
     "down_order", "death_order", "combat_probe", "combat_order", "combat_kill",
+    "carry_order", "npc_carry",
     "inv_order", "inv_bidir", "inv_equip", "inv_reequip", "inv_addequip",
-    "world_item_sync", "wpn_relocate", "world_weapon_drop"
+    "world_item_sync", "wpn_relocate", "world_weapon_drop", "world_armor_drop"
 )
 
 # ---- 1. Select the scenario matrix -------------------------------------------

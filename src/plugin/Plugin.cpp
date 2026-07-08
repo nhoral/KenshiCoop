@@ -30,6 +30,7 @@
 #include "core/Config.h"
 #include "core/Inbound.h"
 #include "net/NetLink.h"
+#include "net/SteamP2P.h"
 #include "game/Engine.h"
 #include "sync/Replicator.h"
 #include "test/Scenario.h"
@@ -61,6 +62,7 @@ const DWORD     SCENARIO_HOLD_MS  = 4000; // hold synced state on screen for cap
 bool            g_setupDone     = false;
 const DWORD     SETUP_DELAY_MS  = 4000; // let the world settle before spawning
 DWORD           g_lastCraftRearmTick = 0; // throttle host craft re-arm
+DWORD           g_bakeSaveTick  = 0;     // != 0: auto-bake save armed at this tick
 const DWORD     CRAFT_REARM_MS  = 3000; // re-issue the work goal at most this often
 
 // Original function pointers, filled by KenshiLib::AddHook.
@@ -91,9 +93,10 @@ void processNetEvents(GameWorld* gw) {
         _snprintf(b, sizeof(b) - 1, "handshake: peer left id=%u", (unsigned)*it);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
-        // Carried-body sync (protocol 18): the departed peer's stream will never
-        // author its drop edges - release any carry its driven copies still hold.
-        if (gw && g_cfg.carrySync) g_repl.sweepCarries(gw);
+        // Carried-body sync (protocol 18) + furniture occupancy (protocol 19):
+        // the departed peer's stream will never author its drop/exit edges -
+        // release any carry or occupancy its driven copies still hold.
+        if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw);
     }
 }
 
@@ -105,6 +108,14 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         g_gameStarted   = true;
         g_gameStartTick = GetTickCount();
         coopLog("KenshiCoop: gameplay started");
+        // Speed-intent capture (vote/effective decoupling): detour the engine's
+        // speed setters so every USER action (button, keyboard pause, simulated
+        // click) registers as a vote, while our own quiet applies stay invisible.
+        // Installed at gameplay start so the seed reads the save's live speed.
+        if (coop::engine::installSpeedIntentHooks(gw))
+            coopLog("[speed] intent hooks installed (setGameSpeed/userPause/togglePause)");
+        else
+            coopLog("[speed] FAILED to install intent hooks (vote capture degraded)");
     }
 
     // Test-runner self-exit: quit cleanly after the configured duration so
@@ -155,6 +166,16 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             bool ok = coop::engine::setupSquadScene(gw);
             coopLog(ok ? "SETUP(squad): second squad tab built - SAVE your two-tab save now"
                        : "SETUP(squad): squad-tab build FAILED");
+        } else if (g_cfg.setupScene == "bedcage") {
+            // Bed+cage occupancy (protocol 19) BAKE: spawn a bed and a prison
+            // cage near the leader so both clients load save-stable furniture
+            // hands. With KENSHICOOP_BAKESAVE set the save is written
+            // automatically a few seconds later (no manual menu round-trip).
+            bool ok = coop::engine::setupBedCageScene(gw);
+            coopLog(ok ? "SETUP(bedcage): bed + cage spawned - SAVE 'bedcage1' now"
+                       : "SETUP(bedcage): spawn FAILED");
+            if (ok && !g_cfg.bakeSave.empty())
+                g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
         } else if (g_cfg.setupScene == "inventory") {
             // Inventory (Phase 4a) BAKE: spawn a save-stable storage container in front
             // of the leader + seed it with items so both clients load an identical
@@ -184,6 +205,18 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             }
         }
         coopLog("SETUP: scene ready - arrange the pose and SAVE the game now");
+    }
+
+    // Deferred auto-bake: write the fixture save once the armed settle window
+    // elapses. One-shot; the self-exit timer (KENSHICOOP_TEST_SECONDS) then
+    // ends the bake run.
+    if (g_bakeSaveTick != 0 && GetTickCount() >= g_bakeSaveTick) {
+        g_bakeSaveTick = 0;
+        bool ok = coop::engine::saveGameAs(g_cfg.bakeSave);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SETUP: auto-bake save '%s' %s",
+                  g_cfg.bakeSave.c_str(), ok ? "ISSUED" : "FAILED");
+        b[sizeof(b) - 1] = '\0'; coopLog(b);
     }
 
     // Craft re-arm (host): a baked work goal does not persist across save/load, and a
@@ -243,7 +276,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // Both clients latch reliable transition events (KO/death/revive) for the bodies
     // they drive, before apply (a side can emit an event for its own owned body and
     // the peer that drives that body must honour it).
-    g_repl.applyEvents(g_inbound);
+    g_repl.applyEvents(gw, g_inbound);
     if (g_gameStarted) {
         g_repl.publishOwned(gw, g_net, g_net.localId());
         // Both clients stream the contents of every squad member they OWN (host tab 0,
@@ -283,12 +316,44 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             g_repl.publishStats(gw, g_net, g_net.localId());
             g_repl.applyStats(gw, g_inbound);
         }
+        // Per-tab wallet sync (protocol 22): each client streams the money of
+        // the squad tabs it OWNS (change-gated reliable, keyed by tab rank);
+        // received snapshots land on the peer tabs via Ownerships::setMoney.
+        // Ordered after publishOwned (ownership ranks are the partition rule).
+        if (g_cfg.moneySync) {
+            g_repl.publishMoney(gw, g_net, g_net.localId());
+            g_repl.applyMoney(gw, g_inbound);
+        }
+        // Recruitment sync (protocol 23): drain the recruit detour's edge queue
+        // into reliable EVT_RECRUIT events (subject = old hand, actor = new
+        // hand) and pin recruited hands to their recruiter's ownership. The
+        // receive half (re-key) lives in applyEvents above. Ordered after
+        // publishOwned so this tick's recruits pin BEFORE next tick's census.
+        if (g_cfg.recruitSync)
+            g_repl.publishRecruits(gw, g_net, g_net.localId());
+        // Stealth sync (protocol 20): the HOST is the world-detection authority
+        // - it streams each DRIVEN sneaker's whoSeesMeSneaking back to the
+        // sneaker's owner; every client replays received snapshots onto the
+        // bodies it OWNS (the indicators render on the owner's screen). The
+        // posture half lives inside applyTargets (continuous BODY_SNEAK apply).
+        if (g_cfg.stealthSync) {
+            if (g_cfg.isHost)
+                g_repl.publishStealth(gw, g_net, g_net.localId());
+            g_repl.applyStealthFeedback(gw, g_inbound);
+        }
         // Consensus game-speed sync: detect local speed clicks as REQUESTS,
         // host arbitrates effective = min(requests) (capped at 1x while either
         // player squad fights) and broadcasts; the join applies the SET. Runs
         // after publishOwned (the combat flag samples the ownHands_ set).
         if (g_cfg.speedSync)
             g_repl.syncSpeed(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+        // Runtime-spawn proxy replication (protocol 21): the join asks about
+        // streamed hands it couldn't resolve last tick (host RUNTIME spawns)
+        // and mints local proxy bodies from the host's replies; the host
+        // answers requests. BEFORE the engine tick so a proxy bound this
+        // frame is driven by this frame's applyTargets.
+        if (g_cfg.spawnSync)
+            g_repl.syncSpawns(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
     }
 
     // Scenario onStart fires once, BEFORE the engine tick, so a host-issued move
@@ -427,6 +492,29 @@ void startNetworking() {
         coopLog(b);
     }
 
+    // Steam reachability spike (channel 1): independent of the transport, so a
+    // UDP session can still prove Steam P2P punch-vs-relay against a peer.
+    if (g_cfg.steamPing != 0) {
+        if (coop::steamp2p::init()) coop::steamp2p::setPingPeer(g_cfg.steamPing);
+        else coopErr("[steam] KENSHICOOP_STEAM_PING set but Steam init failed");
+    }
+
+    // Steam P2P transport: connect by SteamID (NAT punch + Valve relay) with the
+    // ENet protocol unchanged. Requires the partner's steamid64; falls back to
+    // UDP loudly when Steam is unavailable so a misconfigured session still
+    // behaves like the stock build instead of silently doing nothing.
+    if (g_cfg.transport == "steam") {
+        if (g_cfg.steamPeer == 0) {
+            coopErr("[steam] KENSHICOOP_TRANSPORT=steam requires KENSHICOOP_STEAM_PEER=<partner steamid64>; falling back to UDP");
+        } else if (!coop::steamp2p::init()) {
+            coopErr("[steam] init failed (Steam not running / offline?); falling back to UDP");
+        } else {
+            coop::steamp2p::setPeer(g_cfg.steamPeer);
+            g_net.setSteamTransport(g_cfg.steamPeer);
+            coopLog("[steam] transport=steam armed (connect by SteamID; no port forwarding)");
+        }
+    }
+
     bool ok;
     if (g_cfg.isHost) {
         coopLog("KenshiCoop: starting as HOST");
@@ -512,6 +600,22 @@ __declspec(dllexport) void startPlugin() {
     // self-healing carried state. KENSHICOOP_CARRY_SYNC=0 is the A/B escape hatch.
     g_repl.setCarrySync(g_cfg.carrySync);
 
+    // Furniture occupancy sync (protocol 19, default ON): reliable bed/cage
+    // enter/exit edges + self-healing occupancy state. KENSHICOOP_FURN_SYNC=0
+    // is the A/B escape hatch.
+    g_repl.setFurnSync(g_cfg.furnSync);
+    g_repl.setStealthSync(g_cfg.stealthSync);
+
+    // Per-tab wallet sync (protocol 22, default ON): owner-authoritative money
+    // per squad tab. KENSHICOOP_MONEY_SYNC=0 is the A/B escape hatch (and the
+    // shop_probe baseline).
+    g_repl.setMoneySync(g_cfg.moneySync);
+
+    // Runtime-spawn proxy replication (protocol 21, default ON): the join mints
+    // local proxy bodies for host runtime spawns it cannot resolve by hand.
+    // KENSHICOOP_SPAWN_SYNC=0 is the A/B escape hatch (spawn_probe forces off).
+    g_repl.setSpawnSync(g_cfg.spawnSync);
+
     // AI-gating probe (join side): recruit diverged NPCs to test the inhabit lever.
     if (!g_cfg.isHost && g_cfg.probeRecruit) g_repl.setProbeRecruit(true);
 
@@ -559,6 +663,30 @@ __declspec(dllexport) void startPlugin() {
         } else {
             coopLog("[dmg] FAILED to install hitByMeleeAttack detour; damage guard disabled");
         }
+    }
+
+    // Purchase observability (protocol 22, 1c groundwork): log every real
+    // trade-UI purchase ("[shop] BUY-LOCAL"), the field evidence for the
+    // vendor-stock mirror design. Rides the money-sync gate.
+    if (g_cfg.moneySync) {
+        if (coop::engine::installShopHook())
+            coopLog("[shop] buyItem detour installed; purchase logging ON");
+        else
+            coopLog("[shop] FAILED to install buyItem detour; purchase logging off");
+    }
+
+    // Recruitment sync (protocol 23, default ON): detour PlayerInterface::
+    // recruit so every successful local recruit (dialog or programmatic)
+    // authors a reliable EVT_RECRUIT; the peer re-keys its local copy of the
+    // recruited body to the new stream key. KENSHICOOP_RECRUIT_SYNC=0 is the
+    // A/B escape hatch (recruit_probe forces it off to keep the unsynced
+    // baseline measurable).
+    g_repl.setRecruitSync(g_cfg.recruitSync);
+    if (g_cfg.recruitSync) {
+        if (coop::engine::installRecruitHook())
+            coopLog("[recruit] recruit detour installed; recruitment sync ON");
+        else
+            coopLog("[recruit] FAILED to install recruit detour; recruitment sync degraded (no local-edge detection)");
     }
 
     // Auto-load: only hook the title screen when a save name was provided.

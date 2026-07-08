@@ -7,6 +7,11 @@
   One command:
     powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostIp <host public IP>
 
+  Steam P2P (no IPs, no port forwarding - the host tells you their SteamID):
+    powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId <their steamid64>
+  You must ALSO tell the host YOUR SteamID (Steam > profile > Account details,
+  or steamid.io); they pass it as -PeerSteamId on their side.
+
   Installs the bundled mod + save into the local Kenshi, launches the game as
   the JOIN client pointed at the host, lets the agreed scenario run to its own
   self-exit (remote profile: generous timeouts), captures screenshots at the
@@ -19,7 +24,11 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$HostIp,
+    [string]$HostIp = "",
+    # Steam P2P transport: the HOST's steamid64 (or short friend code). No IPs or
+    # port forwarding needed; Steam brokers the connection. The host needs YOUR
+    # SteamID on their side too.
+    [string]$HostSteamId = "",
     # Kenshi install dir (auto-detected from the default Steam path when empty).
     [string]$KenshiDir = "",
     # Override the kit's default scenario ("" = kit default; "free" = no scenario,
@@ -33,12 +42,25 @@ param(
 $ErrorActionPreference = "Stop"
 $kitDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# Short Steam friend codes are steamid64 minus the account-universe base.
+function ConvertTo-SteamId64([string]$id) {
+    $v = [uint64]$id
+    if ($v -lt 76561197960265728) { $v += 76561197960265728 }
+    return $v
+}
+
 # ---- Kit defaults --------------------------------------------------------------
 $kit = Get-Content (Join-Path $kitDir "kit.json") -Raw | ConvertFrom-Json
 $save = $kit.save
 if ($Scenario -eq "") { $Scenario = $kit.scenario }
 if ($Scenario -eq "free") { $Scenario = "" }
 if ($Port -eq 0) { $Port = [int]$kit.port }
+# The kit can pre-bake the Steam transport (kit.json: transport + hostSteamId).
+if ($HostSteamId -eq "" -and $kit.PSObject.Properties["hostSteamId"] -and "$($kit.hostSteamId)" -ne "" -and "$($kit.hostSteamId)" -ne "0") {
+    $HostSteamId = "$($kit.hostSteamId)"
+}
+$useSteam = ($HostSteamId -ne "")
+if (-not $useSteam -and $HostIp -eq "") { throw "Pass -HostIp <ip> (UDP) or -HostSteamId <steamid64> (Steam P2P)." }
 
 # ---- Locate Kenshi ---------------------------------------------------------------
 if ($KenshiDir -eq "") {
@@ -95,9 +117,22 @@ $env:KENSHICOOP_FAKE_CLOCK_SKEW_MS = "0"
 # Peer-ready arming: the scenario clock starts when the host's stream arrives;
 # generous fallback for a slow internet connect.
 $env:KENSHICOOP_ARM_TIMEOUT_MS = "240000"
+if ($useSteam) {
+    $hostId64 = ConvertTo-SteamId64 $HostSteamId
+    $env:KENSHICOOP_TRANSPORT  = "steam"
+    $env:KENSHICOOP_STEAM_PEER = "$hostId64"
+} else {
+    $env:KENSHICOOP_TRANSPORT  = "udp"
+    $env:KENSHICOOP_STEAM_PEER = "0"
+}
 
+$target = if ($useSteam) { "steam:$(ConvertTo-SteamId64 $HostSteamId)" } else { "${HostIp}:$Port" }
 Write-Host ""
-Write-Host "Launching Kenshi as JOIN -> ${HostIp}:$Port  (save '$save', scenario '$Scenario')"
+if ($useSteam) {
+    Write-Host "Transport: STEAM P2P (no IP / port forwarding). Make sure Steam is ONLINE"
+    Write-Host "and that the host launched with YOUR SteamID as their peer."
+}
+Write-Host "Launching Kenshi as JOIN -> $target  (save '$save', scenario '$Scenario')"
 $out = & (Join-Path $kitDir "start_kenshi.ps1") -ExePath (Join-Path $KenshiDir "kenshi_x64.exe") -WorkDir $KenshiDir -TimeoutSec 240 6>&1
 $out | ForEach-Object { Write-Host "    $_" }
 $gamePid = 0
@@ -122,6 +157,9 @@ function Wait-ForLogLine {
 # ---- Monitor: connection, gameplay, scenario anchor, screenshots ------------------------
 if (Wait-ForLogLine -File $joinLog -Pattern "peer connected" -TimeoutSec 120) {
     Write-Host "CONNECTED to the host."
+} elseif ($useSteam) {
+    Write-Warning "No connection after 120 s. Check that BOTH Steams are online and that"
+    Write-Warning "the host used YOUR SteamID as their peer. Results still collected."
 } else {
     Write-Warning "No connection after 120 s. Check the host's port forwarding / firewall."
     Write-Warning "Leaving the game up in case it connects late; results still collected."
@@ -155,6 +193,7 @@ if ($Scenario -ne "") {
 @"
 kit save:      $save
 scenario:      $Scenario
+transport:     $(if ($useSteam) { "steam (host steamid $(ConvertTo-SteamId64 $HostSteamId))" } else { "udp" })
 host ip:       $HostIp
 port:          $Port
 machine:       $env:COMPUTERNAME
