@@ -41,19 +41,30 @@ on both machines. Everything else is bundled in [dist/kit](dist/kit): the
 prebuilt mod, a shared two-squad starter save (`squad1`), and one-command
 host/join scripts that install both for you.
 
-On each machine, from the `dist/kit` folder (each player needs the other's
-[SteamID64](https://steamid.io)):
+First, exchange Steam IDs - each player needs the *other* player's ID before
+launching. Any of these work (the scripts accept either form):
+
+- **Steam friend code** (shortest): in Steam, go to Friends > Add a Friend -
+  your friend code is shown at the top. Swap codes with your friend.
+- **SteamID64** (17-digit number): in Steam, click your profile name > Account
+  details - your Steam ID is shown under your account name. Or paste your
+  profile URL into [steamid.io](https://steamid.io) and use the `steamID64`
+  value.
+- Already launched? The host's ID is also printed in the console after the game
+  starts (`>>> YOUR SteamID: ...`), ready to read to the joining player.
+
+Then, on each machine, from the `dist/kit` folder:
 
 Host:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <their steamid64>
+powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <their id>
 ```
 
 Join:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId <their steamid64>
+powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId <their id>
 ```
 
 The scripts copy the mod into `[Kenshi]/mods/KenshiCoop`, install the `squad1`
