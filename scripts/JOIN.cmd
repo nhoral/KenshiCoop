@@ -22,14 +22,30 @@ echo  IP address instead).
 echo.
 set "HOSTID="
 set /p HOSTID="  Host's code or IP (just press Enter if this kit came with it baked in): "
-set "RESUME="
-set /p RESUME="  Resume a previous session? (y/N): "
+echo.
+echo  Which save do you want to play?
+echo    [1] The bundled co-op starter save  - default
+echo    [2] Resume your last co-op session
+echo    [3] The host's own save - they pick it in-game from Kenshi's Load menu
+set "CHOICE=1"
+set /p CHOICE="  Choose 1, 2 or 3 - Enter = 1: "
+rem First character only: tolerates stray trailing whitespace/CR.
+set "CHOICE=%CHOICE:~0,1%"
 set "ARGS="
 if not "%HOSTID%"=="" (
     echo(%HOSTID%| findstr /L "." >nul
     if not errorlevel 1 (set "ARGS=-HostIp %HOSTID%") else (set "ARGS=-HostSteamId %HOSTID%")
 )
-if /i "%RESUME%"=="y" set "ARGS=%ARGS% -Resume"
+if "%CHOICE%"=="2" set "ARGS=%ARGS% -Resume"
+if "%CHOICE%"=="3" (
+    echo.
+    echo  PLAYING THE HOST'S SAVE: you'll start on the bundled save so the
+    echo  two games can connect. Once BOTH players are in-game, the HOST
+    echo  opens Kenshi's menu ^> Load and picks their save - your game
+    echo  follows automatically, and their save is streamed to you first if
+    echo  you don't have it. Nothing else to do on your side.
+    echo.
+)
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0friend_join.ps1" %ARGS%
 echo.

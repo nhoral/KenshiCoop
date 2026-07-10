@@ -19,11 +19,31 @@ echo  a 17-digit SteamID64 works too).
 echo.
 set "PEER="
 set /p PEER="  Other player's code (just press Enter if this kit came with it baked in): "
-set "RESUME="
-set /p RESUME="  Resume a previous session? (y/N): "
+echo.
+echo  Which save do you want to play?
+echo    [1] The bundled co-op starter save  - default
+echo    [2] Resume your last co-op session
+echo    [3] Your own save - picked in-game from Kenshi's Load menu
+set "CHOICE=1"
+set /p CHOICE="  Choose 1, 2 or 3 - Enter = 1: "
+rem First character only: tolerates stray trailing whitespace/CR.
+set "CHOICE=%CHOICE:~0,1%"
 set "ARGS="
 if not "%PEER%"=="" set "ARGS=-PeerSteamId %PEER%"
-if /i "%RESUME%"=="y" set "ARGS=%ARGS% -Resume"
+if "%CHOICE%"=="2" set "ARGS=%ARGS% -Resume"
+if "%CHOICE%"=="3" (
+    echo.
+    echo  PLAYING YOUR OWN SAVE: you'll start on the bundled save so the two
+    echo  games can connect. Once BOTH players are in-game, open Kenshi's
+    echo  menu ^> Load and pick your save - the other player's game follows
+    echo  automatically, and your save is streamed to them first if they
+    echo  don't have it. Only the HOST can pick the save this way.
+    echo.
+    echo  TIP: your friend controls the SECOND squad tab. If your save only
+    echo  has one squad, move some units into a new squad tab in-game to
+    echo  give them a crew.
+    echo.
+)
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0friend_host.ps1" %ARGS%
 echo.

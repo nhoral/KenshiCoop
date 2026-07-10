@@ -216,15 +216,23 @@ either player loads a save mid-session, both games load the identical
 save and the session continues from there (expect a normal load screen
 on both sides).
 
-RESUMING A PREVIOUS SESSION
----------------------------
+CHOOSING A SAVE
+---------------
 
-After your first session there is no save copying and no new kit needed -
-the previous session's save is already on both machines. Double-click
-$launcherUC and answer 'y' to "Resume a previous session?", or add -Resume
-to the PowerShell command. This loads the 'coopresume' save; if you saved
-under a different name, add -ResumeSave <name> on the command line. Both
-sides must load the SAME save.
+The launcher asks which save to play (both players must pick the same):
+
+  [1] The bundled starter save - the default. A fresh start on the
+      two-squad co-op save that ships with this kit.
+  [2] Resume your last co-op session - loads the save that was shared to
+      both machines automatically last time (no file copying, no new
+      kit). Saved under a custom name? Use the PowerShell command with
+      -Resume -ResumeSave <name> instead.
+  [3] Your own save - both games start on the bundled save so they can
+      connect; once BOTH players are in-game, the HOST opens Kenshi's
+      menu > Load and picks any save. The other player's game follows
+      automatically (the save is streamed over first if their copy
+      differs). Tip: the second player controls the save's SECOND squad
+      tab - move some units into a new squad tab to give them a crew.
 
 UNINSTALL
 ---------
