@@ -376,7 +376,7 @@ SCENARIO RESULT <PASS|FAIL>
 
 ### How to add a scenario
 
-1. In `src/plugin/Scenario.cpp`, subclass `coop::Scenario`:
+1. In `src/plugin/test/Scenario.cpp`, subclass `coop::Scenario`:
    - `name()` returns the id that matches `KENSHICOOP_SCENARIO`,
    - `onStart(ctx)` runs once on the first in-game frame,
    - `onTick(ctx)` runs each frame; return `true` when done (gate steps on
