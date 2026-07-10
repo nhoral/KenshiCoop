@@ -58,19 +58,17 @@ Grab `KenshiCoop-kit.zip` from the
 unzip it anywhere (both players). You do not need to clone this repository -
 but if you did, the same kit is in [dist/kit](dist/kit).
 
-### 2. Swap Steam friend codes
-
-Each player needs the *other* player's code before launching. In Steam:
-**Friends > Add a Friend** - your friend code is at the top. Send codes to
-each other. (A 17-digit SteamID64 or a [steamid.io](https://steamid.io)
-lookup works too.)
-
-### 3. Launch
+### 2. Launch and swap codes
 
 - One player double-clicks **`HOST.cmd`** in the kit folder.
 - The other double-clicks **`JOIN.cmd`**.
 
-Each script asks for the other player's friend code, then does everything
+Each launcher starts by printing **your own Steam friend code** (read
+straight from Steam), so you and your friend just read your codes to each
+other and type in the other player's - no digging through Steam profiles.
+(A 17-digit SteamID64 works too.)
+
+The script then does everything
 else: checks your setup (and tells you exactly what to fix if something is
 missing), installs the mod and the shared starter save, launches Kenshi, and
 connects the two games. When both of you are in-game, you're playing co-op.

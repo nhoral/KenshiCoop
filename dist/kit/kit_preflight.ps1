@@ -63,6 +63,53 @@ function Test-CoopPrereqs {
     }
 }
 
+function Get-MySteamId {
+    # The logged-in user's 32-bit account id IS the Steam friend code.
+    # Registry (live while Steam runs) first; fall back to the most recent
+    # login in Steam's loginusers.vdf (works with Steam closed). Returns
+    # @{ FriendCode; SteamId64 } or $null if neither source pans out.
+    try {
+        $a = (Get-ItemProperty "HKCU:\Software\Valve\Steam\ActiveProcess" -ErrorAction SilentlyContinue).ActiveUser
+        if ($a -and $a -ne 0) {
+            return @{ FriendCode = [uint64]$a; SteamId64 = [uint64]$a + 76561197960265728 }
+        }
+    } catch {}
+    try {
+        $steamPath = (Get-ItemProperty "HKCU:\Software\Valve\Steam" -ErrorAction SilentlyContinue).SteamPath
+        if ($steamPath) {
+            $vdf = Join-Path $steamPath "config\loginusers.vdf"
+            if (Test-Path $vdf) {
+                $raw = Get-Content $vdf -Raw
+                $m = [regex]::Match($raw, '"(\d{17})"\s*\{[^}]*"MostRecent"\s*"1"',
+                                    [System.Text.RegularExpressions.RegexOptions]::Singleline)
+                if ($m.Success) {
+                    $id64 = [uint64]$m.Groups[1].Value
+                    return @{ FriendCode = $id64 - 76561197960265728; SteamId64 = $id64 }
+                }
+            }
+        }
+    } catch {}
+    return $null
+}
+
+function Show-MySteamId {
+    # Solves the ID-exchange chicken-and-egg: print YOUR code before anyone
+    # has to type the other player's, so both players can just read their
+    # code off this screen to each other.
+    $me = Get-MySteamId
+    if ($null -ne $me) {
+        Write-Host ""
+        Write-Host (">>> YOUR Steam friend code: $($me.FriendCode)") -ForegroundColor Green
+        Write-Host ">>> Send it to the other player - they enter it on their side." -ForegroundColor Green
+        Write-Host ""
+    } else {
+        Write-Host ""
+        Write-Host "(Could not detect your Steam friend code - find it in Steam under"
+        Write-Host " Friends > Add a Friend, and send it to the other player.)"
+        Write-Host ""
+    }
+}
+
 function Wait-PluginLoaded {
     # The co-op plugin creates its log file the moment RE_Kenshi loads it
     # (before any menu/save). If the game is up but the log never appears,

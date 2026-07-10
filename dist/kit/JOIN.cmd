@@ -13,10 +13,12 @@ echo  =================================
 echo    KenshiCoop  -  JOIN a session
 echo  =================================
 echo.
-echo  You need the HOST's Steam friend code: in Steam, go to
-echo  Friends ^> Add a Friend - the code is the number at the top.
-echo  (A 17-digit SteamID64 works too. On a direct-UDP kit, enter
-echo  the host's public IP address instead.)
+rem Show THIS player's friend code first (read from Steam) so both players
+rem can swap codes straight off this screen - no profile-page digging.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ". '%~dp0kit_preflight.ps1'; Show-MySteamId"
+echo  Now enter the HOST's code (they see theirs the same way; a 17-digit
+echo  SteamID64 works too - on a direct-UDP kit, enter the host's public
+echo  IP address instead).
 echo.
 set "HOSTID="
 set /p HOSTID="  Host's code or IP (just press Enter if this kit came with it baked in): "

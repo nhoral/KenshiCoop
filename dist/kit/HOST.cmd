@@ -11,9 +11,11 @@ echo  =================================
 echo    KenshiCoop  -  HOST a session
 echo  =================================
 echo.
-echo  You need the OTHER player's Steam friend code: in Steam, go to
-echo  Friends ^> Add a Friend - the code is the number at the top.
-echo  (A 17-digit SteamID64 works too.)
+rem Show THIS player's friend code first (read from Steam) so both players
+rem can swap codes straight off this screen - no profile-page digging.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ". '%~dp0kit_preflight.ps1'; Show-MySteamId"
+echo  Now enter the OTHER player's code (they see theirs the same way;
+echo  a 17-digit SteamID64 works too).
 echo.
 set "PEER="
 set /p PEER="  Other player's code (just press Enter if this kit came with it baked in): "

@@ -16,10 +16,11 @@ Step 0 - one-time prerequisites (both players):
 
 Step 1 - swap Steam friend codes:
 
-  Each player needs the OTHER player's code before launching. In Steam:
-  Friends > Add a Friend - your friend code is the number at the top.
-  Send codes to each other. (A 17-digit SteamID64 or a steamid.io lookup
-  of a profile URL works too.)
+  Each player needs the OTHER player's code before connecting. The
+  launcher reads YOUR code from Steam and prints it on screen the moment
+  you start it - just read it to the other player and type theirs in.
+  (Codes are also in Steam under Friends > Add a Friend; a 17-digit
+  SteamID64 works too.)
 
 Step 2 - launch:
 

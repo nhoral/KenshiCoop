@@ -90,6 +90,10 @@ if ($HostSteamId -eq "" -and $kit.PSObject.Properties["hostSteamId"] -and "$($ki
     $HostSteamId = "$($kit.hostSteamId)"
 }
 $useSteam = ($HostSteamId -ne "")
+# Print YOUR friend code first (read from Steam) so the two of you can swap
+# codes right off this screen - the host needs YOURS as much as you need
+# theirs. Shown even if the launch then stops for a missing host id.
+if ($useSteam -or "$($kit.transport)" -eq "steam") { Show-MySteamId }
 if (-not $useSteam -and $HostIp -eq "") { throw "Pass -HostIp <ip> (UDP) or -HostSteamId <steamid64> (Steam P2P)." }
 # Validate the ID up front (clear error now beats a dead session later).
 if ($useSteam) { [void](ConvertTo-SteamId64 $HostSteamId) }

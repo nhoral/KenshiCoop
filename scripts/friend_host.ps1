@@ -99,6 +99,9 @@ if ($PeerSteamId -eq "" -and $kit.PSObject.Properties["peerSteamId"] -and "$($ki
 $useSteam = ($PeerSteamId -ne "")
 # Validate the ID up front (clear error now beats a dead session later).
 if ($useSteam) { [void](ConvertTo-SteamId64 $PeerSteamId) }
+# Print YOUR friend code first (read from Steam) so the two of you can swap
+# codes right off this screen - no profile-page spelunking.
+if ($useSteam -or "$($kit.transport)" -eq "steam") { Show-MySteamId }
 
 # ---- Connectivity helpers ----------------------------------------------------------
 . (Join-Path $kitDir "upnp_portmap.ps1")
