@@ -22,22 +22,22 @@ set /p PEER="  Other player's code (just press Enter if this kit came with it ba
 echo.
 echo  Which save do you want to play?
 echo    [1] The bundled co-op starter save  - default
-echo    [2] Resume your last co-op session
-echo    [3] Your own save - picked in-game from Kenshi's Load menu
+echo    [2] Your own save - picked in-game from Kenshi's Load menu
 set "CHOICE=1"
-set /p CHOICE="  Choose 1, 2 or 3 - Enter = 1: "
+set /p CHOICE="  Choose 1 or 2 - Enter = 1: "
 rem First character only: tolerates stray trailing whitespace/CR.
 set "CHOICE=%CHOICE:~0,1%"
 set "ARGS="
 if not "%PEER%"=="" set "ARGS=-PeerSteamId %PEER%"
-if "%CHOICE%"=="2" set "ARGS=%ARGS% -Resume"
-if "%CHOICE%"=="3" (
+if "%CHOICE%"=="2" (
     echo.
     echo  PLAYING YOUR OWN SAVE: you'll start on the bundled save so the two
     echo  games can connect. Once BOTH players are in-game, open Kenshi's
-    echo  menu ^> Load and pick your save - the other player's game follows
+    echo  menu ^> Load and pick any save - the other player's game follows
     echo  automatically, and your save is streamed to them first if they
-    echo  don't have it. Only the HOST can pick the save this way.
+    echo  don't have it. This is also how you RESUME a previous co-op
+    echo  session: just load the save you made last time. Only the HOST can
+    echo  pick the save this way.
     echo.
     echo  TIP: your friend controls the SECOND squad tab. If your save only
     echo  has one squad, move some units into a new squad tab in-game to

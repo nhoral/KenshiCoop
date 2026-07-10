@@ -86,14 +86,14 @@ forwarding) is also supported.
 - **Both players must load the exact same save** - that's why the kit installs
   the shared `squad1` save on both machines. Don't substitute your own save
   unless you copy the identical folder to both sides.
-- **Saving just works.** Any save either player makes during a session becomes
-  one shared save on both machines. Next time, pick "Resume your last co-op
-  session" at the launcher's save prompt to pick up where you left off.
 - **You can play your own world.** Pick "Your own save" at the launcher's save
   prompt: the games connect on the bundled save first, then the host loads any
   save from Kenshi's menu - the other player's game follows automatically (the
   save is streamed to them if they don't have it). Give your friend a crew by
   moving units into your save's second squad tab.
+- **Saving just works.** Any save either player makes during a session becomes
+  one shared save on both machines. To resume next time, pick "Your own save"
+  and load it from Kenshi's menu - it's already on both machines.
 
 ### If something goes wrong
 

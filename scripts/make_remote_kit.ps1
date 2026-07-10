@@ -223,16 +223,15 @@ The launcher asks which save to play (both players must pick the same):
 
   [1] The bundled starter save - the default. A fresh start on the
       two-squad co-op save that ships with this kit.
-  [2] Resume your last co-op session - loads the save that was shared to
-      both machines automatically last time (no file copying, no new
-      kit). Saved under a custom name? Use the PowerShell command with
-      -Resume -ResumeSave <name> instead.
-  [3] Your own save - both games start on the bundled save so they can
-      connect; once BOTH players are in-game, the HOST opens Kenshi's
-      menu > Load and picks any save. The other player's game follows
-      automatically (the save is streamed over first if their copy
-      differs). Tip: the second player controls the save's SECOND squad
-      tab - move some units into a new squad tab to give them a crew.
+  [2] Your own save, picked in-game - both games start on the bundled
+      save so they can connect; once BOTH players are in-game, the HOST
+      opens Kenshi's menu > Load and picks any save. The other player's
+      game follows automatically (the save is streamed over first if
+      their copy differs). This is also how you RESUME a previous co-op
+      session: any save either player made last time is already on both
+      machines - just load it. Tip: the second player controls the
+      save's SECOND squad tab - move some units into a new squad tab to
+      give them a crew.
 
 UNINSTALL
 ---------
