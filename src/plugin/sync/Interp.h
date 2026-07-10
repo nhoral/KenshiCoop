@@ -32,9 +32,27 @@ class EntityInterp {
 public:
     EntityInterp();
 
-    // Record a received snapshot (identity + transform + locomotion) with its
-    // local arrival time. Updates the jitter estimate used to size the delay.
-    void push(const EntityState& e, unsigned long nowMs);
+    // What the last sample() actually did - the starvation/teleport telemetry
+    // behind the "[interp]" stat line (protocol 36 jumpiness instrumentation).
+    // LERP is the healthy regime; EXTRAP/CLAMP_OLD mean the buffer starved
+    // (render time ran past the newest snapshot / predates the whole ring);
+    // SEG_SNAP is a source teleport bypassing interpolation.
+    enum SampleMode {
+        SM_NONE = 0, SM_LERP, SM_SINGLE, SM_CLAMP_OLD, SM_EXTRAP, SM_SEG_SNAP
+    };
+    int           lastMode()    const { return lastMode_; }
+    unsigned long lastDelayMs() const { return lastDelay_; }
+    float         jitter()      const { return jitterMs_; }
+    float         avgInterval() const { return avgIntervalMs_; }
+
+    // Record a received snapshot (identity + transform + locomotion). nowMs is
+    // the ring index time: with wire v35 this is the SENDER's capture time
+    // mapped into the local clock (clean 20 Hz spacing - velocity and segment
+    // math never see path jitter). arrivalMs (0 = unknown) is the local arrival
+    // time; the positive gap (arrivalMs - nowMs) is the packet's queueing lag,
+    // tracked peak-hold so renderDelay still covers path jitter even though the
+    // interval stats no longer contain it.
+    void push(const EntityState& e, unsigned long nowMs, unsigned long arrivalMs = 0);
 
     // Produce the render-time pose at 'nowMs' into 'out' (identity + locomotion
     // copied from the latest snapshot, transform interpolated). Returns false if
@@ -71,8 +89,11 @@ private:
     unsigned long lastArrival_;
     float         avgIntervalMs_;
     float         jitterMs_;
+    float         lagMs_;            // peak-decayed queueing lag (arrival - ring time)
     EntityState   last_;             // most recent full state (identity/locomotion)
     bool          haveLast_;
+    int           lastMode_;         // SampleMode of the last sample() call
+    unsigned long lastDelay_;        // renderDelay used by the last sample() call
 };
 
 } // namespace coop

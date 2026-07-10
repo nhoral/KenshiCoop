@@ -43,6 +43,25 @@ public:
     // Stage 4: also stream nearby host-authoritative world NPCs (host side).
     void setStreamNpcs(bool v) { streamNpcs_ = v; }
 
+    // Protocol 36 live-tuning knobs (KENSHICOOP_INTERP_* / _CATCHUP_K /
+    // _SNAP_DIST): override the interp buffer's delay/extrapolation window and
+    // the walk-drive's hard-snap / catch-up gains for WAN A/B runs without a
+    // rebuild. Defaults match the historical constants.
+    void setInterpConfig(const InterpConfig& c) { cfg_ = c; }
+    void setDriveTuning(float catchupK, float snapDist) {
+        if (catchupK > 0.0f) catchupK_ = catchupK;
+        if (snapDist > 0.0f) snapDist_ = snapDist;
+    }
+    // KENSHICOOP_SEND_STAMP=0: ignore the batch sendMs and index interp rings
+    // on arrival time (the legacy scheme) - a receiver-local A/B lever.
+    void setSendStamp(bool v) { sendStamp_ = v; }
+    // KENSHICOOP_STARVE_HOLD_MS: how long a driven body whose stream went
+    // STALE keeps its mutation guards (AI suspend + damage guard) before it
+    // is released to local simulation. A brief WAN stall must not become an
+    // authority transfer (architecture review 2026-07-10); 0 restores the
+    // legacy release-on-stale behavior.
+    void setStarveHold(unsigned long ms) { starveHoldMs_ = ms; }
+
     // Bidirectional presence: the SQUAD-TAB ranks (distinct hand-containers, sorted)
     // this client OWNS (controls locally + streams). The peer owns the other tabs and
     // we drive those from its stream. Host defaults to {0}, join to {1}. Runs on BOTH
@@ -145,15 +164,19 @@ public:
     // resend elapsed). No-op when no owned container is registered / resolves.
     void publishInventories(GameWorld* gw, NetLink& net, u32 ownerId);
 
-    // BEFORE engine (host only): scan the interest sphere for free ground items, assign/
+    // BEFORE engine (BOTH clients since the W1 bidir fix): scan the interest sphere for
+    // free ground items WE author (peer proxies are filtered by the echo guard), assign/
     // reuse a netId per item (keyed by its local engine hand), and queue a reliable
     // snapshot for new/changed items + a reliable cull for items that vanished. A settled
     // world produces no traffic (change-detected), with a slow periodic safety resend.
+    // Known carried-over W1 edge: non-gear proxies have no pickup intent - a pickup on
+    // the proxy side leaves the author's real item until the author's own next scan
+    // culls it (self-healing); gear rides the W2/W3 conservation intents instead.
     void publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId);
 
-    // AFTER engine (join only): drain received world-item snapshots/culls and reconcile
-    // local proxies - spawn a proxy for a new netId, move it if it changed, destroy it on
-    // cull. The host skips this (it authors the world stream).
+    // AFTER engine (BOTH clients): drain received world-item snapshots/culls and
+    // reconcile local proxies - spawn a proxy for a new (ownerId, netId), move it if it
+    // changed, destroy it on cull. netId spaces are per-sender, culls owner-scoped.
     void applyWorldItems(GameWorld* gw, Inbound& in);
 
     // BEFORE engine (Phase W2/W3, runs on EVERY client): diff each OWNED character's WEAPON
@@ -177,6 +200,27 @@ public:
     // never acts on a character we own (we already picked it up locally). Runs BEFORE
     // applyInventories so the re-home beats the inventory reconcile.
     void applyWeaponPickups(GameWorld* gw, Inbound& in);
+
+    // BEFORE engine, after publishInventories (protocol 37, BOTH clients): detect a
+    // COMPLETED cross-owner drag. Every tracked container (own + received) keeps a
+    // per-item-total baseline; a scan (~2.5 Hz) that finds a LOSS in one container
+    // and the matching GAIN in another - stable for a settle window, at least one
+    // end peer-authored - is a direct UI trade the single-writer snapshots cannot
+    // represent. Author ONE reliable PKT_INV_XFER (src+dst+item+qty), latch the
+    // pending transfer so applyInventories cannot reconcile it back while the
+    // owner's snapshots are still stale, and (for gear) suppress the W2 weapon-
+    // census drop/pickup reading of the same count edges. Own<->own moves and
+    // unpaired diffs are folded into the baseline (own snapshots already carry
+    // them; a lone loss is a drop/consume, not a trade).
+    void detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // AFTER engine (protocol 37): drain received transfer intents and relocate the
+    // REAL Item* between our own copies of the two containers (conservation - no
+    // fabrication, no destruction, so gear survives; non-gear falls back to
+    // fabricate-into-dst if our src copy is missing). Idempotent by
+    // (ownerId, xferId); skips intents we authored. Runs BEFORE applyInventories
+    // so the relocation beats the reconcile.
+    void applyTransfers(GameWorld* gw, Inbound& in, u32 localId);
 
     // BEFORE engine, after publishOwned (phase 2 vitals sync): stream each OWNED
     // player-squad member's medical model (blood, bleed, limb flesh/bandaging,
@@ -229,13 +273,155 @@ public:
     // queue (the PlayerInterface::recruit detour records every successful LOCAL
     // recruit) and author one reliable EVT_RECRUIT per edge (subject = the OLD
     // hand, actor = the NEW hand). Also pins each recruited hand into
-    // recruitOwned_ so publishOwned streams it even when the engine parked it
+    // pinOwned_ so publishOwned streams it even when the engine parked it
     // in a tab RANK the partition says the peer owns (recruit_probe: a join
     // recruit landed in the host's rank-0 container).
     void publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId);
 
     // Recruitment sync master enable (KENSHICOOP_RECRUIT_SYNC).
     void setRecruitSync(bool v) { recruitSync_ = v; }
+
+    // BEFORE engine (protocol 35, both clients): poll the roster's pointer ->
+    // hand baseline (~2 Hz; the Character* survives a squad-tab move, only its
+    // hand changes - squad_probe) and author one reliable EVT_SQUAD_MOVE per
+    // detected edge (subject = OLD hand, actor = NEW hand; zeroed actor = the
+    // body left the roster). Pins the new hand into pinOwned_ BEFORE the wire
+    // so publishOwned keeps streaming the moved member no matter which tab
+    // rank its new container latched to. The receive half (shared EVT_RECRUIT
+    // re-key) lives in applyEvents.
+    void publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // Squad management sync master enable (KENSHICOOP_SQUAD_SYNC). Also gates
+    // the container-rank LATCH: with it on, tab ranks are assigned once at
+    // first census and newly-seen containers APPEND (a mid-session tab can
+    // never reshuffle existing ranks / flip whole-tab ownership); off = the
+    // legacy per-tick sorted ranking (the squad_probe baseline).
+    void setSquadSync(bool v) { squadSync_ = v; }
+
+    // BEFORE engine (protocol 24, both clients): sample the player-faction
+    // relation table (~1 Hz, immediately when the affectRelations detour saw a
+    // mutation) and stream every row whose value MOVED since the seeded
+    // baseline (change-gated reliable, per-sid safety resend). Both clients
+    // run the same detector, so a change replicates from whichever engine it
+    // happened on; applying a received row updates the local baseline, which
+    // is what makes the channel echo-free.
+    void publishFactions(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 24): drain received relation rows and write each
+    // one onto BOTH local table directions via FactionRelations::setRelation
+    // (the probe showed the engine keeps them mirrored). Stale rows (per-sid
+    // seq guard) and already-converged rows are skipped.
+    void applyFactions(GameWorld* gw, Inbound& in);
+
+    // Faction-relation sync master enable (KENSHICOOP_FACTION_SYNC).
+    void setFactionSync(bool v) { factionSync_ = v; }
+
+    // BEFORE engine (protocol 26, both clients): sample baked doors near the
+    // interest centers (~1 Hz) and stream every row whose (open, locked)
+    // moved since the seeded per-hand baseline (change-gated reliable,
+    // per-hand safety resend for rows ever sent). Both clients run the same
+    // detector, so a door change replicates from whichever engine it
+    // happened on (a local click, an NPC, or the write applyDoors made).
+    void publishDoors(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 26): drain received door rows; each one that
+    // resolves locally is applied through the engine's own door actions
+    // (openDoor/closeDoor + lockDoor/unlockDoor). The baseline updates
+    // BEFORE the write (echo-free); stale rows (per-hand seq guard) and
+    // already-converged rows are skipped; unresolvable hands are skipped
+    // silently (out-of-interest or runtime door - accepted edge).
+    void applyDoors(GameWorld* gw, Inbound& in);
+
+    // Door-state sync master enable (KENSHICOOP_DOOR_SYNC).
+    void setDoorSync(bool v) { doorSync_ = v; }
+
+    // BEFORE engine (protocol 27, both clients): drain local placement edges
+    // (the placeFinalPreviewBuilding detour + programmatic scenario places)
+    // into PKT_BUILD_PLACE announcements keyed by OUR hand, then sample every
+    // building WE placed (~1 Hz) and stream change-gated PKT_BUILD_STATE
+    // progress rows (10 s safety resend while incomplete; the final
+    // complete=1 row latches the channel silent for that site).
+    void publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 27): drain received announcements - each new
+    // key mints a local construction site through the same createBuilding
+    // factory (town-rule-free, probe-proven) and enters the key -> local-hand
+    // translation map (a refused mint is remembered so resends don't retry) -
+    // then apply received progress rows through the engine's own
+    // setConstructionProgress via that map (per-key seq guard drops stale
+    // rows; unknown keys are skipped silently).
+    void applyBuilds(GameWorld* gw, Inbound& in);
+
+    // Placed-building sync master enable (KENSHICOOP_BUILD_SYNC).
+    void setBuildSync(bool v) { buildSync_ = v; }
+
+    // BEFORE engine (protocol 28, both clients): sample the doors of every
+    // building in the session build maps (~1 Hz) and stream change-gated
+    // PKT_BUILD_DOOR rows on the TRANSLATED identity (placer's building hand
+    // + door index; own placements key by our hand, minted proxies through
+    // the reverse map) - the protocol-26 symmetric door shape, so a placed
+    // door replicates from whichever engine moved it.
+    void publishBuildDoors(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 28): drain received placed-door rows; resolve
+    // the key through the build maps (own hand or minted local hand), read
+    // door #index of that building, and apply through the engine's own door
+    // actions. Baseline updates BEFORE the write (echo-free); per-key seq
+    // guard; unknown/tombstoned keys skip silently.
+    void applyBuildDoors(GameWorld* gw, Inbound& in);
+
+    // Placed-building door + removal sync master enable (KENSHICOOP_BDOOR_SYNC).
+    void setBdoorSync(bool v) { bdoorSync_ = v; }
+
+    // Hunger sync enable (protocol 29, KENSHICOOP_HUNGER_SYNC): whether the
+    // hunger/fed scalars ride the medical snapshot (OFF sends/applies them
+    // as -1 = not carried; the rest of the stream is untouched).
+    void setHungerSync(bool v) { hungerSync_ = v; }
+
+    // BEFORE engine (protocol 33, HOST only - the world-simulation
+    // authority): sample machine-class buildings near the interest centers
+    // (~1 Hz) and stream a PKT_PROD row per machine - the first sight of a
+    // machine SENDS (the host's state IS the baseline, unlike the symmetric
+    // door channel), then change-gated on the quantized fields with a 10 s
+    // safety resend (which is also what keeps a join whose own engine
+    // drifted converging). Identity: baked hand (keyKind=0) or protocol-27
+    // placer key through the build maps (keyKind=1).
+    void publishProd(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 33, join side): drain received machine rows;
+    // resolve the key (baked hand directly; placer key through ownBuilds_/
+    // peerBuilds_), read the local machine, and apply only what actually
+    // diverged through the engine's own levers (switchPowerOn / direct
+    // amount + farm-float writes; a still-null output buffer is first
+    // MATERIALIZED via the native setProductionItem). Per-key seq guard
+    // drops stale rows; unresolvable keys skip silently (out-of-interest).
+    void applyProd(GameWorld* gw, Inbound& in);
+
+    // Production machine sync master enable (KENSHICOOP_PROD_SYNC).
+    void setProdSync(bool v) { prodSync_ = v; }
+
+    // Storage/machine container sync (protocol 34, KENSHICOOP_STORE_SYNC):
+    // when set (HOST only - host-authoritative world containers), a ~1 Hz
+    // census of container-bearing buildings (STORAGE + the machine classes)
+    // in the interest spheres auto-registers each as an AUTHORED container,
+    // so publishInventories streams it through the existing change-gated
+    // hash+settle logic. Session-placed buildings translate to the wire via
+    // the protocol-27 build maps (keyKind=1); the receiver resolves back in
+    // ingestInv. Layered on invSync (publishInventories is the carrier).
+    void setStoreSync(bool v) { storeSync_ = v; }
+
+    // Connect-edge resync (protocol 30, no wire change): called from the
+    // game-thread connect drain (processNetEvents) when a peer appears (host
+    // on HELLO, join on WELCOME - covers late joins AND quick reconnects).
+    // Re-announces every live placed building's PKT_BUILD_PLACE (+ a
+    // PKT_BUILD_REMOVE for removed ones; the receiver's session maps dedupe
+    // duplicates) and un-latches their STATE rows, then forces an immediate
+    // resend pass over every change-gated channel cache by aging lastSendMs
+    // on rows EVER SENT (each channel's own safety-resend condition fires on
+    // its next sample). Rows never sent stay silent - the shared-save
+    // baseline is not traffic. Edge-only caches (weaponCensus_, hostBody_)
+    // are deliberately untouched: re-seeding would author phantom edges.
+    void onPeerConnected(NetLink& net, u32 ownerId);
 
     // AFTER publishOwned (protocol 20, HOST only - the world-detection
     // authority): for every DRIVEN copy currently in stealth mode, read its
@@ -261,6 +447,33 @@ public:
     //    apply locally and broadcast PKT_SPEED_SET on change (+ safety resend).
     void syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
 
+    // BEFORE engine, AFTER syncSpeed (protocol 25 game-clock sync):
+    //  * host: broadcast the absolute in-game clock (PKT_TIME, ~1 Hz);
+    //  * join: drain samples, measure offset = hostHours - localHours, and
+    //    steer timeSlew_ - a multiplier the speed layer's quiet writes apply
+    //    ON TOP of the arbitrated consensus speed (proportional, capped, with
+    //    a disengage deadband). The slew composes with speed consensus rather
+    //    than fighting its continuous enforcement; when speedSync is off the
+    //    channel degrades to offset logging (no lever to compose with).
+    void syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
+
+    // Game-clock sync master enable (KENSHICOOP_TIME_SYNC).
+    void setTimeSync(bool v) { timeSync_ = v; }
+
+    // Session reset (protocol 32): called on the world-reload edge (gameplay
+    // non-live -> live after a mid-session load). The old world is GONE - every
+    // raw Character*/RootObject* cache is dangling and every session map
+    // (builds, proxies, change-gate baselines, interp buffers) describes a
+    // world that no longer exists. Clears all of it back to as-if-freshly-
+    // launched state while PRESERVING: the config gates (set* levers), the
+    // ownership partition (ownRanks_), and every OUTBOUND sequence counter
+    // (facSeqOut_, doorSeqOut_, buildSeqOut_, bdoorSeqOut_, prodSeqOut_,
+    // speedSeqOut_, timeSeqOut_, nextEventId_/netId/dropId/pickupId/treatId)
+    // - a peer that
+    // did NOT reload keeps its per-sender stale-row guards, so restarting a
+    // counter would make every new row look stale to it.
+    void resetSession();
+
     // AFTER engine: sample + apply the interpolated pose for every tracked entity.
     void applyTargets(GameWorld* gw);
 
@@ -274,6 +487,19 @@ public:
     // double / extra-NPC problem). Suppressed NPCs are restored if the host later
     // streams them.
     void enforceHostAuthority(GameWorld* gw);
+
+    // HOST, ~1 Hz (protocol 36): publish the wide-radius NPC existence census
+    // (hands only) so the join can cull local-only ghosts far beyond the
+    // positional stream bubble. No-op unless streamNpcs_ and censusRadius_ > 0.
+    void publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // JOIN: drain received censuses into the latest-wins existence set
+    // (censusHands_) consumed by enforceHostAuthority's wide-radius pass.
+    void applyNpcCensus(Inbound& in);
+
+    // KENSHICOOP_CENSUS_RADIUS: wide-radius existence culling reach (units);
+    // <= 0 disables the census channel on both sides.
+    void setCensusRadius(float r) { censusRadius_ = r; }
 
     unsigned int targetCount() const { return (unsigned int)targets_.size(); }
 
@@ -342,6 +568,9 @@ private:
         unsigned long furnNoSeeTick;  // first tick a locally-occupying copy's stream
                                       //   stopped reporting the occupancy bit (the
                                       //   debounced owner-side-exit detector)
+        // Third-party placement (protocol 36): last time the host authored a
+        // PEER-ENTER for this peer-owned driven body (re-author throttle).
+        unsigned long furnPeerTick;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
@@ -356,7 +585,8 @@ private:
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
-                   furnHealTick(0), furnNoSeeTick(0), sneakTick(0) {}
+                   furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
+                   sneakTick(0) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
@@ -425,7 +655,34 @@ private:
     std::map<Key, AuthCount>  authCount_;
     unsigned long             authSuppresses_; // churn counters (split_interest metric)
     unsigned long             authRestores_;
+    // NPC existence census (protocol 36): the host's 1 Hz wide-radius hand
+    // list. On the join, censusHands_ is the latest received existence set and
+    // censusRecvMs_ its arrival time - enforceHostAuthority culls local NPCs
+    // OUTSIDE the stream bubble that are absent from it (with the same
+    // hysteresis), but only while the census is FRESH (staleness disables
+    // wide culling rather than mass-suppressing on a silent host).
+    float                     censusRadius_;  // 0 = census disabled
+    unsigned long             censusSendMs_;  // host: last census publish
+    unsigned long             censusRecvMs_;  // join: last census arrival
+    std::set<Key>             censusHands_;   // join: latest existence set
+    unsigned long             censusCulls_;   // join: wide-radius suppress count
+    // Third-party furniture placement (protocol 36): ENTER edges detected on
+    // peer-owned driven bodies in applyTargets (a guard jailing an arrested
+    // player runs purely on the host sim, so the occupant's owner can never
+    // author the designed occupant-owner edge). Buffered here because
+    // applyTargets has no NetLink; publishOwned drains them onto the wire.
+    struct PendFurnEnter { Key occ; unsigned int furn[5]; int kind; };
+    std::vector<PendFurnEnter> furnPeerPend_;
+    // When WE last authored an owner-side EXIT for an own hand: an in-flight
+    // (5 s re-author window) PEER-ENTER must not re-jail a body its owner
+    // just freed - the exit-vs-reauthor race guard.
+    std::map<Key, unsigned long> ownFurnExit_;
     InterpConfig          cfg_;
+    float                 catchupK_;  // walk-drive gap-proportional speed gain
+    float                 snapDist_;  // moving-body hard-snap distance (u)
+    bool                  sendStamp_; // index interp rings on sender stamps (v35)
+    unsigned long         starveHoldMs_;  // guard-hold window past staleness
+    unsigned int          starveHeldNow_; // bodies in the hold this tick (stat line)
     bool                  leaderOnly_;
     bool                  streamNpcs_;
 
@@ -460,6 +717,15 @@ private:
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
+    // Protocol 34: the host's ~1 Hz container census result (LOCAL hands of
+    // complete STORAGE/machine-class buildings in the interest spheres).
+    // Folded into the authored set each publishInventories pass while
+    // storeSync_ is on; per-container change-gate state lives in invPub_ as
+    // usual. Refreshed wholesale each census (leaving interest just stops
+    // the captures; the invPub_ baseline survives for the return).
+    bool           storeSync_;
+    unsigned long  contCensusMs_;
+    std::set<Key>  censusContainers_;
 
     // Phase W1 world-item state.
     // HOST: worldTrack_ maps a ground item's LOCAL engine hand (Key) to its assigned
@@ -470,7 +736,10 @@ private:
     struct WorldTrack { u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen; };
     struct WorldProxy { RootObject* obj; float x, y, z; u32 hash; };
     std::map<Key, WorldTrack> worldTrack_;
-    std::map<u32, WorldProxy>  worldProxies_;
+    // Spawned proxies for PEER-authored ground items, keyed by (ownerId, netId):
+    // W1 is bidirectional (each client streams the free ground items it authors),
+    // so netId spaces are per-sender and culls are scoped to their owner.
+    std::map<std::pair<u32, u32>, WorldProxy> worldProxies_;
     u32                        nextWorldNetId_;
 
     // Phase W2 conservation-drop state.
@@ -499,11 +768,80 @@ private:
     u32                               nextPickupId_;
     std::set<std::pair<u32, u32> >    appliedPickups_;
 
+    // Protocol 37 cross-owner transfer state.
+    // xferBase_: last-known per-item totals (sid,type)->qty per tracked container - the
+    //   reference the drag detector diffs against. Rebased after every mutation WE make
+    //   (reconcile, transfer apply, W2/W3 relocation) so only USER actions register.
+    // xferPend_: currently-observed unpaired diffs + when each first appeared (a pair of
+    //   matching loss/gain older than the settle window becomes an intent; a diff that
+    //   never pairs is folded back into the baseline after a timeout).
+    // xferLatch_: per PEER container, the pending local delta a sent/applied transfer
+    //   implies. While active, applyInventories ADJUSTS the received snapshot by it
+    //   (suppressing the reconcile-back that caused the dupe/wipe); cleared when the
+    //   owner's snapshot catches up to the local total, or on deadline.
+    // wdSuppress_: (character key, sid) -> expiry; a gear transfer must not be read by
+    //   the W2 weapon census as a ground drop / pickup of that sid on those characters.
+    typedef std::pair<std::string, u32> XKey; // (stringID, itemType)
+    struct XferPend  { int delta; unsigned long sinceMs; };
+    struct XferLatch { int delta; unsigned long deadlineMs; };
+    std::map<Key, std::map<XKey, int> >       xferBase_;
+    std::map<Key, bool>                       xferSeeded_;
+    std::map<Key, std::map<XKey, XferPend> >  xferPend_;
+    std::map<Key, std::map<XKey, XferLatch> > xferLatch_;
+    // Per peer container: when applyInventories first saw a LOCAL diff vs the
+    // detector baseline (an unadjudicated user mutation - possibly one end of a
+    // cross-owner drag). The reconcile DEFERS while it is younger than the defer
+    // window, giving the detector time to pair the drag and author the intent
+    // (otherwise the reconcile undoes the drag and the rebase erases the evidence).
+    std::map<Key, unsigned long>              xferDefer_;
+    u32                                       nextXferId_;
+    std::set<std::pair<u32, u32> >            appliedXfers_;
+    std::map<std::pair<Key, std::string>, unsigned long> wdSuppress_;
+    unsigned long                             xferScanMs_; // last detector scan
+    // Recapture `k`'s container and overwrite its baseline (clears its pends): call
+    // after ANY local mutation we make ourselves so the detector only sees the user.
+    void xferRebase(GameWorld* gw, const Key& k);
+    // True while the transfer detector is watching an unresolved LOSS of `sid` from
+    // container `k` - the W2 census fallback defers its drop verdict for it.
+    bool xferPendingLoss(const Key& k, const char* sid);
+    bool wdSuppressed(const Key& k, const char* sid, unsigned long now);
+
     // Smoothness accumulators (measured from the body's actual motion while its
     // source is moving): how often did the rendered body advance per frame?
     unsigned long activeFrames_;
     unsigned long zeroWhileActive_;
     float         maxStep_;
+    unsigned long slewSkipFrames_; // active frames excluded while clock-slewing
+
+    // Interp/drive telemetry (protocol 36 jumpiness instrumentation): per-sample
+    // regime counts from EntityInterp::lastMode() (EXTRAP/CLAMP = the buffer
+    // starved; SEG = a source teleport crossed the ring), hard-snap and
+    // walk-reissue counts from the drive layer, split squad (the other player's
+    // characters - the user-facing jumpiness) vs world NPCs. Surfaced on a ~5 s
+    // "[interp]" stat line + a "SCENARIO INTERP" summary in logSmoothSummary.
+    unsigned long interpLerp_;
+    unsigned long interpSingle_;
+    unsigned long interpClampOld_;
+    unsigned long interpExtrap_;
+    unsigned long interpSegSnap_;
+    unsigned long hardSnapSquad_;   // SNAP_DIST applyRaw on a moving squad body
+    unsigned long hardSnapNpc_;     // SNAP_DIST applyRaw on a moving world NPC
+    unsigned long walkReissueSquad_;
+    unsigned long walkReissueNpc_;
+    unsigned long interpLogTick_;
+
+    // Protocol 36 (wire v35): per-sender clock mapping for the batch send
+    // stamp. offsetMs tracks the MINIMUM observed (arrival - sendMs) - the
+    // fastest packet carries only the base path delay + clock difference, so
+    // min-tracking strips queueing jitter; mapped time = sendMs + offsetMs
+    // reconstructs the sender's true capture spacing in the local clock. The
+    // offset creeps up slowly (~2 ms/s) so a route change that RAISES the
+    // base delay re-converges instead of reading as permanent starvation.
+    struct PeerClock {
+        long offsetMs; bool have; unsigned long lastCreepMs;
+        PeerClock() : offsetMs(0), have(false), lastCreepMs(0) {}
+    };
+    std::map<u32, PeerClock> peerClock_;
 
     // Anim-truth accumulators (the float-bug oracle): of the frames where the
     // body's actual position translated, how many reported a real walk state
@@ -609,15 +947,147 @@ private:
     };
     std::map<unsigned int, MoneyPub> moneyPub_;
     bool moneySync_;
+    // Protocol 24 faction-relation sync state, per faction sid.
+    // known      = our current baseline (seeded on first sight, updated on every
+    //              local change we sent and every received row we applied - the
+    //              echo guard: an applied row is never re-detected as local).
+    // lastSendVal/lastSendMs = change gate + safety resend (rows never sent
+    //              never resend, so a settled diplomacy is silent).
+    // seqSeen    = newest per-sender seq applied (stale-row guard).
+    struct FacRow {
+        float known; float lastSendVal; unsigned long lastSendMs;
+        u32 seqSeen; bool seeded;
+        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seqSeen(0), seeded(false) {}
+    };
+    std::map<std::string, FacRow> facRows_;
+    u32           facSeqOut_;
+    unsigned long facSampleMs_;
+    bool          factionSync_;
+    // Protocol 26 door-state sync, per door hand (the faction shape: known =
+    // baseline, updated on every local change sent AND every received row
+    // applied - the echo guard; lastSendMs = change gate + safety resend;
+    // seqSeen = stale-row guard).
+    struct DoorRow {
+        int knownOpen; int knownLocked; unsigned long lastSendMs;
+        u32 seqSeen; bool seeded;
+        DoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
+                    seqSeen(0), seeded(false) {}
+    };
+    std::map<Key, DoorRow> doorRows_;
+    u32           doorSeqOut_;
+    unsigned long doorSampleMs_;
+    bool          doorSync_;
+    // Protocol 27 placed-building sync. OwnBuild = a building WE placed
+    // (registered from the local placement edge; we are its progress
+    // authority): lastProg/lastComplete = change gate, lastSendMs = safety
+    // resend, doneSent latches the channel silent once the final complete row
+    // went out. PeerBuild = a building the PEER placed (learned from
+    // PKT_BUILD_PLACE): the key -> local-hand translation entry; minted=0
+    // remembers a refused mint so resends don't retry the factory forever;
+    // seqSeen = stale STATE-row guard.
+    struct OwnBuild {
+        unsigned int hand[5];
+        float lastProg; int lastComplete; unsigned long lastSendMs;
+        bool doneSent;
+        bool removed; // dismantled/destroyed + REMOVE announced: silent forever
+        // Protocol 30: the PLACE announcement captured at edge-drain time, so
+        // a connect-edge resync can re-announce without re-reading the engine
+        // (the template sid lives in the edge, not on the Building).
+        BuildPlacePacket ann;
+        bool haveAnn;
+        OwnBuild() : lastProg(-1.0f), lastComplete(-1), lastSendMs(0),
+                     doneSent(false), removed(false), haveAnn(false) {
+            memset(hand, 0, sizeof(hand));
+            memset(&ann, 0, sizeof(ann));
+        }
+    };
+    struct PeerBuild {
+        unsigned int localHand[5];
+        int minted; u32 seqSeen;
+        bool removed; // proxy destroyed on a REMOVE: tombstone (rows skip)
+        PeerBuild() : minted(0), seqSeen(0), removed(false) { memset(localHand, 0, sizeof(localHand)); }
+    };
+    std::map<Key, OwnBuild>  ownBuilds_;
+    std::map<Key, PeerBuild> peerBuilds_;
+    // Reverse translation (protocol 28): local minted building hand -> the
+    // placer's wire key. Lets the door sampler express a MINTED proxy's door
+    // in the placer's key space, and the protocol-26 filter recognize placed
+    // doors by their parent hand.
+    std::map<Key, Key> mintByLocal_;
+    u32           buildSeqOut_;
+    unsigned long buildSampleMs_;
+    bool          buildSync_;
+    // Protocol 28 placed-door rows, keyed by (placer building key, door
+    // index) - the protocol-26 DoorRow shape on the translated identity.
+    struct BdoorRow {
+        int knownOpen; int knownLocked; unsigned long lastSendMs;
+        u32 seqSeen; bool seeded;
+        BdoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
+                     seqSeen(0), seeded(false) {}
+    };
+    std::map<std::pair<Key, int>, BdoorRow> bdoorRows_;
+    u32           bdoorSeqOut_;
+    unsigned long bdoorSampleMs_;
+    bool          bdoorSync_;
+    // Protocol 29: hunger fold-in enable (rides the medical snapshot).
+    bool          hungerSync_;
+    // Protocol 33 machine rows, keyed by the WIRE identity (keyKind, key) so
+    // a baked hand can never collide with a placer key. HOST: lastSend* =
+    // the change gate + safety resend (sent = the row went out at least
+    // once - first sight sends, see publishProd). JOIN: seqSeen = stale-row
+    // guard (the join never publishes, so the send fields stay idle).
+    struct ProdRow {
+        int knownPower; int knownState;
+        int qOut; int qIn0; int qIn1;          // quantized amounts (x100)
+        int qGrown; int qDied; int qGrowStart; int qHarv;
+        unsigned long lastSendMs;
+        u32 seqSeen; bool sent;
+        ProdRow() : knownPower(-2), knownState(-2), qOut(-200), qIn0(-200),
+                    qIn1(-200), qGrown(-200), qDied(-200), qGrowStart(-200),
+                    qHarv(-200), lastSendMs(0), seqSeen(0), sent(false) {}
+    };
+    std::map<std::pair<int, Key>, ProdRow> prodRows_;
+    u32           prodSeqOut_;
+    unsigned long prodSampleMs_;
+    bool          prodSync_;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
-    // Hands WE recruited this session: publishOwned streams them regardless of
-    // which tab rank their container maps to (the recruiter is the authority
-    // for its recruits - the rank partition alone can misattribute them).
-    std::set<Key> recruitOwned_;
-    // Hands the PEER recruited (learned from EVT_RECRUIT): never publish them
-    // even if a local census would rank them into a tab we own.
-    std::set<Key> peerRecruit_;
+    // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the
+    // tab-rank partition. pinOwned_ = hands WE authored (our recruits, our
+    // squad moves): publishOwned streams them regardless of which tab rank
+    // their container maps to. pinPeer_ = hands the PEER authored (learned
+    // from EVT_RECRUIT / EVT_SQUAD_MOVE): never publish them even if a local
+    // census would rank them into a tab we own. This is how an appended
+    // (mid-session) tab inherits its authoring side's ownership.
+    std::set<Key> pinOwned_;
+    std::set<Key> pinPeer_;
+    // Protocol 35 squad management sync state. tabRank_ is the container ->
+    // rank LATCH: seeded from the first census in sorted order (identical to
+    // the legacy ranking at session start), then newly-seen containers append
+    // - a mid-session tab cannot reshuffle existing ranks. Cleared on session
+    // reset (the reloaded save re-seeds it). rekeyedOld_ stamps hands a
+    // re-key RETIRED: their stale stream tail must never author a spawn REQ
+    // or accept a mint (the duplicate-proxy race, run 192211).
+    bool          squadSync_;
+    std::map<std::pair<u32, u32>, unsigned int> tabRank_;
+    std::map<Key, unsigned long> rekeyedOld_;
+    // Fold this tick's distinct sorted containers into the latch (append-only;
+    // no-op when squadSync_ is off) and rank one container: latched rank when
+    // the gate is on, the legacy per-tick sorted rank otherwise.
+    void latchTabs(const std::vector<std::pair<u32, u32> >& ctnrs);
+    unsigned int tabRankFor(const std::pair<u32, u32>& key,
+                            const std::vector<std::pair<u32, u32> >& ctnrs) const;
+    // Squad-tab census for the rank-keyed channels (money, tab-leader
+    // inventories): ONE representative member hand per tab rank, using the
+    // same latch-aware ranking publishOwned partitions ownership by.
+    unsigned int tabRepresentatives(GameWorld* gw, unsigned int rankHand[][5],
+                                    unsigned int maxRanks);
+    // Shared EVT_RECRUIT / EVT_SQUAD_MOVE receive half: pin the new hand as
+    // peer-authored and re-key our local copy of the old hand onto it in
+    // proxyByKey_ (restoring it first if host-authority had suppressed it).
+    // tag selects the log prefix ("recruit" / "squad").
+    void rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
+                       const char* tag);
     // Phase B: combat-scoped world-NPC vitals (host side). Keys of streamed
     // NPCs that are fighting / being fought / down, with last-qualified time;
     // publishMedical streams their vitals at ~1 Hz while fresh. The join's
@@ -639,6 +1109,28 @@ private:
     u32           speedSeqSeen_;       // newest seq accepted from the peer (stale guard)
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
+
+    // Protocol 25 game-clock sync state. timeSlew_ is the join's correction
+    // multiplier (1.0 = no correction); the speed layer applies effective *
+    // timeSlew_ in its quiet writes so the slew and the consensus compose.
+    bool          timeSync_;
+    float         timeSlew_;          // join: current slew factor (host: always 1)
+    u32           timeSeqOut_;        // host: monotonic seq for PKT_TIME
+    u32           timeSeqSeen_;       // join: newest sample seq applied
+    unsigned long timeLastSendMs_;    // host: last broadcast
+    unsigned long timeLastLogMs_;     // join: offset-log throttle
+    // The engine speed the slewed value was derived from; lets the enforcement
+    // distinguish "our slewed write" from a real user click.
+    float         timeSlewApplied_;   // join: last effective*slew written (-1 = none)
+    // The consensus effective with the clock slew folded in (what the quiet
+    // writes actually drive; clamped to the engine's sane speed range).
+    float slewedEffective(float eff) const {
+        if (eff <= 0.01f) return eff; // paused: never slewed
+        float s = eff * timeSlew_;
+        if (s > 5.0f)  s = 5.0f;
+        if (s < 0.05f) s = 0.05f;
+        return s;
+    }
 
     // Protocol 21 runtime-spawn proxy replication state.
     bool spawnSync_;

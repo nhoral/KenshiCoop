@@ -73,6 +73,16 @@
         regional = @{ DelayMs = 60;  JitterMs = 10; LossPct = 1  }
         bad      = @{ DelayMs = 120; JitterMs = 40; LossPct = 5  }
         awful    = @{ DelayMs = 200; JitterMs = 80; LossPct = 15 }
+        # Starved-replica validation: regional conditions plus one scripted
+        # TOTAL outage (both directions, below ENet) 30 s after the join's
+        # first datagram (mid-scenario for the 24 s windows: connect precedes
+        # gameplay by ~15 s), lasting 4 s - past interp staleMs (2 s), inside
+        # the guard hold (KENSHICOOP_STARVE_HOLD_MS, 10 s). Driven bodies must
+        # starve ([interp] starve>0) WITHOUT local AI/damage resuming. The
+        # standard position gates (npc_track etc.) legitimately fail during a
+        # real outage - this profile is for the manual guard-hold check, not
+        # the regression matrix.
+        stall    = @{ DelayMs = 60;  JitterMs = 10; LossPct = 1; StallAtS = 30; StallForS = 4 }
     }
 
     Scenarios = @{
@@ -314,6 +324,21 @@
             Tier = 'full'; WanVariant = $true
         }
 
+        # cage_peer_sync: protocol-36 third-party placement - the HOST places
+        # the join's KO'd leader (a peer-owned driven body) into the baked
+        # cage, reproducing the guard-jailing-the-join-PC session bug. The
+        # host must author the PEER-ENTER edge (no occupant-owner edge can
+        # fire - the action ran purely on the host sim), hold its self-heal
+        # exit, and the join must apply the enter to its OWN KO'd body; exit
+        # stays owner-authored (the join frees itself at the end).
+        cage_peer_sync = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'cage_peer'
+            Gating   = @('cage_peer', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
         # sneak_probe: protocol-20 phase-0 spike (host-side, log-only). The host
         # forces stealthMode on its DRIVEN copy of the join's leader near the bar
         # NPCs and logs the copy's whoSeesMeSneaking series - proves the engine's
@@ -429,6 +454,39 @@
             Tier = 'probe'; WanVariant = $false
         }
 
+        # squad_probe: squad-management phase-0 diagnostic (protocol 35,
+        # squadSync forced OFF). Each side separates its own tab's highest-
+        # hand member into a NEW squad (lever 0) then tries to move it back
+        # into its original tab (lever 1 setFaction, lever 2 addCharacterAt
+        # fallback), logging hand BEFORE/AFTER per move, the pointer-diff
+        # SQEDGE stream, and a 1 Hz SQTABS census (per-tab member counts -
+        # the rank-reshuffle evidence). Gates the local legs + that the
+        # pointer-diff caught every landed move; the identity/rank/peer-
+        # reaction findings gate the 16b design. Save 'squad1': the baked
+        # 2-tab squad both ownership ranks partition on.
+        squad_probe = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'squad_probe'
+            Gating   = @('squad_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # squad_sync: protocol-35 squad management sync (squadSync ON). Same
+        # script as squad_probe; every scripted move must LAND locally and
+        # Test-SquadSync gates the crossing - each move authored a reliable
+        # EVT_SQUAD_MOVE, the peer re-keyed its local body onto the new hand
+        # (no duplicate proxy, no unresolved-hand storm), tracked it (PROXY
+        # series), and the pre-existing tab ranks never shifted (the
+        # container-rank latch holding). Save 'squad1': the baked 2-tab squad.
+        squad_sync = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'squad_sync'
+            Gating   = @('squad_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # recruit_sync: protocol-23 recruitment sync (recruitSync ON). Same
         # script as recruit_probe; gates that every recruited hand CONVERGED on
         # the peer with exactly ONE body - the baked legs by "[recruit] REKEY"
@@ -441,6 +499,403 @@
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'recruit_sync'
             Gating   = @('recruit_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # faction_probe: faction-relation phase-0 diagnostic (protocol 24 -
+        # factionSync forced OFF; the affectRelations detours stay on for
+        # cause-attribution evidence). Both sides log a 1 Hz FACREL series
+        # (every interesting player-faction relation row by GameData sid) and
+        # write one sentinel setRelation each (host -75 first sorted sid,
+        # join +65 second, both table rows). Gates only that the script ran;
+        # the sid-stability / crossing / operative-row findings gate the 3b
+        # channel design.
+        faction_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'faction_probe'
+            Gating   = @('faction_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # faction_sync: protocol-24 faction-relation sync (factionSync ON).
+        # Same script as faction_probe; gates that each side's sentinel
+        # relation write CONVERGED on the peer (final us AND them rows for
+        # that sid equal the target) and no co-visible row ended diverged.
+        faction_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'faction_sync'
+            Gating   = @('faction_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # time_probe: game-clock phase-0 diagnostic (protocol 25 - timeSync
+        # AND speedSync forced OFF so the host's 2x burst t=15..25s applies
+        # directly and raw unsynced drift is measured). Both sides log a 1 Hz
+        # GTIME series (in-game hours + hourLen + fsm + paused). Gates only
+        # that the clocks are readable + monotonic; the absolute-vs-relative /
+        # offset / drift / rate-vs-fsm findings gate the 25 channel design.
+        time_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'time_probe'
+            Gating   = @('time_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # time_sync: protocol-25 game-clock sync (timeSync + speedSync ON).
+        # Same script, both sides click 2x t=15s / 1x t=25s (consensus
+        # arbitrates 2x); gates that both clocks stay monotonic and the final
+        # host-join clock offset is inside tolerance across the speed change.
+        time_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'time_sync'
+            Gating   = @('time_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # door_probe: door-state phase-0 diagnostic (protocol 26 - doorSync
+        # forced OFF). Both sides log a 1 Hz DOOR census (save-stable hand +
+        # open/locked/state per baked door within ~100m of the interest
+        # centers) and toggle one sentinel door each (host the first in serial
+        # order t=12s, join the second t=24s) through the engine's own
+        # openDoor/closeDoor. Gates only that the script ran (census + write
+        # attempt); the hand-stability / write-lever / non-crossing findings
+        # gate the protocol-26 channel design. Save: 'sync' - if its area has
+        # no doors in range the probe FAILS loudly and the entry moves to a
+        # save with a town/base before 5b.
+        door_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'door_probe'
+            Gating   = @('door_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # door_sync: protocol-26 door-state sync (doorSync ON). Same script;
+        # gates that each side's sentinel toggle CROSSED (the peer's final
+        # census row for that hand shows the writer's target open state) and
+        # no co-visible door ended diverged.
+        door_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'door_sync'
+            Gating   = @('door_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # build_probe: placed-building phase-0 diagnostic (protocol 27 -
+        # buildSync forced OFF). Both sides log a 1 Hz BUILDSITE census
+        # (construction sites within ~100m) and each places a small template
+        # programmatically leader-relative (host t=10s side -4, join t=22s
+        # side +4), then ramps its own site's constructionProgress +0.25/3s
+        # through the engine's own setter. Gates that both placements were
+        # ATTEMPTED and at least one was accepted + enumerable; the findings
+        # (factory-vs-town-rules, runtime-hand non-overlap, progress scale /
+        # self-complete) gate the protocol-27 channel design. Save: 'sync' -
+        # town-adjacent, so the factory-bypass question gets a real answer;
+        # if BOTH placements refuse, the probe fails loudly and the entry
+        # moves to a wilderness save before 6b.
+        build_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'build_probe'
+            Gating   = @('build_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # build_sync: protocol-27 placed-building sync (buildSync ON). Same
+        # script as build_probe; gates that each side's placement was MINTED
+        # on the peer (describe/mint by placer key) and that the placer's
+        # construction-progress ramp CROSSED (the peer applied rows up to the
+        # complete=1 latch through the engine's own setter).
+        build_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'build_sync'
+            Gating   = @('build_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # bdoor_probe: placed-building door + removal phase-0 diagnostic
+        # (protocol 28 - bdoorSync forced OFF, protocol-27 mint channel ON).
+        # Both sides place a SHACK (a door-bearing template), ramp it to
+        # self-complete, census nearby doors with their parent-building link
+        # (1 Hz), toggle their OWN shack's door #0, and the host destroys its
+        # shack at t=42s. Gates the LOCAL legs only (place + door exists +
+        # toggle stuck + destroy worked); the findings (proxy doors on the
+        # peer's mint, toggle non-crossing, the post-destroy ghost) gate the
+        # protocol-28 channel design.
+        bdoor_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'bdoor_probe'
+            Gating   = @('bdoor_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # bdoor_sync: protocol-28 placed-building door + removal sync
+        # (bdoorSync ON). Same script as bdoor_probe; gates that each side's
+        # door toggle CROSSED onto the peer's minted proxy (applied [bdoor]
+        # RECV + census at the toggled state) and that the host's destroy
+        # REMOVED the join's proxy (REMOVE-RECV ok=1 + no ghost census rows).
+        bdoor_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'bdoor_sync'
+            Gating   = @('bdoor_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # hunger_probe: hunger phase-0 diagnostic (protocol 29 - hungerSync
+        # forced OFF, the rest of the medical snapshot streaming). Both sides
+        # census the whole squad's hunger/fed/dazedOrAlert at 1 Hz and each
+        # writes a proportional SENTINEL hunger (own-tab leader, current*0.6;
+        # host t=15s, join t=22s). Gates the LOCAL legs (census + sentinel
+        # stuck); the findings (scale, per-client decay agreement, sentinel
+        # non-crossing, dazedOrAlert range) gate the protocol-29 fold-in.
+        hunger_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'hunger_probe'
+            Gating   = @('hunger_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # hunger_sync: protocol-29 hunger sync (hungerSync ON - the hunger/fed
+        # scalars riding the owner-authoritative medical snapshot). Same
+        # script as hunger_probe; gates that each side's sentinel hunger drop
+        # CROSSED onto the peer's driven copy (drop-relative, within 10 s)
+        # and that end-of-run owner-vs-copy hunger gaps stay small for every
+        # shared hand.
+        hunger_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'hunger_sync'
+            Gating   = @('hunger_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # latejoin_probe: late-join phase-0 diagnostic (protocol 30 -
+        # latejoinSync forced OFF, everything else streaming). The HOST
+        # mutates state in the PRE-ARM window - before the join connects:
+        # toggles a baked door, writes a sentinel faction relation (-85),
+        # bumps its tab wallet (+777), and places + completes a small
+        # building. Post-arm both sides census door/faction/money at 1 Hz.
+        # Gates the LOCAL legs (host mutations ok + censuses ran); the
+        # findings (per-channel heal latency via safety resends, the
+        # building that NEVER mints) motivate the connect-edge resync.
+        latejoin_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'latejoin_probe'
+            Gating   = @('latejoin_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # latejoin_sync: protocol-30 connect-edge resync (latejoinSync ON).
+        # Same script as latejoin_probe; gates that ALL pre-connect host
+        # mutations converged on the join shortly after connect - the door,
+        # faction and money censuses agree across clients, and the
+        # pre-connect building MINTED on the join (the probe's permanent
+        # gap, closed) with its complete latch.
+        latejoin_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'latejoin_sync'
+            Gating   = @('latejoin_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # save_probe: coordinated-save phase-12a diagnostic (protocol 31 -
+        # save detour installed for edge logging, NO coordination). The HOST
+        # issues a mid-session saveGameAs('coopresume') and the probe retires
+        # the two runtime unknowns gating the host-authoritative transfer:
+        # getCurrentGame/getSavePath resolve (spike 39 RVAs, never called
+        # before) and the folder-quiescence completion edge (latency + file
+        # count/bytes + the gameplay hitch while the engine writes).
+        save_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'save_probe'
+            Gating   = @('save_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # save_sync: protocol-31 coordinated save + in-band transfer (saveSync
+        # ON - the default). The HOST issues one mid-session
+        # saveGameAs('coopresume'); the coordination does the rest: detour
+        # edge -> folder quiescence -> paced whole-folder stream to the join
+        # (BEGIN/FILE/DONE) -> staged CRC-verified atomic commit -> ACK.
+        # Gates the full round trip: LOCAL-SAVE edge, QUIESCED, XFER-SENT,
+        # COMMIT ok with file/byte counts EQUAL to the host's, ACK ok=1.
+        save_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'save_sync'
+            Gating   = @('save_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # save_stage1: resume_test.ps1 stage 1 (not a tier member - the
+        # two-stage wrapper drives it). Same coordinated-save gates as
+        # save_sync, but the host FIRST places a construction site and ramps
+        # it part-way (session-runtime state), so the transferred save carries
+        # a building that exists in NO baked save - the stage-2 same-hand
+        # evidence.
+        save_stage1 = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'save_sync'
+            Gating   = @('save_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+
+        # resume_check: resume_test.ps1 stage 2 (not a tier member). Both
+        # clients relaunch on the save the stage-1 transfer delivered
+        # (KENSHICOOP_SAVE=coopresume, NO harness save mirroring - the join
+        # loads what the TRANSFER wrote) and census construction sites at
+        # 1 Hz. Gates that the stage-1 building enumerates on BOTH sides
+        # under the SAME save-stable hand - the identity-reset proof.
+        resume_check = @{
+            Save = 'coopresume'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'save_resume'
+            Gating   = @('save_resume', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+
+        # load_probe: coordinated-load phase-13a diagnostic (protocol 32 -
+        # load detour installed for edge logging, NO load coordination;
+        # saveSync stays ON so the join holds an identical copy first). The
+        # HOST issues a coordinated saveGameAs('coopresume'), waits for the
+        # transfer DONE, then a MID-SESSION engine::loadSave('coopresume').
+        # Retires the runtime unknowns gating the coordinated load: is the
+        # mid-session load safe, does mainLoop_hook tick across the load
+        # screen, does the host survive its own swap with sync running, and
+        # do save-stable hands re-resolve in the fresh world. The JOIN
+        # deliberately does NOT load (the 13a divergence baseline).
+        load_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'load_probe'
+            Gating   = @('load_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # load_sync: protocol-32 coordinated load (loadSync ON - the default).
+        # The user's manual scenario, automated: the HOST places a building,
+        # coordinated-saves 'coopresume' (the join commits an identical copy),
+        # then LOADS it mid-session. The coordination must drive the join to
+        # load the same save: GO broadcast -> join fingerprint MATCH -> join
+        # bypass-once load -> BOTH sides world-swap + protocol-32 session
+        # reset -> the pre-load building enumerates on BOTH sides POST-load
+        # under the SAME save-stable hand. clock_sync is NOT gated: the load
+        # rebuilds both worlds mid-run, which legitimately restarts the
+        # in-game clock series the oracle aligns on.
+        load_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'load_sync'
+            Gating   = @('load_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'clock_sync')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # prod_probe: production machine phase-0 diagnostic (protocol 33 -
+        # prodSync forced OFF, the protocol-27 mint channel ON). The HOST
+        # places a generator + crafting bench leader-relative and ramps both
+        # complete (minting proxies on the join); both sides census machine-
+        # class buildings at 1 Hz (power/state/output/inputs/tech/farm);
+        # the host operates the bench 1 Hz t=20-50s (divergence driver),
+        # toggles the generator's power OFF/ON, then writes the bench output
+        # via the native setProductionItem and a direct amount write. Gates
+        # the LOCAL legs only (place + ramp + census + power applied +
+        # setitem landed + ops ran); the findings (hand intersection,
+        # owner-vs-idle divergence, write-lever stickiness, power
+        # non-crossing, research evidence) gate the protocol-33 design.
+        prod_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'prod_probe'
+            Gating   = @('prod_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # prod_sync: protocol-33 host-authoritative machine state sync
+        # (prodSync ON - the same script as prod_probe, so the probe's
+        # measured gaps must now be CLOSED). The HOST places + completes a
+        # generator and a crafting bench (minting proxies on the join),
+        # operates the bench 1 Hz t=20-50s and toggles the generator power
+        # OFF/ON; publishProd streams change-gated PKT_PROD rows the join
+        # applies through the engine levers. Gates the probe's local legs
+        # PLUS: [prod] rows sent AND applied, join minted both machines,
+        # the bench output converged (final gap <= 1.0), the power OFF
+        # crossed within 6 s and the final power state agrees.
+        prod_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'prod_sync'
+            Gating   = @('prod_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # store_probe: storage/machine container phase-0 diagnostic (protocol
+        # 34 - storeSync forced OFF, the protocol-27 mint channel ON). The
+        # HOST places a crafting bench + a general-storage chest leader-
+        # relative and ramps both complete (minting proxies on the join);
+        # both sides census container-bearing buildings (STORAGE + machine
+        # classes) at 1 Hz with per-row entry count / total qty / content
+        # hash; the host fabricates 5 sentinel items INTO the chest, operates
+        # the bench 1 Hz t=24-54s (whole items land in the machine container
+        # - the divergence driver), reconciles the chest down to 2 sentinels
+        # (removal leg) and force-empties the bench container (churn leg);
+        # the JOIN fabricates into its MINTED chest copy. Gates the LOCAL
+        # legs only (place + ramp + census + add landed + recon removed + ops
+        # ran); the findings (hand intersection, hasInv readability, capacity
+        # vs INV_ITEMS_MAX, owner-vs-idle container divergence, add
+        # non-crossing, post-empty churn) gate the protocol-34 design.
+        store_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'store_probe'
+            Gating   = @('store_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # store_sync: protocol-34 host-authoritative container contents
+        # (storeSync ON, riding the invSync container channel - the same
+        # script as store_probe minus the join-side add, so the probe's
+        # measured gaps must now be CLOSED). The host's ~1 Hz census
+        # registers every complete storage/machine container near the
+        # interest centers as an authored container; placed buildings ride
+        # their protocol-27 placer key (InvSnapshotHeader keyKind=1). Gates
+        # the probe's local legs PLUS: the host census-authored the placed
+        # chest ([inv] SEND kind=1), the join applied [inv] rows, the host's
+        # chest add CROSSED onto the join's minted copy, and the FINAL chest
+        # content hashes agree (so the reconcile-removal crossed too).
+        store_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'store_sync'
+            Gating   = @('store_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # npc_census: protocol-36 wide-radius ghost culling. The join spawns 4
+        # runtime NPCs and parks them ~600 u out - beyond the ~200 u stream
+        # bubble, inside the 2000 u census radius - so ONLY the census channel
+        # (host 1 Hz wide-radius hand list + the join's wide suppression pass)
+        # can cull them. Gates: census flowing both ends, all ghost hands
+        # culled, no mass-suppression of legitimate census NPCs. Save 'sync':
+        # a live town gives the census real NPCs (the restraint control) and
+        # findNearbyNonPlayerFaction a faction to mint the ghosts in.
+        npc_census = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'npc_census'
+            Gating   = @('npc_census', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
@@ -540,6 +995,29 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
+        # Protocol-36 BASELINE for the cross-owner direct-drag bugs (field report:
+        # dupe on take, wipe on give, weapon vanish). The host performs real cross-
+        # owner engine moves; the oracle REPORTS the conservation outcome as evidence.
+        # Not in a tier: it documents the bug the transfer-intent channel then fixes.
+        trade_probe = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'trade_probe'
+            Gating   = @('trade_probe')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'none'; WanVariant = $false
+        }
+        # Protocol-37 VALIDATION of the transfer-intent channel (xferSync ON): the
+        # same three cross-owner drags trade_probe baselined, now expected CLEAN -
+        # TAKE lands + the removal propagates (no dupe), GIVE arrives on the owner
+        # (no wipe), the traded WEAPON survives on BOTH clients (real-object
+        # relocation) and both clients agree on the final per-rank state.
+        trade_peer = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'trade_peer'
+            Gating   = @('trade_peer', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
 
         # ---- world items ------------------------------------------------------------
         drop_probe = @{
@@ -553,6 +1031,17 @@
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'wi_sync'
             Gating   = @('wi_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # W1 BIDIR: the join->host direction of world_item_sync (the join drops +
+        # despawns; the HOST must spawn/cull the proxy) - the field-reported gap
+        # (join ground drops never appeared on the host) closed by the
+        # bidirectional W1 stream with owner-scoped netIds + the proxy echo guard.
+        world_item_join = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'wi_join'
+            Gating   = @('wi_join', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }

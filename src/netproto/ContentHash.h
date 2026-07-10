@@ -56,6 +56,74 @@ inline unsigned int invEntryHash(const InvItemEntry& e) {
     return h;
 }
 
+// Protocol 31 (coordinated save): incremental FNV-1a-32 over raw bytes - the
+// per-file CRC in the PKT_SAVE_DONE table. Seed with fnv1aInit(), fold each
+// chunk with fnv1aUpdate() as it is read/written, so neither sender nor
+// receiver ever needs the whole file in memory. Same function on both ends
+// (and locked by prototest) = the transfer's integrity proof.
+inline unsigned int fnv1aInit() { return 2166136261u; }
+inline unsigned int fnv1aUpdate(unsigned int h, const void* data, unsigned int len) {
+    const unsigned char* p = (const unsigned char*)data;
+    for (unsigned int i = 0; i < len; ++i) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+// Protocol 32 (coordinated load): the FOLDER FINGERPRINT the host attaches to
+// PKT_LOAD_GO and the join compares against its on-disk copy. FNV-1a folded
+// over each file's LOWER-CASED relative path (the NUL rides along as the
+// path/CRC separator) followed by its content CRC (fnv1a over the file
+// bytes), in ascending lower-cased-path order. Sorting inside makes the
+// result invariant to directory enumeration order (FindFirstFile order is
+// filesystem-dependent); lower-casing matches Windows path case-
+// insensitivity. Byte-identical folders agree on both machines; any file
+// added/removed/renamed/rewritten changes the value. 0 is reserved for
+// "missing/unreadable folder", so a real fingerprint landing on 0 is nudged
+// to 1. Locked by prototest (determinism + order-invariance + sensitivity).
+inline unsigned int folderFingerprintOf(const char* const* relPaths,
+                                        const unsigned int* crcs,
+                                        unsigned int count) {
+    if (count == 0) return 0;
+    enum { FP_MAX_FILES = 4096 };
+    if (count > FP_MAX_FILES) return 0;
+    // Sort an index array by lower-cased path (insertion sort: save folders
+    // are tens of files; no <algorithm>/functor plumbing needed for v100).
+    unsigned int idx[FP_MAX_FILES];
+    for (unsigned int i = 0; i < count; ++i) idx[i] = i;
+    for (unsigned int i = 1; i < count; ++i) {
+        unsigned int k = idx[i];
+        int j = (int)i - 1;
+        while (j >= 0) {
+            const char* a = relPaths[idx[j]];
+            const char* b = relPaths[k];
+            int cmp = 0;
+            for (;; ++a, ++b) {
+                int ca = (unsigned char)*a, cb = (unsigned char)*b;
+                if (ca >= 'A' && ca <= 'Z') ca += 32;
+                if (cb >= 'A' && cb <= 'Z') cb += 32;
+                if (ca != cb) { cmp = ca - cb; break; }
+                if (ca == 0) break;
+            }
+            if (cmp <= 0) break;
+            idx[j + 1] = idx[j];
+            --j;
+        }
+        idx[(unsigned int)(j + 1)] = k;
+    }
+    unsigned int h = fnv1aInit();
+    for (unsigned int i = 0; i < count; ++i) {
+        const char* p = relPaths[idx[i]];
+        for (; *p; ++p) {
+            int c = (unsigned char)*p;
+            if (c >= 'A' && c <= 'Z') c += 32;
+            h ^= (unsigned int)c; h *= 16777619u;
+        }
+        h ^= 0u; h *= 16777619u; // the path's NUL separator
+        unsigned int crc = crcs[idx[i]];
+        h = fnv1aUpdate(h, &crc, sizeof(crc));
+    }
+    return h ? h : 1;
+}
+
 } // namespace coop
 
 #endif // KENSHICOOP_CONTENTHASH_H

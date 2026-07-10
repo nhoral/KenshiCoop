@@ -18,9 +18,12 @@ namespace coop {
 
 // One received entity plus the network id of the peer that owns it. The owner
 // tag lets the receiver apply the right authority rule (drive a peer's entity,
-// never one we own).
+// never one we own). sendMs (wire v35) is the sender's monotonic ms clock at
+// capture time - the interp buffer indexes on it (mapped into the local clock)
+// instead of the arrival time, so path jitter stays out of the snapshot spacing.
 struct InboundEntity {
     u32         ownerId;
+    u32         sendMs;
     EntityState e;
 };
 
@@ -32,11 +35,14 @@ struct InboundEvent {
 };
 
 // One received container-contents snapshot (Phase 4a): the authoritative owner, the
-// container's hand, and the full item list. The receiver reconciles its local copy
-// of that container to match. count==0 means "now empty".
+// container's key, and the full item list. The receiver reconciles its local copy
+// of that container to match. count==0 means "now empty". keyKind (protocol 34):
+// 0 = cKey is the raw container hand, 1 = cKey is the protocol-27 placer key of a
+// session-placed building (the receiver translates through its build maps).
 struct InboundInv {
     u32                       ownerId;
-    u32                       cHand[5]; // type, container, containerSerial, index, serial
+    u8                        keyKind;
+    u32                       cKey[5]; // type, container, containerSerial, index, serial
     std::vector<InvItemEntry> items;
 };
 
@@ -55,6 +61,15 @@ struct InboundWorldRemove {
     std::vector<u32> netIds;
 };
 
+// One received NPC existence census (protocol 36, join side): the hands of
+// every world NPC within the host's census radius, flat 5xu32 per NPC. The
+// join culls local NPCs absent from this list at long range (existence
+// authority); position authority stays with the 20 Hz entity stream.
+struct InboundNpcCensus {
+    u32              ownerId;
+    std::vector<u32> hands; // count*5, readObjectHand layout
+};
+
 // One received conservation DROP intent (Phase W2): the owning character + item identity +
 // ground position. The receiver relocates ITS OWN copy of the weapon from that character's
 // bag to the ground (no fabrication). Owner-tagged so the non-owner is the one that acts.
@@ -69,6 +84,15 @@ struct InboundWorldDrop {
 struct InboundWorldPickup {
     u32               ownerId;
     WorldPickupPacket pkt;
+};
+
+// One received cross-owner TRANSFER intent (protocol 37): a peer performed a
+// direct UI drag between two containers, at least one of which it does not
+// author. The receiver relocates the REAL item between its own copies of the
+// two containers (conservation - no fabrication, no destruction).
+struct InboundInvXfer {
+    u32           ownerId;
+    InvXferPacket pkt;
 };
 
 // One received owner-authoritative medical snapshot (phase 2): the subject's
@@ -110,6 +134,69 @@ struct InboundMoney {
     MoneyPacket pkt;
 };
 
+// One received player-faction relation row (protocol 24): from the host it is
+// the authoritative row (the join applies it); from the join it is a forwarded
+// intent (the host applies it, then its own stream echoes the row back).
+struct InboundFaction {
+    u32           ownerId;
+    FactionPacket pkt;
+};
+
+// One received game-clock sample (protocol 25, join side): the host's
+// absolute in-game hours; the join slews its local sim speed to close the
+// offset.
+struct InboundTime {
+    u32        ownerId;
+    TimePacket pkt;
+};
+
+// One received baked-door state row (protocol 26): a door the sender's table
+// saw move; the receiver applies it through the engine's own door actions
+// (baseline updated first - echo-free).
+struct InboundDoor {
+    u32        ownerId;
+    DoorPacket pkt;
+};
+
+// One received placed-building announcement (protocol 27): the sender placed
+// a building; the receiver mints a local construction site and maps the
+// sender's key to its own local hand.
+struct InboundBuildPlace {
+    u32              ownerId;
+    BuildPlacePacket pkt;
+};
+
+// One received construction-progress row (protocol 27): progress for a
+// building the SENDER placed, applied through the receiver's translation map.
+struct InboundBuildState {
+    u32              ownerId;
+    BuildStatePacket pkt;
+};
+
+// One received placed-building door row (protocol 28): keyed by the PLACER's
+// building hand + door index; the receiver resolves its local door through
+// the build maps and applies via the engine's own door actions.
+struct InboundBuildDoor {
+    u32             ownerId;
+    BuildDoorPacket pkt;
+};
+
+// One received building removal (protocol 28): the sender dismantled or
+// destroyed a building it placed; the receiver destroys its mapped proxy.
+struct InboundBuildRemove {
+    u32               ownerId;
+    BuildRemovePacket pkt;
+};
+
+// One received machine state row (protocol 33): the HOST's authoritative
+// power/production/farm state for a machine; the join resolves the key
+// (baked hand or protocol-27 placer key) and applies through the engine's
+// own levers.
+struct InboundProd {
+    u32        ownerId;
+    ProdPacket pkt;
+};
+
 // One received stealth detection-map snapshot (protocol 20): the detection
 // AUTHORITY (the host's world, where the sneaker is a driven copy) streams who
 // notices the sneaker; the sneaker's OWNER replays the entries between its
@@ -134,6 +221,66 @@ struct InboundSpawnInfo {
     SpawnInfoPacket pkt;
 };
 
+// One received join save request (protocol 31, host side): the join's player
+// pressed save (local write suppressed); the host runs the authoritative save.
+struct InboundSaveReq {
+    u32           ownerId;
+    SaveReqPacket pkt;
+};
+
+// One received save-transfer announce (protocol 31, join side): the host is
+// about to stream fileCount files / totalBytes; the join wipes + creates its
+// staging folder.
+struct InboundSaveBegin {
+    u32             ownerId;
+    SaveBeginPacket pkt;
+};
+
+// One received save-file chunk (protocol 31, join side): header + the file's
+// save-relative path + up to SAVE_CHUNK_MAX payload bytes. Ordered-reliable
+// delivery means chunks arrive exactly as the sender paced them.
+struct InboundSaveFile {
+    u32             ownerId;
+    SaveFileHeader  hdr;
+    std::string     path; // hdr.pathLen bytes, save-folder-relative
+    std::vector<u8> data; // hdr.dataLen bytes
+};
+
+// One received save-transfer CRC table (protocol 31, join side): verify the
+// staged files and commit (or discard).
+struct InboundSaveDone {
+    u32              ownerId;
+    SaveDoneHeader   hdr;
+    std::vector<u32> crcs;
+};
+
+// One received commit acknowledgement (protocol 31, host side).
+struct InboundSaveAck {
+    u32           ownerId;
+    SaveAckPacket pkt;
+};
+
+// One received coordinated-load order (protocol 32, join side): the host
+// loaded a save; the join verifies its copy and follows (or NACKs).
+struct InboundLoadGo {
+    u32          ownerId;
+    LoadGoPacket pkt;
+};
+
+// One received join load request (protocol 32, host side): the join's player
+// pressed load (suppressed locally); the host arbitrates.
+struct InboundLoadReq {
+    u32           ownerId;
+    LoadReqPacket pkt;
+};
+
+// One received copy-missing/diverged answer (protocol 32, host side): the
+// join can't load the ordered save; a SaveXfer transfer follows.
+struct InboundLoadNack {
+    u32            ownerId;
+    LoadNackPacket pkt;
+};
+
 class Inbound {
 public:
     Inbound()  { InitializeCriticalSection(&cs_); sawRemote_ = false; }
@@ -146,9 +293,9 @@ public:
     void pushLeave(u32 id) {
         EnterCriticalSection(&cs_); leave_.push_back(id); LeaveCriticalSection(&cs_);
     }
-    // NET thread: one received entity transform, owner-tagged.
-    void pushEntity(u32 ownerId, const EntityState& e) {
-        InboundEntity ie; ie.ownerId = ownerId; ie.e = e;
+    // NET thread: one received entity transform, owner-tagged + send-stamped.
+    void pushEntity(u32 ownerId, u32 sendMs, const EntityState& e) {
+        InboundEntity ie; ie.ownerId = ownerId; ie.sendMs = sendMs; ie.e = e;
         EnterCriticalSection(&cs_); ent_.push_back(ie); sawRemote_ = true;
         LeaveCriticalSection(&cs_);
     }
@@ -167,11 +314,12 @@ public:
         EnterCriticalSection(&cs_); evt_.push_back(ievt); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received container-contents snapshot, owner-tagged.
-    void pushInv(u32 ownerId, const u32 cHand[5], const InvItemEntry* items,
-                 unsigned int count) {
+    void pushInv(u32 ownerId, u8 keyKind, const u32 cKey[5],
+                 const InvItemEntry* items, unsigned int count) {
         InboundInv ii;
         ii.ownerId = ownerId;
-        for (int k = 0; k < 5; ++k) ii.cHand[k] = cHand[k];
+        ii.keyKind = keyKind;
+        for (int k = 0; k < 5; ++k) ii.cKey[k] = cKey[k];
         if (items && count > 0) ii.items.assign(items, items + count);
         EnterCriticalSection(&cs_); inv_.push_back(ii); LeaveCriticalSection(&cs_);
     }
@@ -189,6 +337,13 @@ public:
         if (netIds && count > 0) wr.netIds.assign(netIds, netIds + count);
         EnterCriticalSection(&cs_); wir_.push_back(wr); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received NPC existence census (protocol 36), owner-tagged.
+    void pushNpcCensus(u32 ownerId, const u32* hands, unsigned int count) {
+        InboundNpcCensus nc;
+        nc.ownerId = ownerId;
+        if (hands && count > 0) nc.hands.assign(hands, hands + count * 5);
+        EnterCriticalSection(&cs_); npcCensus_.push_back(nc); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received conservation DROP intent, owner-tagged.
     void pushWorldDrop(u32 ownerId, const WorldDropPacket& pkt) {
         InboundWorldDrop wd; wd.ownerId = ownerId; wd.pkt = pkt;
@@ -198,6 +353,11 @@ public:
     void pushWorldPickup(u32 ownerId, const WorldPickupPacket& pkt) {
         InboundWorldPickup wp; wp.ownerId = ownerId; wp.pkt = pkt;
         EnterCriticalSection(&cs_); wp_.push_back(wp); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received cross-owner transfer intent (protocol 37), owner-tagged.
+    void pushInvXfer(u32 ownerId, const InvXferPacket& pkt) {
+        InboundInvXfer ix; ix.ownerId = ownerId; ix.pkt = pkt;
+        EnterCriticalSection(&cs_); invXfer_.push_back(ix); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received medical snapshot, owner-tagged.
     void pushMedical(u32 ownerId, const MedicalPacket& pkt) {
@@ -224,6 +384,46 @@ public:
         InboundMoney imo; imo.ownerId = ownerId; imo.pkt = pkt;
         EnterCriticalSection(&cs_); money_.push_back(imo); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received faction-relation row (protocol 24), owner-tagged.
+    void pushFaction(u32 ownerId, const FactionPacket& pkt) {
+        InboundFaction ifa; ifa.ownerId = ownerId; ifa.pkt = pkt;
+        EnterCriticalSection(&cs_); faction_.push_back(ifa); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received game-clock sample (protocol 25), owner-tagged.
+    void pushTime(u32 ownerId, const TimePacket& pkt) {
+        InboundTime iti; iti.ownerId = ownerId; iti.pkt = pkt;
+        EnterCriticalSection(&cs_); time_.push_back(iti); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received baked-door state row (protocol 26), owner-tagged.
+    void pushDoor(u32 ownerId, const DoorPacket& pkt) {
+        InboundDoor ido; ido.ownerId = ownerId; ido.pkt = pkt;
+        EnterCriticalSection(&cs_); door_.push_back(ido); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received machine state row (protocol 33), owner-tagged.
+    void pushProd(u32 ownerId, const ProdPacket& pkt) {
+        InboundProd ip; ip.ownerId = ownerId; ip.pkt = pkt;
+        EnterCriticalSection(&cs_); prod_.push_back(ip); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
+    void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
+        InboundBuildPlace ibp; ibp.ownerId = ownerId; ibp.pkt = pkt;
+        EnterCriticalSection(&cs_); buildPlace_.push_back(ibp); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received construction-progress row (protocol 27), owner-tagged.
+    void pushBuildState(u32 ownerId, const BuildStatePacket& pkt) {
+        InboundBuildState ibs; ibs.ownerId = ownerId; ibs.pkt = pkt;
+        EnterCriticalSection(&cs_); buildState_.push_back(ibs); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received placed-building door row (protocol 28), owner-tagged.
+    void pushBuildDoor(u32 ownerId, const BuildDoorPacket& pkt) {
+        InboundBuildDoor ibd; ibd.ownerId = ownerId; ibd.pkt = pkt;
+        EnterCriticalSection(&cs_); buildDoor_.push_back(ibd); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received building removal (protocol 28), owner-tagged.
+    void pushBuildRemove(u32 ownerId, const BuildRemovePacket& pkt) {
+        InboundBuildRemove ibr; ibr.ownerId = ownerId; ibr.pkt = pkt;
+        EnterCriticalSection(&cs_); buildRemove_.push_back(ibr); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received stealth detection-map snapshot, owner-tagged.
     void pushStealth(u32 ownerId, const StealthPacket& pkt) {
         InboundStealth isl; isl.ownerId = ownerId; isl.pkt = pkt;
@@ -238,6 +438,48 @@ public:
     void pushSpawnInfo(u32 ownerId, const SpawnInfoPacket& pkt) {
         InboundSpawnInfo si; si.ownerId = ownerId; si.pkt = pkt;
         EnterCriticalSection(&cs_); spawnInfo_.push_back(si); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: coordinated-save packets (protocol 31), owner-tagged.
+    void pushSaveReq(u32 ownerId, const SaveReqPacket& pkt) {
+        InboundSaveReq sr; sr.ownerId = ownerId; sr.pkt = pkt;
+        EnterCriticalSection(&cs_); saveReq_.push_back(sr); LeaveCriticalSection(&cs_);
+    }
+    void pushSaveBegin(u32 ownerId, const SaveBeginPacket& pkt) {
+        InboundSaveBegin sb; sb.ownerId = ownerId; sb.pkt = pkt;
+        EnterCriticalSection(&cs_); saveBegin_.push_back(sb); LeaveCriticalSection(&cs_);
+    }
+    void pushSaveFile(u32 ownerId, const SaveFileHeader& hdr,
+                      const char* path, const u8* data) {
+        InboundSaveFile sf;
+        sf.ownerId = ownerId;
+        sf.hdr     = hdr;
+        sf.path.assign(path, path + hdr.pathLen);
+        if (data && hdr.dataLen > 0) sf.data.assign(data, data + hdr.dataLen);
+        EnterCriticalSection(&cs_); saveFile_.push_back(sf); LeaveCriticalSection(&cs_);
+    }
+    void pushSaveDone(u32 ownerId, const SaveDoneHeader& hdr, const u32* crcs) {
+        InboundSaveDone sd;
+        sd.ownerId = ownerId;
+        sd.hdr     = hdr;
+        if (crcs && hdr.fileCount > 0) sd.crcs.assign(crcs, crcs + hdr.fileCount);
+        EnterCriticalSection(&cs_); saveDone_.push_back(sd); LeaveCriticalSection(&cs_);
+    }
+    void pushSaveAck(u32 ownerId, const SaveAckPacket& pkt) {
+        InboundSaveAck sa; sa.ownerId = ownerId; sa.pkt = pkt;
+        EnterCriticalSection(&cs_); saveAck_.push_back(sa); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: coordinated-load packets (protocol 32), owner-tagged.
+    void pushLoadGo(u32 ownerId, const LoadGoPacket& pkt) {
+        InboundLoadGo lg; lg.ownerId = ownerId; lg.pkt = pkt;
+        EnterCriticalSection(&cs_); loadGo_.push_back(lg); LeaveCriticalSection(&cs_);
+    }
+    void pushLoadReq(u32 ownerId, const LoadReqPacket& pkt) {
+        InboundLoadReq lr; lr.ownerId = ownerId; lr.pkt = pkt;
+        EnterCriticalSection(&cs_); loadReq_.push_back(lr); LeaveCriticalSection(&cs_);
+    }
+    void pushLoadNack(u32 ownerId, const LoadNackPacket& pkt) {
+        InboundLoadNack ln; ln.ownerId = ownerId; ln.pkt = pkt;
+        EnterCriticalSection(&cs_); loadNack_.push_back(ln); LeaveCriticalSection(&cs_);
     }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
@@ -262,11 +504,17 @@ public:
     void drainWorldRemove(std::deque<InboundWorldRemove>& out) {
         EnterCriticalSection(&cs_); out.swap(wir_); LeaveCriticalSection(&cs_);
     }
+    void drainNpcCensus(std::deque<InboundNpcCensus>& out) {
+        EnterCriticalSection(&cs_); out.swap(npcCensus_); LeaveCriticalSection(&cs_);
+    }
     void drainWorldDrops(std::deque<InboundWorldDrop>& out) {
         EnterCriticalSection(&cs_); out.swap(wd_); LeaveCriticalSection(&cs_);
     }
     void drainWorldPickups(std::deque<InboundWorldPickup>& out) {
         EnterCriticalSection(&cs_); out.swap(wp_); LeaveCriticalSection(&cs_);
+    }
+    void drainInvXfers(std::deque<InboundInvXfer>& out) {
+        EnterCriticalSection(&cs_); out.swap(invXfer_); LeaveCriticalSection(&cs_);
     }
     void drainMedical(std::deque<InboundMedical>& out) {
         EnterCriticalSection(&cs_); out.swap(med_); LeaveCriticalSection(&cs_);
@@ -280,6 +528,30 @@ public:
     void drainStats(std::deque<InboundStats>& out) {
         EnterCriticalSection(&cs_); out.swap(stats_); LeaveCriticalSection(&cs_);
     }
+    void drainFaction(std::deque<InboundFaction>& out) {
+        EnterCriticalSection(&cs_); out.swap(faction_); LeaveCriticalSection(&cs_);
+    }
+    void drainTime(std::deque<InboundTime>& out) {
+        EnterCriticalSection(&cs_); out.swap(time_); LeaveCriticalSection(&cs_);
+    }
+    void drainDoor(std::deque<InboundDoor>& out) {
+        EnterCriticalSection(&cs_); out.swap(door_); LeaveCriticalSection(&cs_);
+    }
+    void drainProd(std::deque<InboundProd>& out) {
+        EnterCriticalSection(&cs_); out.swap(prod_); LeaveCriticalSection(&cs_);
+    }
+    void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
+        EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
+    }
+    void drainBuildState(std::deque<InboundBuildState>& out) {
+        EnterCriticalSection(&cs_); out.swap(buildState_); LeaveCriticalSection(&cs_);
+    }
+    void drainBuildDoor(std::deque<InboundBuildDoor>& out) {
+        EnterCriticalSection(&cs_); out.swap(buildDoor_); LeaveCriticalSection(&cs_);
+    }
+    void drainBuildRemove(std::deque<InboundBuildRemove>& out) {
+        EnterCriticalSection(&cs_); out.swap(buildRemove_); LeaveCriticalSection(&cs_);
+    }
     void drainMoney(std::deque<InboundMoney>& out) {
         EnterCriticalSection(&cs_); out.swap(money_); LeaveCriticalSection(&cs_);
     }
@@ -292,6 +564,48 @@ public:
     void drainSpawnInfos(std::deque<InboundSpawnInfo>& out) {
         EnterCriticalSection(&cs_); out.swap(spawnInfo_); LeaveCriticalSection(&cs_);
     }
+    void drainSaveReqs(std::deque<InboundSaveReq>& out) {
+        EnterCriticalSection(&cs_); out.swap(saveReq_); LeaveCriticalSection(&cs_);
+    }
+    void drainSaveBegins(std::deque<InboundSaveBegin>& out) {
+        EnterCriticalSection(&cs_); out.swap(saveBegin_); LeaveCriticalSection(&cs_);
+    }
+    void drainSaveFiles(std::deque<InboundSaveFile>& out) {
+        EnterCriticalSection(&cs_); out.swap(saveFile_); LeaveCriticalSection(&cs_);
+    }
+    void drainSaveDones(std::deque<InboundSaveDone>& out) {
+        EnterCriticalSection(&cs_); out.swap(saveDone_); LeaveCriticalSection(&cs_);
+    }
+    void drainSaveAcks(std::deque<InboundSaveAck>& out) {
+        EnterCriticalSection(&cs_); out.swap(saveAck_); LeaveCriticalSection(&cs_);
+    }
+    void drainLoadGos(std::deque<InboundLoadGo>& out) {
+        EnterCriticalSection(&cs_); out.swap(loadGo_); LeaveCriticalSection(&cs_);
+    }
+    void drainLoadReqs(std::deque<InboundLoadReq>& out) {
+        EnterCriticalSection(&cs_); out.swap(loadReq_); LeaveCriticalSection(&cs_);
+    }
+    void drainLoadNacks(std::deque<InboundLoadNack>& out) {
+        EnterCriticalSection(&cs_); out.swap(loadNack_); LeaveCriticalSection(&cs_);
+    }
+
+    // MAIN thread, session reset (protocol 32): drop every queued packet that
+    // describes the OLD world after a reload edge. Presence (connect/leave
+    // edges) and the coordinated-load queues themselves survive - the
+    // connection never drops across a world swap, and a LOAD_NACK arriving
+    // while the host was mid-swap must still be answered.
+    void flushWorldState() {
+        EnterCriticalSection(&cs_);
+        ent_.clear();       evt_.clear();        inv_.clear();
+        wi_.clear();        wir_.clear();        wd_.clear();
+        wp_.clear();        med_.clear();        treat_.clear();
+        speed_.clear();     stats_.clear();      money_.clear();
+        faction_.clear();   time_.clear();       door_.clear();
+        buildPlace_.clear(); buildState_.clear(); buildDoor_.clear();
+        buildRemove_.clear(); stealth_.clear();   spawnReq_.clear();
+        spawnInfo_.clear(); prod_.clear();       npcCensus_.clear();
+        LeaveCriticalSection(&cs_);
+    }
 
 private:
     CRITICAL_SECTION          cs_;
@@ -303,16 +617,34 @@ private:
     std::deque<InboundInv>    inv_;
     std::deque<InboundWorldItems>  wi_;
     std::deque<InboundWorldRemove> wir_;
+    std::deque<InboundNpcCensus>   npcCensus_;
     std::deque<InboundWorldDrop>   wd_;
+    std::deque<InboundInvXfer>     invXfer_;
     std::deque<InboundWorldPickup> wp_;
     std::deque<InboundMedical>     med_;
     std::deque<InboundTreatment>   treat_;
     std::deque<InboundSpeed>       speed_;
     std::deque<InboundStats>       stats_;
     std::deque<InboundMoney>       money_;
+    std::deque<InboundFaction>     faction_;
+    std::deque<InboundTime>        time_;
+    std::deque<InboundDoor>        door_;
+    std::deque<InboundProd>        prod_;
+    std::deque<InboundBuildPlace>  buildPlace_;
+    std::deque<InboundBuildState>  buildState_;
+    std::deque<InboundBuildDoor>   buildDoor_;
+    std::deque<InboundBuildRemove> buildRemove_;
     std::deque<InboundStealth>     stealth_;
     std::deque<InboundSpawnReq>    spawnReq_;
     std::deque<InboundSpawnInfo>   spawnInfo_;
+    std::deque<InboundSaveReq>     saveReq_;
+    std::deque<InboundSaveBegin>   saveBegin_;
+    std::deque<InboundSaveFile>    saveFile_;
+    std::deque<InboundSaveDone>    saveDone_;
+    std::deque<InboundSaveAck>     saveAck_;
+    std::deque<InboundLoadGo>      loadGo_;
+    std::deque<InboundLoadReq>     loadReq_;
+    std::deque<InboundLoadNack>    loadNack_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);

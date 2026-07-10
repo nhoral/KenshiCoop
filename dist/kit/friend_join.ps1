@@ -18,6 +18,13 @@
   scenario anchor, and bundles log + screenshots + a small system report into
   KenshiCoop-results-<stamp>.zip for sending back.
 
+  RESUMING a previous session (-Resume): after the first session, every save
+  the HOST makes is streamed to you in-band (coordinated save, protocol 31)
+  and committed as 'coopresume' in your save folder - no manual save copy
+  needed ever again. -Resume skips the kit save install and loads that
+  transferred save; the host resumes with the same name on their side:
+    powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostIp <ip> -Resume
+
   Judged later on the host side by scripts\analyze_run.ps1 - clock alignment
   between the two machines comes from the plugin's wire time-sync (CLOCKSYNC),
   so the friend's wall clock does NOT need to match the host's.
@@ -36,7 +43,13 @@ param(
     [string]$Scenario = "",
     [int]$Port = 0,
     # How long a free-play session runs before self-exit (0 = never).
-    [int]$FreePlayMinutes = 0
+    [int]$FreePlayMinutes = 0,
+    # Resume the previous session: load the 'coopresume' save the host's
+    # coordinated save streamed to this machine (protocol 31) instead of
+    # installing the kit's baked save. Defaults to free play (no scenario).
+    [switch]$Resume,
+    # Save name the coordinated-save flow writes (must match the host's).
+    [string]$ResumeSave = "coopresume"
 )
 
 $ErrorActionPreference = "Stop"
@@ -44,14 +57,31 @@ $kitDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # Short Steam friend codes are steamid64 minus the account-universe base.
 function ConvertTo-SteamId64([string]$id) {
+    $id = "$id".Trim()
+    if ($id -notmatch '^\d{1,17}$') {
+        throw ("'$id' is not a Steam ID. Use the other player's friend code (Steam > " +
+               "Friends > Add a Friend - the number at the top) or their 17-digit " +
+               "SteamID64 (steamid.io converts profile URLs).")
+    }
     $v = [uint64]$id
     if ($v -lt 76561197960265728) { $v += 76561197960265728 }
     return $v
 }
 
+# Preflight helpers (RE_Kenshi / Steam / Mark-of-the-Web / windowed checks).
+. (Join-Path $kitDir "kit_preflight.ps1")
+Invoke-KitUnblock -KitDir $kitDir
+
 # ---- Kit defaults --------------------------------------------------------------
 $kit = Get-Content (Join-Path $kitDir "kit.json") -Raw | ConvertFrom-Json
 $save = $kit.save
+if ($Resume) {
+    # The save the host's coordinated save (protocol 31) streamed here last
+    # session; resume = both sides load the identical file. Free play unless
+    # a scenario is asked for explicitly.
+    $save = $ResumeSave
+    if ($Scenario -eq "") { $Scenario = "free" }
+}
 if ($Scenario -eq "") { $Scenario = $kit.scenario }
 if ($Scenario -eq "free") { $Scenario = "" }
 if ($Port -eq 0) { $Port = [int]$kit.port }
@@ -61,6 +91,8 @@ if ($HostSteamId -eq "" -and $kit.PSObject.Properties["hostSteamId"] -and "$($ki
 }
 $useSteam = ($HostSteamId -ne "")
 if (-not $useSteam -and $HostIp -eq "") { throw "Pass -HostIp <ip> (UDP) or -HostSteamId <steamid64> (Steam P2P)." }
+# Validate the ID up front (clear error now beats a dead session later).
+if ($useSteam) { [void](ConvertTo-SteamId64 $HostSteamId) }
 
 # ---- Locate Kenshi ---------------------------------------------------------------
 if ($KenshiDir -eq "") {
@@ -75,6 +107,8 @@ if ($KenshiDir -eq "" -or -not (Test-Path (Join-Path $KenshiDir "kenshi_x64.exe"
 }
 Write-Host "Kenshi install: $KenshiDir"
 
+Test-CoopPrereqs -KenshiDir $KenshiDir -UseSteam $useSteam
+
 # ---- Install mod + save ------------------------------------------------------------
 $modDst = Join-Path $KenshiDir "mods\KenshiCoop"
 New-Item -ItemType Directory -Force -Path $modDst | Out-Null
@@ -83,18 +117,32 @@ Write-Host "Mod installed -> $modDst"
 
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
 New-Item -ItemType Directory -Force -Path $saveRoot | Out-Null
-$saveDst = Join-Path $saveRoot $save
-if (Test-Path $saveDst) { Remove-Item -Recurse -Force $saveDst }
-Copy-Item -Recurse (Join-Path $kitDir "save\$save") $saveDst
-# Some installs read saves from <Kenshi>\save instead of %LOCALAPPDATA%; mirror
-# to both so auto-load finds it either way.
-$installSaveRoot = Join-Path $KenshiDir "save"
-if (Test-Path $installSaveRoot) {
-    $dst2 = Join-Path $installSaveRoot $save
-    if (Test-Path $dst2) { Remove-Item -Recurse -Force $dst2 }
-    Copy-Item -Recurse (Join-Path $kitDir "save\$save") $dst2
+if ($Resume) {
+    # No install: the save was DELIVERED by the host's coordinated save last
+    # session (streamed in-band, CRC-verified, committed atomically). It must
+    # already exist here or there is nothing to resume.
+    $found = (Test-Path (Join-Path $saveRoot $save)) -or
+             (Test-Path (Join-Path $KenshiDir "save\$save"))
+    if (-not $found) {
+        throw ("Resume save '$save' not found in '$saveRoot' or '$KenshiDir\save'. " +
+               "Run at least one connected session first (the host's save is " +
+               "streamed to this machine automatically), or drop -Resume.")
+    }
+    Write-Host "Resuming on transferred save '$save' (no kit save installed)."
+} else {
+    $saveDst = Join-Path $saveRoot $save
+    if (Test-Path $saveDst) { Remove-Item -Recurse -Force $saveDst }
+    Copy-Item -Recurse (Join-Path $kitDir "save\$save") $saveDst
+    # Some installs read saves from <Kenshi>\save instead of %LOCALAPPDATA%; mirror
+    # to both so auto-load finds it either way.
+    $installSaveRoot = Join-Path $KenshiDir "save"
+    if (Test-Path $installSaveRoot) {
+        $dst2 = Join-Path $installSaveRoot $save
+        if (Test-Path $dst2) { Remove-Item -Recurse -Force $dst2 }
+        Copy-Item -Recurse (Join-Path $kitDir "save\$save") $dst2
+    }
+    Write-Host "Save '$save' installed."
 }
-Write-Host "Save '$save' installed."
 
 # ---- Output folder ------------------------------------------------------------------
 $stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -140,6 +188,10 @@ $line = $out | Where-Object { "$_" -match "GAMEPID=(\d+)" } | Select-Object -Fir
 if ($line -and ("$line" -match "GAMEPID=(\d+)")) { $gamePid = [int]$Matches[1] }
 if ($gamePid -eq 0) { throw "Kenshi failed to get past the launcher." }
 Write-Host "Game PID: $gamePid"
+
+# Confirm RE_Kenshi actually loaded the plugin (its log appears immediately);
+# otherwise the game is running vanilla and waiting for a connection is moot.
+[void](Wait-PluginLoaded -LogPath $joinLog -KenshiDir $KenshiDir -TimeoutSec 120)
 
 function Wait-ForLogLine {
     param([string]$File, [string]$Pattern, [int]$TimeoutSec)

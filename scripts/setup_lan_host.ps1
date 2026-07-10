@@ -7,8 +7,8 @@
 
 .DESCRIPTION
   Connection settings come from scripts\lan.config.json (copy the .example).
-  SSH key auth to the machine must already work (OpenSSH server +
-  administrators_authorized_keys).
+  SSH key auth to the machine must already work (same setup as the VideoEditor
+  GPU-PC flow: OpenSSH server + administrators_authorized_keys).
 
   Prerequisites on the LAN machine (verified where possible):
     * Kenshi installed (kenshiDir), RE_Kenshi 0.3.1+ installed

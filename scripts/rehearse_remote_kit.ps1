@@ -51,6 +51,7 @@ if ($Save -eq "") { throw "No save for scenario '$Scenario' (pass -Save)." }
 Write-Host "=== 1. assemble kit ==="
 $kitArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass",
              "-File", (Join-Path $scriptDir "make_remote_kit.ps1"),
+             "-Role", "join",   # this rehearsal drives the kit's friend_join.ps1
              "-Save", $Save, "-Scenario", $Scenario, "-Port", "$Port")
 if ($SkipBuild) { $kitArgs += "-SkipBuild" }
 & powershell @kitArgs

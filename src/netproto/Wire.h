@@ -13,9 +13,11 @@
 namespace coop {
 
 typedef unsigned char  u8;
+typedef signed char    i8;
 typedef unsigned short u16;
 typedef unsigned int   u32;
 typedef float          f32;
+typedef double         f64;
 
 // Protocol version. Bumped to 2 when EntityState gained the bodyState field
 // (Stage 2 down/dead/ragdoll replication); to 3 when the reliable event channel
@@ -144,8 +146,161 @@ typedef float          f32;
 // channel (PKT_SPAWN_REQ/INFO) runs BIDIRECTIONALLY so a runtime-born recruit
 // resolves in either direction; and recruited hands are owned by their
 // RECRUITER regardless of which local tab rank they land in (the probe showed
-// a join recruit landing in the HOST-owned rank-0 container).
-const u16 PROTOCOL_VERSION = 23;
+// a join recruit landing in the HOST-owned rank-0 container);
+// to 24 when FACTION-RELATION sync was added (PKT_FACTION): relation state is
+// per-client `FactionRelations` and nothing crossed (faction_probe run
+// 132239: sentinel setRelation writes stuck locally, never moved the peer),
+// so attacking a faction flipped hostility on ONE machine only. The probe
+// showed faction GameData stringIDs are cross-client stable, the engine keeps
+// the two tables MIRRORED (player->them == them->player in every row), and
+// the enemy/ally flags DERIVE from the value - so ONE float per faction sid
+// is the whole state. SYMMETRIC change detection: both clients sample their
+// player-faction table (~1 Hz, immediately on a detoured affectRelations
+// mutation), stream rows that moved vs the seeded shared-save baseline
+// (change-gated reliable), and apply received rows onto both local table
+// directions - updating the baseline BEFORE the write keeps it echo-free;
+// to 25 when GAME-CLOCK sync was added (PKT_TIME): each client integrates its
+// own in-game clock from its own load/pause moments, so day/night (NPC
+// schedules, shop hours, stealth vision) diverges. time_probe (run 141509)
+// showed the clock is ABSOLUTE campaign time (save-derived; the host-join
+// offset was exactly the load-moment skew), hour length is identical on both
+// clients, and the clock rate tracks frameSpeedMult exactly (2x burst -> 2.00
+// rate ratio) - so the correction lever is a SLEW, not a memory write: the
+// host broadcasts its clock ~1 Hz and the join scales its local sim speed
+// quietly (on top of the arbitrated consensus speed) until the offset closes;
+// to 26 when DOOR-STATE sync was added (PKT_DOOR): door/gate open+lock state
+// on BAKED buildings is per-client (door_probe run 160041: sentinel toggles
+// through the engine's own openDoor/closeDoor stuck locally, never moved the
+// peer), so one player walks through a gate the other sees closed. The probe
+// showed baked-door hands are cross-client stable (census intersection on
+// the shared save) and the polite write lever works (state animates
+// OPENING->OPEN; `open` on the wire is the collapsed DESTINATION state).
+// SYMMETRIC change detection, the faction shape: both clients sample nearby
+// doors ~1 Hz, stream rows whose (open, locked) moved vs a seeded per-hand
+// baseline, and apply received rows via the same engine actions - updating
+// the baseline BEFORE the write keeps it echo-free; per-sender seq drops
+// stale rows; rows for hands that fail to resolve locally are skipped
+// (out-of-interest or runtime door - accepted edge);
+// to 27 when PLACED-BUILDING sync was added (PKT_BUILD_PLACE +
+// PKT_BUILD_STATE): a player-placed building is a RUNTIME object - its hand
+// exists only in the placer's session (build_probe run 174550: census hand
+// intersection was ZERO for minted sites; the protocol-21 identity problem
+// for structures), so a building one player places does not exist at all for
+// the other, and construction progress has no channel. PLACER-AUTHORITATIVE
+// describe/mint: a local placement (UI commit detour on placeFinalPreview-
+// Building, or a programmatic scenario place) announces template sid +
+// transform keyed by the PLACER's local hand; the receiver mints a local
+// construction site via the same createBuilding factory (probe-proven to
+// bypass the UI's town-placement rules) and keeps a key -> local-hand
+// translation map. Progress then streams as change-gated PKT_BUILD_STATE
+// rows (~1 Hz sample, 10 s safety resend while incomplete) applied through
+// the engine's own setConstructionProgress (probe: 0..1 scale, engine
+// self-completes at >= 1.0 natively). The receiver's mint never re-announces
+// (it does not pass through the placement detour) - echo-free by
+// construction;
+// to 28 when PLACED-BUILDING DOOR + DISMANTLE sync was added
+// (PKT_BUILD_DOOR + PKT_BUILD_REMOVE): a placed building's doors are
+// runtime objects too, so the protocol-26 door channel skips them (bdoor_probe
+// run 195513: toggles stayed local), and a dismantled/destroyed placed
+// building left a GHOST proxy on the peer (11 census samples after the
+// placer's destroy). The probe proved the translation identity: a minted
+// proxy mints its own DoorStuff children in the same template order
+// (parent->doors index 0 on both sides), so a placed door's wire key is
+// (PLACER's building hand, door index) resolved through the protocol-27
+// build maps on both ends - the raw door hand never crosses. Door rows are
+// the symmetric protocol-26 shape on the translated key; removal is
+// placer-authoritative (dismantle detour edge or programmatic destroy ->
+// PKT_BUILD_REMOVE -> the peer destroys its mapped proxy via the engine's
+// own GameWorld::destroy and tombstones the map entry);
+// to 29 when HUNGER sync was added (MedicalPacket grew hunger + fed):
+// hunger is a per-client local simulation - each engine decays EVERY
+// character's hunger and eating happens only on the owner's client, so a
+// driven copy starves in the peer's view (hunger_probe run 213751: the
+// engine's scale is ~0..3, the ACTIVE leader decayed ~0.024/s while its
+// idle driven copy decayed ~0.0002/s - a 40% owner-vs-copy gap opened in
+// one 50 s run; sentinel writes stick and stay local). The owner's
+// hunger/fed ride the existing owner-authoritative medical snapshot
+// (change-gated by the quantized fingerprint; -1 = field not carried, the
+// KENSHICOOP_HUNGER_SYNC A/B hatch);
+// to 30 when COORDINATED SAVE + SESSION RESUME was added (protocol 31):
+// the HOST's save is authoritative - on a coordinated save (any local save
+// edge on the host, or a join save request forwarded as PKT_SAVE_REQ with
+// the join's local write suppressed) the host writes its native save, waits
+// for the save folder to QUIESCE (the save is deferred + multi-file), then
+// streams the whole folder to the join over CH_RELIABLE in ~4 KB chunks
+// (PKT_SAVE_BEGIN / PKT_SAVE_FILE / PKT_SAVE_DONE with per-file FNV CRCs);
+// the join stages into save/<name>__incoming/, verifies, commits atomically
+// over save/<name>/ and PKT_SAVE_ACKs. Resume = both clients load the
+// identical file, re-running the shared-save-lineage guarantee all the
+// hand-keyed replication rests on (no sidecar; session-placed buildings and
+// recruits bake into ONE save with ONE hand, identical on both sides);
+// to 31 when COORDINATED LOAD was added (protocol 32): the HOST is
+// load-authoritative, mirroring the save arbitration. A host load edge
+// broadcasts PKT_LOAD_GO (name + folder fingerprint + loadId); the join
+// fingerprint-verifies its on-disk copy and loads the identical save, or
+// answers PKT_LOAD_NACK (missing/diverged copy) so the host streams the
+// folder via the existing protocol-31 SaveXfer after its own reload, the
+// join loading after commit. A load initiated on the JOIN is suppressed
+// locally and forwarded as PKT_LOAD_REQ (the host arbitrates). Both sides
+// run a full session reset on their own world-reload edge; loadId guards
+// stale GO/NACK pairs across the swap;
+// to 32 when PRODUCTION MACHINE sync was added (protocol 33): machines
+// (production / crafting / furnace / farm / research) simulate per-client -
+// prod_probe run 152730 measured the owner's bench output moving under
+// operate() while the peer's copy stayed flat, and a power toggle never
+// crossing. The HOST is the machine authority (world-simulation precedent):
+// it samples machine-class buildings in the interest spheres ~1 Hz and
+// streams change-gated PKT_PROD rows (power bit, production state, output
+// buffer item+amount, input amounts, farm growth floats; -1 = field not
+// carried); the join applies through the probe-validated engine levers
+// (switchPowerOn / setProductionItem - which also MATERIALIZES a null
+// output buffer - / direct ConsumptionItem::amount + farm-float writes).
+// BAKED machines key by their save-stable hand; session-placed ones by the
+// protocol-27 placer key (keyKind disambiguates), translated through the
+// build maps on both ends.
+//
+// v33 (protocol 34): InvSnapshotHeader gains a keyKind byte - the PKT_PROD
+// identity approach applied to the container-inventory channel, so the host's
+// container census can author SESSION-PLACED chests/machines under their
+// protocol-27 placer key (0 = raw hand, the previous implicit behaviour).
+//
+// v34 (protocol 35): EVT_SQUAD_MOVE on the existing EventPacket - a squad-tab
+// move re-containers the body (squad_probe: container AND index/serial all
+// change, every move mints a fresh hand), so the mover streams the re-key
+// edge exactly like EVT_RECRUIT. No struct change; the version gates the
+// event id.
+//
+// v35 (protocol 36): sendMs on EntityBatchHeader (+ PKT_NPC_CENSUS). Interp
+// buffers were indexed by ARRIVAL time, so real-path jitter (Steam relay)
+// smeared straight into the snapshot spacing - the walk-drive consumed
+// bursts and starved (the jumpy remote-player movement of the 2026-07-09
+// session). The sender's millisecond stamp restores the true 20 Hz spacing;
+// the receiver maps it into its own clock with a min-offset tracker.
+// ENTITY_BATCH_MAX drops 18 -> 17 to keep a full batch inside the datagram
+// budget with the wider header.
+//
+// v36 (protocol 37): CROSS-OWNER TRANSFER intents (PKT_INV_XFER). Inventory
+// sync is single-writer per container (Doctrine 8), but the UI lets a player
+// drag items straight between squads - a direct mutation of a PEER-authored
+// container the owner never sees. The owner's next snapshot then reconciled
+// the drag AWAY: an item dragged OUT was re-fabricated on the dragger (a
+// dupe, since the dragger's own container also kept the moved item) while
+// the owner never lost its copy; an item dragged IN was destroyed by the
+// same reconcile; and a dragged WEAPON - which createItem cannot rebuild -
+// vanished on the dragger's screen while the owner-side surplus was
+// destroyed via removeItemAutoDestroy (trade_probe run 133142 baselined all
+// three signatures). The fix is the conservation model applied to bags: the
+// dragging client detects the completed cross-owner move by diffing each
+// tracked container against its last-known baseline, PAIRS the loss with
+// the matching gain, and authors ONE reliable transfer intent (src + dst
+// container hands + item identity + qty). The receiver relocates the REAL
+// Item* between its own copies of those containers (removeItemDontDestroy +
+// tryAddItem - never fabricates or destroys, so weapons survive), while the
+// sender latches the pending transfer so the owner's stale snapshots cannot
+// reconcile it back in the interim. Gear transfers also suppress the W2
+// weapon-census drop/pickup interpretation for that sid on both ends (a
+// bag-to-bag trade is not a ground drop).
+const u16 PROTOCOL_VERSION = 36;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -169,7 +324,25 @@ enum PacketType {
     PKT_STEALTH          = 18,// UNRELIABLE detection-map snapshot (host -> owner); StealthPacket
     PKT_SPAWN_REQ        = 19,// RELIABLE unresolved-hand query (join -> host); SpawnReqPacket
     PKT_SPAWN_INFO       = 20,// RELIABLE runtime-spawn description (host -> join); SpawnInfoPacket
-    PKT_MONEY            = 21 // RELIABLE owner-authoritative tab wallet (protocol 22); MoneyPacket
+    PKT_MONEY            = 21,// RELIABLE owner-authoritative tab wallet (protocol 22); MoneyPacket
+    PKT_FACTION          = 22,// RELIABLE player-faction relation row (protocol 24); FactionPacket
+    PKT_TIME             = 23,// RELIABLE host-authoritative game clock (protocol 25); TimePacket
+    PKT_DOOR             = 24,// RELIABLE baked-door open/lock state row (protocol 26); DoorPacket
+    PKT_BUILD_PLACE      = 25,// RELIABLE placed-building describe/mint (protocol 27); BuildPlacePacket
+    PKT_BUILD_STATE      = 26,// RELIABLE placer-authoritative construction progress (protocol 27); BuildStatePacket
+    PKT_BUILD_DOOR       = 27,// RELIABLE placed-building door row, translated key (protocol 28); BuildDoorPacket
+    PKT_BUILD_REMOVE     = 28,// RELIABLE placer-authoritative building removal (protocol 28); BuildRemovePacket
+    PKT_SAVE_REQ         = 29,// RELIABLE join save request (join -> host, protocol 31); SaveReqPacket
+    PKT_SAVE_BEGIN       = 30,// RELIABLE save-transfer announce (host -> join, protocol 31); SaveBeginPacket
+    PKT_SAVE_FILE        = 31,// RELIABLE save-file chunk (host -> join, protocol 31); SaveFileHeader + path + payload
+    PKT_SAVE_DONE        = 32,// RELIABLE save-transfer CRC table (host -> join, protocol 31); SaveDoneHeader + u32*count
+    PKT_SAVE_ACK         = 33,// RELIABLE commit acknowledgement (join -> host, protocol 31); SaveAckPacket
+    PKT_LOAD_GO          = 34,// RELIABLE coordinated-load order (host -> join, protocol 32); LoadGoPacket
+    PKT_LOAD_REQ         = 35,// RELIABLE join load request (join -> host, protocol 32); LoadReqPacket
+    PKT_LOAD_NACK        = 36,// RELIABLE join copy missing/diverged (join -> host, protocol 32); LoadNackPacket
+    PKT_PROD             = 37,// RELIABLE host-authoritative machine state row (protocol 33); ProdPacket
+    PKT_NPC_CENSUS       = 38,// RELIABLE wide-radius NPC existence list (protocol 36); NpcCensusHeader
+    PKT_INV_XFER         = 39 // RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -202,7 +375,15 @@ enum EventType {
     // receiver re-keys its local copy of the old hand to the new key (no
     // duplicate body); if the old hand doesn't resolve there (runtime-born
     // subject) the bidirectional describe/mint channel covers it instead.
-    EVT_RECRUIT = 10
+    EVT_RECRUIT = 10,
+    // Squad management sync (protocol 35). Same shape as EVT_RECRUIT:
+    // subject = the moved body's OLD hand, actor = its NEW hand after the
+    // squad-tab move re-containered it (squad_probe: every move - UI drag,
+    // separate-into-new-squad, setFaction move-back - mints a FRESH hand;
+    // index/serial do not survive). An all-zero actor = the body LEFT the
+    // roster (dismissal). The receiver shares the EVT_RECRUIT re-key path
+    // and pins the new hand as peer-owned (rank reshuffle cannot flip it).
+    EVT_SQUAD_MOVE = 11
 };
 
 // Sentinel ownerId meaning "all remote peers" (used on local disconnect to sweep
@@ -356,14 +537,29 @@ inline bool bodySneaking(u16 s)  { return (s & BODY_SNEAK) != 0; }
 // An entity batch is: [EntityBatchHeader][EntityState * count]. ownerId tags the
 // streaming peer; the receiver attributes every contained hand to that owner so
 // it applies the right authority rule. Capped so one batch fits a datagram.
+// sendMs (v35) is the sender's millisecond clock at capture time: the receiver
+// indexes its interp ring on (sendMs + estimated clock offset) instead of the
+// arrival time, so path jitter no longer smears into the snapshot spacing.
 struct EntityBatchHeader {
     u8  type;    // = PKT_ENTITY_BATCH
     u32 ownerId; // network player id of the batch's owner
+    u32 sendMs;  // sender's monotonic ms clock when the batch was captured
     u8  count;   // number of EntityState that follow
 };
 
-// 18 * sizeof(EntityState) + header stays comfortably under a 1400 B datagram.
-const unsigned int ENTITY_BATCH_MAX = 18;
+// 17 * sizeof(EntityState) + header stays comfortably under a 1400 B datagram
+// (v35: one entity of headroom traded for the sendMs stamp). This is the HARD
+// receive-side bound and the raw-UDP sender chunk size.
+const unsigned int ENTITY_BATCH_MAX = 17;
+
+// Steam sender chunk size: the Steam P2P transport clamps ENet's MTU to
+// 1200 B, and ENet sends an oversized UNRELIABLE packet as RELIABLE
+// fragments - retransmits and ordering stalls on the 20 Hz motion stream,
+// on exactly the transport real sessions use (architecture review
+// 2026-07-10). 14 * 79 B + 10 B header = 1116 B, inside 1200 with ENet's
+// per-packet overhead. Sender-side only - the receiver validates by
+// len >= need against the header count, so mixed caps interoperate.
+const unsigned int ENTITY_BATCH_MAX_STEAM = 14;
 
 // ---- Phase 4a: container-contents (inventory) snapshot ---------------------
 // World objects (items/buildings) carry the same save-stable `hand` as Characters,
@@ -404,12 +600,20 @@ struct InvItemEntry {
 };
 
 // An inventory snapshot is: [InvSnapshotHeader][InvItemEntry * count]. The container
-// hand identifies WHOSE inventory this is (a storage building, a character, a chest).
+// key identifies WHOSE inventory this is (a storage building, a character, a chest).
 // count == 0 is a valid "container is now empty" snapshot.
 struct InvSnapshotHeader {
     u8  type;    // = PKT_INV_SNAPSHOT
     u32 ownerId; // network player id of the authoritative sender
-    // container hand (whose inventory)
+    // Protocol 34: container identity kind. 0 = the c* fields are the raw
+    // (save-stable) hand - characters, baked chests, the previous implicit
+    // behaviour. 1 = the c* fields are the protocol-27 PLACER key of a
+    // session-placed building: the sender translated its local hand through
+    // its build maps (own placement = own hand; a minted proxy = the reverse
+    // map) and the receiver resolves through its own (peer key -> minted
+    // local hand; own key -> own hand) - the PKT_PROD identity approach.
+    u8  keyKind;
+    // container key (whose inventory; hand or placer key per keyKind)
     u32 cType;
     u32 cContainer;
     u32 cContainerSerial;
@@ -456,7 +660,8 @@ struct WorldItemEntry {
 // legal (a keep-alive) but normally omitted.
 struct WorldItemSnapshotHeader {
     u8  type;    // = PKT_WORLD_ITEM
-    u32 ownerId; // authoritative sender (the host)
+    u32 ownerId; // authoring sender (W1 bidir: netId spaces are PER-SENDER; the
+                 // receiver keys proxies by (ownerId, netId))
     u8  count;   // number of WorldItemEntry that follow
 };
 
@@ -465,7 +670,7 @@ struct WorldItemSnapshotHeader {
 // the join destroys its matching proxy. Reliable so a despawn is never missed.
 struct WorldItemRemoveHeader {
     u8  type;    // = PKT_WORLD_ITEM_REMOVE
-    u32 ownerId; // authoritative sender (the host)
+    u32 ownerId; // authoring sender (culls are scoped to this owner's netId space)
     u8  count;   // number of u32 netIds that follow
 };
 
@@ -531,6 +736,43 @@ struct WorldPickupPacket {
     char stringID[48];
     u32  itemType;   // GameData::type (WEAPON for now)
     u16  quality;    // quality*100 (0 if n/a)
+};
+
+// ---- Protocol 37: cross-owner TRANSFER intent --------------------------------
+// A direct UI drag between two squads mutates a PEER-authored container - the one
+// write the single-writer container snapshots cannot represent (the owner would
+// reconcile it away: dupe on take, wipe on give, weapon-vanish for gear; see the
+// PROTOCOL_VERSION 36 note). The dragging client detects the COMPLETED move by
+// diffing its tracked containers against their last-known baselines, pairs the
+// loss with the matching gain, and authors this intent once, reliably. The
+// receiver relocates the REAL Item* between its own copies of the two containers
+// (the W2/W3 conservation doctrine applied to bags: no fabrication, no
+// destruction - so gear survives). xferId is per-sender monotonic (idempotence).
+// Container hands use the raw save-stable layout (characters and baked chests;
+// the same keys the PKT_INV_SNAPSHOT channel streams with keyKind 0).
+struct InvXferPacket {
+    u8  type;        // = PKT_INV_XFER
+    u32 ownerId;     // network player id of the sender (the client that saw the drag)
+    u32 xferId;      // monotonic per-sender (idempotency)
+    // SOURCE container hand (the item left here)
+    u32 sType;
+    u32 sContainer;
+    u32 sContainerSerial;
+    u32 sIndex;
+    u32 sSerial;
+    // DESTINATION container hand (the item landed here)
+    u32 dType;
+    u32 dContainer;
+    u32 dContainerSerial;
+    u32 dIndex;
+    u32 dSerial;
+    // item identity (the receiver locates its own copy in src by these)
+    char stringID[48];
+    u32  itemType;   // GameData::type category
+    u16  quantity;   // units moved
+    u16  quality;    // quality*100 of the moved stack (advisory)
+    char manufacturer[48];
+    char material[48];
 };
 
 // Reserved netId meaning "no/invalid world item".
@@ -606,6 +848,12 @@ struct MedicalPacket {
     u32 sSerial;
     f32 blood;
     f32 bleedRate;
+    // Protocol 29: hunger scalars (MedicalSystem::hunger/fed, engine scale
+    // ~0..3). -1 = not carried (hungerSync off on the sender) - the receiver
+    // leaves its local value untouched. dazedOrAlert deliberately NOT on the
+    // wire (unconfirmed semantics; probe-diagnostics only).
+    f32 hunger;
+    f32 fed;
     u8  flags;  // MED_* bits (advisory; events own the transitions)
     u8  nParts; // filled MedPartEntry slots (anatomy order, from index 0)
     MedPartEntry parts[MED_PARTS_MAX];
@@ -708,6 +956,150 @@ struct MoneyPacket {
     int money;   // Ownerships::money for that tab's platoon
 };
 
+// ---- Protocol 24: player-faction relation row --------------------------------
+// ONE relation row between the shared player faction and a world faction,
+// keyed by the faction's GameData stringID (cross-client stable -
+// faction_probe run 132239; the same identity protocol 21 round-trips for
+// proxy spawns). The probe showed the engine keeps the two per-side tables
+// MIRRORED (player->them always equals them->player) and derives the
+// enemy/ally flags from the value, so one float is the whole state; the
+// receiver writes BOTH local rows via FactionRelations::setRelation. The
+// channel is SYMMETRIC: each client streams rows its own table moved
+// (change-gated vs a seeded baseline, ~1 Hz sample or immediate on a
+// detoured affectRelations mutation) and applies whatever arrives; the
+// receiver updates its baseline BEFORE writing, so an applied row is never
+// re-detected as a local change (echo-free). seq is per-sender monotonic so
+// a stale row never overwrites a newer one on either side.
+struct FactionPacket {
+    u8  type;      // = PKT_FACTION
+    u32 ownerId;   // network player id of the sender
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    char sid[48];  // faction GameData stringID ("" never sent)
+    f32 relation;  // the row value (engine range approx. -100..100)
+};
+
+// ---- Protocol 25: host-authoritative game clock -------------------------------
+// The host's absolute in-game clock (GameWorld::getTimeStamp_inGameHours, in
+// total campaign hours - time_probe run 141509 proved it save-derived and
+// advancing at exactly frameSpeedMult x the base rate). ~1 Hz on CH_RELIABLE.
+// The join computes offset = hostHours - localHours and corrects by SLEWING:
+// it quietly scales its local sim speed on top of the arbitrated consensus
+// speed until the offset is inside tolerance (there is no engine setter for
+// the clock base; a slew converges without one and never makes the clock
+// jump or run backwards). At the default hour length (~109 real-seconds per
+// game hour) 50 ms of wire latency is ~0.0005 game hours - ignorable, so no
+// RTT compensation. seq is host-monotonic (stale-sample guard).
+struct TimePacket {
+    u8  type;      // = PKT_TIME
+    u32 ownerId;   // network player id of the sender (the host)
+    u32 seq;       // per-sender monotonic (stale-sample guard)
+    f64 gameHours; // absolute in-game clock, total hours
+};
+
+// ---- Protocol 26: baked-door open/lock state ----------------------------------
+// One door/gate state row, keyed by the door Building's save-stable hand (the
+// furniture/bed identity precedent - door_probe run 160041 confirmed census
+// intersection on the shared save). SYMMETRIC change-gated channel: each
+// client samples doors near its interest centers ~1 Hz, streams rows whose
+// (open, locked) moved vs a seeded per-hand baseline, and applies received
+// rows through the engine's own openDoor/closeDoor/lockDoor/unlockDoor -
+// updating the baseline BEFORE the write, so an applied row is never
+// re-detected as a local change (echo-free). seq is per-sender monotonic so
+// a stale row never overwrites a newer one. open is the collapsed DESTINATION
+// state (OPENING counts as open, CLOSING as closed) so a door mid-swing never
+// publishes a transient. A receiver that cannot resolve the hand skips the
+// row silently (out-of-interest or a runtime-placed door - accepted edge).
+struct DoorPacket {
+    u8  type;      // = PKT_DOOR
+    u32 ownerId;   // network player id of the sender
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    // door hand [type, container, containerSerial, index, serial]
+    u32 hand[5];
+    u8  open;      // 1 = open/opening
+    u8  locked;    // 1 = DoorLock engaged (only applied when the door has a lock)
+};
+
+// ---- Protocol 27: placed-building sync --------------------------------------
+// A placed building is a RUNTIME object: its hand exists only in the placer's
+// session (build_probe: minted-site hand intersection across clients is zero),
+// so the wire key is the PLACER's local hand and the receiver keeps a
+// key -> local-hand translation map, exactly the protocol-21 proxy precedent
+// for structures. The PLACER is the authority for its building's construction
+// progress (the describe/mint edge names the authority implicitly - whoever
+// announced the key streams its state).
+//
+// PLACE announces one local placement (the UI commit detour on
+// PreviewBuilding::placeFinalPreviewBuilding, or a programmatic scenario
+// place). The receiver mints a local construction site with the same
+// createBuilding factory the placer used (probe-proven to bypass the UI's
+// town-placement verification, so a peer mint always lands where the placer's
+// did) and never re-announces it (a factory mint does not pass through the
+// placement detour - echo-free by construction). Re-announced keys (safety
+// resends) are deduped by the translation map.
+struct BuildPlacePacket {
+    u8  type;      // = PKT_BUILD_PLACE
+    u32 ownerId;   // network player id of the sender (the placer = the authority)
+    u32 seq;       // per-sender monotonic (diagnostics/ordering)
+    // the placed building's hand IN THE PLACER'S SESSION (the wire key)
+    u32 key[5];
+    char sid[48];  // building template GameData stringID
+    f32 x;         // placement transform (the receiver mints here; the
+    f32 y;         //  factory re-grounds vertically itself)
+    f32 z;
+    f32 yaw;       // radians
+    u8  fromUi;    // 1 = real build-mode commit, 0 = programmatic (diagnostics)
+};
+
+// One construction-progress row for a building the SENDER placed (keyed by
+// the sender's hand = the PLACE key). Change-gated ~1 Hz with a 10 s safety
+// resend while incomplete; complete=1 latches (the engine self-completes at
+// progress >= 1.0 through its own setter - scaffold off, navmesh updated).
+// A receiver whose translation map lacks the key skips the row silently
+// (mint refused or PLACE not yet applied - reliable ordering makes the
+// latter transient).
+struct BuildStatePacket {
+    u8  type;      // = PKT_BUILD_STATE
+    u32 ownerId;   // network player id of the sender (the placer)
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    u32 key[5];    // the PLACER's hand for the building (translation-map key)
+    f32 progress;  // ConstructionState::constructionProgress (0..1 while building)
+    u8  complete;  // 1 = ConstructionState::isComplete (latched)
+};
+
+// ---- Protocol 28: placed-building doors + dismantle --------------------------
+// A placed building's doors are runtime objects on BOTH clients (the placer's
+// original and the peer's minted proxy each mint their own DoorStuff children),
+// so no raw door hand ever crosses. bdoor_probe (run 195513) proved the
+// translation identity: the factory mints doors in template order, so
+// (PLACER's building hand, index in Building::doors) names the same physical
+// door on both clients once resolved through the protocol-27 build maps.
+// Symmetric change-gated rows, the protocol-26 door shape on the translated
+// key: both clients sample their placed/minted buildings' doors ~1 Hz and
+// stream rows whose (open, locked) moved vs the seeded baseline; the baseline
+// updates BEFORE the apply write (echo-free); per-sender seq drops stale rows.
+struct BuildDoorPacket {
+    u8  type;      // = PKT_BUILD_DOOR
+    u32 ownerId;   // network player id of the sender
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    u32 bkey[5];   // the PLACER's hand for the owning building (map key)
+    u8  doorIndex; // position in the building's ordered doors list
+    u8  open;      // 1 = open/opening (collapsed destination state)
+    u8  locked;    // 1 = DoorLock engaged (applied only when the door has one)
+};
+
+// Placer-authoritative removal of a session-placed building: the dismantle
+// detour (UI path) or a programmatic destroy queues the edge; the receiver
+// destroys its mapped proxy through the engine's own GameWorld::destroy and
+// tombstones the translation entry (later rows for the key skip silently).
+// Only buildings in the session's build maps ever stream removal - baked
+// buildings are untouched by this channel.
+struct BuildRemovePacket {
+    u8  type;    // = PKT_BUILD_REMOVE
+    u32 ownerId; // network player id of the sender (the placer)
+    u32 seq;     // per-sender monotonic
+    u32 key[5];  // the PLACER's hand for the removed building
+};
+
 // ---- Protocol 20: stealth detection-map snapshot ---------------------------
 // The host's authoritative world computes WHO NOTICES a sneaking character
 // (Character::whoSeesMeSneaking, filled by the engine's own vision checks -
@@ -786,6 +1178,178 @@ struct SpawnInfoPacket {
     u8  found;        // 1 = resolved + described; 0 = negative (stop retrying)
     u8  dead;         // body was dead at reply time (join spawns + death-latches)
 };
+
+// ---- Protocol 31: coordinated save + session resume --------------------------
+// The HOST's save is authoritative. Any local save on the HOST (menu save,
+// quicksave, autosave, programmatic) triggers the coordinated flow: wait for
+// folder quiescence, then stream the whole save folder to the join. A save
+// initiated on the JOIN is suppressed locally (its engine never writes) and
+// forwarded to the host as PKT_SAVE_REQ instead - one authoritative save,
+// host-arbitrated. All five packets ride CH_RELIABLE (ENet fragments the
+// ~4 KB chunks transparently; ordered-reliable means FILE chunks can never
+// arrive before their BEGIN or after their DONE).
+
+// Save-name capacity on the wire (matches the SaveEdge capture buffer).
+const u8 SAVE_NAME_LEN = 48;
+// One PKT_SAVE_FILE payload cap. 4 KB = ~4 ENet fragments at the 1200 B
+// Steam MTU; small enough that pacing (chunks/pump) bounds burst bandwidth.
+const u16 SAVE_CHUNK_MAX = 4096;
+// Relative-path capacity inside a save folder (e.g. "platoon\\x.platoon").
+const u16 SAVE_PATH_MAX = 260;
+
+// Join -> host: "my player pressed save" (the join's local write was
+// suppressed). The host runs its own saveGameAs(name) and the coordinated
+// transfer follows. reqId is per-sender monotonic (log correlation).
+struct SaveReqPacket {
+    u8   type;    // = PKT_SAVE_REQ
+    u32  ownerId; // network player id of the sender (the join)
+    u32  reqId;   // monotonic per-sender
+    char name[48]; // requested save name ('\0'-padded)
+};
+
+// Host -> join: the transfer is starting. xferId keys every FILE/DONE/ACK of
+// this transfer (a per-host monotonic counter - a stale chunk from an
+// aborted transfer is dropped by id mismatch). fileCount/totalBytes size the
+// join's progress accounting and staging.
+struct SaveBeginPacket {
+    u8   type;      // = PKT_SAVE_BEGIN
+    u32  ownerId;   // network player id of the sender (the host)
+    u32  xferId;    // per-host monotonic transfer id
+    char name[48];  // save name (the join stages save/<name>__incoming/)
+    u16  fileCount; // files that will follow
+    unsigned __int64 totalBytes; // sum of file sizes (progress + sanity)
+};
+
+// Host -> join: one chunk of one file. Variable length:
+//   [SaveFileHeader][char path[pathLen]][u8 payload[dataLen]]
+// path is the file's save-folder-relative path ('\\'-separated, NOT
+// terminated); it rides every chunk so the receiver is stateless per chunk
+// (no separate file-table packet to lose ordering against). offset is the
+// write position within the file; fileIdx indexes the DONE CRC table.
+struct SaveFileHeader {
+    u8  type;     // = PKT_SAVE_FILE
+    u32 ownerId;  // network player id of the sender (the host)
+    u32 xferId;   // matching SaveBeginPacket.xferId
+    u16 fileIdx;  // 0-based index into the transfer's file list
+    u16 pathLen;  // bytes of relative path following this header (1..SAVE_PATH_MAX)
+    u32 offset;   // byte offset of this chunk within the file
+    u16 dataLen;  // payload bytes following the path (0..SAVE_CHUNK_MAX;
+                  // 0 is legal for an empty file's single chunk)
+};
+
+// Host -> join: end of transfer + the per-file CRC table (FNV-1a-32 over
+// each file's full content, fileIdx order): [SaveDoneHeader][u32 * fileCount].
+struct SaveDoneHeader {
+    u8  type;      // = PKT_SAVE_DONE
+    u32 ownerId;   // network player id of the sender (the host)
+    u32 xferId;    // matching SaveBeginPacket.xferId
+    u16 fileCount; // CRC entries that follow (must equal BEGIN's fileCount)
+};
+
+// Join -> host: the staged save verified + committed (ok=1) or failed
+// (ok=0: CRC mismatch / missing file / IO error - staging is discarded, the
+// join's previous save state is untouched).
+struct SaveAckPacket {
+    u8  type;     // = PKT_SAVE_ACK
+    u32 ownerId;  // network player id of the sender (the join)
+    u32 xferId;   // the transfer being acknowledged
+    u8  ok;       // 1 = committed; 0 = verify/commit failed
+    u16 files;    // files committed
+    unsigned __int64 bytes; // bytes committed
+};
+
+// ---- Coordinated load (protocol 32) ------------------------------------------
+// The HOST is load-authoritative, mirroring the save arbitration. A load on
+// the HOST (menu or programmatic - the SaveManager::load detour catches
+// them all) broadcasts LOAD_GO before the host's own (never delayed) native
+// load. The join compares the fingerprint against its on-disk copy: match
+// = load the identical save now; missing/diverged = LOAD_NACK, the host
+// streams the folder via the protocol-31 SaveXfer after its own reload and
+// the join loads on commit. A join-initiated load is suppressed locally and
+// forwarded as LOAD_REQ. loadId is per-host monotonic: a stale NACK from a
+// superseded load is dropped by id mismatch.
+
+// Host -> join: "load this save now". fingerprint is FNV-1a-32 over the
+// folder's sorted relative paths + per-file content CRCs (savexfer::
+// folderFingerprint) - byte-identical folders agree, any divergence differs.
+// fingerprint 0 = the host folder was unreadable (the join must NACK).
+struct LoadGoPacket {
+    u8   type;        // = PKT_LOAD_GO
+    u32  ownerId;     // network player id of the sender (the host)
+    u32  loadId;      // per-host monotonic load id (stale-NACK guard)
+    u32  fingerprint; // folder fingerprint of the host's copy (0 = unknown)
+    char name[48];    // save name ('\0'-padded)
+};
+
+// Join -> host: "my player pressed load" (the join's local load was
+// suppressed). The host runs its own loadSave(name) - whose detour edge
+// broadcasts the LOAD_GO - if the save exists on the host.
+struct LoadReqPacket {
+    u8   type;    // = PKT_LOAD_REQ
+    u32  ownerId; // network player id of the sender (the join)
+    u32  reqId;   // monotonic per-sender (log correlation)
+    char name[48]; // requested save name ('\0'-padded)
+};
+
+// Join -> host: "I can't load that - my copy is missing or diverged". The
+// host answers with a protocol-31 SaveXfer of the folder (after its own
+// reload completes); the join loads after the verified commit.
+struct LoadNackPacket {
+    u8   type;        // = PKT_LOAD_NACK
+    u32  ownerId;     // network player id of the sender (the join)
+    u32  loadId;      // the LOAD_GO being refused
+    u32  fingerprint; // the join's local fingerprint (0 = missing folder)
+    char name[48];    // save name ('\0'-padded)
+};
+
+// ---- Protocol 33: production machine sync ------------------------------------
+// One machine state row, HOST-authoritative (world-simulation precedent: the
+// host's engine is the one whose production/power/farming ticks count; the
+// join's copies are quieted by convergence, not suppression - its machines
+// still tick, this channel just corrects them ~1 Hz). Change-gated on the
+// quantized fields + 10 s safety resend; per-sender seq drops stale rows.
+// Identity: BAKED machines have save-stable hands (keyKind=0, the door
+// precedent); SESSION-PLACED machines are runtime objects, so the key is the
+// protocol-27 PLACER hand (keyKind=1) - the sender translates its local hand
+// through its build maps (own placement = own hand; a minted proxy = the
+// reverse map), the receiver resolves through its own (peer key -> minted
+// local hand; own key -> own hand). -1 sentinels = field not carried (not
+// this machine class / no buffer yet) - the hunger fold-in trick.
+struct ProdPacket {
+    u8  type;      // = PKT_PROD
+    u32 ownerId;   // network player id of the sender (the host)
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    u8  keyKind;   // 0 = baked hand, 1 = protocol-27 placer key
+    u32 key[5];
+    u8  classType; // BuildingClassType (diagnostics; apply re-reads locally)
+    i8  powerOn;   // 0/1; -1 = unreadable (not applied)
+    i8  prodState; // ProductionBuilding::ProductionState; -1 = not carried
+    f32 outAmount; // output buffer amount; -1 = not carried
+    char outSid[48]; // output item template sid ("" = not carried) - lets the
+                   // receiver MATERIALIZE a still-null buffer with the same
+                   // item via the native setProductionItem lever
+    f32 inAmount[2]; // input buffer amounts; -1 = not carried
+    f32 grown;     // farm growth floats; -1 = not a farm
+    f32 died;
+    f32 growStart;
+    f32 harvested; // int on the engine side; carried as f32 (-1 = not a farm)
+};
+
+// NPC existence census (protocol 36): the host's 1 Hz wide-radius hand list.
+// The positional stream stays at the ~200 u interest bubble; this list only
+// says WHICH world NPCs exist on the host within the census radius, so the
+// join can cull local-only ghosts long before they enter the stream bubble
+// (the 2026-07-09 field report: join-visible NPCs vanishing on approach).
+// Layout: [NpcCensusHeader][u32 hand[5] * count] - 20 B per NPC, reliable
+// (ENet fragments large lists), a few KB/s at worst.
+struct NpcCensusHeader {
+    u8  type;    // = PKT_NPC_CENSUS
+    u32 ownerId; // network player id of the sender (the host)
+    u16 count;   // number of 5xu32 hands that follow
+};
+
+// Hard cap on hands per census packet (512 * 20 B = ~10 KB, fragmented fine).
+const unsigned int NPC_CENSUS_MAX = 512;
 
 struct TimePingPacket {
     u8  type;       // = PKT_TIME_PING

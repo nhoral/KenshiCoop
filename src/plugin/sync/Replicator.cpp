@@ -42,8 +42,10 @@ unsigned long nowMs() {
 namespace {
 const float MOVE_EPS    = 0.20f;  // source speed above which we treat it as moving
 const float SNAP_DIST   = 8.0f;   // gap beyond which we hard-snap (teleport)
+                                  // (default for snapDist_ - env-tunable, proto 36)
 const float REPARK_DIST = 1.0f;   // at rest, re-place if it drifts past this
 const float CATCHUP_K   = 2.0f;   // gap-proportional speed boost (chase a moving tgt)
+                                  // (default for catchupK_ - env-tunable, proto 36)
 const float REISSUE_DIST = 1.0f;  // re-issue the walk order only when tgt moved this far
 const float LEAD_SECONDS = 0.6f;  // project the walk target this far along source velocity
 const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "walking"
@@ -100,6 +102,8 @@ const unsigned long CARRY_DROP_MS = 3000; // stream must stop reporting the carr
 const unsigned long FURN_HEAL_MS = 1500;  // min gap between self-heal enters
 const unsigned long FURN_EXIT_MS = 3000;  // stream must stop reporting occupancy
                                           // this long before the local copy exits
+const unsigned long FURN_PEER_MS = 5000;  // third-party PEER-ENTER re-author gap
+                                          // (protocol 36: guard jails a peer PC)
 const float FURN_MATCH_DIST = 6.0f;       // self-heal fixture search radius around
                                           // the streamed occupant position
 // Stealth sync (protocol 20). The posture is CONTINUOUS state (a pure bool in
@@ -131,24 +135,131 @@ inline bool isGearType(unsigned int t) { return t == 2u || t == 3u; }
 } // namespace
 
 Replicator::Replicator()
-    : leaderOnly_(true), streamNpcs_(false),
-      activeFrames_(0), zeroWhileActive_(0), maxStep_(0.0f),
+    : catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), sendStamp_(true),
+      starveHoldMs_(10000), starveHeldNow_(0),
+      leaderOnly_(true), streamNpcs_(false),
+      activeFrames_(0), zeroWhileActive_(0), maxStep_(0.0f), slewSkipFrames_(0),
+      interpLerp_(0), interpSingle_(0), interpClampOld_(0),
+      interpExtrap_(0), interpSegSnap_(0),
+      hardSnapSquad_(0), hardSnapNpc_(0),
+      walkReissueSquad_(0), walkReissueNpc_(0), interpLogTick_(0),
       translateFrames_(0), walkTruthFrames_(0),
       restSampleFrames_(0), marchFrames_(0),
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
       probeRecruit_(false), probedCount_(0),
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
-      nextWorldNetId_(1), nextDropId_(1), nextPickupId_(1), nextTreatId_(1),
+      nextWorldNetId_(1), nextDropId_(1), nextPickupId_(1), nextXferId_(1),
+      xferScanMs_(0), nextTreatId_(1),
       quietRelapse_(0), sitOrders_(0), detachUses_(0), noDetach_(false),
       dmgGuard_(false), carrySync_(true), furnSync_(true), stealthSync_(true),
       gateAuthority_(false), trustLogTick_(0),
       trustGrants_(0), trustRevokes_(0),
       authSuppresses_(0), authRestores_(0), authReassertMs_(0),
+      censusRadius_(0.0f), censusSendMs_(0), censusRecvMs_(0), censusCulls_(0),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0),
-      spawnSync_(false), spawnPosLogMs_(0), moneySync_(true), recruitSync_(true) {}
+      spawnSync_(false), spawnPosLogMs_(0), moneySync_(true), recruitSync_(true),
+      squadSync_(true),
+      facSeqOut_(1), facSampleMs_(0), factionSync_(true),
+      doorSeqOut_(1), doorSampleMs_(0), doorSync_(true),
+      buildSeqOut_(1), buildSampleMs_(0), buildSync_(true),
+      bdoorSeqOut_(1), bdoorSampleMs_(0), bdoorSync_(true),
+      hungerSync_(true),
+      prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
+      storeSync_(false), contCensusMs_(0),
+      timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
+      timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f) {}
+
+void Replicator::resetSession() {
+    // Pointer caches (dangling after the swap) + everything keyed off them.
+    targets_.clear();          // interp buffers + per-body drive state
+    drivenChars_.clear();
+    proxyByKey_.clear();
+    suppressed_.clear();
+    hostBody_.clear();
+    attackerOf_.clear();
+    authCount_.clear();
+    ownHands_.clear();
+    // Protocol 36: the existence census describes the OLD world's hands; the
+    // host re-publishes within a second of the new world going live.
+    censusHands_.clear();
+    censusRecvMs_ = 0;
+    censusSendMs_ = 0;
+    furnPeerPend_.clear();
+    ownFurnExit_.clear();
+    // Session maps + change-gate baselines (they describe the OLD world; the
+    // reloaded save re-seeds them on first sample).
+    ownBuilds_.clear();
+    peerBuilds_.clear();
+    mintByLocal_.clear();
+    bdoorRows_.clear();
+    doorRows_.clear();
+    prodRows_.clear();
+    facRows_.clear();
+    invPub_.clear();
+    invRecv_.clear();
+    ownedContainers_.clear();
+    censusContainers_.clear(); // protocol 34: re-censused in the new world
+    worldTrack_.clear();
+    worldProxies_.clear();
+    weaponCensus_.clear();
+    appliedDrops_.clear();
+    appliedPickups_.clear();
+    groundedWeapons_.clear();
+    // Protocol 37: every container hand and Item* baseline is stale in the new world.
+    xferBase_.clear();
+    xferSeeded_.clear();
+    xferPend_.clear();
+    xferLatch_.clear();
+    xferDefer_.clear();
+    appliedXfers_.clear();
+    wdSuppress_.clear();
+    xferScanMs_ = 0;
+    medPub_.clear();
+    medRecv_.clear();
+    medNpc_.clear();
+    statsPub_.clear();
+    moneyPub_.clear();
+    stealthPub_.clear();
+    pinOwned_.clear();
+    pinPeer_.clear();
+    // Protocol 35: the rank latch + the engine's pointer->hand baseline both
+    // describe the OLD world (containers and Character* dangle after a swap);
+    // the reloaded save re-seeds them at first census/poll.
+    tabRank_.clear();
+    rekeyedOld_.clear();
+    engine::clearSquadRoster();
+    probed_.clear();
+    spawnReq_.clear();
+    unresolvedHands_.clear();
+    spawnLogged_.clear();
+    spawnReplyMs_.clear();
+    // Speed/time consensus: re-seed from the fresh world's live state (the
+    // save's speed becomes the new baseline; the join's slew re-measures).
+    speedLastApplied_ = -1.0f;
+    speedMyReq_       = -1.0f;
+    speedPeerReq_     = -1.0f;
+    speedMyCombat_    = false;
+    speedPeerCombat_  = false;
+    speedLastSet_     = -1.0f;
+    speedSeqSeen_     = 0;
+    speedLastSendMs_  = 0;
+    speedCombatSampleMs_ = 0;
+    timeSlew_         = 1.0f;
+    timeSeqSeen_      = 0;
+    timeLastSendMs_   = 0;
+    timeSlewApplied_  = -1.0f;
+    // Sample-cadence clocks restart.
+    facSampleMs_ = doorSampleMs_ = buildSampleMs_ = bdoorSampleMs_ = 0;
+    prodSampleMs_ = 0;
+    contCensusMs_ = 0;
+    authReassertMs_ = 0;
+    // Config gates, ownRanks_ and every OUTBOUND seq counter are deliberately
+    // preserved (see the header comment).
+    coop::logLine("[load] session reset: pointer caches, session maps, change gates cleared");
+}
 
 void Replicator::ingest(Inbound& in) {
     std::deque<InboundEntity> got;
@@ -156,8 +267,31 @@ void Replicator::ingest(Inbound& in) {
     if (got.empty()) return;
     unsigned long now = nowMs();
     for (std::deque<InboundEntity>::iterator it = got.begin(); it != got.end(); ++it) {
+        // Wire v35: index the interp ring on the SENDER's capture time mapped
+        // into the local clock, not the arrival time - path jitter (Steam
+        // relay) otherwise smears straight into the snapshot spacing and the
+        // buffer starves into extrapolation/snap cycles (the jumpy remote-
+        // player movement). Mapping = sendMs + min-tracked offset (see
+        // PeerClock); clamped to 'now' so a stamp can never land in the future.
+        unsigned long t = now;
+        if (sendStamp_) {
+            PeerClock& pc = peerClock_[it->ownerId];
+            long off = (long)(now - (unsigned long)it->sendMs);
+            if (!pc.have) {
+                pc.offsetMs = off; pc.have = true; pc.lastCreepMs = now;
+            } else {
+                unsigned long dt = now - pc.lastCreepMs;
+                if (dt >= 500) { // creep ~2 ms/s toward slower routes
+                    pc.offsetMs += (long)(dt / 500);
+                    pc.lastCreepMs = now;
+                }
+                if (off < pc.offsetMs) pc.offsetMs = off;
+            }
+            t = (unsigned long)((long)it->sendMs + pc.offsetMs);
+            if ((long)(t - now) > 0) t = now;
+        }
         Driven& d = targets_[keyOf(it->e)];
-        d.interp.push(it->e, now);
+        d.interp.push(it->e, t, now);
         d.lastSeenMs = now;
     }
 }
@@ -172,13 +306,61 @@ void Replicator::ingestInv(Inbound& in) {
     std::deque<InboundInv> got;
     in.drainInv(got);
     for (std::deque<InboundInv>::iterator it = got.begin(); it != got.end(); ++it) {
-        Key k; k.t = it->cHand[0]; k.c = it->cHand[1]; k.cs = it->cHand[2];
-        k.i = it->cHand[3]; k.s = it->cHand[4];
+        Key k; k.t = it->cKey[0]; k.c = it->cKey[1]; k.cs = it->cKey[2];
+        k.i = it->cKey[3]; k.s = it->cKey[4];
+        // Protocol 34: a placer-key row resolves through OUR build maps to
+        // the LOCAL building hand (own placement = own hand; the host's
+        // placement = our minted proxy). An unresolvable key (mint not
+        // landed yet / refused / tombstoned) is dropped - the sender's 5 s
+        // safety resend re-delivers once the mint exists.
+        if (it->keyKind == 1) {
+            std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(k);
+            if (ob != ownBuilds_.end()) {
+                if (ob->second.removed) continue;
+                k.t = ob->second.hand[0]; k.c = ob->second.hand[1];
+                k.cs = ob->second.hand[2]; k.i = ob->second.hand[3];
+                k.s = ob->second.hand[4];
+            } else {
+                std::map<Key, PeerBuild>::iterator pb = peerBuilds_.find(k);
+                if (pb == peerBuilds_.end() || pb->second.minted != 1 ||
+                    pb->second.removed)
+                    continue;
+                k.t = pb->second.localHand[0]; k.c = pb->second.localHand[1];
+                k.cs = pb->second.localHand[2]; k.i = pb->second.localHand[3];
+                k.s = pb->second.localHand[4];
+            }
+        }
         InvRecv& r = invRecv_[k];
         r.ownerId = it->ownerId;
         r.items   = it->items; // latest snapshot supersedes
         r.dirty   = true;
     }
+}
+
+void Replicator::latchTabs(const std::vector<std::pair<u32, u32> >& ctnrs) {
+    if (!squadSync_) return; // legacy per-tick ranking needs no state
+    for (unsigned int i = 0; i < ctnrs.size(); ++i) {
+        if (tabRank_.find(ctnrs[i]) != tabRank_.end()) continue;
+        unsigned int next = (unsigned int)tabRank_.size();
+        tabRank_[ctnrs[i]] = next;
+        if (next >= 2) { // session-start seeding of the standard 2-tab save is silent
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "[squad] LATCH cont=%u,%u rank=%u",
+                      ctnrs[i].first, ctnrs[i].second, next);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+unsigned int Replicator::tabRankFor(const std::pair<u32, u32>& key,
+                                    const std::vector<std::pair<u32, u32> >& ctnrs) const {
+    if (squadSync_) {
+        std::map<std::pair<u32, u32>, unsigned int>::const_iterator it =
+            tabRank_.find(key);
+        return it == tabRank_.end() ? 0xFFFFFFFFu : it->second;
+    }
+    return (unsigned int)(std::lower_bound(ctnrs.begin(), ctnrs.end(), key)
+                          - ctnrs.begin());
 }
 
 void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
@@ -205,22 +387,27 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
     std::sort(ctnrs.begin(), ctnrs.end());
     ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
+    // Protocol 35 rank latch: with squad sync on, ranks are assigned once
+    // (first census = the sorted order, identical to the legacy ranking) and
+    // newly-seen containers APPEND - a mid-session move/createSquad can never
+    // reshuffle existing ranks and silently flip whole-tab ownership.
+    latchTabs(ctnrs);
     ownHands_.clear();
     unsigned int n = 0;
     for (unsigned int i = 0; i < nSquad && n < MAX_PUBLISH; ++i) {
         std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);
-        unsigned int rank = (unsigned int)(std::lower_bound(ctnrs.begin(), ctnrs.end(), key)
-                                           - ctnrs.begin());
+        unsigned int rank = tabRankFor(key, ctnrs);
         // Empty ownRanks_ (never configured) is a safety fallback to the first tab,
         // so a missing setOwnRanks never makes us stream every tab or nothing.
         bool owned = ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
-        // Protocol 23: a RECRUIT belongs to its RECRUITER regardless of which
-        // local tab rank the engine parked it in (recruit_probe: a join recruit
-        // landed in the host-owned rank-0 container). Our own recruits always
-        // publish; hands the peer recruited never do.
+        // Ownership pins (protocols 23 + 35): a RECRUIT belongs to its
+        // RECRUITER and a MOVED member to its MOVER regardless of which local
+        // tab rank the engine parked it in (recruit_probe: a join recruit
+        // landed in the host-owned rank-0 container). Our own edges always
+        // publish; hands the peer authored never do.
         Key hk = keyOf(raw[i]);
-        if (recruitOwned_.count(hk))     owned = true;
-        else if (peerRecruit_.count(hk)) owned = false;
+        if (pinOwned_.count(hk))     owned = true;
+        else if (pinPeer_.count(hk)) owned = false;
         if (!owned) continue;
         buf[n++] = raw[i];
         ownHands_.insert(hk);
@@ -431,6 +618,9 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                         ev.eventId, e.hIndex, e.hSerial, hb.furn[3], hb.furn[4],
                         hb.furnKind);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    // Protocol 36 race guard: a stale in-flight PEER-ENTER
+                    // must not re-jail this body right after we freed it.
+                    ownFurnExit_[keyOf(e)] = nowPub;
                     hb.furnKind = 0;
                     hb.furn[0] = hb.furn[1] = hb.furn[2] = hb.furn[3] = hb.furn[4] = 0;
                 }
@@ -537,6 +727,31 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             hb.furn[0] = hb.furn[1] = hb.furn[2] = hb.furn[3] = hb.furn[4] = 0;
         }
     }
+
+    // Third-party placement edges (protocol 36): drain the PEER-ENTER events
+    // applyTargets detected on peer-owned driven bodies (host = world
+    // authority; the occupant's owner applies them to its own KO'd body).
+    if (furnSync_ && !furnPeerPend_.empty()) {
+        for (unsigned int pi = 0; pi < furnPeerPend_.size(); ++pi) {
+            const PendFurnEnter& pe = furnPeerPend_[pi];
+            EventPacket ev; memset(&ev, 0, sizeof(ev));
+            ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_ENTER_FURNITURE;
+            ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
+            ev.sType = pe.occ.t; ev.sContainer = pe.occ.c;
+            ev.sContainerSerial = pe.occ.cs;
+            ev.sIndex = pe.occ.i; ev.sSerial = pe.occ.s;
+            ev.aType = pe.furn[0]; ev.aContainer = pe.furn[1];
+            ev.aContainerSerial = pe.furn[2];
+            ev.aIndex = pe.furn[3]; ev.aSerial = pe.furn[4];
+            ev.arg = (f32)pe.kind;
+            net.queueEvent(ev);
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[furn] SEND PEER-ENTER id=%u occ=%u,%u furn=%u,%u kind=%d",
+                ev.eventId, pe.occ.i, pe.occ.s, pe.furn[3], pe.furn[4], pe.kind);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        furnPeerPend_.clear();
+    }
     // Age out entities that left the interest set long ago (step 6): an unbounded
     // hostBody_ leaks a session's worth of passers-by. 60 s is far beyond any
     // interest-boundary flicker, so a pruned entry that returns just re-baselines
@@ -554,12 +769,17 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
 // Protocol 16: covers the FULL anatomy (flesh+stun+bandage+juryRig per part)
 // plus the 4 LimbStates - a stun hit or a limb loss re-fingerprints too.
 static coop::u32 medicalHash(const engine::MedicalRead& m) {
-    long q[4 + 12 * 4 + 4];
+    long q[4 + 12 * 4 + 4 + 2];
     memset(q, 0, sizeof(q));
     q[0] = (long)(m.blood * 2.0f);
     q[1] = (long)(m.bleedRate * 20.0f);
     q[2] = m.unconscious ? 1 : 0;
     q[3] = m.dead ? 1 : 0;
+    // Protocol 29: hunger quantizes to 0.1 units (engine scale ~0..3; the
+    // probe's heaviest decay was ~0.024/s, so a bucket flips slower than the
+    // 3 s safety resend - the fold-in adds no traffic).
+    q[4 + 12 * 4 + 4 + 0] = (long)(m.hunger * 10.0f);
+    q[4 + 12 * 4 + 4 + 1] = (long)(m.fed * 10.0f);
     unsigned int n = m.nParts; if (n > 12) n = 12;
     for (unsigned int i = 0; i < n; ++i) {
         const engine::MedPartRead& p = m.parts[i];
@@ -606,6 +826,8 @@ static void fillMedicalPacket(MedicalPacket& pkt, const unsigned int subj[5],
     pkt.sIndex = subj[3]; pkt.sSerial = subj[4];
     pkt.blood     = mr.blood;
     pkt.bleedRate = mr.bleedRate;
+    pkt.hunger    = mr.hunger; // -1 when not carried (hungerSync off)
+    pkt.fed       = mr.fed;
     pkt.flags = (mr.unconscious ? MED_UNCONSCIOUS : 0) | (mr.dead ? MED_DEAD : 0);
     unsigned int n = mr.nParts; if (n > MED_PARTS_MAX) n = MED_PARTS_MAX;
     pkt.nParts = (u8)n;
@@ -655,6 +877,10 @@ void Replicator::publishMedical(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
         engine::MedicalRead mr;
         if (!engine::readMedicalByHand(hand, &mr) || !mr.valid) continue;
+        // Protocol 29 A/B hatch: with hungerSync off the fields go out as -1
+        // (not carried) and drop out of the fingerprint, so the medical
+        // channel behaves exactly as pre-29.
+        if (!hungerSync_) { mr.hunger = -1.0f; mr.fed = -1.0f; }
         u32 h = medicalHash(mr);
         MedPub& mp = medPub_[k];
         // Limb-loss transition events (doctrine 16: the reliable event carries
@@ -755,6 +981,11 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         engine::MedicalRead w;
         memset(&w, 0, sizeof(w));
         w.valid = true;
+        w.dazed = -1.0f; // diagnostics-only, never on the wire
+        // Protocol 29: hunger applies only when the sender carried it (>= 0)
+        // AND our own hatch is on (A/B symmetry); writeMedical skips < 0.
+        w.hunger = hungerSync_ ? p.hunger : -1.0f;
+        w.fed    = hungerSync_ ? p.fed    : -1.0f;
         w.blood = p.blood; w.bleedRate = p.bleedRate;
         for (int i = 0; i < 4; ++i) {
             // Legacy 4-limb fields unused when nParts > 0 (writeMedical takes
@@ -961,13 +1192,15 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
 
 // ---- Protocol 22: per-tab wallet sync ---------------------------------------
 
-namespace {
 // Squad-tab census for the money channel: fill ranks[] with ONE representative
-// hand per distinct squad-tab container (the same sorted-distinct-containers
-// ranking publishOwned partitions ownership by). Returns the tab count.
-// rankHand[r] = a member hand of the rank-r tab (readObjectHand layout).
-unsigned int tabRepresentatives(GameWorld* gw, unsigned int rankHand[][5],
-                                unsigned int maxRanks) {
+// hand per distinct squad-tab container, using the same latch-aware ranking
+// publishOwned partitions ownership by (protocol 35: an appended mid-session
+// tab can therefore never shift which rank a pre-existing tab's wallet is
+// keyed under). Returns the rank-space size. rankHand[r] = a member hand of
+// the rank-r tab (readObjectHand layout); 0xFFFFFFFF type = no live member
+// (a latched rank whose tab emptied, or beyond maxRanks).
+unsigned int Replicator::tabRepresentatives(GameWorld* gw, unsigned int rankHand[][5],
+                                            unsigned int maxRanks) {
     const unsigned int MAX_SQ = 96;
     static EntityState raw[MAX_SQ];
     unsigned int nSquad = engine::captureSquad(gw, /*leaderOnly*/ false, raw, MAX_SQ);
@@ -977,13 +1210,14 @@ unsigned int tabRepresentatives(GameWorld* gw, unsigned int rankHand[][5],
         ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
     std::sort(ctnrs.begin(), ctnrs.end());
     ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
-    unsigned int nRanks = (unsigned int)ctnrs.size();
+    latchTabs(ctnrs);
+    unsigned int nRanks = squadSync_ ? (unsigned int)tabRank_.size()
+                                     : (unsigned int)ctnrs.size();
     if (nRanks > maxRanks) nRanks = maxRanks;
     for (unsigned int r = 0; r < nRanks; ++r) rankHand[r][0] = 0xFFFFFFFFu; // unfilled
     for (unsigned int i = 0; i < nSquad; ++i) {
         std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);
-        unsigned int rank = (unsigned int)(std::lower_bound(ctnrs.begin(), ctnrs.end(), key)
-                                           - ctnrs.begin());
+        unsigned int rank = tabRankFor(key, ctnrs);
         if (rank >= nRanks || rankHand[rank][0] != 0xFFFFFFFFu) continue;
         rankHand[rank][0] = raw[i].hType;
         rankHand[rank][1] = raw[i].hContainer;
@@ -993,7 +1227,6 @@ unsigned int tabRepresentatives(GameWorld* gw, unsigned int rankHand[][5],
     }
     return nRanks;
 }
-} // namespace
 
 void Replicator::publishMoney(GameWorld* gw, NetLink& net, u32 ownerId) {
     if (!moneySync_) return;
@@ -1060,6 +1293,764 @@ void Replicator::applyMoney(GameWorld* gw, Inbound& in) {
     }
 }
 
+void Replicator::publishFactions(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (!factionSync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // relations move in bursts; 1 Hz is plenty
+    const unsigned long RESEND_MS = 10000; // safety resend for rows we ever sent
+    const float         EPS       = 0.5f;  // engine values are whole-ish numbers
+    unsigned long now = nowMs();
+
+    // The affectRelations detour saw a REAL mutation this tick: sample NOW so
+    // the row crosses within a tick instead of up to a full sample period
+    // later. The deltas themselves are evidence (already logged); the value
+    // diff below is what actually replicates.
+    engine::FactionDelta deltas[16];
+    unsigned int nDeltas = engine::drainFactionDeltas(deltas, 16);
+    if (nDeltas == 0 && facSampleMs_ != 0 && (now - facSampleMs_) < SAMPLE_MS) return;
+    facSampleMs_ = now;
+
+    const unsigned int MAX_FACTIONS = 96;
+    static engine::FactionRead rows[MAX_FACTIONS]; // main-thread only
+    unsigned int n = engine::listPlayerRelations(gw, rows, MAX_FACTIONS);
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::FactionRead& r = rows[i];
+        float cur = r.usToThem; // probe: the two table directions stay mirrored
+        FacRow& fr = facRows_[std::string(r.sid)];
+        if (!fr.seeded) {
+            // Both clients load the same save, so the baseline is shared: seed
+            // silently and stream only genuine mid-session movement.
+            fr.seeded = true; fr.known = cur;
+            continue;
+        }
+        bool changed = (cur - fr.known >= EPS) || (fr.known - cur >= EPS);
+        bool resend  = fr.lastSendMs != 0 && (now - fr.lastSendMs) >= RESEND_MS;
+        if (!changed && !resend) continue;
+        fr.known = cur; fr.lastSendVal = cur; fr.lastSendMs = now;
+        FactionPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_FACTION;
+        pkt.ownerId = ownerId;
+        pkt.seq     = facSeqOut_++;
+        strncpy(pkt.sid, r.sid, sizeof(pkt.sid) - 1);
+        pkt.sid[sizeof(pkt.sid) - 1] = '\0';
+        pkt.relation = cur;
+        net.queueFaction(pkt);
+        if (changed) { // resends stay silent; the change is the signal
+            char b[144];
+            _snprintf(b, sizeof(b) - 1, "[fac] SEND sid='%s' rel=%.1f seq=%u",
+                      pkt.sid, cur, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyFactions(GameWorld* gw, Inbound& in) {
+    std::deque<InboundFaction> got;
+    in.drainFaction(got);
+    if (got.empty()) return;
+    if (!factionSync_) return;
+    const float EPS = 0.5f;
+    for (std::deque<InboundFaction>::iterator it = got.begin(); it != got.end(); ++it) {
+        const FactionPacket& p = it->pkt;
+        if (p.sid[0] == '\0') continue;
+        FacRow& fr = facRows_[std::string(p.sid)];
+        if (fr.seqSeen != 0 && p.seq <= fr.seqSeen) continue; // stale row
+        fr.seqSeen = p.seq;
+        float us = -999.0f, them = -999.0f;
+        engine::readRelationBySid(gw, p.sid, &us, &them);
+        // Updating the baseline FIRST is the echo guard: the local change this
+        // write causes must not be re-detected as ours next sample.
+        fr.known = p.relation;
+        fr.seeded = true;
+        if (us > -900.0f && (us - p.relation < EPS) && (p.relation - us < EPS))
+            continue; // already converged (resend or echo)
+        bool ok = engine::writeRelationBySid(gw, p.sid, p.relation,
+                                             /*reciprocal*/ true, 0, 0);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "[fac] RECV sid='%s' rel=%.1f was=%.1f ok=%d seq=%u",
+                  p.sid, p.relation, us, ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::publishDoors(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (!doorSync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // doors move in clicks; 1 Hz is plenty
+    const unsigned long RESEND_MS = 10000; // safety resend for rows we ever sent
+    unsigned long now = nowMs();
+    if (doorSampleMs_ != 0 && (now - doorSampleMs_) < SAMPLE_MS) return;
+    doorSampleMs_ = now;
+
+    const unsigned int MAX_DOORS = 64;
+    static engine::DoorRead rows[MAX_DOORS]; // main-thread only
+    unsigned int n = engine::enumDoorsNear(gw, 100.0f, rows, MAX_DOORS);
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::DoorRead& r = rows[i];
+        // Protocol 28 partition: doors on SESSION-PLACED buildings (ours or
+        // minted proxies) ride PKT_BUILD_DOOR on the translated identity -
+        // their runtime hands would never resolve on the peer anyway.
+        if (r.doorIndex >= 0) {
+            Key pk; pk.t = r.parentHand[0]; pk.c = r.parentHand[1];
+            pk.cs = r.parentHand[2]; pk.i = r.parentHand[3]; pk.s = r.parentHand[4];
+            if (ownBuilds_.find(pk) != ownBuilds_.end() ||
+                mintByLocal_.find(pk) != mintByLocal_.end())
+                continue;
+        }
+        Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
+        k.i = r.hand[3]; k.s = r.hand[4];
+        DoorRow& dr = doorRows_[k];
+        if (!dr.seeded) {
+            // Both clients load the same save, so the baseline is shared: seed
+            // silently and stream only genuine mid-session movement.
+            dr.seeded = true; dr.knownOpen = r.open; dr.knownLocked = r.locked;
+            continue;
+        }
+        bool changed = (r.open != dr.knownOpen) || (r.locked != dr.knownLocked);
+        bool resend  = dr.lastSendMs != 0 && (now - dr.lastSendMs) >= RESEND_MS;
+        if (!changed && !resend) continue;
+        dr.knownOpen = r.open; dr.knownLocked = r.locked; dr.lastSendMs = now;
+        DoorPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_DOOR;
+        pkt.ownerId = ownerId;
+        pkt.seq     = doorSeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
+        pkt.open    = (u8)(r.open ? 1 : 0);
+        pkt.locked  = (u8)(r.locked ? 1 : 0);
+        net.queueDoor(pkt);
+        if (changed) { // resends stay silent; the change is the signal
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "[door] SEND hand=%u.%u.%u.%u.%u open=%u locked=%u seq=%u",
+                      pkt.hand[0], pkt.hand[1], pkt.hand[2], pkt.hand[3],
+                      pkt.hand[4], pkt.open, pkt.locked, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyDoors(GameWorld* gw, Inbound& in) {
+    (void)gw;
+    std::deque<InboundDoor> got;
+    in.drainDoor(got);
+    if (got.empty()) return;
+    if (!doorSync_) return;
+    for (std::deque<InboundDoor>::iterator it = got.begin(); it != got.end(); ++it) {
+        const DoorPacket& p = it->pkt;
+        Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
+        k.i = p.hand[3]; k.s = p.hand[4];
+        DoorRow& dr = doorRows_[k];
+        if (dr.seqSeen != 0 && p.seq <= dr.seqSeen) continue; // stale row
+        dr.seqSeen = p.seq;
+        // Updating the baseline FIRST is the echo guard: the local change this
+        // write causes must not be re-detected as ours next sample.
+        dr.knownOpen = (int)p.open; dr.knownLocked = (int)p.locked;
+        dr.seeded = true;
+        engine::DoorRead cur;
+        if (!engine::readDoorByHand(p.hand, &cur))
+            continue; // out-of-interest or runtime door - accepted edge
+        bool lockMoves = cur.hasLock && (cur.locked != (int)p.locked);
+        if (cur.open == (int)p.open && !lockMoves)
+            continue; // already converged (resend or echo)
+        bool ok = engine::writeDoorByHand(p.hand, (int)p.open,
+                                          cur.hasLock ? (int)p.locked : -1, 0);
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "[door] RECV hand=%u.%u.%u.%u.%u open=%u locked=%u was=%d/%d ok=%d seq=%u",
+                  p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
+                  p.open, p.locked, cur.open, cur.locked, ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+namespace {
+// Protocol 33 amount quantization: the change gate compares hundredths, so a
+// machine mid-production (amount creeping every engine tick) sends at most
+// one row per sample, and true idleness sends nothing. -1 sentinels ("field
+// not carried") quantize to -100, distinct from any real amount.
+inline int qProd(float v) {
+    return (int)(v * 100.0f + (v >= 0.0f ? 0.5f : -0.5f));
+}
+} // namespace
+
+void Replicator::publishProd(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (!prodSync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // machines tick slowly; 1 Hz is plenty
+    const unsigned long RESEND_MS = 10000; // safety resend = the join drift corrector
+    unsigned long now = nowMs();
+    if (prodSampleMs_ != 0 && (now - prodSampleMs_) < SAMPLE_MS) return;
+    prodSampleMs_ = now;
+
+    const unsigned int MAX_MACH = 48;
+    static engine::ProdRead rows[MAX_MACH]; // main-thread only
+    unsigned int n = engine::enumMachinesNear(gw, 100.0f, rows, MAX_MACH);
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::ProdRead& r = rows[i];
+        Key lk; lk.t = r.hand[0]; lk.c = r.hand[1]; lk.cs = r.hand[2];
+        lk.i = r.hand[3]; lk.s = r.hand[4];
+        // Wire identity: session-placed machines ride the protocol-27 placer
+        // key (our own placement keys by OUR hand; a minted proxy of the
+        // join's placement translates through the reverse map). Everything
+        // else is a BAKED machine with a save-stable hand.
+        int keyKind = 0; Key wk = lk;
+        if (ownBuilds_.find(lk) != ownBuilds_.end()) {
+            keyKind = 1;
+        } else {
+            std::map<Key, Key>::iterator mit = mintByLocal_.find(lk);
+            if (mit != mintByLocal_.end()) { keyKind = 1; wk = mit->second; }
+        }
+        ProdRow& pr = prodRows_[std::make_pair(keyKind, wk)];
+        int qOut = qProd(r.outAmount);
+        int qIn0 = qProd(r.nInputs > 0 ? r.inAmount[0] : -1.0f);
+        int qIn1 = qProd(r.nInputs > 1 ? r.inAmount[1] : -1.0f);
+        int qGr  = qProd(r.grown), qDi = qProd(r.died);
+        int qGs  = qProd(r.growStart), qHv = qProd((float)r.harvested);
+        bool changed = !pr.sent ||
+                       r.powerOn != pr.knownPower ||
+                       r.productionState != pr.knownState ||
+                       qOut != pr.qOut || qIn0 != pr.qIn0 || qIn1 != pr.qIn1 ||
+                       qGr != pr.qGrown || qDi != pr.qDied ||
+                       qGs != pr.qGrowStart || qHv != pr.qHarv;
+        bool resend = pr.sent && (now - pr.lastSendMs) >= RESEND_MS;
+        if (!changed && !resend) continue;
+        bool first = !pr.sent;
+        pr.sent = true; pr.lastSendMs = now;
+        pr.knownPower = r.powerOn; pr.knownState = r.productionState;
+        pr.qOut = qOut; pr.qIn0 = qIn0; pr.qIn1 = qIn1;
+        pr.qGrown = qGr; pr.qDied = qDi; pr.qGrowStart = qGs; pr.qHarv = qHv;
+        ProdPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type      = (u8)PKT_PROD;
+        pkt.ownerId   = ownerId;
+        pkt.seq       = prodSeqOut_++;
+        pkt.keyKind   = (u8)keyKind;
+        pkt.key[0] = wk.t; pkt.key[1] = wk.c; pkt.key[2] = wk.cs;
+        pkt.key[3] = wk.i; pkt.key[4] = wk.s;
+        pkt.classType = (u8)r.classType;
+        pkt.powerOn   = (i8)r.powerOn;
+        pkt.prodState = (i8)r.productionState;
+        pkt.outAmount = r.outAmount;
+        strncpy(pkt.outSid, r.outSid, sizeof(pkt.outSid) - 1);
+        pkt.outSid[sizeof(pkt.outSid) - 1] = '\0';
+        pkt.inAmount[0] = (r.nInputs > 0) ? r.inAmount[0] : -1.0f;
+        pkt.inAmount[1] = (r.nInputs > 1) ? r.inAmount[1] : -1.0f;
+        pkt.grown = r.grown; pkt.died = r.died; pkt.growStart = r.growStart;
+        pkt.harvested = (float)r.harvested;
+        net.queueProd(pkt);
+        if (changed) { // resends stay silent; the change is the signal
+            char b[256];
+            _snprintf(b, sizeof(b) - 1,
+                      "[prod] SEND key=%u.%u.%u.%u.%u kind=%d class=%d pwr=%d "
+                      "state=%d out='%s' outAmt=%.3f in0=%.3f in1=%.3f "
+                      "grown=%.3f first=%d seq=%u",
+                      pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
+                      keyKind, r.classType, r.powerOn, r.productionState,
+                      pkt.outSid, r.outAmount, pkt.inAmount[0], pkt.inAmount[1],
+                      r.grown, first ? 1 : 0, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyProd(GameWorld* gw, Inbound& in) {
+    (void)gw;
+    std::deque<InboundProd> got;
+    in.drainProd(got);
+    if (got.empty()) return;
+    if (!prodSync_) return;
+    for (std::deque<InboundProd>::iterator it = got.begin(); it != got.end(); ++it) {
+        const ProdPacket& p = it->pkt;
+        Key wk; wk.t = p.key[0]; wk.c = p.key[1]; wk.cs = p.key[2];
+        wk.i = p.key[3]; wk.s = p.key[4];
+        ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wk)];
+        if (pr.seqSeen != 0 && p.seq <= pr.seqSeen) continue; // stale row
+        pr.seqSeen = p.seq;
+        // Resolve the wire key to OUR machine's hand: baked hands resolve
+        // directly; a placer key is either a building WE placed (our own
+        // hand) or one we MINTED for the host's placement (translation map).
+        unsigned int hand[5];
+        if (p.keyKind == 0) {
+            for (unsigned int h = 0; h < 5; ++h) hand[h] = p.key[h];
+        } else {
+            std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(wk);
+            if (ob != ownBuilds_.end()) {
+                if (ob->second.removed) continue;
+                memcpy(hand, ob->second.hand, sizeof(hand));
+            } else {
+                std::map<Key, PeerBuild>::iterator pb = peerBuilds_.find(wk);
+                if (pb == peerBuilds_.end() || pb->second.minted != 1 ||
+                    pb->second.removed)
+                    continue; // unknown / refused / tombstoned key
+                memcpy(hand, pb->second.localHand, sizeof(hand));
+            }
+        }
+        engine::ProdRead cur;
+        if (!engine::readMachineByHand(hand, &cur))
+            continue; // out-of-interest / not resolvable here - accepted edge
+        if (!cur.complete)
+            continue; // still a construction site here; protocol 27 will finish it
+        // Apply only what actually diverged, through the engine's own levers.
+        int wantPower = -1;
+        if (p.powerOn >= 0 && cur.powerOn >= 0 && (int)p.powerOn != cur.powerOn)
+            wantPower = (int)p.powerOn;
+        float outWant = -1.0f;
+        if (p.outAmount >= 0.0f &&
+            qProd(p.outAmount) != qProd(cur.outAmount >= 0.0f ? cur.outAmount : 0.0f))
+            outWant = p.outAmount;
+        float inWant[2] = { -1.0f, -1.0f };
+        for (unsigned int k = 0; k < 2; ++k)
+            if (p.inAmount[k] >= 0.0f && (int)k < cur.nInputs &&
+                qProd(p.inAmount[k]) != qProd(cur.inAmount[k]))
+                inWant[k] = p.inAmount[k];
+        float farmWant[4] = { -1.0f, -1.0f, -1.0f, -1.0f };
+        if (p.grown >= 0.0f && qProd(p.grown) != qProd(cur.grown))
+            farmWant[0] = p.grown;
+        if (p.died >= 0.0f && qProd(p.died) != qProd(cur.died))
+            farmWant[1] = p.died;
+        if (p.growStart >= 0.0f && qProd(p.growStart) != qProd(cur.growStart))
+            farmWant[2] = p.growStart;
+        if (p.harvested >= 0.0f && qProd(p.harvested) != qProd((float)cur.harvested))
+            farmWant[3] = p.harvested;
+        bool needIn   = (inWant[0] >= 0.0f) || (inWant[1] >= 0.0f);
+        bool needFarm = farmWant[0] >= 0.0f || farmWant[1] >= 0.0f ||
+                        farmWant[2] >= 0.0f || farmWant[3] >= 0.0f;
+        if (wantPower < 0 && outWant < 0.0f && !needIn && !needFarm)
+            continue; // already converged (resend or settled row)
+        // A still-null output buffer can't take the direct amount write -
+        // materialize it FIRST via the native setProductionItem (the probe-
+        // proven materializing lever), then land the exact amount directly
+        // (setProductionItem splits stack into inventory; the direct write
+        // is what makes the buffer byte-match the host's).
+        if (outWant >= 0.0f && cur.outAmount < 0.0f)
+            engine::writeMachineByHand(hand, -1, outWant, /*useSetItem*/true,
+                                       0, 0, 0);
+        engine::ProdRead after;
+        bool ok = engine::writeMachineByHand(hand, wantPower, outWant,
+                                             /*useSetItem*/false,
+                                             needIn ? inWant : 0,
+                                             needFarm ? farmWant : 0, &after);
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "[prod] RECV key=%u.%u.%u.%u.%u kind=%u pwr=%d->%d "
+                  "out=%.3f->%.3f in0=%.3f->%.3f ok=%d seq=%u",
+                  p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                  (unsigned)p.keyKind, cur.powerOn, (int)p.powerOn,
+                  cur.outAmount, p.outAmount, cur.inAmount[0], p.inAmount[0],
+                  ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    if (!buildSync_) return;
+
+    // 1. Local placement edges -> PLACE announcements (drained every tick so
+    // the edge queue never backs up; the detour caps it at 32 anyway).
+    engine::BuildEdge edges[8];
+    unsigned int n = engine::drainBuildEdges(edges, 8);
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::BuildEdge& e = edges[i];
+        if (!e.sid[0]) continue; // no template sid = nothing the peer can mint
+        Key k; k.t = e.hand[0]; k.c = e.hand[1]; k.cs = e.hand[2];
+        k.i = e.hand[3]; k.s = e.hand[4];
+        OwnBuild& ob = ownBuilds_[k];
+        memcpy(ob.hand, e.hand, sizeof(ob.hand));
+        BuildPlacePacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_BUILD_PLACE;
+        pkt.ownerId = ownerId;
+        pkt.seq     = buildSeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = e.hand[h];
+        strncpy(pkt.sid, e.sid, sizeof(pkt.sid) - 1);
+        pkt.sid[sizeof(pkt.sid) - 1] = '\0';
+        pkt.x = e.x; pkt.y = e.y; pkt.z = e.z; pkt.yaw = e.yaw;
+        pkt.fromUi = (u8)(e.fromUi ? 1 : 0);
+        // Protocol 30: retain the announcement so a connect-edge resync can
+        // re-send it to a late joiner (the one-shot edge, made repeatable).
+        memcpy(&ob.ann, &pkt, sizeof(pkt));
+        ob.haveAnn = true;
+        net.queueBuildPlace(pkt);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] PLACE-SEND key=%u.%u.%u.%u.%u sid='%s' ui=%u "
+                  "pos=%.1f,%.1f,%.1f seq=%u",
+                  pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
+                  pkt.sid, pkt.fromUi, pkt.x, pkt.y, pkt.z, pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // 1b. Removal edges (protocol 28): the dismantle detour (UI path) and the
+    // programmatic destroy both queue hands here. Only buildings WE placed
+    // stream a REMOVE (placer-authoritative); a dismantle of a baked building
+    // or of a peer's proxy logs at the detour but stays local.
+    unsigned int rmEdges[8][5];
+    unsigned int rn = engine::drainRemoveEdges(rmEdges, 8);
+    for (unsigned int i = 0; i < rn; ++i) {
+        Key k; k.t = rmEdges[i][0]; k.c = rmEdges[i][1]; k.cs = rmEdges[i][2];
+        k.i = rmEdges[i][3]; k.s = rmEdges[i][4];
+        std::map<Key, OwnBuild>::iterator f = ownBuilds_.find(k);
+        if (f == ownBuilds_.end() || f->second.removed) continue;
+        f->second.removed = true;
+        if (!bdoorSync_) continue; // A/B hatch: edge observed, nothing streams
+        BuildRemovePacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_BUILD_REMOVE;
+        pkt.ownerId = ownerId;
+        pkt.seq     = buildSeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = rmEdges[i][h];
+        net.queueBuildRemove(pkt);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] REMOVE-SEND key=%u.%u.%u.%u.%u seq=%u",
+                  pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
+                  pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // 2. Progress rows for buildings WE placed (~1 Hz, change-gated + 10 s
+    // safety resend while incomplete; the final complete row latches).
+    const unsigned long SAMPLE_MS = 1000;
+    const unsigned long RESEND_MS = 10000;
+    unsigned long now = nowMs();
+    if (buildSampleMs_ != 0 && (now - buildSampleMs_) < SAMPLE_MS) return;
+    buildSampleMs_ = now;
+    const float EPS = 0.005f;
+    for (std::map<Key, OwnBuild>::iterator it = ownBuilds_.begin();
+         it != ownBuilds_.end(); ++it) {
+        OwnBuild& ob = it->second;
+        if (ob.removed)  continue; // dismantled/destroyed: nothing to sample
+        if (ob.doneSent) continue; // finished + announced: silent forever
+        engine::BuildRead cur;
+        if (!engine::readBuildingByHand(ob.hand, &cur))
+            continue; // destroyed/unloaded locally - stop streaming quietly
+        float dp = cur.progress - ob.lastProg;
+        bool changed = (dp > EPS || dp < -EPS) || (cur.complete != ob.lastComplete);
+        bool resend  = ob.lastSendMs != 0 && (now - ob.lastSendMs) >= RESEND_MS;
+        if (!changed && !resend) continue;
+        ob.lastProg = cur.progress; ob.lastComplete = cur.complete;
+        ob.lastSendMs = now;
+        BuildStatePacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type     = (u8)PKT_BUILD_STATE;
+        pkt.ownerId  = ownerId;
+        pkt.seq      = buildSeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = ob.hand[h];
+        pkt.progress = cur.progress;
+        pkt.complete = (u8)(cur.complete ? 1 : 0);
+        net.queueBuildState(pkt);
+        if (cur.complete) ob.doneSent = true;
+        if (changed) { // resends stay silent; the change is the signal
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] STATE-SEND key=%u.%u.%u.%u.%u prog=%.3f complete=%u seq=%u",
+                      pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
+                      cur.progress, pkt.complete, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyBuilds(GameWorld* gw, Inbound& in) {
+    // Announcements first (same-channel ordered-reliable means a STATE row
+    // never precedes its PLACE on the wire; keep that property here too).
+    std::deque<InboundBuildPlace> places;
+    in.drainBuildPlace(places);
+    std::deque<InboundBuildState> states;
+    in.drainBuildState(states);
+    if (!buildSync_) return;
+    for (std::deque<InboundBuildPlace>::iterator it = places.begin();
+         it != places.end(); ++it) {
+        const BuildPlacePacket& p = it->pkt;
+        if (p.sid[0] == '\0') continue;
+        Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
+        k.i = p.key[3]; k.s = p.key[4];
+        if (peerBuilds_.find(k) != peerBuilds_.end())
+            continue; // already minted (or mint already refused) - dedupe
+        PeerBuild& pb = peerBuilds_[k];
+        // Mint INCOMPLETE always: the placer's STATE rows drive progress from
+        // here (a real UI placement starts at 0 anyway).
+        int rc = engine::placeBuildingAt(gw, p.sid, p.x, p.y, p.z, p.yaw,
+                                         /*completed*/false, pb.localHand);
+        pb.minted = (rc == 1) ? 1 : 0;
+        if (pb.minted) {
+            // Reverse translation (protocol 28): the door sampler and the
+            // protocol-26 filter recognize this proxy by its LOCAL hand.
+            Key lk; lk.t = pb.localHand[0]; lk.c = pb.localHand[1];
+            lk.cs = pb.localHand[2]; lk.i = pb.localHand[3]; lk.s = pb.localHand[4];
+            mintByLocal_[lk] = k;
+        }
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] MINT key=%u.%u.%u.%u.%u sid='%s' ui=%u rc=%d "
+                  "local=%u.%u.%u.%u.%u",
+                  p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                  p.sid, p.fromUi, rc,
+                  pb.localHand[0], pb.localHand[1], pb.localHand[2],
+                  pb.localHand[3], pb.localHand[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    for (std::deque<InboundBuildState>::iterator it = states.begin();
+         it != states.end(); ++it) {
+        const BuildStatePacket& p = it->pkt;
+        Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
+        k.i = p.key[3]; k.s = p.key[4];
+        std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
+        if (f == peerBuilds_.end() || !f->second.minted)
+            continue; // mint refused or key unknown - skip silently
+        PeerBuild& pb = f->second;
+        if (pb.removed) continue; // tombstoned (REMOVE already applied)
+        if (pb.seqSeen != 0 && p.seq <= pb.seqSeen) continue; // stale row
+        pb.seqSeen = p.seq;
+        engine::BuildRead cur;
+        if (engine::readBuildingByHand(pb.localHand, &cur)) {
+            float d = cur.progress - p.progress;
+            bool progClose = (d < 0.005f && d > -0.005f);
+            if (progClose && cur.complete == (int)p.complete)
+                continue; // already converged (resend)
+            if (cur.complete) continue; // completion is latched locally
+        }
+        engine::BuildRead post;
+        bool ok = engine::writeBuildProgressByHand(pb.localHand, p.progress, &post);
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] STATE-RECV key=%u.%u.%u.%u.%u prog=%.3f complete=%u "
+                  "ok=%d localProg=%.3f localComplete=%d seq=%u",
+                  p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                  p.progress, p.complete, ok ? 1 : 0,
+                  post.progress, post.complete, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Removals (protocol 28, placer-authoritative): destroy the mapped proxy
+    // through the engine's own GameWorld::destroy and tombstone the entry so
+    // any late STATE/DOOR rows for the key skip silently. Gated on bdoorSync
+    // (the removal channel ships with the placed-door slice).
+    std::deque<InboundBuildRemove> removes;
+    in.drainBuildRemove(removes);
+    if (!bdoorSync_) return;
+    for (std::deque<InboundBuildRemove>::iterator it = removes.begin();
+         it != removes.end(); ++it) {
+        const BuildRemovePacket& p = it->pkt;
+        Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
+        k.i = p.key[3]; k.s = p.key[4];
+        std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
+        if (f == peerBuilds_.end() || !f->second.minted || f->second.removed)
+            continue; // never minted here or already gone - nothing to remove
+        PeerBuild& pb = f->second;
+        pb.removed = true;
+        bool ok = engine::destroyBuildingByHand(gw, pb.localHand);
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] REMOVE-RECV key=%u.%u.%u.%u.%u ok=%d "
+                  "local=%u.%u.%u.%u.%u seq=%u",
+                  p.key[0], p.key[1], p.key[2], p.key[3], p.key[4], ok ? 1 : 0,
+                  pb.localHand[0], pb.localHand[1], pb.localHand[2],
+                  pb.localHand[3], pb.localHand[4], p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
+    // 1. One-shot edges, replayed: every live placed building's PLACE (and
+    // the REMOVE for removed ones) goes out again. The receiver's session
+    // maps dedupe - a known key skips the mint, a tombstoned key skips the
+    // remove - so a quick reconnect is safe and a fresh joiner finally
+    // learns what it missed.
+    unsigned int nPlace = 0, nRemove = 0;
+    if (buildSync_) {
+        for (std::map<Key, OwnBuild>::iterator it = ownBuilds_.begin();
+             it != ownBuilds_.end(); ++it) {
+            OwnBuild& ob = it->second;
+            if (!ob.haveAnn) continue;
+            if (ob.removed) {
+                if (!bdoorSync_) continue; // removal ships with the bdoor slice
+                BuildRemovePacket pkt;
+                memset(&pkt, 0, sizeof(pkt));
+                pkt.type    = (u8)PKT_BUILD_REMOVE;
+                pkt.ownerId = ownerId;
+                pkt.seq     = buildSeqOut_++;
+                for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = ob.hand[h];
+                net.queueBuildRemove(pkt);
+                ++nRemove;
+            } else {
+                ob.ann.ownerId = ownerId;
+                ob.ann.seq     = buildSeqOut_++;
+                net.queueBuildPlace(ob.ann);
+                // Un-latch the STATE row: the next publishBuilds sample sees
+                // "changed" against the reset baseline and sends one fresh
+                // progress row (complete=1 re-latches doneSent immediately).
+                ob.doneSent   = false;
+                ob.lastProg   = -1.0f;
+                ob.lastComplete = -1;
+                ob.lastSendMs = 0;
+                ++nPlace;
+            }
+        }
+    }
+
+    // 2. Force-resend pass over the change-gated caches: age lastSendMs to 1
+    // on every row EVER SENT, so each channel's own safety-resend condition
+    // fires on its next sample (rows never sent - the seeded shared-save
+    // baseline - correctly stay silent). Edge-only caches (weaponCensus_,
+    // hostBody_, stealthPub_) are left alone: re-seeding them would author
+    // phantom drop/KO edges rather than heal state.
+    unsigned int nFac = 0, nDoor = 0, nBdoor = 0, nMed = 0, nStats = 0,
+                 nMoney = 0, nInv = 0, nWorld = 0, nProd = 0;
+    for (std::map<std::string, FacRow>::iterator it = facRows_.begin();
+         it != facRows_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nFac; }
+    for (std::map<Key, DoorRow>::iterator it = doorRows_.begin();
+         it != doorRows_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nDoor; }
+    for (std::map<std::pair<Key, int>, BdoorRow>::iterator it = bdoorRows_.begin();
+         it != bdoorRows_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nBdoor; }
+    for (std::map<Key, MedPub>::iterator it = medPub_.begin();
+         it != medPub_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nMed; }
+    for (std::map<Key, StatsPub>::iterator it = statsPub_.begin();
+         it != statsPub_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nStats; }
+    for (std::map<unsigned int, MoneyPub>::iterator it = moneyPub_.begin();
+         it != moneyPub_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nMoney; }
+    for (std::map<Key, InvPub>::iterator it = invPub_.begin();
+         it != invPub_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nInv; }
+    for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin();
+         it != worldTrack_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nWorld; }
+    for (std::map<std::pair<int, Key>, ProdRow>::iterator it = prodRows_.begin();
+         it != prodRows_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nProd; }
+
+    char b[224];
+    _snprintf(b, sizeof(b) - 1,
+              "[latejoin] RESYNC place=%u remove=%u fac=%u door=%u bdoor=%u "
+              "med=%u stats=%u money=%u inv=%u world=%u prod=%u",
+              nPlace, nRemove, nFac, nDoor, nBdoor, nMed, nStats, nMoney,
+              nInv, nWorld, nProd);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+void Replicator::publishBuildDoors(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    if (!bdoorSync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // the protocol-26 door cadence
+    const unsigned long RESEND_MS = 10000; // safety resend for rows ever sent
+    unsigned long now = nowMs();
+    if (bdoorSampleMs_ != 0 && (now - bdoorSampleMs_) < SAMPLE_MS) return;
+    bdoorSampleMs_ = now;
+
+    const unsigned int MAX_DOORS_PER_BUILDING = 4;
+    // Two passes over the build maps: buildings WE placed (wire key = our
+    // hand) and minted proxies (wire key = the placer's, via the map key).
+    for (int pass = 0; pass < 2; ++pass) {
+        std::map<Key, OwnBuild>::iterator oit = ownBuilds_.begin();
+        std::map<Key, PeerBuild>::iterator pit = peerBuilds_.begin();
+        for (;;) {
+            const Key* wireKey = 0;
+            const unsigned int* localHand = 0;
+            if (pass == 0) {
+                if (oit == ownBuilds_.end()) break;
+                if (oit->second.removed) { ++oit; continue; }
+                wireKey = &oit->first; localHand = oit->second.hand; ++oit;
+            } else {
+                if (pit == peerBuilds_.end()) break;
+                if (!pit->second.minted || pit->second.removed) { ++pit; continue; }
+                wireKey = &pit->first; localHand = pit->second.localHand; ++pit;
+            }
+            for (unsigned int di = 0; di < MAX_DOORS_PER_BUILDING; ++di) {
+                engine::DoorRead dr;
+                if (!engine::readDoorOfBuilding(localHand, di, &dr)) break;
+                BdoorRow& row = bdoorRows_[std::make_pair(*wireKey, (int)di)];
+                if (!row.seeded) {
+                    // Both sides mint the door closed and the PLACE seeded the
+                    // building, so the first sample is the shared baseline.
+                    row.seeded = true;
+                    row.knownOpen = dr.open; row.knownLocked = dr.locked;
+                    continue;
+                }
+                bool changed = (dr.open != row.knownOpen) ||
+                               (dr.locked != row.knownLocked);
+                bool resend  = row.lastSendMs != 0 && (now - row.lastSendMs) >= RESEND_MS;
+                if (!changed && !resend) continue;
+                row.knownOpen = dr.open; row.knownLocked = dr.locked;
+                row.lastSendMs = now;
+                BuildDoorPacket pkt;
+                memset(&pkt, 0, sizeof(pkt));
+                pkt.type    = (u8)PKT_BUILD_DOOR;
+                pkt.ownerId = ownerId;
+                pkt.seq     = bdoorSeqOut_++;
+                pkt.bkey[0] = wireKey->t; pkt.bkey[1] = wireKey->c;
+                pkt.bkey[2] = wireKey->cs; pkt.bkey[3] = wireKey->i;
+                pkt.bkey[4] = wireKey->s;
+                pkt.doorIndex = (u8)di;
+                pkt.open    = (u8)(dr.open ? 1 : 0);
+                pkt.locked  = (u8)(dr.locked ? 1 : 0);
+                net.queueBuildDoor(pkt);
+                if (changed) { // resends stay silent; the change is the signal
+                    char b[176];
+                    _snprintf(b, sizeof(b) - 1,
+                              "[bdoor] SEND key=%u.%u.%u.%u.%u idx=%u open=%u locked=%u seq=%u",
+                              pkt.bkey[0], pkt.bkey[1], pkt.bkey[2], pkt.bkey[3],
+                              pkt.bkey[4], pkt.doorIndex, pkt.open, pkt.locked, pkt.seq);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+    }
+}
+
+void Replicator::applyBuildDoors(GameWorld* gw, Inbound& in) {
+    (void)gw;
+    std::deque<InboundBuildDoor> got;
+    in.drainBuildDoor(got);
+    if (got.empty()) return;
+    if (!bdoorSync_) return;
+    for (std::deque<InboundBuildDoor>::iterator it = got.begin(); it != got.end(); ++it) {
+        const BuildDoorPacket& p = it->pkt;
+        Key k; k.t = p.bkey[0]; k.c = p.bkey[1]; k.cs = p.bkey[2];
+        k.i = p.bkey[3]; k.s = p.bkey[4];
+        // Resolve the key to the LOCAL building: our own placement (the peer
+        // moved a door on OUR building's proxy) or a minted proxy of theirs.
+        const unsigned int* localHand = 0;
+        std::map<Key, OwnBuild>::iterator oit = ownBuilds_.find(k);
+        if (oit != ownBuilds_.end() && !oit->second.removed) {
+            localHand = oit->second.hand;
+        } else {
+            std::map<Key, PeerBuild>::iterator pit = peerBuilds_.find(k);
+            if (pit != peerBuilds_.end() && pit->second.minted && !pit->second.removed)
+                localHand = pit->second.localHand;
+        }
+        BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
+        if (row.seqSeen != 0 && p.seq <= row.seqSeen) continue; // stale row
+        row.seqSeen = p.seq;
+        // Updating the baseline FIRST is the echo guard: the local change this
+        // write causes must not be re-detected as ours next sample.
+        row.knownOpen = (int)p.open; row.knownLocked = (int)p.locked;
+        row.seeded = true;
+        if (!localHand) continue; // unknown/tombstoned key - skip silently
+        engine::DoorRead cur;
+        if (!engine::readDoorOfBuilding(localHand, p.doorIndex, &cur))
+            continue; // no such door locally (mint refused earlier) - skip
+        bool lockMoves = cur.hasLock && (cur.locked != (int)p.locked);
+        if (cur.open == (int)p.open && !lockMoves)
+            continue; // already converged (resend or echo)
+        bool ok = engine::writeDoorByHand(cur.hand, (int)p.open,
+                                          cur.hasLock ? (int)p.locked : -1, 0);
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+                  "[bdoor] RECV key=%u.%u.%u.%u.%u idx=%u open=%u locked=%u "
+                  "was=%d/%d ok=%d seq=%u",
+                  p.bkey[0], p.bkey[1], p.bkey[2], p.bkey[3], p.bkey[4],
+                  p.doorIndex, p.open, p.locked, cur.open, cur.locked,
+                  ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId) {
     (void)gw;
     if (!recruitSync_) return; // hook is only installed when the sync is on
@@ -1070,7 +2061,7 @@ void Replicator::publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId) {
         // the new hand no matter which tab rank its container maps to.
         Key nk; nk.t = edges[i].after[0]; nk.c = edges[i].after[1];
         nk.cs = edges[i].after[2]; nk.i = edges[i].after[3]; nk.s = edges[i].after[4];
-        recruitOwned_.insert(nk);
+        pinOwned_.insert(nk);
         EventPacket ev;
         memset(&ev, 0, sizeof(ev));
         ev.type    = (u8)PKT_EVENT;
@@ -1089,6 +2080,55 @@ void Replicator::publishRecruits(GameWorld* gw, NetLink& net, u32 ownerId) {
                   "[recruit] EVT send old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u",
                   ev.sType, ev.sContainer, ev.sContainerSerial, ev.sIndex, ev.sSerial,
                   ev.aType, ev.aContainer, ev.aContainerSerial, ev.aIndex, ev.aSerial);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (!squadSync_) return;
+    // Per-TICK poll (run 192211: a 500 ms throttle lost the race - a member
+    // moved back into a rank-owned tab streamed its new hand immediately,
+    // and the peer's REQ/mint round-trip built a duplicate proxy before the
+    // throttled EVT arrived). Polling every tick puts the reliable edge in
+    // the SAME flush as the new hand's first entity batch, so the peer's
+    // re-key always lands before its spawn REQ could even be authored.
+    engine::pollSquadRoster(gw);
+    engine::SquadMoveEdge edges[8];
+    unsigned int n = engine::drainSquadMoveEdges(edges, 8);
+    for (unsigned int i = 0; i < n; ++i) {
+        Key ok; ok.t = edges[i].before[0]; ok.c = edges[i].before[1];
+        ok.cs = edges[i].before[2]; ok.i = edges[i].before[3]; ok.s = edges[i].before[4];
+        Key nk; nk.t = edges[i].after[0]; nk.c = edges[i].after[1];
+        nk.cs = edges[i].after[2]; nk.i = edges[i].after[3]; nk.s = edges[i].after[4];
+        bool exited = (nk.t | nk.c | nk.cs | nk.i | nk.s) == 0;
+        // The old hand is dead either way - drop any pin it carried (a moved
+        // recruit / a re-moved member must not leave a stale claim behind).
+        pinOwned_.erase(ok);
+        pinPeer_.erase(ok);
+        // Pin ownership BEFORE the wire (the recruit pattern): every edge
+        // polled from OUR roster is OUR user's action, so the new hand
+        // publishes from this side no matter which rank its container latched
+        // to (an appended tab inherits our ownership through this pin).
+        if (!exited) pinOwned_.insert(nk);
+        EventPacket ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.type    = (u8)PKT_EVENT;
+        ev.event   = EVT_SQUAD_MOVE;
+        ev.ownerId = ownerId;
+        ev.eventId = nextEventId_++;
+        ev.sType = edges[i].before[0]; ev.sContainer = edges[i].before[1];
+        ev.sContainerSerial = edges[i].before[2];
+        ev.sIndex = edges[i].before[3]; ev.sSerial = edges[i].before[4];
+        ev.aType = edges[i].after[0]; ev.aContainer = edges[i].after[1];
+        ev.aContainerSerial = edges[i].after[2];
+        ev.aIndex = edges[i].after[3]; ev.aSerial = edges[i].after[4];
+        net.queueEvent(ev);
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "[squad] EVT send old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u exit=%d",
+                  ev.sType, ev.sContainer, ev.sContainerSerial, ev.sIndex, ev.sSerial,
+                  ev.aType, ev.aContainer, ev.aContainerSerial, ev.aIndex, ev.aSerial,
+                  exited ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1283,8 +2323,10 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         } else if (p.type == (u8)PKT_SPEED_SET && !isHost) {
             // QUIET apply: drives the sim to the arbitrated effective without
             // touching the UI buttons - they keep showing this player's VOTE.
+            // The clock slew (protocol 25) folds in here: the join's sim runs
+            // at effective * timeSlew_ until its game clock matches the host's.
             float eff = pkPaused ? 0.0f : p.speed;
-            if (engine::writeGameSpeedQuiet(gw, eff, pkPaused)) {
+            if (engine::writeGameSpeedQuiet(gw, slewedEffective(eff), pkPaused)) {
                 speedLastApplied_ = eff;
                 bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
                 speedLastSet_ = eff;
@@ -1314,7 +2356,8 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         if (changed || userActed || speedLastSendMs_ == 0 ||
             (now - speedLastSendMs_) >= RESEND_MS) {
             bool effPaused = (eff <= EPS);
-            if (engine::writeGameSpeedQuiet(gw, eff, effPaused))
+            // slewedEffective is identity on the host (timeSlew_ stays 1.0).
+            if (engine::writeGameSpeedQuiet(gw, slewedEffective(eff), effPaused))
                 speedLastApplied_ = eff;
             SpeedPacket pkt;
             memset(&pkt, 0, sizeof(pkt));
@@ -1363,11 +2406,106 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         float mult = 0.0f; bool paused = false;
         if (engine::readGameSpeed(gw, &mult, &paused)) {
             float cur = paused ? 0.0f : mult;
-            if (fabs(cur - speedLastSet_) > EPS) {
-                if (engine::writeGameSpeedQuiet(gw, speedLastSet_, speedLastSet_ <= EPS))
+            // The enforcement target carries the clock slew (protocol 25):
+            // comparing against the UNSLEWED effective would revert the slew
+            // write every tick and the join's clock could never catch up.
+            float want = slewedEffective(speedLastSet_);
+            if (fabs(cur - want) > EPS) {
+                if (engine::writeGameSpeedQuiet(gw, want, speedLastSet_ <= EPS))
                     speedLastApplied_ = speedLastSet_;
             }
         }
+    }
+}
+
+void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
+                          bool isHost) {
+    std::deque<InboundTime> got;
+    in.drainTime(got);
+    if (!timeSync_) return;
+    unsigned long now = nowMs();
+
+    if (isHost) {
+        // The authority just broadcasts its absolute clock at ~1 Hz; the join
+        // does all the correcting. timeSlew_ stays 1.0 here by construction.
+        const unsigned long SEND_MS = 1000;
+        if (timeLastSendMs_ != 0 && (now - timeLastSendMs_) < SEND_MS) return;
+        double hours = -1.0;
+        if (!engine::readGameClock(gw, &hours, 0) || hours < 0.0) return;
+        timeLastSendMs_ = now;
+        TimePacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type      = (u8)PKT_TIME;
+        pkt.ownerId   = ownerId;
+        pkt.seq       = timeSeqOut_++;
+        pkt.gameHours = hours;
+        net.queueTime(pkt);
+        return;
+    }
+
+    // JOIN: newest sample wins (ordered-reliable channel; the seq guard is
+    // belt-and-braces). No new sample this tick = keep the current slew - the
+    // next 1 Hz sample re-measures what the slew achieved.
+    const TimePacket* newest = 0;
+    for (std::deque<InboundTime>::iterator it = got.begin(); it != got.end(); ++it) {
+        if (timeSeqSeen_ != 0 && (long)(it->pkt.seq - timeSeqSeen_) <= 0) continue;
+        timeSeqSeen_ = it->pkt.seq;
+        newest = &it->pkt;
+    }
+    if (!newest) return;
+    double local = -1.0;
+    if (!engine::readGameClock(gw, &local, 0) || local < 0.0) return;
+    // Sample age is one wire hop (~ms) = well under 0.001 game hours at the
+    // measured hour length (109 s/gh, time_probe run 141509) - no extrapolation.
+    double off = newest->gameHours - local; // >0 = we are BEHIND, speed up
+
+    // SLEW is the one working lever. A clock STEP was tried and rejected:
+    // writing the timeStamper perf-timer base (self-verifying, reverted on
+    // mismatch) never moved getTimeStamp_inGameHours - the absolute calendar
+    // is a separate global the frame tick advances, not a live read off that
+    // timer (run 150001; the RVA clusters agree: the clock reads sit with the
+    // environment code, far from SimpleTimeStamper). So the join CATCHES UP
+    // by running its sim faster - a visible but bounded session-start
+    // transient (~35 s at 2x for the typical ~0.3 gh load skew).
+    //
+    // Proportional slew with hysteresis. Capped at 2x - a speed the game runs
+    // routinely (a 4x cap converged faster but disturbed the join's world
+    // enough to dip npc_sync tracking below gate, run 142912); the clock rate
+    // tracks fsm exactly (time_probe), so the gain tapers the correction
+    // smoothly into the deadband (no bang-bang).
+    const double ENGAGE_GH    = 0.01;  // dead until |off| > 36 game-seconds
+    const double DISENGAGE_GH = 0.002; // slewing until |off| < 7 game-seconds
+    const double GAIN         = 30.0;  // slew delta per game-hour of offset
+    bool slewing = (timeSlew_ < 0.999f || timeSlew_ > 1.001f);
+    bool engage  = slewing ? (fabs(off) > DISENGAGE_GH) : (fabs(off) > ENGAGE_GH);
+    float newSlew = 1.0f;
+    if (engage) {
+        double d = off * GAIN;
+        if (d >  1.0) d =  1.0;  // cap: 2x sim while far behind
+        if (d < -0.75) d = -0.75; // floor: 0.25x sim while ahead (never pause)
+        newSlew = (float)(1.0 + d);
+    }
+    bool slewChanged = fabs(newSlew - timeSlew_) > 0.01f;
+    timeSlew_ = newSlew;
+
+    // Apply through the consensus layer immediately (its continuous
+    // enforcement would converge next tick anyway; this shaves the latency).
+    // speedLastSet_ < 0 = no consensus state yet (or speedSync off): degrade
+    // to measuring - there is no lever to compose with.
+    if (slewChanged && speedLastSet_ > 0.01f) {
+        float want = slewedEffective(speedLastSet_);
+        if (engine::writeGameSpeedQuiet(gw, want, false))
+            timeSlewApplied_ = want;
+    }
+    bool logNow = slewChanged || timeLastLogMs_ == 0 ||
+                  (now - timeLastLogMs_) >= 5000;
+    if (logNow) {
+        timeLastLogMs_ = now;
+        char b[144];
+        _snprintf(b, sizeof(b) - 1,
+                  "[time] OFFSET off=%.4fgh slew=%.2f host=%.5f local=%.5f",
+                  off, timeSlew_, newest->gameHours, local);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
 
@@ -1381,6 +2519,9 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     const unsigned long REQ_DEBOUNCE_MS  = 2000;
     const unsigned int  REQ_MAX_SENDS    = 5;
     const unsigned long DENIED_RETRY_MS  = 30000;
+    // Re-keyed-away hands (protocol 35): how long the OLD key stays REQ/mint-
+    // dead after a re-key retired it (covers any batch/reply still in flight).
+    const unsigned long REKEYED_GRACE_MS = 10000;
     // Host reply throttle: a re-request inside this window is a duplicate in
     // flight, not a new question.
     const unsigned long REPLY_THROTTLE_MS = 2000;
@@ -1450,6 +2591,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             continue;
         }
         if (proxyByKey_.find(k) != proxyByKey_.end()) continue; // duplicate reply
+        // A hand re-keyed away (recruit/squad move) between our REQ and this
+        // reply is DEAD - minting it would resurrect the duplicate the re-key
+        // just cleaned up (protocol 35 run 192211).
+        std::map<Key, unsigned long>::iterator rko = rekeyedOld_.find(k);
+        if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS)
+            continue;
         Character* proxy = engine::spawnProxyNpc(gw, p.charSid, p.facSid,
                                                  p.x, p.y, p.z, p.heading);
         if (!proxy) {
@@ -1485,6 +2632,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
              it != unresolvedHands_.end(); ++it) {
             const Key& k = it->first;
             if (proxyByKey_.find(k) != proxyByKey_.end()) continue;
+            // Never ask about a hand a re-key just retired (protocol 35): a
+            // stale batch of the OLD key may still be in flight, and a REQ
+            // for it would mint the duplicate the re-key exists to prevent.
+            std::map<Key, unsigned long>::iterator rko = rekeyedOld_.find(k);
+            if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS)
+                continue;
             SpawnReqState& rq = spawnReq_[k];
             if (rq.deniedMs != 0) {
                 if ((now - rq.deniedMs) < DENIED_RETRY_MS) continue;
@@ -1545,6 +2698,30 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     // reconciles a container it authors.
     std::set<Key> owned = ownedContainers_;
     owned.insert(ownHands_.begin(), ownHands_.end());
+    // Protocol 34 (storeSync, HOST only): fold in the ~1 Hz container census -
+    // every COMPLETE storage chest / machine container near the interest
+    // centers becomes an authored container, riding the same per-container
+    // hash + settle + safety-resend gate below. The census set is replaced
+    // wholesale each pass (containers leaving interest stop being captured;
+    // their invPub_ baseline survives for the return).
+    if (storeSync_) {
+        unsigned long cnow = nowMs();
+        if (contCensusMs_ == 0 || (cnow - contCensusMs_) >= 1000) {
+            contCensusMs_ = cnow;
+            const unsigned int MAX_CONT = 48;
+            static engine::ContRead rows[MAX_CONT]; // main-thread only
+            unsigned int n = engine::enumContainersNear(gw, 100.0f, rows, MAX_CONT);
+            censusContainers_.clear();
+            for (unsigned int i = 0; i < n; ++i) {
+                if (!rows[i].hasInv) continue; // no Inventory = nothing to author
+                Key k; k.t = rows[i].hand[0]; k.c = rows[i].hand[1];
+                k.cs = rows[i].hand[2]; k.i = rows[i].hand[3];
+                k.s = rows[i].hand[4];
+                censusContainers_.insert(k);
+            }
+        }
+        owned.insert(censusContainers_.begin(), censusContainers_.end());
+    }
     if (owned.empty()) return;
     const unsigned long INV_RESEND_MS = 5000; // periodic safety resend (loss/late join)
     // A changed snapshot must be STABLE this long before we publish it. A change that only
@@ -1589,13 +2766,31 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         bool changed  = differs && settled;
         bool periodic = sent && !differs && (now - pub.lastSendMs >= INV_RESEND_MS);
         if (!changed && !periodic) continue;
-        net.queueInvSnapshot(ownerId, cHand, items, n);
+        // Protocol 34 wire identity: a session-placed building rides its
+        // protocol-27 placer key (own placement = our hand; a minted proxy =
+        // the reverse map). Characters / baked containers stay raw (kind 0).
+        u8 keyKind = 0;
+        u32 wireKey[5] = { it->t, it->c, it->cs, it->i, it->s };
+        if (ownBuilds_.find(*it) != ownBuilds_.end()) {
+            keyKind = 1;
+        } else {
+            std::map<Key, Key>::iterator mit = mintByLocal_.find(*it);
+            if (mit != mintByLocal_.end()) {
+                keyKind = 1;
+                wireKey[0] = mit->second.t; wireKey[1] = mit->second.c;
+                wireKey[2] = mit->second.cs; wireKey[3] = mit->second.i;
+                wireKey[4] = mit->second.s;
+            }
+        }
+        net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n);
         pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n;
         if (changed) {
-            char b[160];
+            char b[200];
             _snprintf(b, sizeof(b) - 1,
-                "[inv] SEND hand=%u,%u,%u,%u,%u items=%u hash=%u",
-                it->t, it->c, it->cs, it->i, it->s, n, hash);
+                "[inv] SEND hand=%u,%u,%u,%u,%u kind=%u key=%u,%u,%u,%u,%u items=%u hash=%u",
+                it->t, it->c, it->cs, it->i, it->s, (unsigned)keyKind,
+                wireKey[0], wireKey[1], wireKey[2], wireKey[3], wireKey[4],
+                n, hash);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             static int dumpInv = -1;
             if (dumpInv < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpInv = (e && e[0] == '1') ? 1 : 0; }
@@ -1617,7 +2812,123 @@ void Replicator::applyInventories(GameWorld* gw) {
         unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
         const InvItemEntry* items = it->second.items.empty() ? 0 : &it->second.items[0];
         unsigned int n = (unsigned int)it->second.items.size();
+        // Protocol 37 (the race that blinded the detector in run 141024): if this
+        // peer container's LOCAL contents differ from the transfer detector's
+        // baseline, a user mutation (possibly one end of a cross-owner drag) has not
+        // been adjudicated yet - reconciling NOW would undo the drag (the dupe/wipe)
+        // and the post-apply rebase would erase the evidence. Defer briefly (the
+        // detector scans at 400 ms / settles at 600 ms, so ~2 s covers pairing +
+        // intent authoring); on deadline fall through (genuine desync heal). Only
+        // active while the detector itself runs (xferSync on -> xferScanMs_ != 0).
+        if (xferScanMs_ != 0 && xferSeeded_.count(k) != 0 &&
+            engine::resolveObjectByHand(cHand) != 0) {
+            const unsigned long XFER_DEFER_MS = 3000;
+            InvItemEntry cur[64];
+            unsigned int nc = engine::captureContainerContents(gw, cHand, cur, 64, 0);
+            std::map<XKey, int> tot;
+            for (unsigned int i = 0; i < nc; ++i) {
+                int q = cur[i].quantity; if (q < 1) q = 1;
+                tot[XKey(std::string(cur[i].stringID), cur[i].itemType)] += q;
+            }
+            if (tot != xferBase_[k]) {
+                unsigned long now = nowMs();
+                unsigned long& since = xferDefer_[k];
+                if (since == 0) since = now;
+                if (now - since < XFER_DEFER_MS) {
+                    it->second.dirty = true; // re-visit next tick
+                    continue;
+                }
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[xfer] defer-expired hand=%u,%u,%u,%u,%u (unadjudicated local diff; applying)",
+                    k.t, k.c, k.cs, k.i, k.s);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            xferDefer_.erase(k);
+        }
+        // Protocol 37: an active transfer latch means this snapshot may be STALE with
+        // respect to a cross-owner move (ours or an applied peer intent) the container's
+        // owner hasn't republished yet. Adjust the desired list by each latch - a taken
+        // item must not be re-added (the dupe), a given item must not be destroyed (the
+        // wipe) - until the owner catches up (raw desired == local for the key) or the
+        // grace deadline passes.
+        std::vector<InvItemEntry> adj;
+        std::map<Key, std::map<XKey, XferLatch> >::iterator lt = xferLatch_.find(k);
+        if (lt != xferLatch_.end() && !lt->second.empty() &&
+            engine::resolveObjectByHand(cHand) != 0) {
+            unsigned long now = nowMs();
+            // Local capture: totals for the catch-up check + entries for provenance.
+            InvItemEntry loc[64];
+            unsigned int nl = engine::captureContainerContents(gw, cHand, loc, 64, 0);
+            adj.assign(items, items + n);
+            for (std::map<XKey, XferLatch>::iterator le = lt->second.begin();
+                 le != lt->second.end(); ) {
+                const XKey& key = le->first;
+                int want = 0;
+                for (unsigned int i = 0; i < n; ++i)
+                    if (items[i].itemType == key.second &&
+                        strcmp(items[i].stringID, key.first.c_str()) == 0)
+                        want += (items[i].quantity < 1) ? 1 : (int)items[i].quantity;
+                int local = 0;
+                for (unsigned int i = 0; i < nl; ++i)
+                    if (loc[i].itemType == key.second &&
+                        strcmp(loc[i].stringID, key.first.c_str()) == 0)
+                        local += (loc[i].quantity < 1) ? 1 : (int)loc[i].quantity;
+                if (want == local || now > le->second.deadlineMs) {
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[xfer] latch-%s hand=%u,%u,%u,%u,%u sid='%s' delta=%d",
+                        (want == local) ? "caught-up" : "expired",
+                        k.t, k.c, k.cs, k.i, k.s, key.first.c_str(), le->second.delta);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    lt->second.erase(le++);
+                    continue;
+                }
+                int d = le->second.delta;
+                if (d < 0) {
+                    // We TOOK units: strip them from the desired list (loose stacks
+                    // first) so the reconcile doesn't re-fabricate them here.
+                    int strip = -d;
+                    for (int pass = 0; pass < 2 && strip > 0; ++pass) {
+                        for (unsigned int i = 0; i < adj.size() && strip > 0; ++i) {
+                            if (adj[i].itemType != key.second) continue;
+                            if ((int)adj[i].equipped != pass) continue;
+                            if (strcmp(adj[i].stringID, key.first.c_str()) != 0) continue;
+                            int have = adj[i].quantity; if (have < 1) have = 1;
+                            int cut = (strip < have) ? strip : have;
+                            adj[i].quantity = (u16)(have - cut);
+                            strip -= cut;
+                        }
+                    }
+                    for (unsigned int i = 0; i < adj.size(); )
+                        if (adj[i].quantity == 0) adj.erase(adj.begin() + i); else ++i;
+                } else if (d > 0) {
+                    // We GAVE units: keep them in the desired list so the reconcile
+                    // doesn't destroy them. Copy the real local entry (provenance).
+                    InvItemEntry e; memset(&e, 0, sizeof(e));
+                    bool found = false;
+                    for (int pass = 0; pass < 2 && !found; ++pass)
+                        for (unsigned int i = 0; i < nl; ++i) {
+                            if (loc[i].itemType != key.second) continue;
+                            if ((int)loc[i].equipped != pass) continue;
+                            if (strcmp(loc[i].stringID, key.first.c_str()) != 0) continue;
+                            e = loc[i]; found = true; break;
+                        }
+                    if (!found) {
+                        strncpy(e.stringID, key.first.c_str(), sizeof(e.stringID) - 1);
+                        e.itemType = key.second;
+                    }
+                    e.equipped = 0; e.slot = 0; e.section = 0;
+                    e.quantity = (u16)d;
+                    adj.push_back(e);
+                }
+                ++le;
+            }
+            if (lt->second.empty()) xferLatch_.erase(lt);
+            items = adj.empty() ? 0 : &adj[0];
+            n = (unsigned int)adj.size();
+        }
         engine::applyContainerContents(gw, cHand, items, n);
+        // Keep the transfer detector blind to the reconcile we just performed.
+        xferRebase(gw, k);
         char b[160];
         _snprintf(b, sizeof(b) - 1,
             "[inv] APPLY hand=%u,%u,%u,%u,%u items=%u",
@@ -1630,10 +2941,12 @@ void Replicator::applyInventories(GameWorld* gw) {
 }
 
 void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
-    // Host-authoritative world stream. Scan the interest sphere for free ground items,
-    // assign/reuse a netId per item (keyed by its local engine hand), and stream new/
-    // changed items + cull vanished ones. A settled world produces stable content+pos -
-    // so zero traffic - with a slow periodic safety resend.
+    // Owner-authoritative world stream, BOTH directions since the W1 bidir fix (each
+    // client streams the free ground items IT authors - the join's dropped materials
+    // were invisible on the host before). Scan the interest sphere for free ground
+    // items, assign/reuse a netId per item (keyed by its local engine hand), and
+    // stream new/changed items + cull vanished ones. A settled world produces stable
+    // content+pos - so zero traffic - with a slow periodic safety resend.
     const float         RADIUS       = 60.0f; // interest scope for ground items (v1)
     const float         POS_EPS      = 0.5f;  // re-stream a moved item past this gap
     const unsigned long WI_RESEND_MS = 5000;  // periodic safety resend (loss / late join)
@@ -1643,6 +2956,15 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
     unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
     unsigned long now = nowMs();
+
+    // ECHO GUARD: a proxy we spawned for a PEER's streamed item is a real local
+    // RootObject and enumerates like any other ground item - re-publishing it would
+    // bounce the item back to its author as a duplicate. Filter every capture row
+    // that resolves to an object in our proxy set.
+    std::set<RootObject*> proxyObjs;
+    for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
+         pi != worldProxies_.end(); ++pi)
+        proxyObjs.insert(pi->second.obj);
 
     for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ++it)
         it->second.seen = false;
@@ -1654,6 +2976,9 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     WorldItemEntry send[WORLD_ITEMS_MAX]; unsigned int ns = 0;
     for (unsigned int i = 0; i < n; ++i) {
         if (isGearType(raw[i].itemType)) continue;
+        if (!proxyObjs.empty() &&
+            proxyObjs.count(engine::resolveObjectByHand(raw[i].hand)) != 0)
+            continue; // peer-authored proxy - not ours to publish
         Key k; k.t = raw[i].hand[0]; k.c = raw[i].hand[1]; k.cs = raw[i].hand[2];
         k.i = raw[i].hand[3]; k.s = raw[i].hand[4];
         std::map<Key, WorldTrack>::iterator tit = worldTrack_.find(k);
@@ -1717,20 +3042,22 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
     if (dumpWi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWi = (e && e[0] == '1') ? 1 : 0; }
     const float POS_EPS = 0.5f;
 
-    // Snapshots: spawn a proxy for a new netId, move it if it changed.
+    // Snapshots: spawn a proxy for a new (owner, netId), move it if it changed.
+    // netId spaces are per-sender (W1 bidir), so the owner scopes every key.
     for (std::deque<InboundWorldItems>::iterator b = items.begin(); b != items.end(); ++b) {
         for (std::vector<WorldItemEntry>::iterator e = b->items.begin(); e != b->items.end(); ++e) {
-            std::map<u32, WorldProxy>::iterator pit = worldProxies_.find(e->netId);
+            std::pair<u32, u32> pk(b->ownerId, e->netId);
+            std::map<std::pair<u32, u32>, WorldProxy>::iterator pit = worldProxies_.find(pk);
             if (pit == worldProxies_.end()) {
                 RootObject* obj = engine::spawnWorldItemProxy(gw, e->stringID, e->itemType,
                                                               (int)e->quantity, e->x, e->y, e->z);
                 if (obj) {
                     WorldProxy wp; wp.obj = obj; wp.x = e->x; wp.y = e->y; wp.z = e->z; wp.hash = 0;
-                    worldProxies_[e->netId] = wp;
+                    worldProxies_[pk] = wp;
                 }
                 char b2[200]; _snprintf(b2, sizeof(b2) - 1,
-                    "[wi] SPAWN netId=%u ok=%d sid='%s' pos=%.2f,%.2f,%.2f",
-                    e->netId, obj ? 1 : 0, e->stringID, e->x, e->y, e->z);
+                    "[wi] SPAWN owner=%u netId=%u ok=%d sid='%s' pos=%.2f,%.2f,%.2f",
+                    b->ownerId, e->netId, obj ? 1 : 0, e->stringID, e->x, e->y, e->z);
                 b2[sizeof(b2) - 1] = '\0'; if (dumpWi || !obj) coop::logLine(b2);
             } else {
                 WorldProxy& wp = pit->second;
@@ -1745,15 +3072,17 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
             }
         }
     }
-    // Culls: destroy the proxy and drop the mapping.
+    // Culls: destroy the proxy and drop the mapping (scoped to the authoring owner).
     for (std::deque<InboundWorldRemove>::iterator b = rems.begin(); b != rems.end(); ++b) {
         for (std::vector<u32>::iterator id = b->netIds.begin(); id != b->netIds.end(); ++id) {
-            std::map<u32, WorldProxy>::iterator pit = worldProxies_.find(*id);
+            std::map<std::pair<u32, u32>, WorldProxy>::iterator pit =
+                worldProxies_.find(std::make_pair(b->ownerId, *id));
             if (pit == worldProxies_.end()) continue;
             engine::removeWorldItemProxy(gw, pit->second.obj);
             worldProxies_.erase(pit);
-            if (dumpWi) { char b2[96]; _snprintf(b2, sizeof(b2) - 1, "[wi] CULL netId=%u", *id);
-                          b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
+            if (dumpWi) { char b2[128]; _snprintf(b2, sizeof(b2) - 1,
+                "[wi] CULL owner=%u netId=%u", b->ownerId, *id);
+                b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
         }
     }
 }
@@ -1815,6 +3144,15 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
             std::map<std::string, WCensusItem>::iterator pp = prevC.items.find(ce->first);
             int prevCount = (pp != prevC.items.end()) ? pp->second.count : 0;
             int inc = ce->second.count - prevCount;
+            // Protocol 37: a pending/applied cross-owner gear transfer must not be
+            // read as a ground PICKUP of the same sid (the count edge is the trade).
+            // The end-of-loop baseline update absorbs the new count silently.
+            if (inc > 0 && wdSuppressed(*it, ce->first.c_str(), nowMs())) {
+                if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] increase-suppressed (xfer) sid='%s' inc=%d", ce->first.c_str(), inc);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                continue;
+            }
             for (int k = 0; k < inc; ++k) {
                 WorldPickupPacket pkt; memset(&pkt, 0, sizeof(pkt));
                 pkt.type = (u8)PKT_WORLD_PICKUP; pkt.ownerId = ownerId;
@@ -1840,6 +3178,16 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
             int now = (ce != cur.end()) ? ce->second.count : 0;
             int delta = pe->second.count - now;
             if (delta <= 0) { prevC.retries.erase(pe->first); continue; }
+            // Protocol 37: a pending/applied cross-owner gear transfer must not be
+            // read as a ground DROP of the same sid (the count edge is the trade;
+            // the baseline update below absorbs it silently).
+            if (wdSuppressed(*it, pe->first.c_str(), nowMs())) {
+                prevC.retries.erase(pe->first);
+                if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] decrease-suppressed (xfer) sid='%s' delta=%d", pe->first.c_str(), delta);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                continue;
+            }
             float pos[3] = { 0, 0, 0 };
             unsigned int gtype = pe->second.itemType;
             bool onGround = engine::firstFreeGroundItemPos(gw, cHand, pe->first.c_str(),
@@ -1854,6 +3202,12 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                     r = MAX_RETRY;
                     if (dumpWd) engine::diagGroundScan(gw, cHand, pe->first.c_str(), GROUND_R);
                 }
+                // Protocol 37: while the transfer detector is still watching an
+                // unresolved LOSS of this sid from this container, the count edge may
+                // be a bag-to-bag trade mid-detection - keep holding rather than
+                // committing the drop-fallback (the detector either fires the intent,
+                // which registers a suppression, or folds the diff and releases us).
+                if (r <= 1 && xferPendingLoss(*it, pe->first.c_str())) r = MAX_RETRY;
                 if (--r > 0) {
                     if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[wd] decrease-pending hand=%u,%u,%u,%u,%u sid='%s' prev=%d now=%d retry=%d",
@@ -1943,6 +3297,8 @@ void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
         // Track the relocated REAL object so a later PICKUP intent re-homes this exact handle
         // back into the owner's bag (no spatial re-query, which fails in towns).
         if (moved > 0 && dropped) groundedWeapons_[std::string(p.stringID)].push_back(dropped);
+        // Keep the transfer detector blind to the relocation we just made.
+        if (moved > 0) xferRebase(gw, ok);
         char b[240]; _snprintf(b, sizeof(b) - 1,
             "[wd] APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u moved=%d pos=%.2f,%.2f,%.2f tracked=%u",
             p.dropId, p.stringID, p.oType, p.oContainer, p.oContainerSerial, p.oIndex,
@@ -1978,6 +3334,274 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
             "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u moved=%d trackedLeft=%u",
             p.pickupId, p.stringID, p.oType, p.oContainer, p.oContainerSerial, p.oIndex,
             p.oSerial, moved, (unsigned)q.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // Keep the transfer detector blind to the relocation we just made.
+        Key tk; tk.t = p.oType; tk.c = p.oContainer; tk.cs = p.oContainerSerial;
+        tk.i = p.oIndex; tk.s = p.oSerial;
+        xferRebase(gw, tk);
+    }
+}
+
+// ---- Protocol 37: cross-owner transfer intents ------------------------------
+
+void Replicator::xferRebase(GameWorld* gw, const Key& k) {
+    unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
+    std::map<XKey, int>& base = xferBase_[k];
+    base.clear();
+    if (engine::resolveObjectByHand(cHand) != 0) {
+        InvItemEntry items[64];
+        unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
+        for (unsigned int i = 0; i < n; ++i) {
+            int q = items[i].quantity; if (q < 1) q = 1;
+            base[XKey(std::string(items[i].stringID), items[i].itemType)] += q;
+        }
+    }
+    xferSeeded_[k] = true;
+    xferPend_.erase(k);
+}
+
+bool Replicator::xferPendingLoss(const Key& k, const char* sid) {
+    std::map<Key, std::map<XKey, XferPend> >::iterator pit = xferPend_.find(k);
+    if (pit == xferPend_.end()) return false;
+    for (std::map<XKey, XferPend>::iterator e = pit->second.begin();
+         e != pit->second.end(); ++e)
+        if (e->second.delta < 0 && e->first.first == sid) return true;
+    return false;
+}
+
+bool Replicator::wdSuppressed(const Key& k, const char* sid, unsigned long now) {
+    std::map<std::pair<Key, std::string>, unsigned long>::iterator it =
+        wdSuppress_.find(std::make_pair(k, std::string(sid)));
+    if (it == wdSuppress_.end()) return false;
+    if (now > it->second) { wdSuppress_.erase(it); return false; }
+    return true;
+}
+
+void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId) {
+    const unsigned long XFER_SCAN_MS   = 400;   // detector cadence
+    const unsigned long XFER_SETTLE_MS = 600;   // a diff must persist (mid-drag cursor hold)
+    const unsigned long XFER_PEND_MS   = 6000;  // unpaired diff folds back into the baseline
+    const unsigned long XFER_GRACE_MS  = 10000; // reconcile-suppression latch lifetime
+    unsigned long now = nowMs();
+    if (xferScanMs_ != 0 && now - xferScanMs_ < XFER_SCAN_MS) return;
+    xferScanMs_ = now;
+    static int dumpX = -1;
+    if (dumpX < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpX = (e && e[0] == '1') ? 1 : 0; }
+
+    // Tracked set: every container we author + every peer container we have received a
+    // snapshot for. Both ends of any drag a player can perform live in this union.
+    std::set<Key> tracked = ownedContainers_;
+    tracked.insert(ownHands_.begin(), ownHands_.end());
+    for (std::map<Key, InvRecv>::iterator ri = invRecv_.begin(); ri != invRecv_.end(); ++ri)
+        tracked.insert(ri->first);
+    if (tracked.empty()) return;
+
+    // Capture this scan's per-item totals for each resolvable container.
+    InvItemEntry items[64];
+    std::map<Key, std::map<XKey, int> > cur;
+    for (std::set<Key>::iterator it = tracked.begin(); it != tracked.end(); ++it) {
+        unsigned int cHand[5] = { it->t, it->c, it->cs, it->i, it->s };
+        if (engine::resolveObjectByHand(cHand) == 0) continue;
+        std::map<XKey, int>& tot = cur[*it];
+        unsigned int n = engine::captureContainerContents(gw, cHand, items, 64, 0);
+        for (unsigned int i = 0; i < n; ++i) {
+            int q = items[i].quantity; if (q < 1) q = 1;
+            tot[XKey(std::string(items[i].stringID), items[i].itemType)] += q;
+        }
+        if (!xferSeeded_[*it]) { xferBase_[*it] = tot; xferSeeded_[*it] = true; cur.erase(*it); }
+    }
+
+    // Refresh the pend set: per container, per item key, the current diff vs baseline.
+    // A diff that returns to zero (cursor put the item back) drops its pend; a diff
+    // that CHANGES restarts its settle clock; a diff that outlives XFER_PEND_MS never
+    // paired - fold it into the baseline (a lone loss is a drop/consume, a lone gain
+    // is loot/craft: the owner's own snapshot channel carries those).
+    for (std::map<Key, std::map<XKey, int> >::iterator ci = cur.begin(); ci != cur.end(); ++ci) {
+        const Key& k = ci->first;
+        std::map<XKey, int>& base = xferBase_[k];
+        std::map<XKey, XferPend>& pend = xferPend_[k];
+        std::set<XKey> keys;
+        for (std::map<XKey, int>::iterator b = base.begin(); b != base.end(); ++b) keys.insert(b->first);
+        for (std::map<XKey, int>::iterator c = ci->second.begin(); c != ci->second.end(); ++c) keys.insert(c->first);
+        for (std::set<XKey>::iterator ky = keys.begin(); ky != keys.end(); ++ky) {
+            std::map<XKey, int>::iterator bi = base.find(*ky);
+            std::map<XKey, int>::iterator cv = ci->second.find(*ky);
+            int delta = ((cv != ci->second.end()) ? cv->second : 0)
+                      - ((bi != base.end()) ? bi->second : 0);
+            std::map<XKey, XferPend>::iterator pe = pend.find(*ky);
+            if (delta == 0) {
+                if (pe != pend.end()) pend.erase(pe);
+                continue;
+            }
+            if (pe == pend.end()) {
+                XferPend p; p.delta = delta; p.sinceMs = now;
+                pend[*ky] = p;
+            } else if (pe->second.delta != delta) {
+                pe->second.delta = delta; pe->second.sinceMs = now;
+            } else if (now - pe->second.sinceMs >= XFER_PEND_MS) {
+                // Never paired: fold into the baseline and stop watching.
+                if (cv != ci->second.end()) base[*ky] = cv->second; else base.erase(*ky);
+                if (dumpX) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[xfer] fold hand=%u,%u,%u,%u,%u sid='%s' delta=%d (unpaired)",
+                    k.t, k.c, k.cs, k.i, k.s, ky->first.c_str(), delta);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                pend.erase(*ky);
+            }
+        }
+    }
+
+    // PAIR pass: a settled LOSS of an item key in one container + the matching settled
+    // GAIN in another is a completed drag between the two. Collect first (rebase
+    // invalidates the pend iterators), then act.
+    struct Fire { Key src; Key dst; XKey key; int qty; };
+    std::vector<Fire> fires;
+    std::set<Key> consumed;
+    for (std::map<Key, std::map<XKey, XferPend> >::iterator li = xferPend_.begin();
+         li != xferPend_.end(); ++li) {
+        if (consumed.count(li->first) || cur.find(li->first) == cur.end()) continue;
+        for (std::map<XKey, XferPend>::iterator le = li->second.begin();
+             le != li->second.end(); ++le) {
+            if (le->second.delta >= 0) continue;
+            if (now - le->second.sinceMs < XFER_SETTLE_MS) continue;
+            for (std::map<Key, std::map<XKey, XferPend> >::iterator gi = xferPend_.begin();
+                 gi != xferPend_.end(); ++gi) {
+                if (gi == li || consumed.count(gi->first) || cur.find(gi->first) == cur.end())
+                    continue;
+                std::map<XKey, XferPend>::iterator ge = gi->second.find(le->first);
+                if (ge == gi->second.end() || ge->second.delta <= 0) continue;
+                if (now - ge->second.sinceMs < XFER_SETTLE_MS) continue;
+                Fire f; f.src = li->first; f.dst = gi->first; f.key = le->first;
+                f.qty = -le->second.delta;
+                if (ge->second.delta < f.qty) f.qty = ge->second.delta;
+                fires.push_back(f);
+                consumed.insert(f.src); consumed.insert(f.dst);
+                break;
+            }
+            if (consumed.count(li->first)) break;
+        }
+    }
+
+    for (unsigned int i = 0; i < fires.size(); ++i) {
+        const Fire& f = fires[i];
+        bool srcOwn = ownedContainers_.count(f.src) != 0 || ownHands_.count(f.src) != 0;
+        bool dstOwn = ownedContainers_.count(f.dst) != 0 || ownHands_.count(f.dst) != 0;
+        if (!srcOwn || !dstOwn) {
+            // At least one end is peer-authored: the single-writer snapshots cannot
+            // carry this move - author the reliable transfer intent.
+            InvXferPacket pkt; memset(&pkt, 0, sizeof(pkt));
+            pkt.type = (u8)PKT_INV_XFER; pkt.ownerId = ownerId; pkt.xferId = nextXferId_++;
+            pkt.sType = f.src.t; pkt.sContainer = f.src.c; pkt.sContainerSerial = f.src.cs;
+            pkt.sIndex = f.src.i; pkt.sSerial = f.src.s;
+            pkt.dType = f.dst.t; pkt.dContainer = f.dst.c; pkt.dContainerSerial = f.dst.cs;
+            pkt.dIndex = f.dst.i; pkt.dSerial = f.dst.s;
+            strncpy(pkt.stringID, f.key.first.c_str(), sizeof(pkt.stringID) - 1);
+            pkt.itemType = f.key.second;
+            pkt.quantity = (u16)((f.qty > 65535) ? 65535 : f.qty);
+            // Provenance/quality off the moved stack (it lives in dst now) - a peer
+            // may need them if it has to fabricate a missing non-gear copy.
+            unsigned int dHand[5] = { f.dst.t, f.dst.c, f.dst.cs, f.dst.i, f.dst.s };
+            unsigned int nd = engine::captureContainerContents(gw, dHand, items, 64, 0);
+            for (unsigned int j = 0; j < nd; ++j) {
+                if (items[j].itemType != f.key.second) continue;
+                if (strcmp(items[j].stringID, f.key.first.c_str()) != 0) continue;
+                pkt.quality = items[j].quality;
+                strncpy(pkt.manufacturer, items[j].manufacturer, sizeof(pkt.manufacturer) - 1);
+                strncpy(pkt.material,     items[j].material,     sizeof(pkt.material) - 1);
+                break;
+            }
+            net.queueInvXfer(pkt);
+            // Latch the pending move on each PEER end so applyInventories cannot
+            // reconcile it back while the owner's snapshots are still stale.
+            if (!srcOwn) {
+                XferLatch& L = xferLatch_[f.src][f.key];
+                L.delta -= f.qty; L.deadlineMs = now + XFER_GRACE_MS;
+                if (L.delta == 0) xferLatch_[f.src].erase(f.key);
+            }
+            if (!dstOwn) {
+                XferLatch& L = xferLatch_[f.dst][f.key];
+                L.delta += f.qty; L.deadlineMs = now + XFER_GRACE_MS;
+                if (L.delta == 0) xferLatch_[f.dst].erase(f.key);
+            }
+            // A gear trade must not be read by the W2 weapon census as a ground
+            // drop (src) / pickup (dst) of the same sid.
+            if (isGearType(f.key.second)) {
+                wdSuppress_[std::make_pair(f.src, f.key.first)] = now + XFER_GRACE_MS;
+                wdSuppress_[std::make_pair(f.dst, f.key.first)] = now + XFER_GRACE_MS;
+            }
+            char b[240]; _snprintf(b, sizeof(b) - 1,
+                "[xfer] SEND id=%u sid='%s' type=%u qty=%d src=%u,%u,%u,%u,%u(%s) dst=%u,%u,%u,%u,%u(%s)",
+                pkt.xferId, pkt.stringID, pkt.itemType, f.qty,
+                f.src.t, f.src.c, f.src.cs, f.src.i, f.src.s, srcOwn ? "own" : "peer",
+                f.dst.t, f.dst.c, f.dst.cs, f.dst.i, f.dst.s, dstOwn ? "own" : "peer");
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // Own<->own moves need no intent (our own snapshots carry both ends); either
+        // way the baselines absorb the move so the detector never re-fires on it.
+        xferRebase(gw, f.src);
+        xferRebase(gw, f.dst);
+    }
+}
+
+void Replicator::applyTransfers(GameWorld* gw, Inbound& in, u32 localId) {
+    std::deque<InboundInvXfer> got;
+    in.drainInvXfers(got);
+    if (got.empty()) return;
+    const unsigned long XFER_GRACE_MS = 10000;
+    unsigned long now = nowMs();
+    for (std::deque<InboundInvXfer>::iterator it = got.begin(); it != got.end(); ++it) {
+        const InvXferPacket& p = it->pkt;
+        if (p.ownerId == localId) continue; // never act on our own (relay safety)
+        std::pair<u32, u32> id(p.ownerId, p.xferId);
+        if (appliedXfers_.count(id) != 0) continue; // idempotent (reliable resend / replay)
+        appliedXfers_.insert(id);
+        if (appliedXfers_.size() > 4096) appliedXfers_.erase(appliedXfers_.begin());
+        unsigned int sHand[5] = { p.sType, p.sContainer, p.sContainerSerial, p.sIndex, p.sSerial };
+        unsigned int dHand[5] = { p.dType, p.dContainer, p.dContainerSerial, p.dIndex, p.dSerial };
+        Key sk; sk.t = p.sType; sk.c = p.sContainer; sk.cs = p.sContainerSerial;
+        sk.i = p.sIndex; sk.s = p.sSerial;
+        Key dk; dk.t = p.dType; dk.c = p.dContainer; dk.cs = p.dContainerSerial;
+        dk.i = p.dIndex; dk.s = p.dSerial;
+        // Relocate OUR copy of the real item between the same two containers - the
+        // conservation move (never fabricates or destroys), so gear survives.
+        int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
+                                                      p.itemType, (int)p.quantity);
+        int fab = 0;
+        if (moved < (int)p.quantity && !isGearType(p.itemType)) {
+            // Our src copy is short (desync) - non-gear can be fabricated into dst so
+            // the trade still lands. Gear never fabricates (the sender's latch + the
+            // authoritative snapshots repair the miss instead).
+            fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
+                                                   (int)p.quantity - moved, (int)p.quality,
+                                                   p.manufacturer, p.material);
+        }
+        XKey key(std::string(p.stringID), p.itemType);
+        // Latch OUR peer end(s) too: an in-flight stale snapshot (captured by its
+        // owner before this transfer) must not reconcile the relocation away.
+        bool srcOwn = ownedContainers_.count(sk) != 0 || ownHands_.count(sk) != 0;
+        bool dstOwn = ownedContainers_.count(dk) != 0 || ownHands_.count(dk) != 0;
+        int applied = moved + fab;
+        if (applied > 0) {
+            if (!srcOwn) {
+                XferLatch& L = xferLatch_[sk][key];
+                L.delta -= applied; L.deadlineMs = now + XFER_GRACE_MS;
+                if (L.delta == 0) xferLatch_[sk].erase(key);
+            }
+            if (!dstOwn) {
+                XferLatch& L = xferLatch_[dk][key];
+                L.delta += applied; L.deadlineMs = now + XFER_GRACE_MS;
+                if (L.delta == 0) xferLatch_[dk].erase(key);
+            }
+        }
+        if (isGearType(p.itemType)) {
+            wdSuppress_[std::make_pair(sk, key.first)] = now + XFER_GRACE_MS;
+            wdSuppress_[std::make_pair(dk, key.first)] = now + XFER_GRACE_MS;
+        }
+        // Keep the transfer detector blind to the relocation we just made.
+        xferRebase(gw, sk);
+        xferRebase(gw, dk);
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d",
+            p.xferId, p.ownerId, p.stringID, p.itemType, (unsigned)p.quantity, moved, fab);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -2060,10 +3684,35 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // actor = the FURNITURE's save-stable hand (both clients loaded
                 // the same save, so it resolves locally). Run the engine's own
                 // setBedMode/setPrisonMode between the LOCAL pair - the in-bed/
-                // in-cage pose and transform are engine-native here. Never on a
-                // body we own (our engine already executed the real placement).
+                // in-cage pose and transform are engine-native here. On a body
+                // we OWN, only a THIRD-PARTY placement is honoured (protocol
+                // 36): the world authority jailed our KO'd body (a guard
+                // action that runs purely on the host sim - our engine never
+                // executed it). Conscious voluntary use stays owner-authored:
+                // for those our engine did the real placement and this event
+                // is just the echo of our own edge.
                 if (!furnSync_) break;
-                if (ownHands_.find(k) != ownHands_.end()) break;
+                if (ownHands_.find(k) != ownHands_.end()) {
+                    Character* own = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                    bool down = own && coop::bodyIsDown(engine::readBodyState(own));
+                    engine::FurnitureRead ofr;
+                    bool already = own && engine::readFurniture(own, &ofr) &&
+                                   ofr.valid && ofr.kind == (int)ev.arg;
+                    // Race guard: the host re-authors PEER-ENTER on a 5 s
+                    // cadence, so one can be in flight when we free our own
+                    // body - a recent owner-side exit vetoes the stale enter.
+                    std::map<Key, unsigned long>::iterator ox = ownFurnExit_.find(k);
+                    bool justExited = ox != ownFurnExit_.end() &&
+                                      (nowMs() - ox->second) < 10000;
+                    if (!down || already || justExited) {
+                        char sb[160]; _snprintf(sb, sizeof(sb) - 1,
+                            "[furn] RECV PEER-ENTER own occ=%u,%u SKIP (down=%d already=%d exited=%d)",
+                            k.i, k.s, down ? 1 : 0, already ? 1 : 0,
+                            justExited ? 1 : 0);
+                        sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+                        break;
+                    }
+                }
                 Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
@@ -2094,54 +3743,37 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 break;
             }
             case EVT_RECRUIT: {
-                // Protocol 23: the sender recruited subject (OLD hand) into its
-                // squad as actor (NEW hand). RE-KEY our local copy of the old
-                // hand to the new stream key - the body it already has IS the
-                // recruit, so binding it in proxyByKey_ makes the whole driven-
-                // NPC path (AI-suspend, damage guard, latches) inherit it with
-                // no duplicate proxy mint. If the old hand doesn't resolve here
-                // (runtime-born subject), the bidirectional describe/mint
-                // channel covers it instead.
+                // Protocol 23: the sender recruited subject (OLD hand) into
+                // its squad as actor (NEW hand). Shared re-key path below.
                 if (!recruitSync_) break;
                 Key nk; nk.t = ev.aType; nk.c = ev.aContainer;
                 nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
-                // A hand WE recruited must never enter peerRecruit_ (that set
-                // vetoes publishing): an echo - or both sides recruiting the
-                // SAME baked NPC, which lands on the SAME new hand (run
-                // 120738) - would otherwise silence our own recruit's stream.
-                if (recruitOwned_.count(nk) || ownHands_.count(nk)) break;
-                // Never ours to drive again: the recruiter owns this hand even
-                // if a local tab census would rank it into a tab we own.
-                peerRecruit_.insert(nk);
-                if (proxyByKey_.find(nk) != proxyByKey_.end()) break; // rebound
-                Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
-                if (!c) {
-                    // The old hand may itself be a MINTED proxy (the sender
-                    // recruited a runtime NPC we were already driving as a
-                    // proxy - the mid-fight ambusher case). Migrate the
-                    // binding to the new key instead of orphaning the body.
-                    std::map<Key, Character*>::iterator pit = proxyByKey_.find(k);
-                    if (pit != proxyByKey_.end()) {
-                        c = pit->second;
-                        proxyByKey_.erase(pit);
-                    }
+                rekeyPeerBody(gw, k, nk, "recruit");
+                break;
+            }
+            case EVT_SQUAD_MOVE: {
+                // Protocol 35: the sender MOVED subject (OLD hand) between its
+                // squad tabs; actor = the fresh hand the move minted
+                // (squad_probe: index/serial do not survive a re-container).
+                // A zeroed actor = the body LEFT the sender's roster
+                // (dismissal): just drop our pins/binding for the old key -
+                // the body reverts to whatever the world partition says.
+                if (!squadSync_) break;
+                Key nk; nk.t = ev.aType; nk.c = ev.aContainer;
+                nk.cs = ev.aContainerSerial; nk.i = ev.aIndex; nk.s = ev.aSerial;
+                if ((nk.t | nk.c | nk.cs | nk.i | nk.s) == 0) {
+                    pinPeer_.erase(k);
+                    pinOwned_.erase(k);
+                    proxyByKey_.erase(k);
+                    targets_.erase(k);
+                    rekeyedOld_[k] = nowMs(); // no REQ for the dead key's tail
+                    char xb[128]; _snprintf(xb, sizeof(xb) - 1,
+                        "[squad] RECV EXIT old=%u,%u,%u,%u,%u (pins cleared)",
+                        k.t, k.c, k.cs, k.i, k.s);
+                    xb[sizeof(xb) - 1] = '\0'; coop::logLine(xb);
+                    break;
                 }
-                if (c) {
-                    // Host-authority suppression may have already hidden the
-                    // old copy (its hand left the peer's stream the moment the
-                    // recruit re-containered it) - bring the body back first.
-                    std::map<Key, Character*>::iterator sit = suppressed_.find(k);
-                    if (sit != suppressed_.end()) {
-                        engine::restoreNpc(gw, c);
-                        suppressed_.erase(sit);
-                    }
-                    proxyByKey_[nk] = c;
-                }
-                char rb[192]; _snprintf(rb, sizeof(rb) - 1,
-                    "[recruit] REKEY old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u ok=%d",
-                    k.t, k.c, k.cs, k.i, k.s,
-                    nk.t, nk.c, nk.cs, nk.i, nk.s, c ? 1 : 0);
-                rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+                rekeyPeerBody(gw, k, nk, "squad");
                 break;
             }
             default: break;
@@ -2153,6 +3785,85 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
             ev.aIndex, ev.aSerial);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
+}
+
+// Shared EVT_RECRUIT / EVT_SQUAD_MOVE receive half (protocols 23 + 35): the
+// sender re-containered a body it owns (recruit or squad-tab move), minting
+// the NEW hand it streams under from now on. RE-KEY our local copy of the old
+// hand to the new stream key - the body it already has IS the subject, so
+// binding it in proxyByKey_ makes the whole driven-NPC path (AI-suspend,
+// damage guard, latches) inherit it with no duplicate proxy mint. If the old
+// hand doesn't resolve here (runtime-born subject), the bidirectional
+// describe/mint channel covers it instead.
+void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
+                               const char* tag) {
+    // A hand WE authored must never enter pinPeer_ (that set vetoes
+    // publishing): an echo - or both sides recruiting the SAME baked NPC,
+    // which lands on the SAME new hand (run 120738) - would otherwise
+    // silence our own edge's stream.
+    if (pinOwned_.count(newK) || ownHands_.count(newK)) return;
+    // Never ours to drive again: the author owns this hand even if a local
+    // tab census would rank it into a tab we own.
+    pinPeer_.insert(newK);
+    // A chained edge (recruit then move, move then move) leaves the OLD key's
+    // pin dead - drop it so the pin sets track only live hands.
+    pinPeer_.erase(oldK);
+    // Drop the old key's stream state too (run 192211: the interp TAIL of a
+    // re-keyed hand kept replaying after the migration, went unresolved and
+    // REQ'd a duplicate proxy). The grace stamp suppresses spawn REQs/mints
+    // from any batch or reply still in flight for the dead key.
+    targets_.erase(oldK);
+    spawnReq_.erase(oldK);
+    rekeyedOld_[oldK] = nowMs();
+    Character* c = engine::resolveCharByHand(oldK.i, oldK.s, oldK.t, oldK.c, oldK.cs);
+    if (!c) {
+        // The old hand may itself be a MINTED proxy (the sender re-keyed a
+        // runtime body we were already driving as a proxy - the mid-fight
+        // ambusher case, or a squad move of an earlier runtime recruit).
+        // Migrate the binding to the new key instead of orphaning the body.
+        std::map<Key, Character*>::iterator pit = proxyByKey_.find(oldK);
+        if (pit != proxyByKey_.end()) {
+            c = pit->second;
+            proxyByKey_.erase(pit);
+        }
+    }
+    int repaired = 0, culled = -1;
+    std::map<Key, Character*>::iterator ex = proxyByKey_.find(newK);
+    if (ex != proxyByKey_.end()) {
+        if (!c || ex->second == c) {
+            // True rebound (duplicate event delivery / already migrated).
+            char db[160]; _snprintf(db, sizeof(db) - 1,
+                "[%s] REKEY new=%u,%u,%u,%u,%u ok=1 rebound=1",
+                tag, newK.t, newK.c, newK.cs, newK.i, newK.s);
+            db[sizeof(db) - 1] = '\0'; coop::logLine(db);
+            return;
+        }
+        // A spawn REQ/mint round-trip beat the reliable edge (WAN race): a
+        // duplicate proxy stands under the new hand while the REAL local
+        // copy is still ours under the old key. Repair: cull the mint,
+        // rebind the real body below.
+        Character* mint = ex->second;
+        proxyByKey_.erase(ex);
+        culled = engine::removeWorldItemProxy(
+                     gw, reinterpret_cast<RootObject*>(mint)) ? 1 : 0;
+        repaired = 1;
+    }
+    if (c) {
+        // Host-authority suppression may have already hidden the old copy
+        // (its hand left the peer's stream the moment the edge re-containered
+        // it) - bring the body back first.
+        std::map<Key, Character*>::iterator sit = suppressed_.find(oldK);
+        if (sit != suppressed_.end()) {
+            engine::restoreNpc(gw, c);
+            suppressed_.erase(sit);
+        }
+        proxyByKey_[newK] = c;
+    }
+    char rb[224]; _snprintf(rb, sizeof(rb) - 1,
+        "[%s] REKEY old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u ok=%d repaired=%d culled=%d",
+        tag, oldK.t, oldK.c, oldK.cs, oldK.i, oldK.s,
+        newK.t, newK.c, newK.cs, newK.i, newK.s, c ? 1 : 0, repaired, culled);
+    rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
 }
 
 void Replicator::applyTargets(GameWorld* gw) {
@@ -2172,6 +3883,7 @@ void Replicator::applyTargets(GameWorld* gw) {
     // to recognise a streamed body whose LOCAL hand key changed (combat detach
     // re-containers world NPCs) so it never hides a body we are driving.
     drivenChars_.clear();
+    starveHeldNow_ = 0; // per-tick starved-hold census (stat line)
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
         // Never drive a body WE own: we control + stream it locally, the peer drives
         // its copy from our stream. The disjoint partition + no local loopback means
@@ -2181,11 +3893,60 @@ void Replicator::applyTargets(GameWorld* gw) {
         Driven& d = it->second;
         EntityState out;
         if (!d.interp.sample(now, cfg_, &out)) {
-            // Stream stale: release the body back to local AI (stop driving).
+            // Stream stale: stop DRIVING the body - but a stall is not an
+            // authority transfer (architecture review 2026-07-10). Two guards
+            // used to drop here instantly, and they starve differently:
+            //   * DAMAGE guard - held for EVERY driven body for the bounded
+            //     window. Locally-simulated melee mutating the local-only
+            //     medical model during a WAN hiccup is the silent divergence
+            //     this fix exists for.
+            //   * AI suspend (the freeze) - held ONLY for squad-class bodies
+            //     (a peer's player characters: engine-inert when uncontrolled,
+            //     so the park is free, and a peer PC acting autonomously is
+            //     the worst face of the bug). World NPCs release to local AI
+            //     exactly as before: A/B 2026-07-10 showed freezing a stale
+            //     interest-boundary wanderer while the host copy keeps
+            //     patrolling degrades npc_sync tracking (ratio 0.64-0.73 vs
+            //     the 0.8 gate; hold-off passed) - the local AI on the shared
+            //     save shadows the host's patrol better than a freeze, and
+            //     host-authority suppression + census already police NPC
+            //     existence.
+            // After the hold (or with the knob at 0) everything releases as
+            // before; targets_ prunes at 30 s regardless.
             d.haveActual = false; d.parked = false; d.fresh = false;
+            if (starveHoldMs_ > 0 && d.lastSeenMs != 0 &&
+                (now - d.lastSeenMs) <= cfg_.staleMs + starveHoldMs_ &&
+                d.interp.latest(&out, 0, 0, 0)) {
+                Character* c = engine::resolve(out);
+                if (!c && (spawnSync_ || recruitSync_)) {
+                    std::map<Key, Character*>::iterator pit =
+                        proxyByKey_.find(it->first);
+                    if (pit != proxyByKey_.end()) c = pit->second;
+                }
+                if (c) {
+                    if (dmgGuard_) engine::addDamageGuard(c);
+                    if (engine::isLocalPlayerChar(gw, c)) {
+                        // Squad-class: full park. drivenChars_ membership also
+                        // keeps host-authority suppression off the body.
+                        drivenChars_.insert(c);
+                        if (aiSuspend_) engine::addAiSuspend(c);
+                    }
+                    // World NPCs: damage guard only - AI, suppression and
+                    // census treat them exactly as the pre-hold release did.
+                    ++starveHeldNow_;
+                }
+            }
             continue;
         }
         d.fresh = true;
+        switch (d.interp.lastMode()) {
+        case EntityInterp::SM_LERP:      ++interpLerp_;     break;
+        case EntityInterp::SM_SINGLE:    ++interpSingle_;   break;
+        case EntityInterp::SM_CLAMP_OLD: ++interpClampOld_; break;
+        case EntityInterp::SM_EXTRAP:    ++interpExtrap_;   break;
+        case EntityInterp::SM_SEG_SNAP:  ++interpSegSnap_;  break;
+        default: break;
+        }
 
         Character* c = engine::resolve(out);
         // Protocol 21: a streamed hand with NO local body is a host RUNTIME
@@ -2312,6 +4073,40 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
                 continue;
             } else if (localKind != 0) {
+                // Third-party placement authority (protocol 36): a HOST-sim
+                // actor (a guard jailing an arrested player) put this PEER-
+                // OWNED squad body into furniture. The occupant's owner never
+                // sees the action, so the occupant-owner ENTER can't fire -
+                // the owner's stream keeps reporting no bit and the debounced
+                // HEAL EXIT below ejected the body every 3 s ("the host kept
+                // taking it out of the cage", 2026-07-09). The host is the
+                // world authority for NPC actions: author the ENTER for the
+                // owner (buffered; publishOwned sends), HOLD the self-heal
+                // exit while it crosses, and re-author every FURN_PEER_MS
+                // until the owner's stream carries the bit. KO'd/down bodies
+                // only - a conscious voluntary use stays owner-authored.
+                bool downish = coop::bodyIsDown(out.bodyState) || d.koLatched ||
+                               d.deathLatched ||
+                               coop::bodyIsDown(engine::readBodyState(c));
+                if (streamNpcs_ && isSquad && downish) {
+                    if (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS) {
+                        d.furnPeerTick = now;
+                        PendFurnEnter pe;
+                        pe.occ = keyOf(out);
+                        for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = lfr.furn[fi];
+                        pe.kind = localKind;
+                        furnPeerPend_.push_back(pe);
+                        char b[160]; _snprintf(b, sizeof(b) - 1,
+                            "[furn] PEER-ENTER author occ=%u,%u furn=%u,%u kind=%d",
+                            out.hIndex, out.hSerial, lfr.furn[3], lfr.furn[4],
+                            localKind);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                    d.furnNoSeeTick = 0; // never self-heal-eject a host placement
+                    d.parked = false; d.haveDest = false;
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    continue;
+                }
                 if (d.furnNoSeeTick == 0) {
                     d.furnNoSeeTick = now;
                 } else if ((now - d.furnNoSeeTick) > FURN_EXIT_MS) {
@@ -2734,8 +4529,9 @@ void Replicator::applyTargets(GameWorld* gw) {
             //     where the fidget-in-place drift came from.
             // removeFromUpdateList is NOT used: it freezes the movement controller
             // (walk + teleport both no-op). Real sit/idle poses come in Stage 5.
-            if (npcMoving && haveActual && gapNewest > SNAP_DIST) {
+            if (npcMoving && haveActual && gapNewest > snapDist_) {
                 engine::applyRaw(c, newest);
+                ++hardSnapNpc_;
                 d.parked = false; d.haveDest = false;
             } else if (npcMoving) {
                 float tx = newest.x, ty = newest.y, tz = newest.z;
@@ -2744,11 +4540,12 @@ void Replicator::applyTargets(GameWorld* gw) {
                 float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
                                          : (REISSUE_DIST + 1.0f);
                 if (moved > REISSUE_DIST) {
-                    float spd = out.cSpeed + gapNewest * CATCHUP_K;
+                    float spd = out.cSpeed + gapNewest * catchupK_;
                     float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
                     float cap = base * 2.5f;
                     if (spd > cap) spd = cap;
                     engine::walkTo(c, tx, ty, tz, spd);
+                    ++walkReissueNpc_;
                     d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
                 }
                 d.parked = false;
@@ -2767,10 +4564,11 @@ void Replicator::applyTargets(GameWorld* gw) {
                 applyRest(c, d, out, haveActual, ax, ay, az, now, /*isSquad*/false);
                 d.haveDest = false;
             }
-        } else if (hostMoving && haveActual && haveNewest && gapNewest > SNAP_DIST) {
+        } else if (hostMoving && haveActual && haveNewest && gapNewest > snapDist_) {
             // Fell behind / source warped: hard-snap to the true position (no-halt
             // teleport keeps the clip phase advancing rather than freezing).
             engine::applyRaw(c, newest);
+            ++hardSnapSquad_;
             d.parked = false;
             d.haveDest = false;
         } else if (hostMoving) {
@@ -2795,11 +4593,12 @@ void Replicator::applyTargets(GameWorld* gw) {
                                      : (REISSUE_DIST + 1.0f);
             if (moved > REISSUE_DIST) {
                 float spd = out.cSpeed;
-                spd += gapNewest * CATCHUP_K;
+                spd += gapNewest * catchupK_;
                 float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
                 float cap = base * 2.5f;
                 if (spd > cap) spd = cap;
                 engine::walkTo(c, tx, ty, tz, spd);
+                ++walkReissueSquad_;
                 d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
             }
             d.parked = false;
@@ -2821,9 +4620,22 @@ void Replicator::applyTargets(GameWorld* gw) {
         bool oracleActive = isSquad ? hostMoving : npcMoving;
         if (oracleActive && haveActual && d.haveActual) {
             float step = dist3(ax, ay, az, d.lx, d.ly, d.lz);
-            ++activeFrames_;
-            if (step < 0.01f) ++zeroWhileActive_;
-            if (step > maxStep_) maxStep_ = step;
+            // Smoothness is only scored at steady sim speed. During the
+            // session-start clock catch-up the join sims at up to 2x
+            // (timeSlew_, protocol 25) while the host streams positions at
+            // 1x wall-clock - about twice the render frames per streamed
+            // step, a structural zero-step source that measured the SLEW,
+            // not the interp pipeline (zeroFrac flaked 0.2-0.9 run-to-run
+            // with the transient inside the window; user-confirmed "join
+            // NPCs animate faster" 2026-07-10). Skipped frames are counted
+            // so the summary shows how much of the run was excluded.
+            if (timeSlew_ > 0.99f && timeSlew_ < 1.01f) {
+                ++activeFrames_;
+                if (step < 0.01f) ++zeroWhileActive_;
+                if (step > maxStep_) maxStep_ = step;
+            } else {
+                ++slewSkipFrames_;
+            }
 
             if (step > TRANSLATE_EPS) {
                 // The body physically moved this frame: it MUST report a real
@@ -2850,6 +4662,33 @@ void Replicator::applyTargets(GameWorld* gw) {
         char b[96];
         _snprintf(b, sizeof(b), "[ai] suspended=%u driven=%u",
                   engine::aiSuspendCount(), (unsigned)targets_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    // Interp/drive stat line (~5 s, protocol 36 jumpiness instrumentation).
+    // Cumulative counters, so two lines diff into a rate; delay/jit report the
+    // WORST live buffer (the adaptive render delay + its jitter estimate) -
+    // a delay pinned at maxDelayMs with high jitter means the buffer can no
+    // longer absorb the path's jitter and starvation (extrap/clamp) follows.
+    if (!targets_.empty() && (now - interpLogTick_) > 5000) {
+        interpLogTick_ = now;
+        unsigned long maxDelay = 0; float maxJit = 0.0f;
+        for (std::map<Key, Driven>::iterator it = targets_.begin();
+             it != targets_.end(); ++it) {
+            if (!it->second.fresh) continue;
+            if (it->second.interp.lastDelayMs() > maxDelay)
+                maxDelay = it->second.interp.lastDelayMs();
+            if (it->second.interp.jitter() > maxJit)
+                maxJit = it->second.interp.jitter();
+        }
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+            "[interp] lerp=%lu extrap=%lu clamp=%lu seg=%lu single=%lu "
+            "snapSq=%lu snapNpc=%lu reissueSq=%lu reissueNpc=%lu "
+            "delay=%lu jit=%.1f starve=%u",
+            interpLerp_, interpExtrap_, interpClampOld_, interpSegSnap_,
+            interpSingle_, hardSnapSquad_, hardSnapNpc_,
+            walkReissueSquad_, walkReissueNpc_, maxDelay, maxJit,
+            starveHeldNow_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     if (gateAuthority_ && (now - trustLogTick_) > 3000) {
@@ -2921,6 +4760,71 @@ void Replicator::sweepCarries(GameWorld* gw) {
     }
 }
 
+void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
+    // Host-only existence broadcast (protocol 36): hands of every world NPC
+    // within the census radius, 1 Hz. Position streaming stays at the ~200 u
+    // bubble; this only answers "does this NPC exist on the host" so the join
+    // can cull local-only ghosts at render range.
+    if (!gw || !streamNpcs_ || censusRadius_ <= 0.0f) return;
+    unsigned long now = nowMs();
+    if (censusSendMs_ != 0 && (now - censusSendMs_) < 1000) return;
+    censusSendMs_ = now;
+    static Character*  chars[NPC_CENSUS_MAX];  // main-thread only
+    static EntityState states[NPC_CENSUS_MAX];
+    // Publish 25% WIDER than the join culls against: an unstreamed far NPC is
+    // locally simulated on BOTH sides, so its two positions legitimately
+    // diverge - without the margin a real NPC wandering near the boundary
+    // (inside the join's scan, outside the host's) would be false-culled.
+    unsigned int n = engine::listNpcsWide(gw, censusRadius_ * 1.25f, chars, states,
+                                          NPC_CENSUS_MAX);
+    static u32 hands[NPC_CENSUS_MAX * 5];
+    for (unsigned int i = 0; i < n; ++i) {
+        hands[i * 5 + 0] = states[i].hType;
+        hands[i * 5 + 1] = states[i].hContainer;
+        hands[i * 5 + 2] = states[i].hContainerSerial;
+        hands[i * 5 + 3] = states[i].hIndex;
+        hands[i * 5 + 4] = states[i].hSerial;
+    }
+    net.queueNpcCensus(ownerId, hands, n);
+    // ~10 s cadence log so free-play sessions show the census breathing
+    // without 1 Hz spam.
+    static unsigned long logTick = 0;
+    if ((now - logTick) > 10000) {
+        logTick = now;
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[census] sent n=%u radius=%.0f", n, censusRadius_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyNpcCensus(Inbound& in) {
+    std::deque<InboundNpcCensus> got;
+    in.drainNpcCensus(got);
+    if (got.empty()) return;
+    // Latest wins (reliable-ordered channel, 1 Hz - normally one pending).
+    const InboundNpcCensus& nc = got.back();
+    censusHands_.clear();
+    unsigned int n = (unsigned int)(nc.hands.size() / 5);
+    for (unsigned int i = 0; i < n; ++i) {
+        Key k;
+        k.t  = nc.hands[i * 5 + 0];
+        k.c  = nc.hands[i * 5 + 1];
+        k.cs = nc.hands[i * 5 + 2];
+        k.i  = nc.hands[i * 5 + 3];
+        k.s  = nc.hands[i * 5 + 4];
+        censusHands_.insert(k);
+    }
+    censusRecvMs_ = nowMs();
+    static unsigned long logTick = 0;
+    if ((censusRecvMs_ - logTick) > 10000) {
+        logTick = censusRecvMs_;
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[census] recv n=%u culls=%lu",
+                  n, censusCulls_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::enforceHostAuthority(GameWorld* gw) {
     if (!gw) return;
     // Hysteresis (step 5, spike 18): a hard streamed/unstreamed edge churned
@@ -2941,11 +4845,25 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     static EntityState states[MAX_NPCS];
     unsigned int n = engine::listNpcs(gw, chars, states, MAX_NPCS);
 
+    // Protocol 36 wide-radius existence pass: enumerate out to the census
+    // radius so local-only ghosts get culled at render range instead of at the
+    // ~200 u stream bubble (the 2026-07-09 field report). Only while the
+    // host's census is FRESH - a silent census (host lagging, channel down)
+    // DISABLES wide culling rather than mass-suppressing the loaded area.
+    static Character*  wChars[NPC_CENSUS_MAX]; // main-thread only
+    static EntityState wStates[NPC_CENSUS_MAX];
+    unsigned int wn = 0;
+    bool censusFresh = censusRadius_ > 0.0f && censusRecvMs_ != 0 &&
+                       (nowMs() - censusRecvMs_) <= 5000;
+    if (censusFresh)
+        wn = engine::listNpcsWide(gw, censusRadius_, wChars, wStates, NPC_CENSUS_MAX);
+
     // Prune counters for hands the enumeration no longer sees (left interest),
     // preserving suppressed entries (a hidden body may drop out of the query but
     // must keep its counters so the restore dwell works when it returns).
     std::set<Key> seen;
     for (unsigned int i = 0; i < n; ++i) seen.insert(keyOf(states[i]));
+    for (unsigned int i = 0; i < wn; ++i) seen.insert(keyOf(wStates[i]));
     for (std::map<Key, AuthCount>::iterator it = authCount_.begin(); it != authCount_.end(); ) {
         if (seen.find(it->first) == seen.end() &&
             suppressed_.find(it->first) == suppressed_.end()) authCount_.erase(it++);
@@ -3001,6 +4919,57 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                     char b[96]; _snprintf(b, sizeof(b) - 1,
                         "[authority] suppress MISS hand=%u,%u (engine call failed; retrying)",
                         states[i].hIndex, states[i].hSerial);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+    }
+
+    // Wide pass (protocol 36): an NPC beyond the stream bubble is never in
+    // this tick's fresh set, so its authority signal is EXISTENCE (its hand in
+    // the host's census) rather than streaming. NPCs the near pass already
+    // judged are skipped by pointer (its streamed logic is authoritative
+    // inside the bubble), as is anything applyTargets drove this tick. Same
+    // hysteresis counters so a census-boundary NPC doesn't churn.
+    if (censusFresh && wn > 0) {
+        std::set<Character*> nearSet;
+        for (unsigned int i = 0; i < n; ++i) nearSet.insert(chars[i]);
+        for (unsigned int i = 0; i < wn; ++i) {
+            if (nearSet.find(wChars[i]) != nearSet.end()) continue;
+            if (drivenChars_.find(wChars[i]) != drivenChars_.end()) continue;
+            Key k = keyOf(wStates[i]);
+            bool exists = censusHands_.find(k) != censusHands_.end() ||
+                          keep.find(k) != keep.end();
+            std::map<Key, Character*>::iterator s = suppressed_.find(k);
+            AuthCount& ac = authCount_[k];
+            if (exists) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
+            else        { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
+            if (exists) {
+                if (s != suppressed_.end() && ac.streamed >= RESTORE_AFTER_FRAMES) {
+                    engine::restoreNpc(gw, wChars[i]);
+                    suppressed_.erase(s);
+                    ++authRestores_;
+                    { char b[112]; _snprintf(b, sizeof(b) - 1,
+                        "[census] restore NPC hand=%u,%u (supp=%u culls=%lu)",
+                        wStates[i].hIndex, wStates[i].hSerial,
+                        (unsigned)suppressed_.size(), censusCulls_);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                }
+            } else if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
+                if (engine::suppressNpc(gw, wChars[i])) {
+                    suppressed_[k] = wChars[i];
+                    ++authSuppresses_;
+                    ++censusCulls_;
+                    { char b[128]; _snprintf(b, sizeof(b) - 1,
+                        "[census] cull NPC hand=%u,%u (census=%u wide=%u supp=%u culls=%lu)",
+                        wStates[i].hIndex, wStates[i].hSerial,
+                        (unsigned)censusHands_.size(), wn,
+                        (unsigned)suppressed_.size(), censusCulls_);
+                      b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                } else if (ac.unstreamed == SUPPRESS_AFTER_FRAMES) {
+                    char b[96]; _snprintf(b, sizeof(b) - 1,
+                        "[census] cull MISS hand=%u,%u (engine call failed; retrying)",
+                        wStates[i].hIndex, wStates[i].hSerial);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 }
             }
@@ -3160,10 +5129,10 @@ void Replicator::logSmoothSummary() {
     float zeroFrac = (activeFrames_ > 0)
                          ? (float)zeroWhileActive_ / (float)activeFrames_
                          : 0.0f;
-    char b[160];
+    char b[176];
     _snprintf(b, sizeof(b) - 1,
-              "SCENARIO SMOOTH active=%lu zeroWhileActive=%lu zeroFrac=%.3f maxStep=%.3f",
-              activeFrames_, zeroWhileActive_, zeroFrac, maxStep_);
+              "SCENARIO SMOOTH active=%lu zeroWhileActive=%lu zeroFrac=%.3f maxStep=%.3f slewSkip=%lu",
+              activeFrames_, zeroWhileActive_, zeroFrac, maxStep_, slewSkipFrames_);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
 
@@ -3224,6 +5193,27 @@ void Replicator::logSmoothSummary() {
               "SCENARIO AUTH suppresses=%lu restores=%lu", authSuppresses_, authRestores_);
     au[sizeof(au) - 1] = '\0';
     coop::logLine(au);
+
+    // Protocol 36 jumpiness evidence: what regime the interp buffer ran in
+    // (extrapFrac = starvation share of all samples) and how often the drive
+    // layer had to hard-snap / re-path. Under WAN jitter these are the numbers
+    // the interp fixes must move.
+    {
+        unsigned long total = interpLerp_ + interpSingle_ + interpClampOld_ +
+                              interpExtrap_ + interpSegSnap_;
+        float extrapFrac = (total > 0)
+                               ? (float)(interpExtrap_ + interpClampOld_) / (float)total
+                               : 0.0f;
+        char ip[224];
+        _snprintf(ip, sizeof(ip) - 1,
+                  "SCENARIO INTERP samples=%lu lerp=%lu extrap=%lu clamp=%lu seg=%lu "
+                  "extrapFrac=%.3f snapSq=%lu snapNpc=%lu reissueSq=%lu reissueNpc=%lu",
+                  total, interpLerp_, interpExtrap_, interpClampOld_, interpSegSnap_,
+                  extrapFrac, hardSnapSquad_, hardSnapNpc_,
+                  walkReissueSquad_, walkReissueNpc_);
+        ip[sizeof(ip) - 1] = '\0';
+        coop::logLine(ip);
+    }
 
     // Step-3 evidence: how many locally-simulated melee hits the damage guard
     // intercepted vs passed through. guarded>0 in a combat scenario proves the

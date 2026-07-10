@@ -4,7 +4,7 @@ REM machine that has only "Windows SDK 7.1 + VC2010 SP1 compiler update" (no ful
 REM VS2010). We hand MSBuild a complete PATH/INCLUDE/LIB and UseEnv=true so it does
 REM not rely on VS2010 registry/SDK auto-detection.
 REM
-REM Prereqs (see docs/BUILD_SETUP.md):
+REM Prereqs (see resources/BUILD_SETUP.md):
 REM   - VC++ 2010 (v100) x64 compiler  (SDK 7.1 + KB2519277)
 REM   - VS2022 Build Tools (for MSBuild.exe)
 REM   - third_party/KenshiLib_deps (deps + Boost) and env vars set
@@ -33,7 +33,10 @@ REM x64 native toolchain on PATH so cl.exe finds its sibling DLLs (mspdb100, etc
 set "PATH=%VC%\bin\amd64;%VC%\bin;%VS10%\Common7\IDE;%SDK%\Bin\x64;%SDK%\Bin;%PATH%"
 
 REM Headers: VC10 CRT + Win SDK 7.1 + vc10_compat ammintrin.h shim + our deps.
-set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat;%KL%\KenshiLib\Include;%KL%\boost_1_60_0;%ENET%"
+REM ...\Include\ogre is needed because the vendored ogre math headers include
+REM each other by bare name ("OgreVector3.h"); vc10_compat also shims the
+REM missing OgreConfig.h/OgrePlatformInformation.h that chain pulls in.
+set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat;%KL%\KenshiLib\Include;%KL%\KenshiLib\Include\ogre;%KL%\boost_1_60_0;%ENET%"
 
 REM Libs: VC10 x64 CRT + Win SDK 7.1 x64 + KenshiLib (kenshilib.lib, OgreMain_x64.lib).
 set "LIB=%VC%\lib\amd64;%SDK%\Lib\x64;%KL%\KenshiLib\Libraries"

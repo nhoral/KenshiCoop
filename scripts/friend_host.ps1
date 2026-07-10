@@ -50,7 +50,13 @@ param(
     # Steam P2P transport: the JOINING player's steamid64 (or short friend code).
     # When set, Steam brokers the connection - the firewall / UPnP / public-IP
     # checklist is skipped entirely. The kit may pre-bake this (kit.json).
-    [string]$PeerSteamId = ""
+    [string]$PeerSteamId = "",
+    # Resume the previous session: load the 'coopresume' save the coordinated
+    # save (protocol 31) wrote last session instead of installing the kit's
+    # baked save. BOTH sides must resume. Defaults to free play (no scenario).
+    [switch]$Resume,
+    # Save name the coordinated-save flow writes (must match the join's).
+    [string]$ResumeSave = "coopresume"
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,14 +64,31 @@ $kitDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # Short Steam friend codes are steamid64 minus the account-universe base.
 function ConvertTo-SteamId64([string]$id) {
+    $id = "$id".Trim()
+    if ($id -notmatch '^\d{1,17}$') {
+        throw ("'$id' is not a Steam ID. Use the other player's friend code (Steam > " +
+               "Friends > Add a Friend - the number at the top) or their 17-digit " +
+               "SteamID64 (steamid.io converts profile URLs).")
+    }
     $v = [uint64]$id
     if ($v -lt 76561197960265728) { $v += 76561197960265728 }
     return $v
 }
 
+# Preflight helpers (RE_Kenshi / Steam / Mark-of-the-Web / windowed checks).
+. (Join-Path $kitDir "kit_preflight.ps1")
+Invoke-KitUnblock -KitDir $kitDir
+
 # ---- Kit defaults --------------------------------------------------------------
 $kit = Get-Content (Join-Path $kitDir "kit.json") -Raw | ConvertFrom-Json
 $save = $kit.save
+if ($Resume) {
+    # The save the coordinated save (protocol 31) wrote last session; resume =
+    # both sides load the identical file. Free play unless a scenario is asked
+    # for explicitly.
+    $save = $ResumeSave
+    if ($Scenario -eq "") { $Scenario = "free" }
+}
 if ($Scenario -eq "") { $Scenario = $kit.scenario }
 if ($Scenario -eq "free") { $Scenario = "" }
 if ($Port -eq 0) { $Port = [int]$kit.port }
@@ -74,6 +97,8 @@ if ($PeerSteamId -eq "" -and $kit.PSObject.Properties["peerSteamId"] -and "$($ki
     $PeerSteamId = "$($kit.peerSteamId)"
 }
 $useSteam = ($PeerSteamId -ne "")
+# Validate the ID up front (clear error now beats a dead session later).
+if ($useSteam) { [void](ConvertTo-SteamId64 $PeerSteamId) }
 
 # ---- Connectivity helpers ----------------------------------------------------------
 . (Join-Path $kitDir "upnp_portmap.ps1")
@@ -174,6 +199,8 @@ if ($KenshiDir -eq "" -or -not (Test-Path (Join-Path $KenshiDir "kenshi_x64.exe"
 }
 Write-Host "Kenshi install: $KenshiDir"
 
+Test-CoopPrereqs -KenshiDir $KenshiDir -UseSteam $useSteam
+
 # ---- Install mod + save ------------------------------------------------------------
 $modDst = Join-Path $KenshiDir "mods\KenshiCoop"
 New-Item -ItemType Directory -Force -Path $modDst | Out-Null
@@ -182,14 +209,27 @@ Write-Host "Mod installed -> $modDst"
 
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
 New-Item -ItemType Directory -Force -Path $saveRoot | Out-Null
-foreach ($destBase in @($saveRoot, (Join-Path $KenshiDir "save"))) {
-    if ($destBase -like "*\save" -and -not (Test-Path (Split-Path -Parent $destBase))) { continue }
-    New-Item -ItemType Directory -Force -Path $destBase | Out-Null
-    $dst = Join-Path $destBase $save
-    if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
-    Copy-Item -Recurse (Join-Path $kitDir "save\$save") $dst
+if ($Resume) {
+    # No install: the save was written by last session's coordinated save
+    # (protocol 31). It must already exist here or there is nothing to resume.
+    $found = (Test-Path (Join-Path $saveRoot $save)) -or
+             (Test-Path (Join-Path $KenshiDir "save\$save"))
+    if (-not $found) {
+        throw ("Resume save '$save' not found in '$saveRoot' or '$KenshiDir\save'. " +
+               "Run at least one connected session first (any save during it is " +
+               "coordinated + shared automatically), or drop -Resume.")
+    }
+    Write-Host "Resuming on coordinated save '$save' (no kit save installed)."
+} else {
+    foreach ($destBase in @($saveRoot, (Join-Path $KenshiDir "save"))) {
+        if ($destBase -like "*\save" -and -not (Test-Path (Split-Path -Parent $destBase))) { continue }
+        New-Item -ItemType Directory -Force -Path $destBase | Out-Null
+        $dst = Join-Path $destBase $save
+        if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+        Copy-Item -Recurse (Join-Path $kitDir "save\$save") $dst
+    }
+    Write-Host "Save '$save' installed."
 }
-Write-Host "Save '$save' installed."
 
 # ---- Firewall (local) + router mapping + checklist --------------------------------------
 $upnp = $null
@@ -295,6 +335,10 @@ try {
     if ($line -and ("$line" -match "GAMEPID=(\d+)")) { $gamePid = [int]$Matches[1] }
     if ($gamePid -eq 0) { throw "Kenshi failed to get past the launcher." }
     Write-Host "Game PID: $gamePid"
+
+    # Confirm RE_Kenshi actually loaded the plugin (its log appears immediately);
+    # otherwise the game is running vanilla and nobody will ever connect.
+    [void](Wait-PluginLoaded -LogPath $hostLog -KenshiDir $KenshiDir -TimeoutSec 120)
 
     # Steam transport: surface this machine's SteamID (plugin logs "[steam] id=")
     # so the friend can read it to the joining player for their -HostSteamId.

@@ -14,7 +14,13 @@
 // loopback runs could never exercise. Jitter naturally reorders datagrams.
 //
 // Usage:
-//   netsim <listenPort> <hostIp> <hostPort> <delayMs> <jitterMs> <lossPct> [seed]
+//   netsim <listenPort> <hostIp> <hostPort> <delayMs> <jitterMs> <lossPct> [seed [stallAtS stallForS]]
+//
+// stallAtS/stallForS (starved-replica validation): starting stallAtS seconds
+// after the FIRST join datagram (i.e. session-relative, not process-relative,
+// so game boot time doesn't eat the window), drop EVERY datagram in BOTH
+// directions for stallForS seconds - a scripted total outage that starves the
+// entity stream past the interp staleMs and exercises the guard-hold path.
 //
 // Single-client by design (the harness runs one join); stats print every 5 s.
 // Stop with Ctrl+C or by killing the process (run_test.ps1 does the latter).
@@ -67,6 +73,8 @@ int main(int argc, char** argv) {
     const int jitterMs   = std::atoi(argv[5]);
     const int lossPct    = std::atoi(argv[6]);
     std::srand(argc >= 8 ? (unsigned)std::atoi(argv[7]) : (unsigned)GetTickCount());
+    const int stallAtS   = (argc >= 10) ? std::atoi(argv[8]) : 0;
+    const int stallForS  = (argc >= 10) ? std::atoi(argv[9]) : 0;
 
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -113,12 +121,18 @@ int main(int argc, char** argv) {
     std::memset(&clientAddr, 0, sizeof(clientAddr));
     bool haveClient = false;
 
-    std::printf("netsim: relaying :%d <-> %s:%d  delay=%dms jitter=+/-%dms loss=%d%%\n",
+    std::printf("netsim: relaying :%d <-> %s:%d  delay=%dms jitter=+/-%dms loss=%d%%",
                 listenPort, hostIp, hostPort, delayMs, jitterMs, lossPct);
+    if (stallForS > 0)
+        std::printf("  stall=%ds@+%ds", stallForS, stallAtS);
+    std::printf("\n");
     std::fflush(stdout);
 
     std::deque<Held> held;
     DWORD lastStats = GetTickCount();
+    DWORD firstClientTick = 0;   // session start = first join datagram
+    bool  stallAnnounced = false, stallEnded = false;
+    unsigned long dropStall = 0;
 
     for (;;) {
         // Wait (briefly) for traffic on either socket.
@@ -131,6 +145,27 @@ int main(int argc, char** argv) {
 
         DWORD now = GetTickCount();
 
+        // Scripted total-outage window (see header comment). Session-relative:
+        // the clock starts at the first join datagram.
+        bool stalled = false;
+        if (stallForS > 0 && firstClientTick != 0) {
+            DWORD rel = now - firstClientTick;
+            DWORD s0 = (DWORD)stallAtS * 1000u;
+            DWORD s1 = s0 + (DWORD)stallForS * 1000u;
+            stalled = (rel >= s0 && rel < s1);
+            if (stalled && !stallAnnounced) {
+                stallAnnounced = true;
+                std::printf("netsim: STALL BEGIN (t=+%lus, %ds outage)\n",
+                            (unsigned long)(rel / 1000), stallForS);
+                std::fflush(stdout);
+            }
+            if (!stalled && stallAnnounced && !stallEnded && rel >= s1) {
+                stallEnded = true;
+                std::printf("netsim: STALL END (dropped=%lu)\n", dropStall);
+                std::fflush(stdout);
+            }
+        }
+
         // Ingest from the join side.
         if (FD_ISSET(clientSock, &rd)) {
             for (;;) {
@@ -139,6 +174,8 @@ int main(int argc, char** argv) {
                 int n = recvfrom(clientSock, (char*)h.data, MAX_DGRAM, 0, (sockaddr*)&from, &flen);
                 if (n <= 0) break;
                 clientAddr = from; haveClient = true;
+                if (firstClientTick == 0) firstClientTick = now;
+                if (stalled) { ++dropStall; ++g_dropUp; continue; }
                 if (lossPct > 0 && (std::rand() % 100) < lossPct) { ++g_dropUp; continue; }
                 int d = delayMs + uniformJitter(jitterMs);
                 if (d < 0) d = 0;
@@ -155,6 +192,7 @@ int main(int argc, char** argv) {
                 sockaddr_in from; int flen = sizeof(from);
                 int n = recvfrom(hostSock, (char*)h.data, MAX_DGRAM, 0, (sockaddr*)&from, &flen);
                 if (n <= 0) break;
+                if (stalled) { ++dropStall; ++g_dropDown; continue; }
                 if (lossPct > 0 && (std::rand() % 100) < lossPct) { ++g_dropDown; continue; }
                 int d = delayMs + uniformJitter(jitterMs);
                 if (d < 0) d = 0;

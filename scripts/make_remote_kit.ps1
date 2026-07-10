@@ -95,6 +95,14 @@ $friendScript = if ($Role -eq "host") { "friend_host.ps1" } else { "friend_join.
 Copy-Item (Join-Path $scriptDir $friendScript)      "$kitDir\$friendScript"
 Copy-Item (Join-Path $scriptDir "start_kenshi.ps1") "$kitDir\start_kenshi.ps1"
 Copy-Item (Join-Path $scriptDir "screenshot.ps1")   "$kitDir\screenshot.ps1"
+# Preflight helpers (RE_Kenshi / Steam / Mark-of-the-Web checks), dot-sourced
+# by the friend script.
+Copy-Item (Join-Path $scriptDir "kit_preflight.ps1") "$kitDir\kit_preflight.ps1"
+# Double-click launcher matching the kit's role: prompts for the other
+# player's Steam code and runs the friend script (no PowerShell knowledge
+# needed).
+$launcher = if ($Role -eq "host") { "HOST.cmd" } else { "JOIN.cmd" }
+Copy-Item (Join-Path $scriptDir $launcher) "$kitDir\$launcher"
 if ($Role -eq "host") {
     # UPnP router-mapping helpers (dot-sourced by friend_host.ps1).
     Copy-Item (Join-Path $scriptDir "upnp_portmap.ps1") "$kitDir\upnp_portmap.ps1"
@@ -122,130 +130,124 @@ if ($Transport -eq "steam" -and $myId64 -ne "") {
 }
 $kitMeta | ConvertTo-Json | Set-Content "$kitDir\kit.json" -Encoding UTF8
 
-$steamKit = ($Transport -eq "steam")
-$howTo = if ($steamKit -and $Role -eq "host") {
-@"
-This kit uses STEAM P2P: Steam connects the two of you BY STEAMID - no port
-forwarding, no router setup, no public IPs. Keep Steam RUNNING and ONLINE.
-
-When it's time to play, from PowerShell in this folder:
-
-$(if ($myId64 -ne "") {
-"  powershell -ExecutionPolicy Bypass -File friend_host.ps1
-
-(The other player's SteamID is already baked into this kit.)"
+$steamKit   = ($Transport -eq "steam")
+$launcherUC = $launcher
+$psCmd = if ($Role -eq "host") {
+    if ($steamKit) { "powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <their code>" }
+    else           { "powershell -ExecutionPolicy Bypass -File friend_host.ps1" }
 } else {
-"  powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <the other player's steamid64>
-
-(They will read you their SteamID; steamid.io converts profile URLs.)"
-})
-
-What it does:
-  * copies the mod into your Kenshi install (mods\KenshiCoop),
-  * copies the shared test save,
-  * launches Kenshi as the HOST and prints YOUR SteamID - read it to the
-    other player so they can join you,
-  * waits for the session (the test scenario starts only when the other
-    player is in-game; the game closes itself when the scenario finishes),
-  * bundles your log + screenshots into KenshiCoop-results-<stamp>.zip
-    next to this script. Send that zip back.
-"@
-} elseif ($steamKit) {
-@"
-This kit uses STEAM P2P: Steam connects the two of you BY STEAMID - no port
-forwarding, no router setup, no public IPs. Keep Steam RUNNING and ONLINE.
-
-Then, from PowerShell in this folder:
-
-$(if ($myId64 -ne "") {
-"  powershell -ExecutionPolicy Bypass -File friend_join.ps1
-
-(The host's SteamID is already baked into this kit.)"
-} else {
-"  powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId <the host's steamid64>"
-})
-
-IMPORTANT: also tell the host YOUR SteamID (Steam > profile > Account
-details, or steamid.io) - they need it on their side before you connect.
-
-What it does:
-  * copies the mod into your Kenshi install (mods\KenshiCoop),
-  * copies the shared test save into %LOCALAPPDATA%\kenshi\save,
-  * launches Kenshi, auto-loads the save and connects to the host via Steam,
-  * runs the agreed test scenario (it exits by itself when done),
-  * bundles your log + screenshots into KenshiCoop-results-<stamp>.zip
-    next to this script. Send that zip back.
-"@
-} elseif ($Role -eq "host") {
-@"
-RECOMMENDED - the day before the session, run the connectivity check
-(takes seconds, installs nothing):
-
-  powershell -ExecutionPolicy Bypass -File friend_host.ps1 -CheckOnly
-
-If it prints READY you are set. If it says NEEDS MANUAL PORT FORWARD,
-forward UDP $Port to your PC on your router (or enable UPnP in the router
-settings and re-run the check) - doing this ahead of time saves the session.
-
-Then, when it's time to play, from PowerShell in this folder:
-
-  powershell -ExecutionPolicy Bypass -File friend_host.ps1
-
-What it does:
-  * copies the mod into your Kenshi install (mods\KenshiCoop),
-  * copies the shared test save,
-  * adds a Windows Firewall rule for UDP $Port,
-  * asks your router to forward UDP $Port automatically (UPnP); only if
-    your router refuses do you need to set up port forwarding by hand -
-    the script tells you either way, and it looks up the public IP you
-    send to the joining player,
-  * launches Kenshi as the HOST and waits (the test scenario starts only
-    when the other player is in-game, and the game closes itself when the
-    scenario finishes),
-  * bundles your log + screenshots into KenshiCoop-results-<stamp>.zip
-    next to this script. Send that zip back.
-"@
-} else {
-@"
-Then, from PowerShell in this folder:
-
-  powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostIp <the host's public IP>
-
-What it does:
-  * copies the mod into your Kenshi install (mods\KenshiCoop),
-  * copies the shared test save into %LOCALAPPDATA%\kenshi\save,
-  * launches Kenshi, auto-loads the save and connects to the host,
-  * runs the agreed test scenario (it exits by itself when done),
-  * bundles your log + screenshots into KenshiCoop-results-<stamp>.zip
-    next to this script. Send that zip back.
-"@
+    if ($steamKit) { "powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId <their code>" }
+    else           { "powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostIp <the host's public IP>" }
 }
 
 @"
-KenshiCoop remote co-op test kit (your role: $($Role.ToUpper()))
-================================
+KenshiCoop co-op kit  (your role: $($Role.ToUpper()))
+=====================================
 
-You need:
-  1. Kenshi 1.0.65 (Steam), set to WINDOWED mode (Options > Video > Full Screen off).
-  2. RE_Kenshi 0.3.1+ installed (Nexus mod - it loads the co-op plugin DLL).
+QUICK START
+-----------
 
-$howTo
+Step 0 - one-time prerequisites (both players):
+
+  1. Kenshi 1.0.65 (Steam), set to WINDOWED mode: launch Kenshi once,
+     Options > Video > un-check Full Screen.
+  2. RE_Kenshi 0.3.1+ installed - a free mod that loads the co-op plugin:
+     https://www.nexusmods.com/kenshi/mods/847
+$(if ($steamKit) {
+"  3. Steam RUNNING and ONLINE on both machines. That is the whole network
+     setup - the connection goes through Steam, so there is no port
+     forwarding, no router setup, and no IP addresses."
+} else {
+"  3. This is a direct-UDP kit: the HOST's UDP port $Port must be reachable
+     from the internet. The host script sets up the Windows Firewall and
+     asks the router to forward the port automatically (UPnP); run
+     'powershell -ExecutionPolicy Bypass -File friend_host.ps1 -CheckOnly'
+     the day before to verify off the clock."
+})
+
+$(if ($steamKit) {
+"Step 1 - swap Steam friend codes:
+
+  Each player needs the OTHER player's code before launching. In Steam:
+  Friends > Add a Friend - your friend code is the number at the top.
+  Send codes to each other. (A 17-digit SteamID64 or a steamid.io lookup
+  of a profile URL works too.)"
+} else {
+"Step 1 - get the HOST's public IP:
+
+  The host player finds it at whatismyip.com (friend_host.ps1 also prints
+  it) and sends it to the joining player before launching."
+})
+
+Step 2 - launch:
+
+  Double-click $launcherUC in this folder. It asks for the other player's
+  $(if ($steamKit) { "code" } else { "details" }), then does everything else: checks your setup (and tells you
+  exactly what to fix if something is missing), installs the mod and the
+  shared starter save, launches Kenshi, and connects the two games. When
+  both of you are in-game, you're playing co-op.
+
+  Prefer a terminal? The same flow is:
+    $psCmd
+
+WHAT SYNCS
+----------
 
 In free play the full sync set is active by default: positions, combat,
-health/limbs, stats, game speed, carried bodies, AND (new) inventory +
-equipment changes + items dropped on the ground.
+health/limbs, stats, game speed, carried bodies, inventory + equipment
+changes, items dropped on the ground, direct trades between the two
+squads, and squad management (recruits you hire AND units you move
+between squad tabs mid-session stay tracked on the other machine - note
+they won't appear in the other player's squad UI, that's a known
+limitation).
+
+Base-building syncs too: placed buildings, construction progress, doors,
+dismantling, production machines - power switches, generators, crafting
+bench / furnace / drill output, input fuel and farm growth - and
+container CONTENTS: every storage chest and machine inventory near the
+players holds the same items on both machines.
+
+Saves are coordinated: any save either player makes during a connected
+session becomes ONE shared save - the host's game writes it and streams
+the whole save folder to the other machine automatically (verified +
+committed only when it arrives intact). Loading works the same way: when
+either player loads a save mid-session, both games load the identical
+save and the session continues from there (expect a normal load screen
+on both sides).
+
+RESUMING A PREVIOUS SESSION
+---------------------------
+
+After your first session there is no save copying and no new kit needed -
+the previous session's save is already on both machines. Double-click
+$launcherUC and answer 'y' to "Resume a previous session?", or add -Resume
+to the PowerShell command. This loads the 'coopresume' save; if you saved
+under a different name, add -ResumeSave <name> on the command line. Both
+sides must load the SAME save.
+
+UNINSTALL
+---------
 
 Nothing else on your machine is touched. To remove: delete
 <Kenshi>\mods\KenshiCoop and the test save folder.
 
-Troubleshooting:
-  * "protocol mismatch" in the log = your kit is older/newer than the other
-    player's build; ask for a fresh kit.
+TROUBLESHOOTING
+---------------
+
+  * "Running scripts is disabled" or Windows SmartScreen blocks the kit:
+    right-click the downloaded zip BEFORE extracting, Properties > Unblock.
+    The $launcherUC launcher also bypasses this automatically.
+  * "RE_Kenshi not found": install RE_Kenshi into your Kenshi folder
+    (https://www.nexusmods.com/kenshi/mods/847) and run the launcher again.
+  * "The co-op plugin has not started": the game launched but RE_Kenshi did
+    not load the plugin. Check <Kenshi>\RE_Kenshi_log.txt for 'KenshiCoop';
+    reinstalling RE_Kenshi usually fixes it.
 $(if ($steamKit) {
-"  * No connection (Steam kit): both Steams must be RUNNING and ONLINE (not
-    offline mode), and each side must be launched with the OTHER player's
-    SteamID. Look for '[steam] session ... active=1' in the log - relay=1
-    just means Valve is relaying (works fine, slightly higher ping)."
+"  * No connection: both Steams must be RUNNING and ONLINE (not offline
+    mode), and each side must be launched with the OTHER player's code -
+    a typo'd code fails silently, so re-check both. Look for
+    '[steam] session ... active=1' in the log - relay=1 just means Valve
+    is relaying (works fine, slightly higher ping)."
 } else {
 "  * No connection: UDP $Port must be reachable on the HOST. friend_host.ps1
     handles the Windows Firewall and asks the router to open the port via
@@ -254,6 +256,8 @@ $(if ($steamKit) {
     carrier-grade NAT, forwarding won't help - use a VPN overlay such as
     Tailscale and share that IP instead."
 })
+  * "protocol mismatch" in the log: your kit is older/newer than the other
+    player's build; both players should get the latest kit.
 "@ | Set-Content "$kitDir\README.txt" -Encoding UTF8
 
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
