@@ -46,6 +46,34 @@ struct Config {
     unsigned int  netSimJitterMs;  // KENSHICOOP_NETSIM_JITTER_MS (+/- uniform variance)
     unsigned int  netSimLossPct;   // KENSHICOOP_NETSIM_LOSS_PCT  (0-100 drop chance)
 
+    // Protocol 36 movement-smoothness live tuning (defaults = the historical
+    // constants; 0/absent = default). The interp knobs feed InterpConfig, the
+    // drive knobs feed the walk-drive's hard-snap / catch-up gains - all for
+    // WAN A/B runs without a rebuild.
+    bool         sendStamp;         // KENSHICOOP_SEND_STAMP != "0": index interp
+                                    // rings on the sender's capture stamp (wire
+                                    // v35); "0" = legacy arrival-time indexing
+                                    // (receiver-local A/B, no wire change)
+    unsigned int interpMinDelayMs;  // KENSHICOOP_INTERP_MIN_DELAY_MS  (50)
+    unsigned int interpMaxDelayMs;  // KENSHICOOP_INTERP_MAX_DELAY_MS  (200)
+    unsigned int interpMaxExtrapMs; // KENSHICOOP_INTERP_MAX_EXTRAP_MS (250)
+    unsigned int interpStaleMs;     // KENSHICOOP_INTERP_STALE_MS      (2000)
+    float        interpSnapDist;    // KENSHICOOP_INTERP_SNAP_DIST     (50 u)
+    float        catchupK;          // KENSHICOOP_CATCHUP_K            (2.0)
+    float        snapDist;          // KENSHICOOP_SNAP_DIST            (8 u)
+
+    // Protocol 36 NPC existence census: wide-radius ghost-culling reach in
+    // world units. The host broadcasts the hand list of every world NPC within
+    // this radius at 1 Hz; the join suppresses local NPCs absent from it.
+    // 0 disables the census channel entirely (stream-bubble culling only).
+    float        censusRadius;      // KENSHICOOP_CENSUS_RADIUS        (2000 u)
+
+    // Starved-replica guard hold: how long (ms) a driven body whose stream
+    // went stale keeps its AI-suspend + damage-guard before releasing to
+    // local simulation - a WAN stall must not become an authority transfer.
+    // 0 = legacy release-on-stale.
+    unsigned int starveHoldMs;      // KENSHICOOP_STARVE_HOLD_MS       (10000)
+
     // Injected fake wall-clock skew (KENSHICOOP_FAKE_CLOCK_SKEW_MS, may be
     // negative; join only in practice). Shifts coop::wallClockMs() - i.e. BOTH
     // the log-line timestamps AND the wire time-sync - so a loopback run can
@@ -103,6 +131,14 @@ struct Config {
     // the 2026-07-07 remote session: equipment changes never crossed with it off.
     // Scripted test scenarios outside the auto-on list keep it off.
     bool          invSync;
+
+    // Protocol 37 cross-owner transfer intents (KENSHICOOP_XFER_SYNC: "1" force on,
+    // "0" force off, unset = ON whenever invSync is on). When on, BOTH clients run
+    // the completed-drag detector over every tracked container (own + received) and
+    // author reliable PKT_INV_XFER intents for moves that cross the single-writer
+    // ownership boundary; receivers relocate the real item between their own copies
+    // (conservation: no fabrication or destruction, so traded gear survives).
+    bool          xferSync;
 
     // Phase W1/W2 world-item sync (KENSHICOOP_WORLD_SYNC: "1" force on, "0" force
     // off, unset = ON for real sessions [scenario == ""] and the world_item_* /
@@ -184,6 +220,142 @@ struct Config {
     // recruit_probe (the diagnostic baselines the unsynced behaviour).
     // "0" is the A/B escape hatch.
     bool          recruitSync;
+
+    // KENSHICOOP_FACTION_SYNC (default ON): faction-relation sync (protocol
+    // 24) - the host streams the player-faction relation table (keyed by
+    // faction GameData stringID, change-gated reliable) and the join applies
+    // it via FactionRelations::setRelation; join-side relation mutations
+    // (detoured affectRelations) forward to the host as reliable intents.
+    // Without it attacking a faction flips hostility on one client only.
+    // Forced OFF for faction_probe (the diagnostic baselines the unsynced
+    // relations). "0" is the A/B escape hatch.
+    bool          factionSync;
+
+    // KENSHICOOP_TIME_SYNC (default ON): game-clock sync (protocol 25) - the
+    // host broadcasts its absolute in-game clock (PKT_TIME, ~1 Hz reliable);
+    // the join measures the offset and corrects it (step if a writable clock
+    // base exists, otherwise slew by scaling its local sim speed QUIETLY on
+    // top of the arbitrated consensus speed). Without it each client
+    // integrates its own clock from its own load/pause moments and day/night
+    // diverges. Forced OFF for time_probe (with speedSync, so the probe
+    // measures raw unsynced drift and its speed burst isn't re-arbitrated).
+    // "0" is the A/B escape hatch.
+    bool          timeSync;
+
+    // KENSHICOOP_DOOR_SYNC (default ON): door/gate state sync (protocol 26) -
+    // a symmetric change-gated channel: both clients sample nearby baked
+    // doors ~1 Hz and stream rows whose (open, locked) moved vs a per-hand
+    // baseline; received rows apply through the engine's own door actions.
+    // Without it one player walks through a gate the other sees closed.
+    // Forced OFF for door_probe (it measures the unsynced baseline). "0" is
+    // the A/B escape hatch.
+    bool          doorSync;
+
+    // KENSHICOOP_BUILD_SYNC (default ON): placed-building sync (protocol 27)
+    // - a placer-authoritative describe/mint channel: a local placement
+    // (UI commit detour or programmatic) streams its template sid +
+    // transform keyed by the PLACER's hand; the peer mints a local proxy
+    // site and applies streamed construction-progress rows through the
+    // engine's own setter. Without it a building one player places does not
+    // exist for the other. Forced OFF for build_probe (it measures the
+    // unsynced baseline). "0" is the A/B escape hatch.
+    bool          buildSync;
+
+    // KENSHICOOP_BDOOR_SYNC (default ON): placed-building door + dismantle
+    // sync (protocol 28) - door rows on session-placed buildings translated
+    // through the protocol-27 build maps (keyed by the placer's building
+    // hand + door index), and placer-authoritative building removal
+    // (PKT_BUILD_REMOVE) so a dismantled/destroyed placed building removes
+    // its proxy on the peer. Forced OFF for bdoor_probe (it measures the
+    // unsynced baseline with the mint channel still on). "0" is the A/B
+    // escape hatch.
+    bool          bdoorSync;
+
+    // KENSHICOOP_HUNGER_SYNC (default ON): hunger sync (protocol 29) - the
+    // owner-authoritative hunger/fed scalars ride the PKT_MEDICAL snapshot
+    // (a sub-gate of medSync: OFF sends/applies the fields as -1 = not
+    // carried while the rest of the medical stream is untouched). Without it
+    // each client decays every character's hunger locally and eating only
+    // happens on the owner's client, so driven copies starve in the peer's
+    // view. Forced OFF for hunger_probe (it measures the unsynced baseline).
+    // "0" is the A/B escape hatch.
+    bool          hungerSync;
+
+    // KENSHICOOP_SAVE_SYNC (default ON): coordinated save + session resume
+    // (protocol 31) - every local save on the HOST (menu, quicksave,
+    // autosave, programmatic) triggers the host-authoritative flow: wait for
+    // the save folder to quiesce, then stream the whole folder to the join
+    // (PKT_SAVE_BEGIN/FILE/DONE, staged + CRC-verified + atomically
+    // committed, PKT_SAVE_ACK back). A save initiated on the JOIN is
+    // suppressed locally and forwarded as PKT_SAVE_REQ (one authoritative
+    // save; the transfer delivers the join's copy). Resume = both clients
+    // load the identical file. Forced OFF for save_probe (it measures the
+    // raw save behaviour with the detour alone). "0" is the A/B escape
+    // hatch.
+    bool          saveSync;
+
+    // KENSHICOOP_LOAD_SYNC (default ON): coordinated load (protocol 32) -
+    // a mid-session load on the HOST (menu or programmatic - the
+    // SaveManager::load detour catches them all) broadcasts PKT_LOAD_GO
+    // (name + folder fingerprint); the join fingerprint-verifies its local
+    // copy and loads the identical save, falling back to the protocol-31
+    // SaveXfer transfer when its copy is missing/diverged (PKT_LOAD_NACK).
+    // A load initiated on the JOIN is suppressed locally and forwarded as
+    // PKT_LOAD_REQ (the host arbitrates). Both sides run a full session
+    // reset on their own world-reload edge. Forced OFF for load_probe (it
+    // measures the raw swap behaviour with the detour + edge detection
+    // alone). "0" is the A/B escape hatch.
+    bool          loadSync;
+
+    // KENSHICOOP_PROD_SYNC (default ON): production machine sync (protocol
+    // 33) - the HOST samples machine-class buildings (production / crafting /
+    // furnace / farm / research) in the interest spheres ~1 Hz and streams
+    // power state, production state, output/input buffer amounts and farm
+    // growth floats (change-gated reliable, keyed by hand with the
+    // protocol-27 translation for session-placed machines); the join applies
+    // through the engine's own levers (switchPowerOn / setProductionItem /
+    // direct amount writes). Without it every machine simulates per-client
+    // and stored output, fuel, power and crop growth silently fork. Forced
+    // OFF for prod_probe (it measures the unsynced baseline). "0" is the A/B
+    // escape hatch.
+    bool          prodSync;
+
+    // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
+    // (protocol 34) - the HOST censuses container-bearing buildings (storage
+    // chests + the machine classes) in the interest spheres ~1 Hz and
+    // registers each with the container-inventory channel, replacing the
+    // single-container v1 registration; contents stream as the existing
+    // change-gated PKT_INV_SNAPSHOT (hash + settle window + safety resend),
+    // keyed by hand with the protocol-27 translation for session-placed
+    // buildings. The join reconciles through applyContainerContents. Without
+    // it every chest and machine inventory forks per-client the moment items
+    // land in it. Layered on invSync (no container channel, no store sync).
+    // Forced OFF for store_probe (it measures the unsynced baseline). "0" is
+    // the A/B escape hatch.
+    bool          storeSync;
+
+    // KENSHICOOP_SQUAD_SYNC (default ON): squad management sync (protocol 35)
+    // - a squad-tab MOVE re-containers the body (its hand changes) exactly
+    // like a recruit, but no engine function owns the UI path, so the roster
+    // is POLLED ~1 Hz (pointer -> hand diff; the Character* survives the
+    // re-container). Each edge streams as EVT_SQUAD_MOVE (the EVT_RECRUIT
+    // shape); the peer re-keys its local body to the new stream key and the
+    // ownership pins keep the mover authoritative regardless of how the tab
+    // ranks shuffle. Without it a moved unit freezes/forks on the peer.
+    // Forced OFF for squad_probe (it measures the unsynced baseline). "0" is
+    // the A/B escape hatch.
+    bool          squadSync;
+
+    // KENSHICOOP_LATEJOIN_SYNC (default ON): late-join/reconnect resync
+    // (protocol 30, no wire change) - on the peer-connect edge the
+    // Replicator re-announces every live placed-building PLACE (+ REMOVE
+    // for removed ones) and forces an immediate full resend across all
+    // change-gated reliable channels. Without it, state that moved before
+    // the connect heals only per-channel safety resend (up to 10 s), and a
+    // building placed before the connect never exists on the peer at all.
+    // Forced OFF for latejoin_probe (it measures the unsynced baseline).
+    // "0" is the A/B escape hatch.
+    bool          latejoinSync;
 
     // Transport selection (KENSHICOOP_TRANSPORT): "udp" (default) or "steam".
     // "steam" tunnels the unchanged ENet protocol over Steam P2P (legacy

@@ -1247,6 +1247,87 @@ function Test-FurnPut {
     return (Add-GateResult -Name $gate -Status PASS -Metrics $m)
 }
 
+# cage_peer_sync (protocol 36, third-party placement): the HOST places the
+# join's KO'd leader (a peer-owned DRIVEN body on the host) into the baked
+# cage - the guard-jails-the-join-PC reproduction. Gates:
+#   author     - the host authored the third-party edge ([furn] SEND PEER-ENTER
+#                for L1's hand); the local put itself landed (FURNACT ok=1).
+#   apply      - the JOIN applied the enter to its OWN body ([furn] RECV ENTER
+#                occ=L1 ok=1) - the relaxed own-hand path.
+#   occupancy  - the join's local L1 reads in=2 within MaxLatencyMs of the
+#                host put, and stays in through the hold window.
+#   no-eject   - the host NEVER self-heal-ejected the body ([furn] HEAL EXIT
+#                for L1 absent) and its own series shows no in=0 dwell inside
+#                the hold window - the 2026-07-09 "kept taking it out" bug.
+#   exit-clean - after the join's owner-side out, both sides' final series
+#                read in=0.
+function Test-CagePeer {
+    param([string]$HostFile, [string]$JoinFile, [int]$MaxLatencyMs = 12000)
+    $mk = Select-String -Path $JoinFile -Pattern 'SCENARIO FURN L1 hand=(\d+),(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mk) {
+        Write-Host "  CAGE-PEER FAIL - L1 never latched on the join"
+        return (Add-GateResult -Name "cage_peer" -Status FAIL -Detail "no L1 latch")
+    }
+    $subj = ($mk.Matches[0].Groups[1].Value + ',' + $mk.Matches[0].Groups[2].Value)
+    $bad = @(); $m = @{}
+
+    # Author-side markers: the host's put landed, the join's out landed.
+    $pk = Select-String -Path $HostFile -Pattern 'SCENARIO FURNACT host put hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $pk) { $bad += "host put never landed (no ok=1 marker)" }
+    $ok2 = Select-String -Path $JoinFile -Pattern 'SCENARIO FURNACT join out hand=[\d,]+ kind=2 ok=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $ok2) { $bad += "join out never landed (no ok=1 marker)" }
+
+    # 1. Third-party authorship on the host.
+    $authored = (Select-String -Path $HostFile -Pattern ('\[furn\] SEND PEER-ENTER id=\d+ occ=' + [regex]::Escape($subj)) -Quiet)
+    if (-not $authored) { $bad += "host never authored SEND PEER-ENTER for L1" }
+    # 2. Own-body apply on the join.
+    $applied = (Select-String -Path $JoinFile -Pattern ('\[furn\] RECV ENTER id=\d+ occ=' + [regex]::Escape($subj) + ' .*ok=1') -Quiet)
+    if (-not $applied) { $bad += "join never applied the enter to its own body" }
+
+    if ($bad.Count -eq 0) {
+        $Tp = Get-MarkerTimeMs -File $HostFile -Pattern 'SCENARIO FURNACT host put '
+        $Td = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO FURNACT join out '
+        $J = Get-FurnSeries -File $JoinFile -HandIS $subj
+        $H = Get-FurnSeries -File $HostFile -HandIS $subj
+        # 3. Occupancy on the JOIN (its own body entered the cage).
+        $jIn = @($J | Where-Object { $_.t -ge $Tp -and $_.t -le $Td -and $_.in -eq 2 })
+        if ($jIn.Count -lt 1) {
+            $bad += "join's own body never read in=2"
+        } else {
+            $enterLat = [int]($jIn[0].t - $Tp)
+            $m["EnterLatMs"] = $enterLat
+            if ($enterLat -gt $MaxLatencyMs) { $bad += "enter latency ${enterLat}ms > $MaxLatencyMs" }
+        }
+        # 4. No eject on the HOST: no self-heal exit for L1, and once its copy
+        # entered, no in=0 dwell inside the hold window (2 consecutive samples
+        # = ~1 s, well under the old 3 s eject-repark cycle's visibility).
+        $healExit = (Select-String -Path $HostFile -Pattern ('\[furn\] HEAL EXIT occ=' + [regex]::Escape($subj)) -Quiet)
+        if ($healExit) { $bad += "host self-heal EJECTED the body (HEAL EXIT fired)" }
+        $hIn = @($H | Where-Object { $_.t -ge $Tp -and $_.t -le $Td -and $_.in -eq 2 })
+        if ($hIn.Count -ge 1) {
+            $zeros = 0; $maxZeros = 0
+            foreach ($s in @($H | Where-Object { $_.t -ge $jIn[0].t -and $_.t -le ($Td - 1000) })) {
+                if ($s.in -eq 0) { $zeros++; if ($zeros -gt $maxZeros) { $maxZeros = $zeros } }
+                else { $zeros = 0 }
+            }
+            $m["HostZeroDwell"] = $maxZeros
+            if ($maxZeros -ge 4) { $bad += "host copy left the cage mid-hold ($maxZeros consecutive in=0 samples)" }
+        } else {
+            $bad += "host copy never read in=2 (put never took?)"
+        }
+        # 5. Exit clean: both final samples read in=0.
+        if ($J.Count -ge 1 -and $J[$J.Count-1].in -ne 0) { $bad += "join's final sample still occupied (in=$($J[$J.Count-1].in))" }
+        if ($H.Count -ge 1 -and $H[$H.Count-1].in -ne 0) { $bad += "host's final sample still occupied (in=$($H[$H.Count-1].in))" }
+    }
+
+    $v = if ($bad.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $bad -join "; "
+    Write-Host "  CAGE-PEER $v - authored=$authored applied=$applied enterLat=$($m.EnterLatMs)ms hostZeroDwell=$($m.HostZeroDwell) $detail"
+    return (Add-GateResult -Name "cage_peer" -Status $v `
+                -Metrics @{ authored = $authored; applied = $applied
+                            enterLatMs = $m.EnterLatMs; hostZeroDwell = $m.HostZeroDwell } -Detail $detail)
+}
+
 # sneak_probe (protocol 20 phase 0, host-side spike): the host forced
 # stealthMode on a DRIVEN copy near NPCs. Gates: the engine call landed
 # (SNEAKACT on ok=1), the mode read back 1 on the copy, and the copy's
@@ -2581,6 +2662,281 @@ function Test-AddEquip {
                 -Metrics @{ host = $h; join = $j })
 }
 
+# trade_probe (protocol-36 BASELINE, evidence not a sync-quality gate): the host
+# performed three real cross-owner drags (TAKE / GIVE / WTAKE, violating the
+# single-writer inventory model the way a player's direct drag does) while both
+# clients sampled both squad containers. PASS = the probe EXECUTED; the value is
+# the printed conservation report (dupe / loss / weapon-vanish signatures).
+function Test-TradeProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = "SCENARIO TRDP r=(\d+) (OWN|PEER) t=(\d+) count=(\d+) hash=(\d+) probe=(-?\d+) wpn=(-?\d+)"
+    $series = {
+        param($file)
+        $arr = @()
+        if (Test-Path $file) {
+            foreach ($ln in Get-Content $file) {
+                if ($ln -match $rx) {
+                    $arr += [pscustomobject]@{
+                        rank = [int]$matches[1]; t = [int]$matches[3]
+                        count = [int]$matches[4]; probe = [int]$matches[6]; wpn = [int]$matches[7]
+                    }
+                }
+            }
+        }
+        return ,$arr
+    }
+    $H = & $series $HostFile
+    $J = & $series $JoinFile
+    if ($H.Count -lt 2 -or $J.Count -lt 2) {
+        Write-Host "  TRADE-PROBE FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
+        return (Add-GateResult -Name "trade_probe" -Status FAIL `
+                    -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
+    }
+    # The three cross-owner drags (host log). WTAKE n=-1 = no weapon was found to move.
+    $moves = @{}
+    foreach ($m in @("TAKE", "GIVE", "WTAKE")) {
+        $l = Select-String -Path $HostFile -Pattern "SCENARIO TRDP $m n=(-?\d+) sid='([^']*)'" |
+             Select-Object -Last 1
+        if ($l -and $l.Line -match "n=(-?\d+) sid='([^']*)'") {
+            $moves[$m] = @{ n = [int]$matches[1]; sid = $matches[2] }
+        }
+    }
+    $seedH = Select-String -Path $HostFile -Pattern "SCENARIO TRDP SEED r=0 n=[1-9]" -Quiet
+    $seedJ = Select-String -Path $JoinFile -Pattern "SCENARIO TRDP SEED r=1 n=[1-9]" -Quiet
+
+    # Per client: first/final probe + weapon totals across both containers, and
+    # per-rank finals (where the moved items LANDED). A cross-owner move conserves
+    # the per-client total; the seeds add +5 globally (host +2, join +3, same sid).
+    $summar = {
+        param($S)
+        $first = @{}; $final = @{}
+        foreach ($r in 0, 1) {
+            $rows = @($S | Where-Object { $_.rank -eq $r })
+            if ($rows.Count -gt 0) {
+                $first[$r] = $rows[0]
+                $final[$r] = $rows[$rows.Count - 1]
+            }
+        }
+        if (-not ($first.ContainsKey(0) -and $first.ContainsKey(1))) { return $null }
+        [pscustomobject]@{
+            probeFirst = $first[0].probe + $first[1].probe
+            probeFinal = $final[0].probe + $final[1].probe
+            probeR0 = $final[0].probe; probeR1 = $final[1].probe
+            wpnFirst = $first[0].wpn + $first[1].wpn
+            wpnFinal = $final[0].wpn + $final[1].wpn
+            wpnR0 = $final[0].wpn; wpnR1 = $final[1].wpn
+        }
+    }
+    $hs = & $summar $H
+    $js = & $summar $J
+    if (-not $hs -or -not $js) {
+        Write-Host "  TRADE-PROBE FAIL - a client never sampled both containers"
+        return (Add-GateResult -Name "trade_probe" -Status FAIL -Detail "missing rank series")
+    }
+    # PER-MOVE signatures (final totals alone can lie: a TAKE-dupe and a GIVE-wipe
+    # cancel arithmetically). The drags fire at fixed scenario times (TAKE 16 s /
+    # GIVE 26 s / WTAKE 36 s on the host clock; both scenario clocks arm at
+    # peer-ready, so join timestamps align within ~a second) - read each rank's
+    # value just before each drag and compare with the settled value before the
+    # NEXT drag / at the end.
+    $valAt = {
+        param($S, $rank, $tMax)   # last sample of `rank` strictly before tMax (0 = final)
+        $rows = @($S | Where-Object { $_.rank -eq $rank -and ($tMax -le 0 -or $_.t -lt $tMax) })
+        if ($rows.Count -eq 0) { return $null }
+        return $rows[$rows.Count - 1]
+    }
+    $TAKE_MS = 16000; $GIVE_MS = 26000; $WPN_MS = 36000
+    # probe-item value per (client, rank) at each boundary
+    $hR0pre = (& $valAt $H 0 $TAKE_MS).probe; $hR1pre = (& $valAt $H 1 $TAKE_MS).probe
+    $jR1pre = (& $valAt $J 1 $TAKE_MS).probe
+    $hR0mid = (& $valAt $H 0 $GIVE_MS).probe; $hR1mid = (& $valAt $H 1 $GIVE_MS).probe
+    $jR1mid = (& $valAt $J 1 $GIVE_MS).probe
+    $hR0end = $hs.probeR0; $hR1end = $hs.probeR1
+    $jR0end = $js.probeR0; $jR1end = $js.probeR1
+    # TAKE (r1 -> r0 by the host): did it land, did the REMOVAL ever reach the owner,
+    # did the owner's snapshot re-add it on the host (the dupe)?
+    $takeLanded     = ($hR0mid - $hR0pre) -ge 1
+    $takePropagated = ($jR1mid - $jR1pre) -le -1
+    $takeReAdded    = $takeLanded -and (-not $takePropagated) -and ($hR1mid -ge $hR1pre)
+    $takeSig = if ($takeReAdded) { "DUPE(re-added by owner snapshot; removal never propagated)" }
+               elseif ($takeLanded -and $takePropagated) { "CLEAN" }
+               elseif (-not $takeLanded) { "NO-OP(item never landed)" }
+               else { "PARTIAL" }
+    # GIVE (r0 -> r1 by the host): it left r0; did it ever ARRIVE on the owner, or
+    # did the owner's reconcile wipe it?
+    $giveSent    = ($hR0end - $hR0mid) -le -1
+    $giveArrived = ($jR1end - $jR1mid) -ge 1
+    $giveSig = if ($giveSent -and -not $giveArrived) { "WIPED(owner reconcile destroyed the given item)" }
+               elseif ($giveSent -and $giveArrived) { "CLEAN" }
+               else { "NO-OP(item never left)" }
+    # WTAKE (weapon r1 -> r0): weapons cannot be fabricated on a peer, so the failure
+    # mode is cross-client STATE DIVERGENCE (each client renders different bags).
+    $wpnDiverged = ($hs.wpnR0 -ne $js.wpnR0) -or ($hs.wpnR1 -ne $js.wpnR1)
+    $wpnSig = if ($wpnDiverged) { "DIVERGED(host r0=$($hs.wpnR0)/r1=$($hs.wpnR1) vs join r0=$($js.wpnR0)/r1=$($js.wpnR1))" }
+              else { "CLEAN" }
+    $mv = { param($m) if ($moves.ContainsKey($m)) { "n=$($moves[$m].n) sid='$($moves[$m].sid)'" } else { "(missing)" } }
+    Write-Host "  TRADE-PROBE moves: TAKE $(& $mv 'TAKE')  GIVE $(& $mv 'GIVE')  WTAKE $(& $mv 'WTAKE')  seeds host=$seedH join=$seedJ"
+    Write-Host "  TRADE-PROBE probe totals: host $($hs.probeFirst)->$($hs.probeFinal) (r0=$hR0end r1=$hR1end)  join $($js.probeFirst)->$($js.probeFinal) (r0=$jR0end r1=$jR1end)"
+    Write-Host "  TRADE-PROBE wpn   totals: host $($hs.wpnFirst)->$($hs.wpnFinal) (r0=$($hs.wpnR0) r1=$($hs.wpnR1))  join $($js.wpnFirst)->$($js.wpnFinal) (r0=$($js.wpnR0) r1=$($js.wpnR1))"
+    Write-Host "  TRADE-PROBE TAKE : landed=$takeLanded removalPropagated=$takePropagated reAdded=$takeReAdded => $takeSig"
+    Write-Host "  TRADE-PROBE GIVE : sent=$giveSent arrived=$giveArrived => $giveSig"
+    Write-Host "  TRADE-PROBE WTAKE: => $wpnSig"
+    Write-Host "  FINDING: trade_probe baseline - TAKE:$takeSig GIVE:$giveSig WEAPON:$wpnSig"
+    # PASS = executed (all three drags fired, TAKE/GIVE actually moved something,
+    # both clients sampled + seeded). The signatures above are the evidence.
+    $executed = $moves.ContainsKey("TAKE") -and $moves["TAKE"].n -ge 1 -and `
+                $moves.ContainsKey("GIVE") -and $moves["GIVE"].n -ge 1 -and `
+                $moves.ContainsKey("WTAKE") -and $seedH -and $seedJ
+    $v = if ($executed) { "PASS" } else { "FAIL" }
+    Write-Host "  TRADE-PROBE $v - executed=$executed"
+    return (Add-GateResult -Name "trade_probe" -Status $v -Metrics @{
+        hostProbe = "$($hs.probeFirst)->$($hs.probeFinal)"; joinProbe = "$($js.probeFirst)->$($js.probeFinal)"
+        hostWpn = "$($hs.wpnFirst)->$($hs.wpnFinal)"; joinWpn = "$($js.wpnFirst)->$($js.wpnFinal)"
+        takeSig = $takeSig; giveSig = $giveSig; wpnSig = $wpnSig })
+}
+
+# trade_peer (protocol 37 VALIDATION): the trade_probe drags rerun with the
+# transfer-intent channel live. GATES that every baselined failure signature is
+# closed: TAKE lands AND its removal reaches the owner (no dupe), GIVE arrives on
+# the owner (no wipe), the traded WEAPON is conserved per client AND both clients
+# agree on the final per-rank state (no divergence/vanish), and the channel
+# actually carried it ([xfer] SEND on the dragger, [xfer] APPLY on the peer).
+function Test-TradePeer {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = "SCENARIO TRDE r=(\d+) (OWN|PEER) t=(\d+) count=(\d+) hash=(\d+) probe=(-?\d+) wpn=(-?\d+)"
+    $series = {
+        param($file)
+        $arr = @()
+        if (Test-Path $file) {
+            foreach ($ln in Get-Content $file) {
+                if ($ln -match $rx) {
+                    $arr += [pscustomobject]@{
+                        rank = [int]$matches[1]; t = [int]$matches[3]
+                        count = [int]$matches[4]; probe = [int]$matches[6]; wpn = [int]$matches[7]
+                    }
+                }
+            }
+        }
+        return ,$arr
+    }
+    $H = & $series $HostFile
+    $J = & $series $JoinFile
+    if ($H.Count -lt 2 -or $J.Count -lt 2) {
+        Write-Host "  TRADE-PEER FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
+        return (Add-GateResult -Name "trade_peer" -Status FAIL `
+                    -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
+    }
+    # The three cross-owner drags must have MOVED something locally on the host.
+    $moves = @{}
+    foreach ($m in @("TAKE", "GIVE", "WTAKE")) {
+        $l = Select-String -Path $HostFile -Pattern "SCENARIO TRDE $m n=(-?\d+) sid='([^']*)'" |
+             Select-Object -Last 1
+        if ($l -and $l.Line -match "n=(-?\d+) sid='([^']*)'") {
+            $moves[$m] = @{ n = [int]$matches[1]; sid = $matches[2] }
+        }
+    }
+    $seedH = Select-String -Path $HostFile -Pattern "SCENARIO TRDE SEED r=0 n=[1-9]" -Quiet
+    $seedJ = Select-String -Path $JoinFile -Pattern "SCENARIO TRDE SEED r=1 n=[1-9]" -Quiet
+    # The channel evidence: the dragger authored intents, the peer applied them.
+    $sends   = @(Select-String -Path $HostFile -Pattern "\[xfer\] SEND id=").Count
+    $applies = @(Select-String -Path $JoinFile -Pattern "\[xfer\] APPLY id=").Count
+
+    $summar = {
+        param($S)
+        $first = @{}; $final = @{}
+        foreach ($r in 0, 1) {
+            $rows = @($S | Where-Object { $_.rank -eq $r })
+            if ($rows.Count -gt 0) {
+                $first[$r] = $rows[0]
+                $final[$r] = $rows[$rows.Count - 1]
+            }
+        }
+        if (-not ($first.ContainsKey(0) -and $first.ContainsKey(1))) { return $null }
+        [pscustomobject]@{
+            probeFirst = $first[0].probe + $first[1].probe
+            probeFinal = $final[0].probe + $final[1].probe
+            probeR0 = $final[0].probe; probeR1 = $final[1].probe
+            wpnFirst = $first[0].wpn + $first[1].wpn
+            wpnFinal = $final[0].wpn + $final[1].wpn
+            wpnR0 = $final[0].wpn; wpnR1 = $final[1].wpn
+        }
+    }
+    $hs = & $summar $H
+    $js = & $summar $J
+    if (-not $hs -or -not $js) {
+        Write-Host "  TRADE-PEER FAIL - a client never sampled both containers"
+        return (Add-GateResult -Name "trade_peer" -Status FAIL -Detail "missing rank series")
+    }
+    # Same per-move boundaries as the baseline oracle (drag times are shared).
+    $valAt = {
+        param($S, $rank, $tMax)   # last sample of `rank` strictly before tMax (0 = final)
+        $rows = @($S | Where-Object { $_.rank -eq $rank -and ($tMax -le 0 -or $_.t -lt $tMax) })
+        if ($rows.Count -eq 0) { return $null }
+        return $rows[$rows.Count - 1]
+    }
+    $TAKE_MS = 16000; $GIVE_MS = 26000
+    $hR0pre = (& $valAt $H 0 $TAKE_MS).probe; $hR1pre = (& $valAt $H 1 $TAKE_MS).probe
+    $jR1pre = (& $valAt $J 1 $TAKE_MS).probe
+    $hR0mid = (& $valAt $H 0 $GIVE_MS).probe; $hR1mid = (& $valAt $H 1 $GIVE_MS).probe
+    $jR1mid = (& $valAt $J 1 $GIVE_MS).probe
+    $hR0end = $hs.probeR0; $hR1end = $hs.probeR1
+    $jR0end = $js.probeR0; $jR1end = $js.probeR1
+    # TAKE (r1 -> r0): landed on the dragger AND the removal reached the owner AND
+    # no re-add on the dragger's r1 (the dupe window).
+    $takeLanded     = ($hR0mid - $hR0pre) -ge 1
+    $takePropagated = ($jR1mid - $jR1pre) -le -1
+    $takeNoDupe     = ($hR1mid - $hR1pre) -le -1   # dragger's r1 stayed down (no re-add)
+    $takeOk  = $takeLanded -and $takePropagated -and $takeNoDupe
+    $takeSig = if ($takeOk) { "CLEAN" }
+               elseif (-not $takeLanded) { "NO-OP(item never landed)" }
+               elseif (-not $takePropagated) { "DUPE(removal never reached the owner)" }
+               else { "DUPE(re-added on the dragger)" }
+    # GIVE (r0 -> r1): left the dragger's r0 AND arrived on the owner (no wipe).
+    $giveSent    = ($hR0end - $hR0mid) -le -1
+    $giveArrived = ($jR1end - $jR1mid) -ge 1
+    $giveKeptH   = ($hR1end - $hR1mid) -ge 1       # the dragger still renders it in r1
+    $giveOk  = $giveSent -and $giveArrived -and $giveKeptH
+    $giveSig = if ($giveOk) { "CLEAN" }
+               elseif (-not $giveSent) { "NO-OP(item never left)" }
+               elseif (-not $giveArrived) { "WIPED(never arrived on the owner)" }
+               else { "WIPED(reconciled away on the dragger)" }
+    # WTAKE: conservation per client + cross-client agreement + it actually moved.
+    $wpnConsH  = $hs.wpnFinal -eq $hs.wpnFirst
+    $wpnConsJ  = $js.wpnFinal -eq $js.wpnFirst
+    $wpnAgree  = ($hs.wpnR0 -eq $js.wpnR0) -and ($hs.wpnR1 -eq $js.wpnR1)
+    $wpnMoved  = $hs.wpnR0 -ge 1
+    $wpnOk  = $wpnConsH -and $wpnConsJ -and $wpnAgree -and $wpnMoved
+    $wpnSig = if ($wpnOk) { "CLEAN" }
+              elseif (-not ($wpnConsH -and $wpnConsJ)) { "VANISH(host $($hs.wpnFirst)->$($hs.wpnFinal) join $($js.wpnFirst)->$($js.wpnFinal))" }
+              elseif (-not $wpnAgree) { "DIVERGED(host r0=$($hs.wpnR0)/r1=$($hs.wpnR1) vs join r0=$($js.wpnR0)/r1=$($js.wpnR1))" }
+              else { "NO-MOVE(weapon never landed in r0)" }
+    # Probe-item conservation: cross-owner moves conserve; the seeds add +5 globally.
+    $consH = $hs.probeFinal -eq ($hs.probeFirst + 5)
+    $consJ = $js.probeFinal -eq ($js.probeFirst + 5)
+    $probeAgree = ($hR0end -eq $jR0end) -and ($hR1end -eq $jR1end)
+    $mv = { param($m) if ($moves.ContainsKey($m)) { "n=$($moves[$m].n) sid='$($moves[$m].sid)'" } else { "(missing)" } }
+    Write-Host "  TRADE-PEER moves: TAKE $(& $mv 'TAKE')  GIVE $(& $mv 'GIVE')  WTAKE $(& $mv 'WTAKE')  seeds host=$seedH join=$seedJ  xfer sent=$sends applied=$applies"
+    Write-Host "  TRADE-PEER probe totals: host $($hs.probeFirst)->$($hs.probeFinal) (r0=$hR0end r1=$hR1end)  join $($js.probeFirst)->$($js.probeFinal) (r0=$jR0end r1=$jR1end)  conserve host=$consH join=$consJ agree=$probeAgree"
+    Write-Host "  TRADE-PEER wpn   totals: host $($hs.wpnFirst)->$($hs.wpnFinal) (r0=$($hs.wpnR0) r1=$($hs.wpnR1))  join $($js.wpnFirst)->$($js.wpnFinal) (r0=$($js.wpnR0) r1=$($js.wpnR1))"
+    Write-Host "  TRADE-PEER TAKE : landed=$takeLanded removalPropagated=$takePropagated noDupe=$takeNoDupe => $takeSig"
+    Write-Host "  TRADE-PEER GIVE : sent=$giveSent arrived=$giveArrived keptOnDragger=$giveKeptH => $giveSig"
+    Write-Host "  TRADE-PEER WTAKE: conserveH=$wpnConsH conserveJ=$wpnConsJ agree=$wpnAgree moved=$wpnMoved => $wpnSig"
+    $executed = $moves.ContainsKey("TAKE") -and $moves["TAKE"].n -ge 1 -and `
+                $moves.ContainsKey("GIVE") -and $moves["GIVE"].n -ge 1 -and `
+                $moves.ContainsKey("WTAKE") -and $moves["WTAKE"].n -ge 1 -and `
+                $seedH -and $seedJ
+    $channel = ($sends -ge 3) -and ($applies -ge 3)
+    $ok = $executed -and $channel -and $takeOk -and $giveOk -and $wpnOk -and `
+          $consH -and $consJ -and $probeAgree
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  TRADE-PEER $v - executed=$executed channel=$channel take=$takeOk give=$giveOk wpn=$wpnOk conserve=$($consH -and $consJ) agree=$probeAgree"
+    return (Add-GateResult -Name "trade_peer" -Status $v -Metrics @{
+        hostProbe = "$($hs.probeFirst)->$($hs.probeFinal)"; joinProbe = "$($js.probeFirst)->$($js.probeFinal)"
+        hostWpn = "$($hs.wpnFirst)->$($hs.wpnFinal)"; joinWpn = "$($js.wpnFirst)->$($js.wpnFinal)"
+        sends = $sends; applies = $applies
+        takeSig = $takeSig; giveSig = $giveSig; wpnSig = $wpnSig })
+}
+
 # drop_probe (W0 diagnostic): assert the probe EXECUTED and surface the evidence.
 function Test-DropProbe {
     param([string]$HostFile)
@@ -2617,7 +2973,11 @@ function Test-DropProbe {
 
 # world_item_sync (W1): drop streams to the join (proxy spawn), despawn culls it.
 function Test-WorldItemSync {
-    param([string]$HostFile, [string]$JoinFile, [double]$Tol = 3.0)
+    # -JoinAuthor: the world_item_join variant (W1 bidir) - the JOIN drops/despawns
+    # and the HOST must spawn/cull the proxy. Same series logic, roles swapped;
+    # $GateName labels the verdict (wi_sync / wi_join).
+    param([string]$HostFile, [string]$JoinFile, [double]$Tol = 3.0,
+          [switch]$JoinAuthor, [string]$GateName = "wi_sync")
     $rx = 'SCENARIO WI (HOST|JOIN) t=(\d+) n=(\d+) pos=(-?[0-9.]+),(-?[0-9.]+),(-?[0-9.]+) hash=(\d+)'
     $series = {
         param($file, $role)
@@ -2636,36 +2996,40 @@ function Test-WorldItemSync {
     }
     $H = & $series $HostFile "HOST"
     $J = & $series $JoinFile "JOIN"
+    $label = if ($JoinAuthor) { "WI-JOIN" } else { "WI-SYNC" }
     if ($H.Count -lt 2 -or $J.Count -lt 2) {
-        Write-Host "  WI-SYNC FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
-        return (Add-GateResult -Name "wi_sync" -Status FAIL -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
+        Write-Host "  $label FAIL - insufficient samples (host=$($H.Count) join=$($J.Count))"
+        return (Add-GateResult -Name $GateName -Status FAIL -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
     }
-    $drop    = [bool](Select-String -Path $HostFile -Pattern 'SCENARIO WI DROP .*dropped=[1-9]' -Quiet)
-    $despawn = [bool](Select-String -Path $HostFile -Pattern 'SCENARIO WI DESPAWN destroyed=[1-9]' -Quiet)
+    $authorFile = if ($JoinAuthor) { $JoinFile } else { $HostFile }
+    $drop    = [bool](Select-String -Path $authorFile -Pattern 'SCENARIO WI DROP .*dropped=[1-9]' -Quiet)
+    $despawn = [bool](Select-String -Path $authorFile -Pattern 'SCENARIO WI DESPAWN destroyed=[1-9]' -Quiet)
     $hostPresent = $H | Where-Object { $_.n -ge 1 } | Select-Object -First 1
     $joinPresent = $J | Where-Object { $_.n -ge 1 } | Select-Object -First 1
-    $joinSpawned = ($joinPresent -ne $null)
-    $hostSaw     = ($hostPresent -ne $null)
+    # The OBSERVER side seeing the item proves the proxy spawned (the author's own
+    # sighting is just its real local item).
+    $observerSpawned = if ($JoinAuthor) { $hostPresent -ne $null } else { $joinPresent -ne $null }
+    $authorSaw       = if ($JoinAuthor) { $joinPresent -ne $null } else { $hostPresent -ne $null }
     $posMatch = $false; $hashMatch = $false; $dxz = -1.0
-    if ($hostSaw -and $joinSpawned) {
+    if ($hostPresent -and $joinPresent) {
         $dx = $hostPresent.x - $joinPresent.x; $dz = $hostPresent.z - $joinPresent.z
         $dxz = [math]::Sqrt($dx * $dx + $dz * $dz)
         $posMatch  = ($dxz -le $Tol)
         $hashMatch = ($hostPresent.hash -eq $joinPresent.hash)
     }
-    $hostCulled = $hostSaw -and ($H[$H.Count - 1].n -eq 0)
-    $joinCulled = $joinSpawned -and ($J[$J.Count - 1].n -eq 0)
-    $ok = $drop -and $despawn -and $joinSpawned -and $posMatch -and $hashMatch -and $joinCulled -and $hostCulled
+    $hostCulled = ($hostPresent -ne $null) -and ($H[$H.Count - 1].n -eq 0)
+    $joinCulled = ($joinPresent -ne $null) -and ($J[$J.Count - 1].n -eq 0)
+    $ok = $drop -and $despawn -and $authorSaw -and $observerSpawned -and $posMatch -and $hashMatch -and $joinCulled -and $hostCulled
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host ("  WI-SYNC $v - drop=$drop despawn=$despawn joinSpawned=$joinSpawned " +
+    Write-Host ("  $label $v - drop=$drop despawn=$despawn observerSpawned=$observerSpawned " +
                 "posMatch=$posMatch (dXZ=$([math]::Round($dxz,2))u tol=$Tol) hashMatch=$hashMatch " +
                 "hostCulled=$hostCulled joinCulled=$joinCulled")
     if ($hostPresent -and $joinPresent) {
-        Write-Host ("  WI-SYNC   host item pos=($($hostPresent.x),$($hostPresent.y),$($hostPresent.z)) hash=$($hostPresent.hash)")
-        Write-Host ("  WI-SYNC   join item pos=($($joinPresent.x),$($joinPresent.y),$($joinPresent.z)) hash=$($joinPresent.hash)")
+        Write-Host ("  $label   host item pos=($($hostPresent.x),$($hostPresent.y),$($hostPresent.z)) hash=$($hostPresent.hash)")
+        Write-Host ("  $label   join item pos=($($joinPresent.x),$($joinPresent.y),$($joinPresent.z)) hash=$($joinPresent.hash)")
     }
-    return (Add-GateResult -Name "wi_sync" -Status $v -Metrics @{
-        drop = $drop; despawn = $despawn; joinSpawned = $joinSpawned
+    return (Add-GateResult -Name $GateName -Status $v -Metrics @{
+        drop = $drop; despawn = $despawn; observerSpawned = $observerSpawned
         posMatch = $posMatch; dxz = [math]::Round($dxz, 2); hashMatch = $hashMatch
         hostCulled = $hostCulled; joinCulled = $joinCulled })
 }
@@ -3180,6 +3544,2183 @@ function Test-RecruitSync {
                 -Metrics @{ converged = $converged } -Detail $detail)
 }
 
+# Shared SQTABS parser (protocol 35): ordered series of @{n; squad; list; t}
+# where list = "container:serial:count|..." sorted ascending (the same order
+# the Replicator ranks the ownership partition on).
+function Get-SqTabsSeries {
+    param([string]$File)
+    $out = New-Object System.Collections.ArrayList
+    foreach ($m in @(Select-String -Path $File -Pattern 'SCENARIO SQTABS n=(\d+) squad=(\d+) list=(\S*) t=(\d+)' -ErrorAction SilentlyContinue)) {
+        [void]$out.Add(@{ n = [int]$m.Matches[0].Groups[1].Value
+                          squad = [int]$m.Matches[0].Groups[2].Value
+                          list = $m.Matches[0].Groups[3].Value
+                          t = [long]$m.Matches[0].Groups[4].Value })
+    }
+    return $out
+}
+
+# The rank-shift finding: where did each of the FIRST census sample's tab
+# containers land in the LAST sample's sorted order? A shifted index = the
+# ownership partition reshuffled mid-session (the gap-2 hazard).
+function Get-SqRankShifts {
+    param($Series)
+    if ($Series.Count -lt 2) { return @() }
+    $firstPairs = @($Series[0].list -split '\|' | ForEach-Object { ($_ -split ':')[0..1] -join ':' })
+    $lastPairs  = @($Series[$Series.Count - 1].list -split '\|' | ForEach-Object { ($_ -split ':')[0..1] -join ':' })
+    $shifts = @()
+    for ($i = 0; $i -lt $firstPairs.Count; $i++) {
+        $newIdx = [array]::IndexOf($lastPairs, $firstPairs[$i])
+        $shifts += "$($firstPairs[$i]):$i->$newIdx"
+    }
+    return $shifts
+}
+
+$script:SqMoveRegex = 'SCENARIO SQMOVE who=(host|join) lever=(-?\d+) rc=(-?\d+) before=([\d,]+) after=([\d,]+) t=(\d+)'
+$script:SqEdgeRegex = 'SCENARIO SQEDGE who=(host|join) before=([\d,]+) after=([\d,]+) t=(\d+)'
+
+# squad_probe (protocol 35 phase 0): squad-move baseline diagnostic (squadSync
+# forced OFF). Gates the LOCAL legs: both sides logged their SQTABS census and
+# their lever-0 separate attempt, and - when a move LANDED (rc=1) - the
+# pointer-diff SQEDGE caught the same before/after pair (the detection
+# mechanism protocol 35 rides). Everything else is FINDINGs feeding the design:
+#   * identity: which hand fields a move re-keys (container vs index/serial);
+#   * rank reshuffle: did the pre-existing tabs' sorted positions shift when
+#     the new tab appeared (the ownership hazard, measured);
+#   * move-back levers: does setFaction (1) / addCharacterAt (2) land a member
+#     in an EXISTING tab, and does the returning member get its original hand
+#     back (no second re-key) or a fresh one;
+#   * peer reaction: unresolved-hand telemetry / authority suppression around
+#     each landed move (the divergence protocol 35 closes).
+function Test-SquadProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $moves = @{}
+    foreach ($pair in @(@('host', $HostFile), @('join', $JoinFile))) {
+        $side = $pair[0]
+        foreach ($m in @(Select-String -Path $pair[1] -Pattern $script:SqMoveRegex -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            if ($g[1].Value -ne $side) { continue } # each side logs only its own moves
+            $moves["$side/L$($g[2].Value)"] = @{
+                lever = [int]$g[2].Value; rc = [int]$g[3].Value
+                before = $g[4].Value; after = $g[5].Value; t = [long]$g[6].Value
+            }
+        }
+    }
+    # Host leads with the separate (L0); the join's tab is solo (a separate
+    # would no-op), so its first scripted move is the lever-1 move-in.
+    foreach ($k in @('host/L0', 'join/L1')) {
+        if (-not $moves.ContainsKey($k)) { $why += "$k never logged its SQMOVE" }
+    }
+    $hTabs = Get-SqTabsSeries $HostFile
+    $jTabs = Get-SqTabsSeries $JoinFile
+    if ($hTabs.Count -eq 0) { $why += "host logged no SQTABS census" }
+    if ($jTabs.Count -eq 0) { $why += "join logged no SQTABS census" }
+
+    # Detection gate: every LANDED move must be mirrored by a pointer-diff
+    # SQEDGE with the same before/after pair on the mover's own log.
+    foreach ($k in ($moves.Keys | Sort-Object)) {
+        $l = $moves[$k]
+        if ($l.rc -ne 1) { continue }
+        $file = if ($k.StartsWith('host')) { $HostFile } else { $JoinFile }
+        $pat = "SCENARIO SQEDGE who=\w+ before=$([regex]::Escape($l.before)) after=$([regex]::Escape($l.after))"
+        $hit = @(Select-String -Path $file -Pattern $pat -ErrorAction SilentlyContinue).Count
+        if ($hit -eq 0) { $why += "$k landed but the pointer-diff never caught it (no matching SQEDGE)" }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  SQUAD-PROBE $v - $detail"
+
+    # FINDINGS: per-move identity evidence.
+    foreach ($k in ($moves.Keys | Sort-Object)) {
+        $l = $moves[$k]
+        $b = $l.before -split ','; $a = $l.after -split ','
+        $contChanged = ($b[1] -ne $a[1]) -or ($b[2] -ne $a[2])
+        $idxSurvived = ($b[3] -eq $a[3]) -and ($b[4] -eq $a[4])
+        Write-Host "    FINDING: $k rc=$($l.rc) containerChanged=$contChanged indexSerialSurvived=$idxSurvived (before=$($l.before) after=$($l.after))"
+    }
+    # FINDING: did the host's move-back restore the ORIGINAL hand (no second
+    # re-key)? (The join's L0 is a separate-out, not a move-back.)
+    if ($moves.ContainsKey('host/L0')) {
+        $orig = $moves['host/L0'].before
+        foreach ($lev in @(1, 2)) {
+            $k = "host/L$lev"
+            if (-not $moves.ContainsKey($k) -or $moves[$k].rc -ne 1) { continue }
+            $restored = ($moves[$k].after -eq $orig)
+            Write-Host "    FINDING: $k move-back restoredOriginalHand=$restored"
+        }
+    }
+    # FINDING: rank stability of the pre-existing tabs (the reshuffle hazard).
+    foreach ($pair in @(@('host', $hTabs), @('join', $jTabs))) {
+        $shifts = Get-SqRankShifts -Series $pair[1]
+        if ($shifts.Count -gt 0) {
+            $moved = @($shifts | Where-Object { $_ -match ':(\d+)->(\d+)$' -and $Matches[1] -ne $Matches[2] })
+            Write-Host "    FINDING: $($pair[0]) tab ranks first->last [$($shifts -join ' ')] shifted=$($moved.Count)"
+        }
+    }
+    # FINDING: peer reaction to each landed move's NEW hand (sync OFF: the
+    # expected gap - unresolved stream key / authority suppression churn).
+    foreach ($k in ($moves.Keys | Sort-Object)) {
+        $l = $moves[$k]
+        if ($l.rc -ne 1) { continue }
+        $peerFile = if ($k.StartsWith('host')) { $JoinFile } else { $HostFile }
+        $a = $l.after -split ','
+        $unres = @(Select-String -Path $peerFile -Pattern "\[spawn\] (unresolved|REQ) hand=$([regex]::Escape($l.after))" -ErrorAction SilentlyContinue).Count
+        $supp  = @(Select-String -Path $peerFile -Pattern "\[authority\] suppress NPC hand=$($a[3]),$($a[4])" -ErrorAction SilentlyContinue).Count
+        Write-Host "    FINDING: $k peer saw unresolved/REQ=$unres authoritySuppress=$supp for the moved hand"
+    }
+    return (Add-GateResult -Name "squad_probe" -Status $v `
+                -Metrics @{ moves = $moves.Count } -Detail $detail)
+}
+
+# squad_sync (protocol 35): the gated squad-management convergence oracle.
+# Host separates a member out and moves it back (L0 then L1/L2); the join
+# moves its solo member into the host tab and separates it back out (L1/L2
+# then L0). The gates:
+#   1. every scripted move LANDED locally (rc=1; the join's L2 only fires if
+#      its L1 refused, so either counts as the move-in);
+#   2. the mover authored a reliable edge per landed move ("[squad] EVT send"
+#      with that exact before/after pair);
+#   3. the PEER re-keyed its local body onto each new hand ("[squad] REKEY
+#      ... ok=1") - and never minted a duplicate proxy for it ("[spawn]
+#      proxy BOUND" for a moved hand = the identity break came back);
+#   4. no unresolved-hand storm: at most one pre-rekey unresolved line per
+#      moved hand on the peer (the reliable edge must win the batch race);
+#   5. the peer TRACKED each side's finally-moved hand (SCENARIO PROXY
+#      series - the re-keyed body is actually driven, not just bound);
+#   6. the rank latch held: the pre-existing tabs' census positions are
+#      IDENTICAL first-to-last sample on both sides (no ownership reshuffle).
+function Test-SquadSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $moves = @{}
+    foreach ($pair in @(@('host', $HostFile), @('join', $JoinFile))) {
+        $side = $pair[0]
+        foreach ($m in @(Select-String -Path $pair[1] -Pattern $script:SqMoveRegex -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            if ($g[1].Value -ne $side) { continue }
+            $moves["$side/L$($g[2].Value)"] = @{
+                lever = [int]$g[2].Value; rc = [int]$g[3].Value
+                before = $g[4].Value; after = $g[5].Value; t = [long]$g[6].Value
+            }
+        }
+    }
+    # Gate 1: the script's moves all landed.
+    if (-not $moves.ContainsKey('host/L0') -or $moves['host/L0'].rc -ne 1) {
+        $why += "host separate (L0) missing or refused"
+    }
+    $hostBack = @('host/L1', 'host/L2') | Where-Object { $moves.ContainsKey($_) -and $moves[$_].rc -eq 1 }
+    if (-not $hostBack) { $why += "host move-back (L1/L2) never landed" }
+    $joinIn = @('join/L1', 'join/L2') | Where-Object { $moves.ContainsKey($_) -and $moves[$_].rc -eq 1 }
+    if (-not $joinIn) { $why += "join move-in (L1/L2) never landed" }
+    if (-not $moves.ContainsKey('join/L0') -or $moves['join/L0'].rc -ne 1) {
+        $why += "join separate-out (L0) missing or refused"
+    }
+
+    # Gates 2-4 per landed move; track each side's chronologically-last hand.
+    $finalHand = @{}
+    foreach ($k in ($moves.Keys | Sort-Object)) {
+        $l = $moves[$k]
+        if ($l.rc -ne 1) { continue }
+        $side = ($k -split '/')[0]
+        $myFile = if ($side -eq 'host') { $HostFile } else { $JoinFile }
+        $peerFile = if ($side -eq 'host') { $JoinFile } else { $HostFile }
+        $be = [regex]::Escape($l.before); $ae = [regex]::Escape($l.after)
+        $sent = @(Select-String -Path $myFile -Pattern "\[squad\] EVT send old=$be new=$ae" -ErrorAction SilentlyContinue).Count
+        if ($sent -eq 0) { $why += "$k landed but authored no EVT_SQUAD_MOVE edge" }
+        $rekey = @(Select-String -Path $peerFile -Pattern "\[squad\] REKEY old=$be new=$ae ok=1" -ErrorAction SilentlyContinue).Count
+        if ($rekey -eq 0) { $why += "$k edge never re-keyed on the peer (no REKEY ok=1)" }
+        $bound = @(Select-String -Path $peerFile -Pattern "\[spawn\] proxy BOUND hand=$ae" -ErrorAction SilentlyContinue).Count
+        if ($bound -gt 0) { $why += "$k DUPLICATED on the peer (proxy minted despite the re-key)" }
+        $unres = @(Select-String -Path $peerFile -Pattern "\[spawn\] unresolved hand=$ae" -ErrorAction SilentlyContinue).Count
+        if ($unres -gt 1) { $why += "$k unresolved-hand storm on the peer ($unres lines)" }
+        Write-Host "    FINDING: $k sent=$sent rekey=$rekey proxyBound=$bound unresolved=$unres"
+        if (-not $finalHand.ContainsKey($side) -or $l.t -gt $finalHand[$side].t) {
+            $finalHand[$side] = @{ after = $l.after; t = $l.t }
+        }
+    }
+    # Gate 5: the peer tracked each side's finally-moved hand.
+    foreach ($side in $finalHand.Keys) {
+        $peerFile = if ($side -eq 'host') { $JoinFile } else { $HostFile }
+        $a = $finalHand[$side].after -split ','
+        $handIS = [regex]::Escape("$($a[3]),$($a[4]),$($a[0]),$($a[1]),$($a[2])") # i,s,t,c,cs (PROXY order)
+        $track = @(Select-String -Path $peerFile -Pattern "SCENARIO PROXY hand=$handIS" -ErrorAction SilentlyContinue).Count
+        if ($track -eq 0) { $why += "$side's moved member never tracked on the peer (no PROXY series)" }
+        Write-Host "    FINDING: $side final hand $($finalHand[$side].after) peerTrack=$track"
+    }
+    # Gate 6: rank-latch proof - pre-existing tab positions stable per side.
+    foreach ($pair in @(@('host', (Get-SqTabsSeries $HostFile)), @('join', (Get-SqTabsSeries $JoinFile)))) {
+        $side = $pair[0]
+        if ($pair[1].Count -eq 0) { $why += "$side logged no SQTABS census"; continue }
+        $shifts = Get-SqRankShifts -Series $pair[1]
+        # A VANISHED tab (->-1: the join's solo tab empties when its member
+        # moves out) is not a reshuffle; only a SURVIVING pair changing its
+        # sorted position would flip rank-keyed ownership.
+        $moved = @($shifts | Where-Object { $_ -match ':(\d+)->(\d+)$' -and $Matches[1] -ne $Matches[2] })
+        if ($moved.Count -gt 0) { $why += "$side pre-existing tab ranks SHIFTED [$($moved -join ' ')]" }
+        Write-Host "    FINDING: $side tab ranks first->last [$($shifts -join ' ')]"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  SQUAD-SYNC $v - $detail"
+    return (Add-GateResult -Name "squad_sync" -Status $v `
+                -Metrics @{ moves = $moves.Count } -Detail $detail)
+}
+
+# Shared FACREL parser: sid -> ordered series of @{us; them; enemy; erecip; t}.
+function Get-FacRelSeries {
+    param([string]$File)
+    $out = @{}
+    foreach ($m in @(Select-String -Path $File -Pattern "SCENARIO FACREL sid='([^']*)' us=(-?[\d.]+) them=(-?[\d.]+) enemy=(-?\d+) erecip=(-?\d+) ally=(-?\d+) t=(\d+)" -ErrorAction SilentlyContinue)) {
+        $sid = $m.Matches[0].Groups[1].Value
+        if (-not $out.ContainsKey($sid)) { $out[$sid] = New-Object System.Collections.ArrayList }
+        [void]$out[$sid].Add(@{
+            us     = [double]$m.Matches[0].Groups[2].Value
+            them   = [double]$m.Matches[0].Groups[3].Value
+            enemy  = [int]$m.Matches[0].Groups[4].Value
+            erecip = [int]$m.Matches[0].Groups[5].Value
+            t      = [long]$m.Matches[0].Groups[7].Value
+        })
+    }
+    return $out
+}
+
+$script:FacWriteRegex = "SCENARIO FACWRITE who=(host|join) sid='([^']*)' target=(-?[\d.]+) ok=(\d) before=(-?[\d.]+) after=(-?[\d.]+)"
+
+# faction_probe (protocol 24 phase 0): relation-baseline diagnostic. Gates only
+# that the script ran (both FACWRITE lines + FACREL series on both sides);
+# everything else is FINDINGs - sid cross-client stability, whether the
+# sentinel setRelation stuck locally, whether anything crossed (expected: NO),
+# and what the [fac] AFFECT detour saw.
+function Test-FactionProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostW = Select-String -Path $HostFile -Pattern $script:FacWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinW = Select-String -Path $JoinFile -Pattern $script:FacWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostW) { $why += "host never logged its FACWRITE" }
+    if ($null -eq $joinW) { $why += "join never logged its FACWRITE" }
+    $hRel = Get-FacRelSeries -File $HostFile
+    $jRel = Get-FacRelSeries -File $JoinFile
+    if ($hRel.Keys.Count -eq 0) { $why += "host logged no FACREL series" }
+    if ($jRel.Keys.Count -eq 0) { $why += "join logged no FACREL series" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  FACTION-PROBE $v - $detail"
+
+    # FINDING: sid census overlap (the wire-identity question).
+    $common = @($hRel.Keys | Where-Object { $jRel.ContainsKey($_) })
+    Write-Host "    FINDING: FACREL sids host=$($hRel.Keys.Count) join=$($jRel.Keys.Count) common=$($common.Count)"
+
+    # FINDING per write leg: did it stick locally, did it cross to the peer?
+    foreach ($leg in @(@($hostW, $jRel, 'host'), @($joinW, $hRel, 'join'))) {
+        $w = $leg[0]; $peer = $leg[1]; $side = $leg[2]
+        if ($null -eq $w) { continue }
+        $sid = $w.Matches[0].Groups[2].Value
+        $tgt = [double]$w.Matches[0].Groups[3].Value
+        $ok  = $w.Matches[0].Groups[4].Value
+        $aft = [double]$w.Matches[0].Groups[6].Value
+        $stuck = ($ok -eq '1') -and ([math]::Abs($aft - $tgt) -lt 0.5)
+        $crossed = "sid-absent-on-peer"
+        if ($peer.ContainsKey($sid)) {
+            $end = $peer[$sid][$peer[$sid].Count - 1]
+            $crossed = if (([math]::Abs($end.us - $tgt) -lt 0.5) -or
+                           ([math]::Abs($end.them - $tgt) -lt 0.5)) { "CROSSED" } else { "did NOT cross (peer us=$($end.us) them=$($end.them))" }
+        }
+        Write-Host "    FINDING: $side sentinel sid='$sid' target=$tgt stuck=$stuck -> $crossed"
+    }
+    # FINDING: AFFECT detour evidence volume per side.
+    foreach ($pair in @(@('host', $HostFile), @('join', $JoinFile))) {
+        $ev  = @(Select-String -Path $pair[1] -Pattern '\[fac\] AFFECT-EV '  -ErrorAction SilentlyContinue).Count
+        $amt = @(Select-String -Path $pair[1] -Pattern '\[fac\] AFFECT-AMT ' -ErrorAction SilentlyContinue).Count
+        Write-Host "    FINDING: $($pair[0]) AFFECT-EV=$ev AFFECT-AMT=$amt"
+    }
+    return (Add-GateResult -Name "faction_probe" -Status $v `
+                -Metrics @{ commonSids = $common.Count } -Detail $detail)
+}
+
+# faction_sync (protocol 24): the gated relation-convergence oracle. Each side
+# wrote a sentinel relation (host -75 on the first sorted faction, join +65 on
+# the second, both table rows); the gate is that each sentinel CONVERGED on
+# the peer (final FACREL us AND them for that sid equal the target) and no
+# co-visible row ended diverged.
+function Test-FactionSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostW = Select-String -Path $HostFile -Pattern $script:FacWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinW = Select-String -Path $JoinFile -Pattern $script:FacWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostW) { $why += "host never logged its FACWRITE" }
+    if ($null -eq $joinW) { $why += "join never logged its FACWRITE" }
+    foreach ($pair in @(@('host', $hostW), @('join', $joinW))) {
+        $side = $pair[0]; $w = $pair[1]
+        if ($w -and $w.Matches[0].Groups[4].Value -ne '1') { $why += "$side FACWRITE failed locally" }
+    }
+    $hRel = Get-FacRelSeries -File $HostFile
+    $jRel = Get-FacRelSeries -File $JoinFile
+
+    $crossed = 0
+    foreach ($leg in @(@($hostW, $jRel, 'host->join'), @($joinW, $hRel, 'join->host'))) {
+        $w = $leg[0]; $peer = $leg[1]; $tag = $leg[2]
+        if ($null -eq $w) { continue }
+        $sid = $w.Matches[0].Groups[2].Value
+        $tgt = [double]$w.Matches[0].Groups[3].Value
+        if (-not $peer.ContainsKey($sid)) { $why += "$tag sid '$sid' absent from peer FACREL series"; continue }
+        $end = $peer[$sid][$peer[$sid].Count - 1]
+        if (([math]::Abs($end.us - $tgt) -lt 0.5) -and ([math]::Abs($end.them - $tgt) -lt 0.5)) { $crossed++ }
+        else { $why += "$tag sentinel did not converge (peer sid '$sid' ended us=$($end.us) them=$($end.them), want $tgt)" }
+    }
+
+    # No drift on any co-visible row at the end of the run.
+    $diverged = @()
+    foreach ($sid in $hRel.Keys) {
+        if (-not $jRel.ContainsKey($sid)) { continue }
+        $h = $hRel[$sid][$hRel[$sid].Count - 1]
+        $j = $jRel[$sid][$jRel[$sid].Count - 1]
+        if (([math]::Abs($h.us - $j.us) -ge 0.5) -or ([math]::Abs($h.them - $j.them) -ge 0.5)) {
+            $diverged += "$sid(h:$($h.us)/$($h.them) j:$($j.us)/$($j.them))"
+        }
+    }
+    if ($diverged.Count -gt 0) { $why += ("final relations diverged: " + ($diverged -join ", ")) }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  FACTION-SYNC $v - crossed=$crossed/2 $detail"
+    return (Add-GateResult -Name "faction_sync" -Status $v `
+                -Metrics @{ crossed = $crossed; diverged = $diverged.Count } -Detail $detail)
+}
+
+# Shared GTIME parser: ordered series of @{hours; hourLen; fsm; paused; ok; t}.
+function Get-GTimeSeries {
+    param([string]$File)
+    $out = New-Object System.Collections.ArrayList
+    foreach ($m in @(Select-String -Path $File -Pattern "SCENARIO GTIME hours=(-?[\d.]+) hourLen=(-?[\d.]+) fsm=(-?[\d.]+) paused=(\d) ok=(\d) t=(\d+)" -ErrorAction SilentlyContinue)) {
+        [void]$out.Add(@{
+            hours   = [double]$m.Matches[0].Groups[1].Value
+            hourLen = [double]$m.Matches[0].Groups[2].Value
+            fsm     = [double]$m.Matches[0].Groups[3].Value
+            paused  = [int]$m.Matches[0].Groups[4].Value
+            ok      = [int]$m.Matches[0].Groups[5].Value
+            t       = [long]$m.Matches[0].Groups[6].Value
+        })
+    }
+    return ,$out
+}
+
+# Clock rate in game-hours per real second over a t-window of a GTIME series.
+function Get-ClockRate {
+    param($Series, [long]$FromMs, [long]$ToMs)
+    $w = @($Series | Where-Object { $_.ok -eq 1 -and $_.t -ge $FromMs -and $_.t -le $ToMs })
+    if ($w.Count -lt 2) { return $null }
+    $dt = ($w[-1].t - $w[0].t) / 1000.0
+    if ($dt -le 0) { return $null }
+    return ($w[-1].hours - $w[0].hours) / $dt
+}
+
+# time_probe (protocol 25 phase 0): game-clock baseline diagnostic. Gates only
+# that both sides logged a readable GTIME series and the clock is monotonic;
+# everything else is FINDINGs - absolute-vs-relative clock, initial offset,
+# drift rate, and whether the clock rate tracks the fsm burst (2x t=15..25s).
+function Test-TimeProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $h = Get-GTimeSeries -File $HostFile
+    $j = Get-GTimeSeries -File $JoinFile
+    $hOk = @($h | Where-Object { $_.ok -eq 1 })
+    $jOk = @($j | Where-Object { $_.ok -eq 1 })
+    if ($hOk.Count -lt 5) { $why += "host GTIME series too thin (ok=$($hOk.Count))" }
+    if ($jOk.Count -lt 5) { $why += "join GTIME series too thin (ok=$($jOk.Count))" }
+    foreach ($pair in @(@('host', $hOk), @('join', $jOk))) {
+        $s = $pair[1]
+        for ($i = 1; $i -lt $s.Count; $i++) {
+            if ($s[$i].hours -lt $s[$i-1].hours - 0.0001) {
+                $why += "$($pair[0]) clock went BACKWARDS at t=$($s[$i].t)"; break
+            }
+        }
+    }
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  TIME-PROBE $v - $detail"
+    if ($hOk.Count -gt 0 -and $jOk.Count -gt 0) {
+        $h0 = $hOk[0]; $j0 = $jOk[0]; $hN = $hOk[-1]; $jN = $jOk[-1]
+        Write-Host "    FINDING: host hours $($h0.hours)->$($hN.hours) hourLen=$($h0.hourLen); join $($j0.hours)->$($jN.hours) hourLen=$($j0.hourLen)"
+        $off0 = [math]::Round($h0.hours - $j0.hours, 5)
+        $offN = [math]::Round($hN.hours - $jN.hours, 5)
+        Write-Host "    FINDING: host-join offset start=$off0 end=$offN (drift=$([math]::Round($offN-$off0,5)) game-hours over the run)"
+        $pre   = Get-ClockRate -Series $hOk -FromMs 2000  -ToMs 14000
+        $burst = Get-ClockRate -Series $hOk -FromMs 16000 -ToMs 24000
+        if ($null -ne $pre -and $null -ne $burst -and $pre -gt 0) {
+            Write-Host "    FINDING: host clock rate pre-burst=$([math]::Round($pre,6)) gh/s, during 2x burst=$([math]::Round($burst,6)) gh/s (ratio=$([math]::Round($burst/$pre,2)))"
+        } else {
+            Write-Host "    FINDING: clock rate not measurable (pre=$pre burst=$burst)"
+        }
+    }
+    return (Add-GateResult -Name "time_probe" -Status $v `
+                -Metrics @{ hostSamples = $hOk.Count; joinSamples = $jOk.Count } -Detail $detail)
+}
+
+# time_sync (protocol 25): the gated clock-convergence oracle. Gates that both
+# clocks are readable and monotonic, that the final host-join offset is inside
+# tolerance, and that convergence survived the mid-run consensus 2x burst
+# (the last 5 s of wall-aligned samples all agree inside tolerance).
+# Parse the join's "[time] OFFSET off=Xgh slew=Y ..." trace into a summary of
+# the session-start clock catch-up (protocol 25): peak offset, how long the
+# slew was engaged, and whether it converged back to 1x before the log ended.
+# Returns $null when the log has no OFFSET lines (timeSync off / host log).
+function Get-SlewSummary {
+    param([string]$File)
+    if (-not (Test-Path $File)) { return $null }
+    $rx = "^\[(\d{2}:\d{2}:\d{2}\.\d{3})\].*\[time\] OFFSET off=(-?[\d.]+)gh slew=([\d.]+)"
+    $samples = @()
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $samples += @{ t    = [TimeSpan]::Parse($g[1].Value)
+                       off  = [math]::Abs([double]$g[2].Value)
+                       slew = [double]$g[3].Value }
+    }
+    if ($samples.Count -eq 0) { return $null }
+    $engaged = @($samples | Where-Object { $_.slew -lt 0.99 -or $_.slew -gt 1.01 })
+    $peakOff = 0.0; $peakSlew = 0.0
+    foreach ($s in $samples) {
+        if ($s.off -gt $peakOff) { $peakOff = $s.off }
+        if ($s.slew -gt $peakSlew) { $peakSlew = $s.slew }
+    }
+    $slewSecs = 0
+    if ($engaged.Count -gt 0) {
+        $slewSecs = [math]::Round(($engaged[-1].t - $engaged[0].t).TotalSeconds)
+    }
+    $last = $samples[-1]
+    return @{ peakOffGh = [math]::Round($peakOff, 4); peakSlew = $peakSlew
+              slewSecs = $slewSecs; lastSlew = $last.slew
+              lastOffGh = [math]::Round($last.off, 4)
+              converged = ($last.slew -ge 0.99 -and $last.slew -le 1.01) }
+}
+
+function Test-TimeSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $TOL = 0.02 # game hours (~1.2 game-minutes; ~1.2 real-seconds at default hourLen)
+    $why = @()
+    $h = @((Get-GTimeSeries -File $HostFile)  | Where-Object { $_.ok -eq 1 })
+    $j = @((Get-GTimeSeries -File $JoinFile)  | Where-Object { $_.ok -eq 1 })
+    if ($h.Count -lt 5) { $why += "host GTIME series too thin (ok=$($h.Count))" }
+    if ($j.Count -lt 5) { $why += "join GTIME series too thin (ok=$($j.Count))" }
+    foreach ($pair in @(@('host', $h), @('join', $j))) {
+        $s = $pair[1]
+        for ($i = 1; $i -lt $s.Count; $i++) {
+            if ($s[$i].hours -lt $s[$i-1].hours - 0.0001) {
+                $why += "$($pair[0]) clock went BACKWARDS at t=$($s[$i].t)"; break
+            }
+        }
+    }
+    $finalOff = $null
+    if ($h.Count -gt 0 -and $j.Count -gt 0) {
+        # Same-scenario elapsed timers start within the run_test launch skew;
+        # pair samples by nearest t (the series are both 1 Hz).
+        $tail = @($j | Where-Object { $_.t -ge ($j[-1].t - 5000) })
+        $worst = 0.0
+        foreach ($js in $tail) {
+            $near = $h | Sort-Object { [math]::Abs($_.t - $js.t) } | Select-Object -First 1
+            if ($null -eq $near -or [math]::Abs($near.t - $js.t) -gt 1500) { continue }
+            $d = [math]::Abs($near.hours - $js.hours)
+            if ($d -gt $worst) { $worst = $d }
+        }
+        $finalOff = [math]::Round($worst, 5)
+        if ($worst -gt $TOL) { $why += "final clock offset $finalOff game-hours exceeds tolerance $TOL" }
+    }
+    # Return-to-normal-speed gate (2026-07-10): catching up is only half the
+    # contract - the slew must DISENGAGE once converged, leaving BOTH clients
+    # at 1x. Join side: the last [time] OFFSET line must read slew~1.0.
+    # Both sides: the final GTIME fsm (effective sim-speed multiplier) must be
+    # back at 1x (the scenario's 2x burst window ends well before the tail).
+    $slew = Get-SlewSummary -File $JoinFile
+    $slewNote = "no slew engaged"
+    if ($null -ne $slew) {
+        $slewNote = "peakOff=$($slew.peakOffGh)gh peakSlew=$($slew.peakSlew) slewed=$($slew.slewSecs)s lastSlew=$($slew.lastSlew)"
+        if (-not $slew.converged) {
+            $why += "join slew never returned to 1x (last slew=$($slew.lastSlew), off=$($slew.lastOffGh)gh)"
+        }
+    }
+    foreach ($pair in @(@('host', $h), @('join', $j))) {
+        $s = $pair[1]
+        if ($s.Count -eq 0) { continue }
+        $lastFsm = $s[-1].fsm
+        if ([math]::Abs($lastFsm - 1.0) -gt 0.05) {
+            $why += "$($pair[0]) final sim speed fsm=$lastFsm (expected 1x after convergence)"
+        }
+    }
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  TIME-SYNC $v - finalOffset=$finalOff (tol=$TOL) $detail"
+    Write-Host "    FINDING: catch-up $slewNote"
+    return (Add-GateResult -Name "time_sync" -Status $v `
+                -Metrics @{ finalOffset = $finalOff } -Detail $detail)
+}
+
+# Parse the 1 Hz SCENARIO DOOR census into hand -> ordered samples
+# @{open; locked; hasLock; state; gate; name; t}.
+function Get-DoorSeries {
+    param([string]$File)
+    $out = @{}
+    $rx = "SCENARIO DOOR hand=([\d.]+) open=(-?\d+) locked=(-?\d+) hasLock=(-?\d+) state=(-?\d+) gate=(-?\d+) name='([^']*)' pos=\(([^)]*)\) t=(\d+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $hand = $g[1].Value
+        if (-not $out.ContainsKey($hand)) { $out[$hand] = @() }
+        $out[$hand] += @{ open = [int]$g[2].Value; locked = [int]$g[3].Value
+                          hasLock = [int]$g[4].Value; state = [int]$g[5].Value
+                          gate = [int]$g[6].Value; name = $g[7].Value; t = [long]$g[9].Value }
+    }
+    return $out
+}
+
+$script:DoorWriteRegex = 'SCENARIO DOORWRITE who=(host|join) hand=([\d.]+) want=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
+
+# door_probe (protocol 26 phase 0): baked-door baseline diagnostic. Gates only
+# that both sides logged a door census and attempted the sentinel toggle;
+# everything else is FINDINGs - hand census intersection (the wire-identity
+# question), whether the sentinel write stuck and which side it crossed to
+# (expected: none, doorSync forced off), and organic state changes.
+function Test-DoorProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostW = Select-String -Path $HostFile -Pattern $script:DoorWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinW = Select-String -Path $JoinFile -Pattern $script:DoorWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostW) { $why += "host never logged its DOORWRITE" }
+    if ($null -eq $joinW) { $why += "join never logged its DOORWRITE" }
+    $hDoor = Get-DoorSeries -File $HostFile
+    $jDoor = Get-DoorSeries -File $JoinFile
+    if ($hDoor.Keys.Count -eq 0) { $why += "host census saw no doors (move the scenario to a save with doors in range)" }
+    if ($jDoor.Keys.Count -eq 0) { $why += "join census saw no doors" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  DOOR-PROBE $v - $detail"
+
+    # FINDING: hand census overlap (the wire-identity question).
+    $common = @($hDoor.Keys | Where-Object { $jDoor.ContainsKey($_) })
+    Write-Host "    FINDING: DOOR hands host=$($hDoor.Keys.Count) join=$($jDoor.Keys.Count) common=$($common.Count)"
+
+    # FINDING per write leg: did it stick locally, did it cross to the peer?
+    foreach ($leg in @(@($hostW, $jDoor, 'host'), @($joinW, $hDoor, 'join'))) {
+        $w = $leg[0]; $peer = $leg[1]; $side = $leg[2]
+        if ($null -eq $w) { continue }
+        $hand = $w.Matches[0].Groups[2].Value
+        $want = [int]$w.Matches[0].Groups[3].Value
+        $ok   = $w.Matches[0].Groups[4].Value
+        $aft  = [int]$w.Matches[0].Groups[6].Value
+        $stuck = ($ok -eq '1') -and ($aft -eq $want)
+        $crossed = "hand-absent-on-peer"
+        if ($peer.ContainsKey($hand)) {
+            $end = $peer[$hand][$peer[$hand].Count - 1]
+            $crossed = if ($end.open -eq $want) { "CROSSED (peer open=$($end.open))" } else { "did NOT cross (peer open=$($end.open))" }
+        }
+        Write-Host "    FINDING: $side sentinel hand=$hand want=$want stuck=$stuck -> $crossed"
+    }
+    # FINDING: organic open-state flips per side (NPCs using doors).
+    foreach ($pair in @(@('host', $hDoor), @('join', $jDoor))) {
+        $flips = 0
+        foreach ($hand in $pair[1].Keys) {
+            $s = $pair[1][$hand]
+            for ($i = 1; $i -lt $s.Count; $i++) { if ($s[$i].open -ne $s[$i-1].open) { $flips++ } }
+        }
+        Write-Host "    FINDING: $($pair[0]) open-state flips across the series=$flips"
+    }
+    return (Add-GateResult -Name "door_probe" -Status $v `
+                -Metrics @{ commonHands = $common.Count } -Detail $detail)
+}
+
+# door_sync (protocol 26): the gated door-convergence oracle. Each side toggled
+# a sentinel door; the gate is that each sentinel CROSSED - the peer's census
+# OBSERVED the writer's target open state at some sample AFTER the write (the
+# saves in use can have a single co-visible door, so both legs may hit the SAME
+# door and organic NPC use may flip it later; final-state-equals-want would
+# misjudge that) - and that no co-visible door ENDED diverged (host and join
+# final open states agree per common hand).
+function Test-DoorSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostW = Select-String -Path $HostFile -Pattern $script:DoorWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinW = Select-String -Path $JoinFile -Pattern $script:DoorWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostW) { $why += "host never logged its DOORWRITE" }
+    if ($null -eq $joinW) { $why += "join never logged its DOORWRITE" }
+    $hDoor = Get-DoorSeries -File $HostFile
+    $jDoor = Get-DoorSeries -File $JoinFile
+    if ($hDoor.Keys.Count -eq 0) { $why += "host census saw no doors" }
+    if ($jDoor.Keys.Count -eq 0) { $why += "join census saw no doors" }
+
+    # Scenario-elapsed t is comparable across the logs (both sides arm within
+    # the launch skew); the write line carries its own t.
+    $writeTRx = 't=(\d+)$'
+    $crossed = 0
+    foreach ($leg in @(@($hostW, $jDoor, 'host'), @($joinW, $hDoor, 'join'))) {
+        $w = $leg[0]; $peer = $leg[1]; $side = $leg[2]
+        if ($null -eq $w) { continue }
+        $hand = $w.Matches[0].Groups[2].Value
+        $want = [int]$w.Matches[0].Groups[3].Value
+        if ($w.Matches[0].Groups[4].Value -ne '1') { $why += "$side sentinel write failed locally"; continue }
+        if (-not $peer.ContainsKey($hand)) { $why += "$side sentinel hand=$hand absent from peer census"; continue }
+        $wt = 0
+        if ($w.Line -match $writeTRx) { $wt = [long]$Matches[1] }
+        $seen = @($peer[$hand] | Where-Object { $_.t -ge ($wt - 500) -and $_.open -eq $want })
+        if ($seen.Count -gt 0) { $crossed++ }
+        else { $why += "$side sentinel did not cross (hand=$hand want=$want never observed on peer after t=$wt)" }
+    }
+
+    # No co-visible door may END diverged (final open state per common hand).
+    $diverged = 0
+    foreach ($hand in @($hDoor.Keys | Where-Object { $jDoor.ContainsKey($_) })) {
+        $he = $hDoor[$hand][$hDoor[$hand].Count - 1]
+        $je = $jDoor[$hand][$jDoor[$hand].Count - 1]
+        if ($he.open -ne $je.open) {
+            $diverged++
+            $why += "co-visible door hand=$hand ended diverged (host open=$($he.open) join open=$($je.open))"
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  DOOR-SYNC $v - crossed=$crossed diverged=$diverged $detail"
+    return (Add-GateResult -Name "door_sync" -Status $v `
+                -Metrics @{ crossed = $crossed; diverged = $diverged } -Detail $detail)
+}
+
+# Parse the 1 Hz SCENARIO BUILDSITE census into hand -> ordered samples
+# @{sid; prog; complete; name; t}. Only construction sites appear (complete
+# buildings are filtered out by the enumerator).
+function Get-BuildSeries {
+    param([string]$File)
+    $out = @{}
+    $rx = "SCENARIO BUILDSITE hand=([\d.]+) sid='([^']*)' prog=([-\d.]+) complete=(-?\d+) name='([^']*)' pos=\(([^)]*)\) t=(\d+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $hand = $g[1].Value
+        if (-not $out.ContainsKey($hand)) { $out[$hand] = @() }
+        $out[$hand] += @{ sid = $g[2].Value; prog = [double]$g[3].Value
+                          complete = [int]$g[4].Value; name = $g[5].Value
+                          t = [long]$g[7].Value }
+    }
+    return $out
+}
+
+$script:BuildPlaceRegex = "SCENARIO BUILDPLACE who=(host|join) rc=(-?\d+) ok=(\d) sid='([^']*)' hand=([\d.]+) pos=\(([^)]*)\) yaw=([-\d.]+) t=(\d+)"
+$script:BuildProgRegex  = "SCENARIO BUILDPROG who=(host|join) step=(\d+) write=([-\d.]+) ok=(\d) prog=([-\d.]+) complete=(-?\d+) t=(\d+)"
+
+# build_probe (protocol 27 phase 0): placed-building baseline diagnostic
+# (buildSync forced OFF). Gates that both sides ATTEMPTED the programmatic
+# placement and that at least one placement was ACCEPTED and the minted site
+# appeared in its OWN census (the factory + census levers work somewhere - if
+# both refuse, the save is unbuildable and the scenario must move). Everything
+# else is FINDINGs feeding the protocol-27 design:
+#   * factory-vs-town-rules: rc/ok per side (does createBuilding bypass the
+#     UI's placementVerification where the scenario runs?);
+#   * runtime hands: census intersection across clients (expected: the OWN
+#     site is absent from the peer - host-only hands, nothing crosses);
+#   * progress lever: the BUILDPROG ramp (did prog track the writes, did
+#     complete flip at >= 1.0 - the self-complete/scale findings).
+function Test-BuildProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostP = Select-String -Path $HostFile -Pattern $script:BuildPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinP = Select-String -Path $JoinFile -Pattern $script:BuildPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostP) { $why += "host never logged its BUILDPLACE" }
+    if ($null -eq $joinP) { $why += "join never logged its BUILDPLACE" }
+    $hSites = Get-BuildSeries -File $HostFile
+    $jSites = Get-BuildSeries -File $JoinFile
+
+    $placedOk = 0
+    foreach ($leg in @(@($hostP, $hSites, $jSites, 'host'), @($joinP, $jSites, $hSites, 'join'))) {
+        $p = $leg[0]; $own = $leg[1]; $peer = $leg[2]; $side = $leg[3]
+        if ($null -eq $p) { continue }
+        $g = $p.Matches[0].Groups
+        $rc = $g[2].Value; $ok = $g[3].Value; $sid = $g[4].Value; $hand = $g[5].Value
+        Write-Host "    FINDING: $side placement rc=$rc ok=$ok sid='$sid' hand=$hand (factory-vs-town-rules answer)"
+        if ($ok -ne '1') { continue }
+        $placedOk++
+        # The minted site must survive into the placer's OWN census.
+        if ($own.ContainsKey($hand)) {
+            $s = $own[$hand]
+            Write-Host "    FINDING: $side own site enumerable, census samples=$($s.Count) firstProg=$($s[0].prog) lastProg=$($s[$s.Count-1].prog) lastComplete=$($s[$s.Count-1].complete)"
+        } else {
+            # Completion REMOVES a site from the census (enumSitesNear filters
+            # complete buildings) - only flag when the ramp never confirmed it.
+            $why += "$side minted site hand=$hand never appeared in its own census"
+        }
+        # Cross-visibility (expected: absent - runtime hand, no channel).
+        $vis = if ($peer.ContainsKey($hand)) { "VISIBLE on peer (unexpected - hand resolved?)" } else { "absent from peer census (expected: runtime hand, nothing crosses)" }
+        Write-Host "    FINDING: $side site hand=$hand $vis"
+    }
+    if (($null -ne $hostP) -and ($null -ne $joinP) -and $placedOk -eq 0) {
+        $why += "BOTH placements refused - the factory does not bypass placement rules here; move the scenario to a buildable save"
+    }
+
+    # FINDING: the progress ramp per side (lever + scale + self-complete).
+    foreach ($pair in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
+        $steps = @(Select-String -Path $pair[0] -Pattern $script:BuildProgRegex -ErrorAction SilentlyContinue)
+        if ($steps.Count -eq 0) { Write-Host "    FINDING: $($pair[1]) ramp never ran (placement refused or write lever dead)"; continue }
+        $last = $steps[$steps.Count - 1].Matches[0].Groups
+        Write-Host "    FINDING: $($pair[1]) ramp steps=$($steps.Count) lastWrite=$($last[3].Value) lastProg=$($last[5].Value) complete=$($last[6].Value)"
+    }
+    # FINDING: census hand overlap across clients (the wire-identity question).
+    $common = @($hSites.Keys | Where-Object { $jSites.ContainsKey($_) })
+    Write-Host "    FINDING: BUILD hands host=$($hSites.Keys.Count) join=$($jSites.Keys.Count) common=$($common.Count)"
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  BUILD-PROBE $v - placedOk=$placedOk $detail"
+    return (Add-GateResult -Name "build_probe" -Status $v `
+                -Metrics @{ placedOk = $placedOk; commonHands = $common.Count } -Detail $detail)
+}
+
+# build_sync (protocol 27): the gated placed-building convergence oracle. Each
+# side placed one building programmatically (the same script as build_probe);
+# the gate is the full describe/mint + progress leg in BOTH directions:
+#   1. both BUILDPLACE ok=1 (the local placements landed);
+#   2. each placement was MINTED on the peer (a "[build] MINT key=<placer
+#      hand> ... rc=1" with the placer's key);
+#   3. the placer's progress ramp CROSSED: the peer applied at least one
+#      STATE row for that key (ok=1) and observed the complete=1 latch.
+function Test-BuildSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostP = Select-String -Path $HostFile -Pattern $script:BuildPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinP = Select-String -Path $JoinFile -Pattern $script:BuildPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostP) { $why += "host never logged its BUILDPLACE" }
+    if ($null -eq $joinP) { $why += "join never logged its BUILDPLACE" }
+
+    $minted = 0; $crossed = 0
+    foreach ($leg in @(@($hostP, $JoinFile, 'host'), @($joinP, $HostFile, 'join'))) {
+        $p = $leg[0]; $peerFile = $leg[1]; $side = $leg[2]
+        if ($null -eq $p) { continue }
+        $g = $p.Matches[0].Groups
+        if ($g[3].Value -ne '1') { $why += "$side placement failed locally (ok=0)"; continue }
+        $key = $g[5].Value
+        # 2. the peer minted the placer's key
+        $mintRx = "\[build\] MINT key=$([regex]::Escape($key)) sid='[^']*' ui=\d rc=(-?\d+) local=([\d.]+)"
+        $mint = Select-String -Path $peerFile -Pattern $mintRx -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $mint) { $why += "$side placement key=$key never MINTED on peer"; continue }
+        if ($mint.Matches[0].Groups[1].Value -ne '1') {
+            $why += "$side placement key=$key mint REFUSED on peer (rc=$($mint.Matches[0].Groups[1].Value))"; continue
+        }
+        $minted++
+        # 3. progress rows applied on the peer, up to the complete latch
+        $stateRx = "\[build\] STATE-RECV key=$([regex]::Escape($key)) prog=([-\d.]+) complete=(\d) ok=(\d)"
+        $rows = @(Select-String -Path $peerFile -Pattern $stateRx -ErrorAction SilentlyContinue)
+        $applied = @($rows | Where-Object { $_.Matches[0].Groups[3].Value -eq '1' })
+        $done    = @($applied | Where-Object { $_.Matches[0].Groups[2].Value -eq '1' })
+        if ($applied.Count -eq 0) { $why += "$side progress never crossed (no applied STATE-RECV for key=$key on peer)"; continue }
+        if ($done.Count -eq 0)    { $why += "$side site never completed on peer (no applied complete=1 row for key=$key)"; continue }
+        $crossed++
+        Write-Host "    FINDING: $side key=$key minted on peer (local=$($mint.Matches[0].Groups[2].Value)), applied rows=$($applied.Count), complete latched"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  BUILD-SYNC $v - minted=$minted crossed=$crossed $detail"
+    return (Add-GateResult -Name "build_sync" -Status $v `
+                -Metrics @{ minted = $minted; crossed = $crossed } -Detail $detail)
+}
+
+# Parse the 1 Hz SCENARIO BDOOR census into doorHand -> ordered samples
+# @{bhand; idx; open; locked; state; name; t} (bhand = owning building hand).
+function Get-BdoorSeries {
+    param([string]$File)
+    $out = @{}
+    $rx = "SCENARIO BDOOR bhand=([\d.]+) idx=(-?\d+) hand=([\d.]+) open=(-?\d+) locked=(-?\d+) state=(-?\d+) name='([^']*)' t=(\d+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $hand = $g[3].Value
+        if (-not $out.ContainsKey($hand)) { $out[$hand] = @() }
+        $out[$hand] += @{ bhand = $g[1].Value; idx = [int]$g[2].Value
+                          open = [int]$g[4].Value; locked = [int]$g[5].Value
+                          state = [int]$g[6].Value; name = $g[7].Value
+                          t = [long]$g[8].Value }
+    }
+    return $out
+}
+
+$script:BdoorWriteRegex   = 'SCENARIO BDOORWRITE who=(host|join) bhand=([\d.]+) idx=0 want=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+) t=(\d+)'
+$script:BdestroyRegex     = 'SCENARIO BDESTROY who=(host|join) hand=([\d.]+) ok=(\d) stillResolves=(\d) t=(\d+)'
+
+# Peer-side translation: the local hand the peer minted for a placer key
+# ("[build] MINT key=... rc=1 local=..."). Returns $null when never minted.
+function Get-MintLocalHand {
+    param([string]$PeerFile, [string]$PlacerKey)
+    $rx = "\[build\] MINT key=$([regex]::Escape($PlacerKey)) sid='[^']*' ui=\d rc=1 local=([\d.]+)"
+    $m = Select-String -Path $PeerFile -Pattern $rx -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $m) { return $null }
+    return $m.Matches[0].Groups[1].Value
+}
+
+# bdoor_probe (protocol 28 phase 0): placed-door + removal baseline diagnostic
+# (bdoorSync forced OFF, the protocol-27 mint channel ON). Gates the LOCAL
+# legs on both sides: shack placed ok, its door #0 toggled ok (proves minted
+# buildings have DoorStuff children + the polite lever works on runtime
+# doors), and the host's programmatic destroy worked. Everything else is
+# FINDINGs feeding the protocol-28 design:
+#   * does the peer's MINTED proxy have doors (census rows whose bhand is the
+#     mint's local hand - the translation identity the channel rides on)?
+#   * did the toggle CROSS (expected: no - the gap being proven)?
+#   * did the host's destroy remove the JOIN's proxy (expected: no - the
+#     ghost finding proving the removal gap)?
+function Test-BdoorProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostP = Select-String -Path $HostFile -Pattern $script:BuildPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinP = Select-String -Path $JoinFile -Pattern $script:BuildPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostP -or $hostP.Matches[0].Groups[3].Value -ne '1') { $why += "host shack placement missing/failed" }
+    if ($null -eq $joinP -or $joinP.Matches[0].Groups[3].Value -ne '1') { $why += "join shack placement missing/failed" }
+    $hostW = Select-String -Path $HostFile -Pattern $script:BdoorWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinW = Select-String -Path $JoinFile -Pattern $script:BdoorWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostW -or $hostW.Matches[0].Groups[4].Value -ne '1') { $why += "host door toggle missing/failed (no door on the placed shack?)" }
+    if ($null -eq $joinW -or $joinW.Matches[0].Groups[4].Value -ne '1') { $why += "join door toggle missing/failed" }
+    $hostD = Select-String -Path $HostFile -Pattern $script:BdestroyRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostD -or $hostD.Matches[0].Groups[3].Value -ne '1') { $why += "host destroy missing/failed" }
+
+    $hDoors = Get-BdoorSeries -File $HostFile
+    $jDoors = Get-BdoorSeries -File $JoinFile
+
+    # FINDING per side: does the peer's minted PROXY have doors?
+    foreach ($leg in @(@($hostP, $JoinFile, $jDoors, 'host'), @($joinP, $HostFile, $hDoors, 'join'))) {
+        $p = $leg[0]; $peerFile = $leg[1]; $peerDoors = $leg[2]; $side = $leg[3]
+        if ($null -eq $p) { continue }
+        $key = $p.Matches[0].Groups[5].Value
+        $local = Get-MintLocalHand -PeerFile $peerFile -PlacerKey $key
+        if ($null -eq $local) { Write-Host "    FINDING: $side shack key=$key never minted on peer"; continue }
+        $proxyDoors = @($peerDoors.Keys | Where-Object { $peerDoors[$_][0].bhand -eq $local })
+        Write-Host "    FINDING: $side shack proxy (peer local=$local) has $($proxyDoors.Count) door(s) in the peer census"
+        # FINDING: did the toggle cross onto the proxy door (expected: no)?
+        $w = if ($side -eq 'host') { $hostW } else { $joinW }
+        if ($null -ne $w -and $proxyDoors.Count -gt 0) {
+            $want = [int]$w.Matches[0].Groups[3].Value
+            $wt   = [long]$w.Matches[0].Groups[7].Value
+            $seen = 0
+            foreach ($dh in $proxyDoors) {
+                $seen += @($peerDoors[$dh] | Where-Object { $_.t -ge ($wt - 500) -and $_.open -eq $want }).Count
+            }
+            $crossTxt = if ($seen -gt 0) { "CROSSED (unexpected with bdoorSync off)" } else { "did NOT cross (expected: the gap)" }
+            Write-Host "    FINDING: $side door toggle want=$want -> $crossTxt"
+        }
+    }
+    # FINDING: the ghost - does the host's destroyed shack proxy survive on the join?
+    if ($null -ne $hostP -and $null -ne $hostD) {
+        $key = $hostP.Matches[0].Groups[5].Value
+        $local = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $key
+        $dt = [long]$hostD.Matches[0].Groups[5].Value
+        if ($null -ne $local) {
+            $late = 0
+            foreach ($dh in @($jDoors.Keys | Where-Object { $jDoors[$_][0].bhand -eq $local })) {
+                $late += @($jDoors[$dh] | Where-Object { $_.t -ge ($dt + 2000) }).Count
+            }
+            $ghostTxt = if ($late -gt 0) { "GHOST persists on join ($late door samples after destroy - the removal gap)" } else { "proxy gone from join census after destroy" }
+            Write-Host "    FINDING: host destroy at t=$dt -> $ghostTxt"
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  BDOOR-PROBE $v - $detail"
+    return (Add-GateResult -Name "bdoor_probe" -Status $v -Metrics @{} -Detail $detail)
+}
+
+# bdoor_sync (protocol 28): the gated placed-door + removal convergence
+# oracle. Same script as bdoor_probe (shack + ramp + toggle + host destroy),
+# bdoorSync ON. Gates, per direction:
+#   1. the local legs (BUILDPLACE ok=1, BDOORWRITE ok=1; host BDESTROY ok=1);
+#   2. each side's door toggle CROSSED: the peer logged an applied
+#      "[bdoor] RECV key=<placer hand> idx=0 ... ok=1" AND its census shows
+#      the proxy door at the toggled state after the write;
+#   3. the host's destroy REMOVED the join's proxy: the join logged
+#      "[build] REMOVE-RECV key=<host hand> ok=1" and its census has NO proxy
+#      door samples afterwards (the probe's ghost, exorcised).
+function Test-BdoorSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostP = Select-String -Path $HostFile -Pattern $script:BuildPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinP = Select-String -Path $JoinFile -Pattern $script:BuildPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostP -or $hostP.Matches[0].Groups[3].Value -ne '1') { $why += "host shack placement missing/failed" }
+    if ($null -eq $joinP -or $joinP.Matches[0].Groups[3].Value -ne '1') { $why += "join shack placement missing/failed" }
+    $hostW = Select-String -Path $HostFile -Pattern $script:BdoorWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinW = Select-String -Path $JoinFile -Pattern $script:BdoorWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostW -or $hostW.Matches[0].Groups[4].Value -ne '1') { $why += "host door toggle missing/failed" }
+    if ($null -eq $joinW -or $joinW.Matches[0].Groups[4].Value -ne '1') { $why += "join door toggle missing/failed" }
+    $hostD = Select-String -Path $HostFile -Pattern $script:BdestroyRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostD -or $hostD.Matches[0].Groups[3].Value -ne '1') { $why += "host destroy missing/failed" }
+
+    $hDoors = Get-BdoorSeries -File $HostFile
+    $jDoors = Get-BdoorSeries -File $JoinFile
+
+    $crossed = 0
+    foreach ($leg in @(@($hostP, $hostW, $JoinFile, $jDoors, 'host'), @($joinP, $joinW, $HostFile, $hDoors, 'join'))) {
+        $p = $leg[0]; $w = $leg[1]; $peerFile = $leg[2]; $peerDoors = $leg[3]; $side = $leg[4]
+        if ($null -eq $p -or $null -eq $w) { continue }
+        $key = $p.Matches[0].Groups[5].Value
+        $want = [int]$w.Matches[0].Groups[3].Value
+        $wt   = [long]$w.Matches[0].Groups[7].Value
+        # 2a. the peer applied a bdoor row for the placer key
+        $recvRx = "\[bdoor\] RECV key=$([regex]::Escape($key)) idx=0 open=$want locked=\d was=-?\d/-?\d ok=1"
+        $recv = Select-String -Path $peerFile -Pattern $recvRx -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $recv) { $why += "$side door toggle never applied on peer (no [bdoor] RECV ok=1 for key=$key)"; continue }
+        # 2b. the peer's census shows the proxy door at the toggled state
+        $local = Get-MintLocalHand -PeerFile $peerFile -PlacerKey $key
+        if ($null -eq $local) { $why += "$side shack key=$key never minted on peer"; continue }
+        $seen = 0
+        foreach ($dh in @($peerDoors.Keys | Where-Object { $peerDoors[$_][0].bhand -eq $local })) {
+            $seen += @($peerDoors[$dh] | Where-Object { $_.t -ge ($wt - 500) -and $_.open -eq $want }).Count
+        }
+        if ($seen -eq 0) { $why += "$side toggle applied but peer census never showed proxy door open=$want"; continue }
+        $crossed++
+        Write-Host "    FINDING: $side door toggle want=$want CROSSED (peer applied + $seen census samples)"
+    }
+
+    # 3. the removal leg (host destroys; join's proxy must go)
+    $removed = 0
+    if ($null -ne $hostP -and $null -ne $hostD) {
+        $key = $hostP.Matches[0].Groups[5].Value
+        $recvRx = "\[build\] REMOVE-RECV key=$([regex]::Escape($key)) ok=1"
+        $recv = Select-String -Path $JoinFile -Pattern $recvRx -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $recv) {
+            $why += "host destroy never applied on join (no [build] REMOVE-RECV ok=1 for key=$key)"
+        } else {
+            $local = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $key
+            $dt = [long]$hostD.Matches[0].Groups[5].Value
+            $late = 0
+            if ($null -ne $local) {
+                foreach ($dh in @($jDoors.Keys | Where-Object { $jDoors[$_][0].bhand -eq $local })) {
+                    $late += @($jDoors[$dh] | Where-Object { $_.t -ge ($dt + 4000) }).Count
+                }
+            }
+            if ($late -gt 0) {
+                $why += "join proxy GHOST survived the removal ($late door samples after destroy)"
+            } else {
+                $removed = 1
+                Write-Host "    FINDING: host destroy CROSSED - join proxy gone (0 census samples after t=$dt+4s)"
+            }
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  BDOOR-SYNC $v - crossed=$crossed removed=$removed $detail"
+    return (Add-GateResult -Name "bdoor_sync" -Status $v `
+                -Metrics @{ crossed = $crossed; removed = $removed } -Detail $detail)
+}
+
+# Parse the 1 Hz SCENARIO HUNGER census into hand -> ordered samples
+# @{hunger; fed; dazed; t} (protocol 29).
+function Get-HungerSeries {
+    param([string]$File)
+    $out = @{}
+    $rx = "SCENARIO HUNGER hand=([\d.]+) hunger=([-\d.]+) fed=([-\d.]+) dazed=([-\d.]+) t=(\d+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $hand = $g[1].Value
+        if (-not $out.ContainsKey($hand)) { $out[$hand] = @() }
+        $out[$hand] += @{ hunger = [double]$g[2].Value; fed = [double]$g[3].Value
+                          dazed = [double]$g[4].Value; t = [long]$g[5].Value }
+    }
+    return $out
+}
+
+$script:HungerWriteRegex = 'SCENARIO HUNGERWRITE who=(host|join) hand=([\d.]+) before=([-\d.]+) write=([-\d.]+) after=([-\d.]+) ok=(\d) t=(\d+)'
+
+# hunger_probe (protocol 29 phase 0): hunger baseline diagnostic (hungerSync
+# forced OFF; the rest of the medical snapshot streams as usual). Gates the
+# LOCAL legs on both sides: the 1 Hz census ran and each side's sentinel
+# hunger write (own-tab leader, current * 0.6) stuck. Everything else is
+# FINDINGs feeding the protocol-29 fold-in:
+#   * hunger scale + per-client decay for the SAME hand (rate agreement);
+#   * did the sentinel CROSS (expected: no - the gap being proven)?
+#   * owner-vs-copy divergence magnitude at end of run;
+#   * dazedOrAlert value range (drunk/drug evidence for the deferred half).
+function Test-HungerProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostW = Select-String -Path $HostFile -Pattern $script:HungerWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinW = Select-String -Path $JoinFile -Pattern $script:HungerWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostW -or $hostW.Matches[0].Groups[6].Value -ne '1') { $why += "host sentinel hunger write missing/failed" }
+    if ($null -eq $joinW -or $joinW.Matches[0].Groups[6].Value -ne '1') { $why += "join sentinel hunger write missing/failed" }
+    $hSeries = Get-HungerSeries -File $HostFile
+    $jSeries = Get-HungerSeries -File $JoinFile
+    if ($hSeries.Keys.Count -eq 0) { $why += "host hunger census empty" }
+    if ($jSeries.Keys.Count -eq 0) { $why += "join hunger census empty" }
+
+    # FINDING: scale + per-client decay agreement for every shared hand.
+    foreach ($hand in @($hSeries.Keys | Where-Object { $jSeries.ContainsKey($_) })) {
+        $hs = $hSeries[$hand]; $js = $jSeries[$hand]
+        if ($hs.Count -lt 2 -or $js.Count -lt 2) { continue }
+        $hRate = ($hs[$hs.Count-1].hunger - $hs[0].hunger) / [math]::Max(1, ($hs[$hs.Count-1].t - $hs[0].t) / 1000.0)
+        $jRate = ($js[$js.Count-1].hunger - $js[0].hunger) / [math]::Max(1, ($js[$js.Count-1].t - $js[0].t) / 1000.0)
+        Write-Host ("    FINDING: hand=$hand host first={0:N2} last={1:N2} rate={2:N4}/s | join first={3:N2} last={4:N2} rate={5:N4}/s endGap={6:N2}" -f `
+            $hs[0].hunger, $hs[$hs.Count-1].hunger, $hRate, $js[0].hunger, $js[$js.Count-1].hunger, $jRate, `
+            [math]::Abs($hs[$hs.Count-1].hunger - $js[$js.Count-1].hunger))
+    }
+    # FINDING: sentinel crossing per side (expected: no with hungerSync off).
+    # Crossing = the peer's copy shows a DROP of at least half the sentinel
+    # step within 10 s of the write (drop-relative: the run-171751 lesson -
+    # an absolute tolerance wider than the engine's ~0..3 hunger scale calls
+    # everything a cross).
+    foreach ($leg in @(@($hostW, $jSeries, 'host'), @($joinW, $hSeries, 'join'))) {
+        $w = $leg[0]; $peer = $leg[1]; $side = $leg[2]
+        if ($null -eq $w) { continue }
+        $g = $w.Matches[0].Groups
+        $hand = $g[2].Value
+        $before = [double]$g[3].Value; $want = [double]$g[4].Value; $wt = [long]$g[7].Value
+        $drop = $before - $want
+        if (-not $peer.ContainsKey($hand)) { Write-Host "    FINDING: $side sentinel hand=$hand absent from peer census"; continue }
+        $pre = @($peer[$hand] | Where-Object { $_.t -lt $wt }) | Select-Object -Last 1
+        $preH = if ($null -ne $pre) { $pre.hunger } else { $before }
+        $hit = @($peer[$hand] | Where-Object { $_.t -ge $wt -and $_.t -le ($wt + 10000) -and ($preH - $_.hunger) -ge ($drop * 0.5) })
+        $crossTxt = if ($hit.Count -gt 0) { "CROSSED (unexpected with hungerSync off)" } else { "did NOT cross (expected: the gap)" }
+        Write-Host ("    FINDING: $side sentinel write={0:N2} (drop {1:N2}) -> $crossTxt" -f $want, $drop)
+    }
+    # FINDING: dazedOrAlert range (drunk/drug-evidence for the deferred half).
+    foreach ($pair in @(@($hSeries, 'host'), @($jSeries, 'join'))) {
+        $all = @(); foreach ($k in $pair[0].Keys) { $all += @($pair[0][$k] | ForEach-Object { $_.dazed }) }
+        if ($all.Count -gt 0) {
+            $mn = ($all | Measure-Object -Minimum).Minimum; $mx = ($all | Measure-Object -Maximum).Maximum
+            Write-Host ("    FINDING: $($pair[1]) dazedOrAlert range [{0:N3} .. {1:N3}] over $($all.Count) samples" -f $mn, $mx)
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  HUNGER-PROBE $v - $detail"
+    return (Add-GateResult -Name "hunger_probe" -Status $v -Metrics @{} -Detail $detail)
+}
+
+# hunger_sync (protocol 29): the gated hunger convergence oracle. Same script
+# as hunger_probe (1 Hz census + proportional sentinel per side), hungerSync
+# ON. Gates, per direction:
+#   1. the local leg (HUNGERWRITE ok=1);
+#   2. the sentinel CROSSED: the peer's copy of that hand shows at least half
+#      the sentinel's drop within 10 s of the write (drop-relative - the
+#      engine's scale is ~0..3, absolute tolerances are useless);
+#   3. end-of-run owner-vs-copy agreement: for every hand in both censuses
+#      the final hunger gap is small (<= 0.35, ~10% of scale - covers the
+#      change-gate quantization + one decay interval).
+function Test-HungerSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostW = Select-String -Path $HostFile -Pattern $script:HungerWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinW = Select-String -Path $JoinFile -Pattern $script:HungerWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostW -or $hostW.Matches[0].Groups[6].Value -ne '1') { $why += "host sentinel hunger write missing/failed" }
+    if ($null -eq $joinW -or $joinW.Matches[0].Groups[6].Value -ne '1') { $why += "join sentinel hunger write missing/failed" }
+    $hSeries = Get-HungerSeries -File $HostFile
+    $jSeries = Get-HungerSeries -File $JoinFile
+
+    $crossed = 0
+    foreach ($leg in @(@($hostW, $jSeries, 'host'), @($joinW, $hSeries, 'join'))) {
+        $w = $leg[0]; $peer = $leg[1]; $side = $leg[2]
+        if ($null -eq $w) { continue }
+        $g = $w.Matches[0].Groups
+        $hand = $g[2].Value
+        $before = [double]$g[3].Value; $want = [double]$g[4].Value; $wt = [long]$g[7].Value
+        $drop = $before - $want
+        if (-not $peer.ContainsKey($hand)) { $why += "$side sentinel hand=$hand absent from peer census"; continue }
+        $pre = @($peer[$hand] | Where-Object { $_.t -lt $wt }) | Select-Object -Last 1
+        $preH = if ($null -ne $pre) { $pre.hunger } else { $before }
+        $hit = @($peer[$hand] | Where-Object { $_.t -ge $wt -and $_.t -le ($wt + 10000) -and ($preH - $_.hunger) -ge ($drop * 0.5) })
+        if ($hit.Count -eq 0) { $why += "$side sentinel (drop $([math]::Round($drop,2))) never crossed onto the peer copy"; continue }
+        $crossed++
+        Write-Host ("    FINDING: $side sentinel write={0:N2} (drop {1:N2}) CROSSED ({2} peer samples within 10 s)" -f $want, $drop, $hit.Count)
+    }
+
+    # 3. end-of-run agreement for every shared hand.
+    $maxGap = 0.0
+    foreach ($hand in @($hSeries.Keys | Where-Object { $jSeries.ContainsKey($_) })) {
+        $hs = $hSeries[$hand]; $js = $jSeries[$hand]
+        $gap = [math]::Abs($hs[$hs.Count-1].hunger - $js[$js.Count-1].hunger)
+        if ($gap -gt $maxGap) { $maxGap = $gap }
+        if ($gap -gt 0.35) { $why += "hand=$hand final hunger diverged (gap $([math]::Round($gap,2)) > 0.35)" }
+    }
+    Write-Host ("    FINDING: final owner-vs-copy max hunger gap {0:N3}" -f $maxGap)
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  HUNGER-SYNC $v - crossed=$crossed maxGap=$([math]::Round($maxGap,3)) $detail"
+    return (Add-GateResult -Name "hunger_sync" -Status $v `
+                -Metrics @{ crossed = $crossed; maxGap = $maxGap } -Detail $detail)
+}
+
+# Parse the 1 Hz SCENARIO PROD machine census into hand -> ordered samples
+# @{class; power; pwrOut; state; outSid; outAmt; in0Amt; in1Amt; tech; grown;
+# sid; name; t} (protocol 33).
+function Get-ProdSeries {
+    param([string]$File)
+    $out = @{}
+    $rx = "SCENARIO PROD hand=([\d.]+) class=(-?\d+) power=(-?\d+) pwrOut=([-\d.]+) state=(-?\d+) mine=([-\d.]+) out='([^']*)' outAmt=([-\d.]+) outCap=(-?\d+) in0='([^']*)' in0Amt=([-\d.]+) in1='([^']*)' in1Amt=([-\d.]+) tech=(-?\d+) grown=([-\d.]+) died=([-\d.]+) harv=(-?\d+) sid='([^']*)' name='([^']*)' t=(\d+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $hand = $g[1].Value
+        if (-not $out.ContainsKey($hand)) { $out[$hand] = @() }
+        $out[$hand] += @{ class = [int]$g[2].Value; power = [int]$g[3].Value
+                          pwrOut = [double]$g[4].Value; state = [int]$g[5].Value
+                          mine = [double]$g[6].Value; outSid = $g[7].Value
+                          outAmt = [double]$g[8].Value; outCap = [int]$g[9].Value
+                          in0Amt = [double]$g[11].Value; in1Amt = [double]$g[13].Value
+                          tech = [int]$g[14].Value; grown = [double]$g[15].Value
+                          sid = $g[18].Value; name = $g[19].Value
+                          t = [long]$g[20].Value }
+    }
+    return $out
+}
+
+$script:ProdPlaceRegex    = "SCENARIO PRODPLACE who=(host|join) genRc=(-?\d+) genOk=(\d) genSid='([^']*)' genHand=([\d.]+) benchRc=(-?\d+) benchOk=(\d) benchSid='([^']*)' benchHand=([\d.]+) t=(\d+)"
+$script:ProdPowerRegex    = 'SCENARIO PRODWRITE who=(host|join) kind=power want=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+) pwrOut=([-\d.]+) t=(\d+)'
+$script:ProdOutWriteRegex = "SCENARIO PRODWRITE who=(host|join) kind=(setitem|direct) want=([-\d.]+) ok=(\d) before=([-\d.]+) after=([-\d.]+) out='([^']*)' t=(\d+)"
+$script:ProdOpRegex       = 'SCENARIO PRODOP who=(host|join) kind=bench n=(\d+) ok=(\d) state=(-?\d+) outAmt=([-\d.]+) in0Amt=([-\d.]+) t=(\d+)'
+
+# prod_probe (protocol 33 phase 0): production machine baseline diagnostic
+# (prodSync forced OFF, the protocol-27 mint channel ON). Gates the LOCAL
+# legs: host placed + completed both machines (generator + bench), the power
+# toggle applied locally, the native setProductionItem write landed, the
+# operate loop ran, and BOTH censuses produced rows. Everything else is
+# FINDINGs feeding the protocol-33 design:
+#   * census hand intersection across clients (the BAKED-machine wire
+#     identity question - placed machines translate via the build maps);
+#   * divergence baseline: the host's bench output/input series moved under
+#     operate() while the join's minted copy stayed flat (the gap);
+#   * write levers: did the direct amount write survive the next census tick
+#     (update() clamp question), did switchPowerOn persist;
+#   * did the power toggle CROSS (expected: no with prodSync off)?
+#   * research evidence: tech levels + any RESEARCH op rows (progress-store
+#     location input for the follow-up spike).
+function Test-ProdProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostP = Select-String -Path $HostFile -Pattern $script:ProdPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostP) { $why += "host never logged its PRODPLACE" }
+    elseif ($hostP.Matches[0].Groups[3].Value -ne '1' -or $hostP.Matches[0].Groups[7].Value -ne '1') {
+        $why += "host machine placement failed (genOk=$($hostP.Matches[0].Groups[3].Value) benchOk=$($hostP.Matches[0].Groups[7].Value))"
+    }
+    $hSeries = Get-ProdSeries -File $HostFile
+    $jSeries = Get-ProdSeries -File $JoinFile
+    if ($hSeries.Keys.Count -eq 0) { $why += "host machine census empty" }
+    if ($jSeries.Keys.Count -eq 0) { $why += "join machine census empty" }
+
+    # Local power write leg (host generator).
+    $pw = @(Select-String -Path $HostFile -Pattern $script:ProdPowerRegex -ErrorAction SilentlyContinue)
+    $pwOk = @($pw | Where-Object { $_.Matches[0].Groups[3].Value -eq '1' -and $_.Matches[0].Groups[2].Value -eq $_.Matches[0].Groups[5].Value })
+    if ($pw.Count -eq 0) { $why += "host power write never ran" }
+    elseif ($pwOk.Count -eq 0) { $why += "host power writes never applied (after != want)" }
+    foreach ($m in $pw) {
+        $g = $m.Matches[0].Groups
+        Write-Host "    FINDING: host power write want=$($g[2].Value) ok=$($g[3].Value) before=$($g[4].Value) after=$($g[5].Value) pwrOut=$($g[6].Value)"
+    }
+    # Local output write legs (native setitem must land; direct is a finding).
+    $ow = @(Select-String -Path $HostFile -Pattern $script:ProdOutWriteRegex -ErrorAction SilentlyContinue)
+    $setItem = @($ow | Where-Object { $_.Matches[0].Groups[2].Value -eq 'setitem' }) | Select-Object -Last 1
+    if ($null -eq $setItem -or $setItem.Matches[0].Groups[4].Value -ne '1') { $why += "host native setProductionItem write missing/failed" }
+    foreach ($m in $ow) {
+        $g = $m.Matches[0].Groups
+        Write-Host "    FINDING: host output write kind=$($g[2].Value) want=$($g[3].Value) ok=$($g[4].Value) before=$($g[5].Value) after=$($g[6].Value) out='$($g[7].Value)'"
+    }
+    # Operate loop ran (the divergence driver).
+    $ops = @(Select-String -Path $HostFile -Pattern $script:ProdOpRegex -ErrorAction SilentlyContinue)
+    if ($ops.Count -eq 0) { $why += "host operate loop never ran" }
+    else {
+        $last = $ops[$ops.Count - 1].Matches[0].Groups
+        Write-Host "    FINDING: host bench ops=$($last[2].Value) lastState=$($last[4].Value) lastOutAmt=$($last[5].Value) lastIn0Amt=$($last[6].Value)"
+    }
+
+    # FINDING: census hand overlap (the BAKED wire-identity question).
+    $common = @($hSeries.Keys | Where-Object { $jSeries.ContainsKey($_) })
+    Write-Host "    FINDING: PROD hands host=$($hSeries.Keys.Count) join=$($jSeries.Keys.Count) common=$($common.Count)"
+
+    # FINDING: owner-vs-idle divergence for the bench (host hand + the join's
+    # minted copy translated through the protocol-27 MINT line).
+    if ($null -ne $hostP) {
+        $benchKey = $hostP.Matches[0].Groups[9].Value
+        if ($hSeries.ContainsKey($benchKey)) {
+            $s = $hSeries[$benchKey]
+            Write-Host ("    FINDING: host bench outAmt first={0:N3} last={1:N3} in0 first={2:N3} last={3:N3} samples=$($s.Count)" -f `
+                $s[0].outAmt, $s[$s.Count-1].outAmt, $s[0].in0Amt, $s[$s.Count-1].in0Amt)
+        }
+        $local = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $benchKey
+        if ($null -ne $local -and $jSeries.ContainsKey($local)) {
+            $s = $jSeries[$local]
+            Write-Host ("    FINDING: join bench COPY (local=$local) outAmt first={0:N3} last={1:N3} samples=$($s.Count) (flat = the gap)" -f `
+                $s[0].outAmt, $s[$s.Count-1].outAmt)
+        } else {
+            Write-Host "    FINDING: join never minted / never censused the host bench (key=$benchKey local=$local)"
+        }
+        # FINDING: did the power toggle cross (expected: no with prodSync off)?
+        $genKey = $hostP.Matches[0].Groups[5].Value
+        $genLocal = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $genKey
+        $offW = @($pw | Where-Object { $_.Matches[0].Groups[2].Value -eq '0' }) | Select-Object -Last 1
+        if ($null -ne $genLocal -and $jSeries.ContainsKey($genLocal) -and $null -ne $offW) {
+            $wt = [long]$offW.Matches[0].Groups[7].Value
+            $hit = @($jSeries[$genLocal] | Where-Object { $_.t -ge $wt -and $_.power -eq 0 })
+            $crossTxt = if ($hit.Count -gt 0) { "CROSSED (unexpected with prodSync off)" } else { "did NOT cross (expected: the gap)" }
+            Write-Host "    FINDING: host power OFF -> join copy $crossTxt"
+        }
+    }
+    # FINDING: research evidence (tech levels + driven ops).
+    foreach ($pair in @(@($hSeries, 'host'), @($jSeries, 'join'))) {
+        $rb = @($pair[0].Keys | Where-Object { $pair[0][$_][0].class -eq 5 })
+        foreach ($k in $rb) {
+            $s = $pair[0][$k]
+            Write-Host "    FINDING: $($pair[1]) research bench hand=$k tech first=$($s[0].tech) last=$($s[$s.Count-1].tech) name='$($s[0].name)'"
+        }
+    }
+    $res = @(Select-String -Path $HostFile -Pattern 'SCENARIO RESEARCH who=host n=(\d+) ok=(\d) tech=(-?\d+) power=(-?\d+) t=(\d+)' -ErrorAction SilentlyContinue)
+    if ($res.Count -gt 0) {
+        $last = $res[$res.Count - 1].Matches[0].Groups
+        Write-Host "    FINDING: host research ops=$($last[1].Value) lastOk=$($last[2].Value) lastTech=$($last[3].Value)"
+    } else {
+        Write-Host "    FINDING: no research bench in reach (research leg skipped)"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  PROD-PROBE $v - commonHands=$($common.Count) $detail"
+    return (Add-GateResult -Name "prod_probe" -Status $v `
+                -Metrics @{ commonHands = $common.Count } -Detail $detail)
+}
+
+# prod_sync (protocol 33 full tier): host-authoritative machine state sync.
+# Same scenario script as prod_probe but with prodSync ON - so the probe's
+# measured gaps must now be CLOSED. Gates:
+#   * the probe's local legs (host placed + completed both machines, power
+#     toggle applied, native output write landed, operate loop ran);
+#   * the wire ran: host sent [prod] rows, the join received + applied some;
+#   * the join MINTED both host machines (protocol-27 translation identity);
+#   * output convergence: the join bench copy's final outAmt within tolerance
+#     of the host's final (the operate-driven divergence the probe measured
+#     must now cross);
+#   * power crossing: the host's OFF toggle shows up on the join generator
+#     copy within 6 s, and the final power state agrees after the ON.
+function Test-ProdSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostP = Select-String -Path $HostFile -Pattern $script:ProdPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostP) { $why += "host never logged its PRODPLACE" }
+    elseif ($hostP.Matches[0].Groups[3].Value -ne '1' -or $hostP.Matches[0].Groups[7].Value -ne '1') {
+        $why += "host machine placement failed (genOk=$($hostP.Matches[0].Groups[3].Value) benchOk=$($hostP.Matches[0].Groups[7].Value))"
+    }
+    $hSeries = Get-ProdSeries -File $HostFile
+    $jSeries = Get-ProdSeries -File $JoinFile
+    if ($hSeries.Keys.Count -eq 0) { $why += "host machine census empty" }
+    if ($jSeries.Keys.Count -eq 0) { $why += "join machine census empty" }
+
+    # Local legs (the probe's gates - the divergence driver must have run).
+    $pw = @(Select-String -Path $HostFile -Pattern $script:ProdPowerRegex -ErrorAction SilentlyContinue)
+    $pwOk = @($pw | Where-Object { $_.Matches[0].Groups[3].Value -eq '1' -and $_.Matches[0].Groups[2].Value -eq $_.Matches[0].Groups[5].Value })
+    if ($pwOk.Count -eq 0) { $why += "host power writes missing/never applied" }
+    $ow = @(Select-String -Path $HostFile -Pattern $script:ProdOutWriteRegex -ErrorAction SilentlyContinue)
+    $setItem = @($ow | Where-Object { $_.Matches[0].Groups[2].Value -eq 'setitem' }) | Select-Object -Last 1
+    if ($null -eq $setItem -or $setItem.Matches[0].Groups[4].Value -ne '1') { $why += "host native setProductionItem write missing/failed" }
+    $ops = @(Select-String -Path $HostFile -Pattern $script:ProdOpRegex -ErrorAction SilentlyContinue)
+    if ($ops.Count -eq 0) { $why += "host operate loop never ran" }
+
+    # The wire ran on both ends.
+    $sent = @(Select-String -Path $HostFile -Pattern '\[prod\] SEND key=' -ErrorAction SilentlyContinue)
+    $recv = @(Select-String -Path $JoinFile -Pattern '\[prod\] RECV key=' -ErrorAction SilentlyContinue)
+    if ($sent.Count -eq 0) { $why += "host never sent a [prod] row" }
+    if ($recv.Count -eq 0) { $why += "join never received/applied a [prod] row" }
+    Write-Host "    FINDING: [prod] rows host sent=$($sent.Count) join applied=$($recv.Count)"
+
+    $outGap = -1.0
+    if ($null -ne $hostP) {
+        # Output convergence on the bench (the operate-driven divergence).
+        $benchKey = $hostP.Matches[0].Groups[9].Value
+        $benchLocal = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $benchKey
+        if ($null -eq $benchLocal) { $why += "join never minted the host bench (key=$benchKey)" }
+        elseif (-not $jSeries.ContainsKey($benchLocal)) { $why += "join bench copy (local=$benchLocal) absent from its census" }
+        elseif (-not $hSeries.ContainsKey($benchKey)) { $why += "host bench absent from its own census" }
+        else {
+            $hs = $hSeries[$benchKey]; $js = $jSeries[$benchLocal]
+            $hLast = $hs[$hs.Count-1].outAmt; $jLast = $js[$js.Count-1].outAmt
+            $outGap = [math]::Abs($hLast - $jLast)
+            Write-Host ("    FINDING: bench outAmt host first={0:N3} last={1:N3} join copy first={2:N3} last={3:N3} gap={4:N3}" -f `
+                $hs[0].outAmt, $hLast, $js[0].outAmt, $jLast, $outGap)
+            # Tolerance: 1 Hz change-gated rows against a 1 Hz census - the
+            # copy may lag one operate step; anything wider is divergence.
+            if ($outGap -gt 1.0) { $why += "bench output diverged (gap $([math]::Round($outGap,3)) > 1.0)" }
+        }
+        # Power crossing on the generator (OFF must show up, ON must settle).
+        $genKey = $hostP.Matches[0].Groups[5].Value
+        $genLocal = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $genKey
+        if ($null -eq $genLocal) { $why += "join never minted the host generator (key=$genKey)" }
+        elseif (-not $jSeries.ContainsKey($genLocal)) { $why += "join generator copy (local=$genLocal) absent from its census" }
+        else {
+            $gs = $jSeries[$genLocal]
+            $offW = @($pw | Where-Object { $_.Matches[0].Groups[2].Value -eq '0' }) | Select-Object -Last 1
+            if ($null -ne $offW) {
+                $wt = [long]$offW.Matches[0].Groups[7].Value
+                $hit = @($gs | Where-Object { $_.t -ge $wt -and $_.t -le ($wt + 6000) -and $_.power -eq 0 })
+                if ($hit.Count -eq 0) { $why += "host power OFF never crossed onto the join generator copy" }
+                else { Write-Host "    FINDING: host power OFF CROSSED ($($hit.Count) join samples within 6 s)" }
+            }
+            $jFinalPwr = $gs[$gs.Count-1].power
+            $hFinalPwr = if ($hSeries.ContainsKey($genKey)) { $hSeries[$genKey][$hSeries[$genKey].Count-1].power } else { -1 }
+            Write-Host "    FINDING: final generator power host=$hFinalPwr join=$jFinalPwr"
+            if ($hFinalPwr -ge 0 -and $jFinalPwr -ne $hFinalPwr) { $why += "final generator power disagrees (host=$hFinalPwr join=$jFinalPwr)" }
+        }
+    }
+    # FINDING: farm state (no farm leg in the scenario - terrain-dependent;
+    # any baked farm in reach reports its growth floats for the record).
+    foreach ($pair in @(@($hSeries, 'host'), @($jSeries, 'join'))) {
+        $fb = @($pair[0].Keys | Where-Object { $pair[0][$_][0].class -eq 4 })
+        foreach ($k in $fb) {
+            $s = $pair[0][$k]
+            Write-Host "    FINDING: $($pair[1]) farm hand=$k grown first=$($s[0].grown) last=$($s[$s.Count-1].grown) name='$($s[0].name)'"
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  PROD-SYNC $v - outGap=$([math]::Round($outGap,3)) sent=$($sent.Count) applied=$($recv.Count) $detail"
+    return (Add-GateResult -Name "prod_sync" -Status $v `
+                -Metrics @{ outGap = $outGap; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
+}
+
+# Parse the 1 Hz SCENARIO CONT container census into hand -> ordered samples
+# @{class; complete; inv; n; qty; hash; firstSid; firstQty; sid; name; t}
+# (protocol 34).
+function Get-ContSeries {
+    param([string]$File)
+    $out = @{}
+    $rx = "SCENARIO CONT hand=([\d.]+) class=(-?\d+) complete=(\d) inv=(\d) n=(-?\d+) qty=(-?\d+) hash=(\d+) first='([^']*)' firstQty=(-?\d+) sid='([^']*)' name='([^']*)' t=(\d+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $hand = $g[1].Value
+        if (-not $out.ContainsKey($hand)) { $out[$hand] = @() }
+        $out[$hand] += @{ class = [int]$g[2].Value; complete = [int]$g[3].Value
+                          inv = [int]$g[4].Value; n = [int]$g[5].Value
+                          qty = [int]$g[6].Value; hash = [uint32]$g[7].Value
+                          firstSid = $g[8].Value; firstQty = [int]$g[9].Value
+                          sid = $g[10].Value; name = $g[11].Value
+                          t = [long]$g[12].Value }
+    }
+    return $out
+}
+
+$script:ContPlaceRegex = "SCENARIO CONTPLACE who=(host|join) benchRc=(-?\d+) benchOk=(\d) benchSid='([^']*)' benchHand=([\d.]+) chestRc=(-?\d+) chestOk=(\d) chestSid='([^']*)' chestHand=([\d.]+) t=(\d+)"
+$script:ContAddRegex   = "SCENARIO CONTWRITE who=(host|join) kind=add tgt=(\w+) sid='([^']*)' want=(-?\d+) got=(-?\d+) ok=(\d) beforeN=(-?\d+) beforeQty=(-?\d+) afterN=(-?\d+) afterQty=(-?\d+) hash=(\d+) t=(\d+)"
+$script:ContReconRegex = "SCENARIO CONTWRITE who=host kind=recon tgt=chest sid='([^']*)' capN=(\d+) beforeQty=(-?\d+) found=(-?\d+) keep=(\d+) changed=(\d) afterN=(-?\d+) afterQty=(-?\d+) hash=(\d+) t=(\d+)"
+$script:ContEmptyRegex = 'SCENARIO CONTWRITE who=host kind=empty tgt=bench changed=(\d) beforeN=(-?\d+) beforeQty=(-?\d+) afterN=(-?\d+) afterQty=(-?\d+) t=(\d+)'
+$script:ContOpRegex    = "SCENARIO CONTOP who=(host|join) n=(\d+) ok=(\d) contN=(-?\d+) contQty=(-?\d+) hash=(\d+) first='([^']*)' t=(\d+)"
+
+# store_probe (protocol 34 phase 0): storage/machine container baseline
+# diagnostic (storeSync forced OFF, the protocol-27 mint channel ON). Gates
+# the LOCAL legs: host placed + completed both buildings (bench + chest), the
+# fabricate-into-chest add landed, the reconcile removal landed, the operate
+# loop ran, and BOTH censuses produced rows. Everything else is FINDINGs
+# feeding the protocol-34 design:
+#   * census hand intersection across clients + per-row hasInv (do building
+#     containers read?);
+#   * capacity: max distinct entries per container vs INV_ITEMS_MAX=20;
+#   * divergence baseline: the host bench CONTAINER quantity grew under
+#     operate() while the join's minted copy stayed flat (the gap); did the
+#     chest add cross (expected: no with storeSync off)?
+#   * churn: after the host force-emptied the bench container, did its own
+#     update() re-produce items (the reconcile fight risk)?
+#   * join-side fabricate into its MINTED chest copy (the translated-key
+#     apply half).
+function Test-StoreProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostP = Select-String -Path $HostFile -Pattern $script:ContPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostP) { $why += "host never logged its CONTPLACE" }
+    elseif ($hostP.Matches[0].Groups[3].Value -ne '1' -or $hostP.Matches[0].Groups[7].Value -ne '1') {
+        $why += "host placement failed (benchOk=$($hostP.Matches[0].Groups[3].Value) chestOk=$($hostP.Matches[0].Groups[7].Value))"
+    }
+    $hSeries = Get-ContSeries -File $HostFile
+    $jSeries = Get-ContSeries -File $JoinFile
+    if ($hSeries.Keys.Count -eq 0) { $why += "host container census empty" }
+    if ($jSeries.Keys.Count -eq 0) { $why += "join container census empty" }
+
+    # Local add leg (fabricate INTO the placed chest).
+    $adds = @(Select-String -Path $HostFile -Pattern $script:ContAddRegex -ErrorAction SilentlyContinue)
+    $hostAdd = @($adds | Where-Object { $_.Matches[0].Groups[1].Value -eq 'host' }) | Select-Object -Last 1
+    if ($null -eq $hostAdd) { $why += "host chest add never ran" }
+    elseif ($hostAdd.Matches[0].Groups[6].Value -ne '1') { $why += "host chest add failed (fabricate-into-building lever)" }
+    foreach ($m in $adds) {
+        $g = $m.Matches[0].Groups
+        Write-Host "    FINDING: host add tgt=$($g[2].Value) sid='$($g[3].Value)' want=$($g[4].Value) got=$($g[5].Value) ok=$($g[6].Value) qty $($g[8].Value)->$($g[10].Value)"
+    }
+    # Local reconcile-removal leg.
+    $recon = Select-String -Path $HostFile -Pattern $script:ContReconRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $recon) { $why += "host chest reconcile never ran" }
+    else {
+        $g = $recon.Matches[0].Groups
+        Write-Host "    FINDING: host recon capN=$($g[2].Value) beforeQty=$($g[3].Value) found=$($g[4].Value) keep=$($g[5].Value) changed=$($g[6].Value) afterQty=$($g[8].Value)"
+        if ($g[6].Value -ne '1' -or [int]$g[8].Value -ge [int]$g[3].Value) {
+            $why += "host reconcile removal did not stick (changed=$($g[6].Value) beforeQty=$($g[3].Value) afterQty=$($g[8].Value))"
+        }
+    }
+    # Operate loop ran (the divergence driver).
+    $ops = @(Select-String -Path $HostFile -Pattern $script:ContOpRegex -ErrorAction SilentlyContinue)
+    if ($ops.Count -eq 0) { $why += "host operate loop never ran" }
+    else {
+        $last = $ops[$ops.Count - 1].Matches[0].Groups
+        Write-Host "    FINDING: host bench ops=$($last[2].Value) lastContN=$($last[4].Value) lastContQty=$($last[5].Value) first='$($last[7].Value)'"
+    }
+
+    # FINDING: census hand overlap + inventory readability + capacity.
+    $common = @($hSeries.Keys | Where-Object { $jSeries.ContainsKey($_) })
+    Write-Host "    FINDING: CONT hands host=$($hSeries.Keys.Count) join=$($jSeries.Keys.Count) common=$($common.Count)"
+    foreach ($pair in @(@($hSeries, 'host'), @($jSeries, 'join'))) {
+        $withInv = @($pair[0].Keys | Where-Object { $pair[0][$_][0].inv -eq 1 })
+        $maxN = 0
+        foreach ($k in $pair[0].Keys) { foreach ($s in $pair[0][$k]) { if ($s.n -gt $maxN) { $maxN = $s.n } } }
+        Write-Host "    FINDING: $($pair[1]) containers=$($pair[0].Keys.Count) withInv=$($withInv.Count) maxEntries=$maxN (INV_ITEMS_MAX=20)"
+    }
+
+    if ($null -ne $hostP) {
+        # FINDING: owner-vs-idle divergence for the bench CONTAINER (host hand
+        # + the join's minted copy translated through the protocol-27 MINT line).
+        $benchKey = $hostP.Matches[0].Groups[5].Value
+        if ($hSeries.ContainsKey($benchKey)) {
+            $s = $hSeries[$benchKey]
+            Write-Host "    FINDING: host bench container qty first=$($s[0].qty) last=$($s[$s.Count-1].qty) samples=$($s.Count)"
+        }
+        $benchLocal = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $benchKey
+        if ($null -ne $benchLocal -and $jSeries.ContainsKey($benchLocal)) {
+            $s = $jSeries[$benchLocal]
+            Write-Host "    FINDING: join bench COPY (local=$benchLocal) qty first=$($s[0].qty) last=$($s[$s.Count-1].qty) samples=$($s.Count) (flat = the gap)"
+        } else {
+            Write-Host "    FINDING: join never minted / never censused the host bench (key=$benchKey local=$benchLocal)"
+        }
+        # FINDING: did the chest add cross (expected: no with storeSync off)?
+        # Window is bounded by the JOIN's OWN sentinel add (t=40s) - its local
+        # fabricate would otherwise read as a false crossing (run-171728).
+        $chestKey = $hostP.Matches[0].Groups[9].Value
+        $chestLocal = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $chestKey
+        if ($null -ne $chestLocal -and $jSeries.ContainsKey($chestLocal) -and $null -ne $hostAdd) {
+            $at = [long]$hostAdd.Matches[0].Groups[12].Value
+            $jAdd0 = @(Select-String -Path $JoinFile -Pattern $script:ContAddRegex -ErrorAction SilentlyContinue | Where-Object { $_.Matches[0].Groups[1].Value -eq 'join' }) | Select-Object -First 1
+            $jAddT = if ($null -ne $jAdd0) { [long]$jAdd0.Matches[0].Groups[12].Value } else { [long]::MaxValue }
+            $hit = @($jSeries[$chestLocal] | Where-Object { $_.t -ge $at -and $_.t -lt $jAddT -and $_.qty -gt 0 })
+            $crossTxt = if ($hit.Count -gt 0) { "CROSSED (unexpected with storeSync off)" } else { "did NOT cross (expected: the gap)" }
+            Write-Host "    FINDING: host chest add -> join copy $crossTxt"
+        }
+    }
+    # FINDING: churn after the force-empty (does update() re-produce?).
+    $empty = Select-String -Path $HostFile -Pattern $script:ContEmptyRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $empty -and $null -ne $hostP) {
+        $g = $empty.Matches[0].Groups
+        Write-Host "    FINDING: host bench force-empty changed=$($g[1].Value) qty $($g[3].Value)->$($g[5].Value)"
+        $benchKey = $hostP.Matches[0].Groups[5].Value
+        if ($hSeries.ContainsKey($benchKey)) {
+            $et = [long]$g[6].Value
+            $post = @($hSeries[$benchKey] | Where-Object { $_.t -gt $et })
+            if ($post.Count -gt 0) {
+                $regrow = @($post | Where-Object { $_.qty -gt 0 })
+                $churnTxt = if ($regrow.Count -gt 0) { "REGREW to $($post[$post.Count-1].qty) (churn risk - update() re-produces)" } else { "stayed empty ($($post.Count) samples - no churn)" }
+                Write-Host "    FINDING: bench container post-empty $churnTxt"
+            }
+        }
+    } else {
+        Write-Host "    FINDING: host bench force-empty never ran"
+    }
+    # FINDING: join-side fabricate into its minted chest copy.
+    $jAdd = @(Select-String -Path $JoinFile -Pattern $script:ContAddRegex -ErrorAction SilentlyContinue | Where-Object { $_.Matches[0].Groups[1].Value -eq 'join' }) | Select-Object -Last 1
+    if ($null -ne $jAdd) {
+        $g = $jAdd.Matches[0].Groups
+        Write-Host "    FINDING: join minted-chest add ok=$($g[6].Value) got=$($g[5].Value) qty $($g[8].Value)->$($g[10].Value)"
+    } else {
+        Write-Host "    FINDING: join minted-chest add never ran (mint not latched?)"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  STORE-PROBE $v - commonHands=$($common.Count) $detail"
+    return (Add-GateResult -Name "store_probe" -Status $v `
+                -Metrics @{ commonHands = $common.Count } -Detail $detail)
+}
+
+# store_sync (protocol 34 full tier): host-authoritative storage/machine
+# container contents. Same scenario script as store_probe (minus the join-side
+# add) but with storeSync ON - the probe's measured gaps must now be CLOSED.
+# Gates:
+#   * the probe's local legs (host placed + completed both buildings, the
+#     chest add landed, the reconcile removal landed, the operate loop ran);
+#   * the wire ran: the host census-authored the PLACED chest (an [inv] SEND
+#     with kind=1) and the join received + applied [inv] rows;
+#   * content convergence: the join's minted chest copy filled after the host
+#     add (qty > 0) and its FINAL content hash equals the host chest's final
+#     hash (the add AND the reconcile-removal both crossed).
+function Test-StoreSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hostP = Select-String -Path $HostFile -Pattern $script:ContPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hostP) { $why += "host never logged its CONTPLACE" }
+    elseif ($hostP.Matches[0].Groups[3].Value -ne '1' -or $hostP.Matches[0].Groups[7].Value -ne '1') {
+        $why += "host placement failed (benchOk=$($hostP.Matches[0].Groups[3].Value) chestOk=$($hostP.Matches[0].Groups[7].Value))"
+    }
+    $hSeries = Get-ContSeries -File $HostFile
+    $jSeries = Get-ContSeries -File $JoinFile
+    if ($hSeries.Keys.Count -eq 0) { $why += "host container census empty" }
+    if ($jSeries.Keys.Count -eq 0) { $why += "join container census empty" }
+
+    # Local legs (the probe's gates - the divergence driver must have run).
+    $adds = @(Select-String -Path $HostFile -Pattern $script:ContAddRegex -ErrorAction SilentlyContinue)
+    $hostAdd = @($adds | Where-Object { $_.Matches[0].Groups[1].Value -eq 'host' }) | Select-Object -Last 1
+    if ($null -eq $hostAdd -or $hostAdd.Matches[0].Groups[6].Value -ne '1') { $why += "host chest add missing/failed" }
+    $recon = Select-String -Path $HostFile -Pattern $script:ContReconRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $recon -or $recon.Matches[0].Groups[6].Value -ne '1') { $why += "host chest reconcile missing/failed" }
+    $ops = @(Select-String -Path $HostFile -Pattern $script:ContOpRegex -ErrorAction SilentlyContinue)
+    if ($ops.Count -eq 0) { $why += "host operate loop never ran" }
+
+    # The wire ran on both ends (kind=1 = the census-authored PLACED building).
+    $sent  = @(Select-String -Path $HostFile -Pattern '\[inv\] SEND .*kind=1' -ErrorAction SilentlyContinue)
+    $recv  = @(Select-String -Path $JoinFile -Pattern '\[inv\] APPLY' -ErrorAction SilentlyContinue)
+    if ($sent.Count -eq 0) { $why += "host never census-authored a placed container (no [inv] SEND kind=1)" }
+    if ($recv.Count -eq 0) { $why += "join never applied an [inv] snapshot" }
+    Write-Host "    FINDING: [inv] placed-key rows host sent=$($sent.Count) join applied(all)=$($recv.Count)"
+
+    $hashMatch = $false
+    if ($null -ne $hostP) {
+        $chestKey = $hostP.Matches[0].Groups[9].Value
+        $chestLocal = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $chestKey
+        if ($null -eq $chestLocal) { $why += "join never minted the host chest (key=$chestKey)" }
+        elseif (-not $jSeries.ContainsKey($chestLocal)) { $why += "join chest copy (local=$chestLocal) absent from its census" }
+        elseif (-not $hSeries.ContainsKey($chestKey)) { $why += "host chest absent from its own census" }
+        else {
+            $hs = $hSeries[$chestKey]; $js = $jSeries[$chestLocal]
+            $hLast = $hs[$hs.Count-1]; $jLast = $js[$js.Count-1]
+            Write-Host "    FINDING: chest qty host first=$($hs[0].qty) last=$($hLast.qty) join copy first=$($js[0].qty) last=$($jLast.qty)"
+            Write-Host "    FINDING: chest final hash host=$($hLast.hash) join=$($jLast.hash)"
+            # The add must have CROSSED (join copy non-empty at some point
+            # after the host add)...
+            if ($null -ne $hostAdd) {
+                $at = [long]$hostAdd.Matches[0].Groups[12].Value
+                $filled = @($js | Where-Object { $_.t -ge $at -and $_.qty -gt 0 })
+                if ($filled.Count -eq 0) { $why += "host chest add never crossed onto the join copy" }
+            }
+            # ... and the FINAL states must agree (hash equality = identical
+            # multiset, so the reconcile-removal crossed too).
+            $hashMatch = ($hLast.hash -eq $jLast.hash)
+            if (-not $hashMatch) { $why += "final chest contents disagree (host hash=$($hLast.hash) join=$($jLast.hash))" }
+        }
+        # FINDING: the bench machine-container series (the probe found operate()
+        # does NOT materialize items into the Building inventory - record both
+        # sides for the day the engine path changes).
+        $benchKey = $hostP.Matches[0].Groups[5].Value
+        if ($hSeries.ContainsKey($benchKey)) {
+            $s = $hSeries[$benchKey]
+            Write-Host "    FINDING: host bench container qty first=$($s[0].qty) last=$($s[$s.Count-1].qty)"
+        }
+        $benchLocal = Get-MintLocalHand -PeerFile $JoinFile -PlacerKey $benchKey
+        if ($null -ne $benchLocal -and $jSeries.ContainsKey($benchLocal)) {
+            $s = $jSeries[$benchLocal]
+            Write-Host "    FINDING: join bench COPY qty first=$($s[0].qty) last=$($s[$s.Count-1].qty)"
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  STORE-SYNC $v - hashMatch=$hashMatch sent=$($sent.Count) applied=$($recv.Count) $detail"
+    return (Add-GateResult -Name "store_sync" -Status $v `
+                -Metrics @{ hashMatch = [int]$hashMatch; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
+}
+
+# Parse the latejoin 1 Hz censuses (protocol 30). Returns @{ doors = hand ->
+# ordered @{open;locked;t}; facs = sid -> ordered @{us;t}; money = rank ->
+# ordered @{money;t} }.
+function Get-LatejoinCensus {
+    param([string]$File)
+    $doors = @{}; $facs = @{}; $money = @{}
+    foreach ($m in @(Select-String -Path $File -Pattern 'SCENARIO LJDOORROW hand=([\d.]+) open=(-?\d+) locked=(-?\d+) t=(\d+)' -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $h = $g[1].Value
+        if (-not $doors.ContainsKey($h)) { $doors[$h] = @() }
+        $doors[$h] += @{ open = [int]$g[2].Value; locked = [int]$g[3].Value; t = [long]$g[4].Value }
+    }
+    foreach ($m in @(Select-String -Path $File -Pattern "SCENARIO LJFACROW sid='([^']*)' us=([-\d.]+) t=(\d+)" -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $s = $g[1].Value
+        if (-not $facs.ContainsKey($s)) { $facs[$s] = @() }
+        $facs[$s] += @{ us = [double]$g[2].Value; t = [long]$g[3].Value }
+    }
+    foreach ($m in @(Select-String -Path $File -Pattern 'SCENARIO LJMONEYROW rank=(\d+) money=(-?\d+) t=(\d+)' -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $r = [int]$g[1].Value
+        if (-not $money.ContainsKey($r)) { $money[$r] = @() }
+        $money[$r] += @{ money = [int]$g[2].Value; t = [long]$g[3].Value }
+    }
+    return @{ doors = $doors; facs = $facs; money = $money }
+}
+
+# Parse the host's four pre-arm mutation lines. Returns $null when the door
+# mutation (the first) is missing entirely.
+function Get-LatejoinMutations {
+    param([string]$HostFile)
+    $out = @{ doorOk = $false; facOk = $false; moneyOk = $false; buildOk = $false; buildDone = $false }
+    $m = Select-String -Path $HostFile -Pattern 'SCENARIO LJDOOR hand=([\d.]+) mode=(lock|open) before=(-?\d+) want=(-?\d+) ok=(\d) after=(-?\d+) t=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $m) { return $null }
+    $g = $m.Matches[0].Groups
+    $out.doorHand = $g[1].Value; $out.doorMode = $g[2].Value
+    $out.doorWant = [int]$g[4].Value
+    $out.doorOk = ($g[5].Value -eq '1'); $out.doorT = [long]$g[7].Value
+    $m = Select-String -Path $HostFile -Pattern "SCENARIO LJFAC sid='([^']*)' target=([-\d.]+) ok=(\d) before=([-\d.]+) after=([-\d.]+) t=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $m) {
+        $g = $m.Matches[0].Groups
+        $out.facSid = $g[1].Value; $out.facTarget = [double]$g[2].Value
+        $out.facOk = ($g[3].Value -eq '1')
+    }
+    $m = Select-String -Path $HostFile -Pattern 'SCENARIO LJMONEY before=(-?\d+) bump=(\d+) after=(-?\d+) ok=(\d) t=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $m) {
+        $g = $m.Matches[0].Groups
+        $out.moneyAfter = [int]$g[3].Value; $out.moneyOk = ($g[4].Value -eq '1')
+    }
+    $m = Select-String -Path $HostFile -Pattern "SCENARIO LJBUILD rc=(-?\d+) ok=(\d) sid='([^']*)' hand=([\d.]+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $m) {
+        $g = $m.Matches[0].Groups
+        $out.buildOk = ($g[2].Value -eq '1'); $out.buildSid = $g[3].Value
+        $out.buildHand = $g[4].Value
+    }
+    $m = Select-String -Path $HostFile -Pattern 'SCENARIO LJBUILDPROG step=\d+ write=[\d.]+ ok=1 prog=[\d.]+ complete=1' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $out.buildDone = ($null -ne $m)
+    # The arm-time verdict supersedes the initial write lines (a re-asserted
+    # door that HELD counts; a mutation that failed by connect time does not).
+    $m = Select-String -Path $HostFile -Pattern 'SCENARIO LJMUT door=(\d) fac=(\d) money=(\d) build=(\d) done=(\d)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $m) {
+        $g = $m.Matches[0].Groups
+        $out.doorOk = ($g[1].Value -eq '1')
+    }
+    return $out
+}
+
+# Per-channel heal latency findings shared by both latejoin oracles: for each
+# pre-connect host mutation, the join's arm-clock time of the FIRST census
+# sample agreeing with the mutated value (the join arms at peer-ready, i.e.
+# right after the connect, so small t = fast heal). Returns @{door;fac;money}
+# with -1 = never agreed.
+function Get-LatejoinHealLatency {
+    param($Mut, $JoinCensus)
+    $r = @{ door = -1; fac = -1; money = -1 }
+    if ($Mut.doorOk -and $JoinCensus.doors.ContainsKey($Mut.doorHand)) {
+        $field = if ($Mut.doorMode -eq 'lock') { 'locked' } else { 'open' }
+        $hit = @($JoinCensus.doors[$Mut.doorHand] | Where-Object { $_[$field] -eq $Mut.doorWant }) | Select-Object -First 1
+        if ($null -ne $hit) { $r.door = $hit.t }
+    }
+    if ($Mut.facOk -and $JoinCensus.facs.ContainsKey($Mut.facSid)) {
+        $hit = @($JoinCensus.facs[$Mut.facSid] | Where-Object { [math]::Abs($_.us - $Mut.facTarget) -lt 0.5 }) | Select-Object -First 1
+        if ($null -ne $hit) { $r.fac = $hit.t }
+    }
+    if ($Mut.moneyOk -and $JoinCensus.money.ContainsKey(0)) {
+        $hit = @($JoinCensus.money[0] | Where-Object { $_.money -eq $Mut.moneyAfter }) | Select-Object -First 1
+        if ($null -ne $hit) { $r.money = $hit.t }
+    }
+    return $r
+}
+
+# latejoin_probe (protocol 30 phase 0): the unsynced late-join baseline
+# (latejoinSync forced OFF, everything else streaming). The host mutated
+# door/faction/money/build BEFORE the join connected. Gates the LOCAL legs:
+# all four host pre-arm mutations ok (door toggle, faction sentinel, wallet
+# bump, building placed + ramped complete) and both censuses ran. Everything
+# else is FINDINGs motivating the connect-edge resync:
+#   * per-channel heal latency on the join (door/faction/money are expected
+#     to heal via their 10 s / 5 s safety resends - pre-connect sends armed
+#     the resend even though nobody heard them);
+#   * the building mint (expected: the join NEVER minted - PKT_BUILD_PLACE
+#     is a one-shot edge, the permanent loss class);
+#   * connect-edge timing (host's "peer present" line seen).
+function Test-LatejoinProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $mut = Get-LatejoinMutations -HostFile $HostFile
+    if ($null -eq $mut) {
+        Write-Host "  LATEJOIN-PROBE FAIL - host never logged its pre-arm mutations"
+        return (Add-GateResult -Name "latejoin_probe" -Status FAIL -Detail "host pre-arm mutations missing")
+    }
+    # The door leg is FINDINGS-ONLY in both tiers: the sync save's one baked
+    # door belongs to town AI, which fights any sentinel state (reopens and
+    # unlocks its own door - runs 225300/230601), so holding a door mutation
+    # to the connect boundary is not reliably provable there. The door
+    # channel's resync lever is the same lastSendMs=1 code path the GATED
+    # faction rows prove (identical row shape + 10 s safety resend).
+    if (-not $mut.facOk)     { $why += "host pre-arm faction sentinel failed" }
+    if (-not $mut.moneyOk)   { $why += "host pre-arm wallet bump failed" }
+    if (-not $mut.buildOk)   { $why += "host pre-arm building placement failed" }
+    if (-not $mut.buildDone) { $why += "host pre-arm building never ramped complete" }
+    $hC = Get-LatejoinCensus -File $HostFile
+    $jC = Get-LatejoinCensus -File $JoinFile
+    if ($hC.doors.Keys.Count -eq 0 -and $hC.money.Keys.Count -eq 0) { $why += "host census empty" }
+    if ($jC.doors.Keys.Count -eq 0 -and $jC.money.Keys.Count -eq 0) { $why += "join census empty" }
+
+    # FINDING: connect edge on the host (mutations must PRECEDE it).
+    $conn = Select-String -Path $HostFile -Pattern 'handshake: peer present id=' -ErrorAction SilentlyContinue | Select-Object -First 1
+    Write-Host ("    FINDING: host connect edge " + $(if ($null -ne $conn) { "logged" } else { "NOT logged" }))
+
+    # FINDING: did the host HOLD the door mutation (the engine can revert a
+    # baked door - run 224454)? A reverted door makes the door leg inconclusive.
+    if ($mut.doorOk -and $hC.doors.ContainsKey($mut.doorHand)) {
+        $field = if ($mut.doorMode -eq 'lock') { 'locked' } else { 'open' }
+        $hLast = $hC.doors[$mut.doorHand][$hC.doors[$mut.doorHand].Count - 1]
+        Write-Host ("    FINDING: host door $field final=" + $hLast[$field] + " want=" + $mut.doorWant + $(if ($hLast[$field] -eq $mut.doorWant) { " (held)" } else { " (REVERTED - door leg inconclusive)" }))
+    }
+
+    # FINDING: per-channel heal latency on the join (arm clock).
+    $heal = Get-LatejoinHealLatency -Mut $mut -JoinCensus $jC
+    foreach ($ch in @('door', 'fac', 'money')) {
+        $t = $heal[$ch]
+        $txt = if ($t -lt 0) { "NEVER agreed (the gap)" } else { "first agreed at t=${t}ms post-arm" }
+        Write-Host "    FINDING: $ch heal - $txt"
+    }
+    # FINDING: the pre-connect building on the join (expected: never minted).
+    $mint = $null
+    if ($null -ne $mut.buildHand) {
+        $mint = Select-String -Path $JoinFile -Pattern ("\[build\] MINT key=" + [regex]::Escape($mut.buildHand) + " .*rc=1") -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    Write-Host ("    FINDING: pre-connect building " + $(if ($null -ne $mint) { "MINTED on the join (unexpected with latejoinSync off)" } else { "never minted on the join (expected: the permanent loss)" }))
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  LATEJOIN-PROBE $v - $detail"
+    return (Add-GateResult -Name "latejoin_probe" -Status $v `
+                -Metrics @{ doorHealMs = $heal.door; facHealMs = $heal.fac; moneyHealMs = $heal.money } -Detail $detail)
+}
+
+# latejoin_sync (protocol 30): the connect-edge resync gate (latejoinSync ON).
+# Same script as latejoin_probe. Gates:
+#   1. all four host pre-arm mutations ok (same local leg as the probe);
+#   2. every slow-heal channel CONVERGED on the join fast: door open state,
+#      faction sentinel row and host wallet each agree within 20 s of the
+#      join's arm (the resync bursts them at the connect edge - without it
+#      door/faction wait for a 10 s safety resend at best);
+#   3. the pre-connect building MINTED on the join (rc=1 on the placer's key)
+#      and latched complete (STATE-RECV complete=1) - the probe's permanent
+#      loss, closed.
+function Test-LatejoinSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $mut = Get-LatejoinMutations -HostFile $HostFile
+    if ($null -eq $mut) {
+        Write-Host "  LATEJOIN-SYNC FAIL - host never logged its pre-arm mutations"
+        return (Add-GateResult -Name "latejoin_sync" -Status FAIL -Detail "host pre-arm mutations missing")
+    }
+    # Door leg is FINDINGS-ONLY (town AI fights baked-door sentinels - see
+    # Test-LatejoinProbe); faction + money + building are the gated legs.
+    if (-not $mut.facOk)     { $why += "host pre-arm faction sentinel failed" }
+    if (-not $mut.moneyOk)   { $why += "host pre-arm wallet bump failed" }
+    if (-not $mut.buildOk)   { $why += "host pre-arm building placement failed" }
+    if (-not $mut.buildDone) { $why += "host pre-arm building never ramped complete" }
+    $jC = Get-LatejoinCensus -File $JoinFile
+
+    # 2. converged-fast gates (door reported, not gated).
+    $heal = Get-LatejoinHealLatency -Mut $mut -JoinCensus $jC
+    $doorTxt = if ($heal.door -lt 0) { "never agreed (town-AI churn - findings-only leg)" } else { "first agreed at t=$($heal.door)ms post-arm" }
+    Write-Host "    FINDING: door sentinel - $doorTxt"
+    $names = @{ fac = 'faction sentinel'; money = 'host wallet' }
+    foreach ($ch in @('fac', 'money')) {
+        $t = $heal[$ch]
+        if ($t -lt 0) { $why += "$($names[$ch]) never converged on the join" }
+        elseif ($t -gt 20000) { $why += "$($names[$ch]) converged too slowly (t=${t}ms > 20 s - resync not effective?)" }
+        else { Write-Host "    FINDING: $($names[$ch]) converged at t=${t}ms post-arm" }
+    }
+
+    # 3. the pre-connect building minted + complete.
+    $minted = $false; $complete = $false
+    if ($null -ne $mut.buildHand) {
+        $keyRx = [regex]::Escape($mut.buildHand)
+        $minted = $null -ne (Select-String -Path $JoinFile -Pattern ("\[build\] MINT key=" + $keyRx + " .*rc=1") -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $complete = $null -ne (Select-String -Path $JoinFile -Pattern ("\[build\] STATE-RECV key=" + $keyRx + " .*complete=1") -ErrorAction SilentlyContinue | Select-Object -First 1)
+    }
+    if (-not $minted)   { $why += "pre-connect building never minted on the join" }
+    if (-not $complete) { $why += "pre-connect building never latched complete on the join" }
+    if ($minted -and $complete) { Write-Host "    FINDING: pre-connect building MINTED + complete on the join (the probe's permanent gap, closed)" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  LATEJOIN-SYNC $v - doorHeal=$($heal.door)ms facHeal=$($heal.fac)ms moneyHeal=$($heal.money)ms minted=$minted $detail"
+    return (Add-GateResult -Name "latejoin_sync" -Status $v `
+                -Metrics @{ doorHealMs = $heal.door; facHealMs = $heal.fac; moneyHealMs = $heal.money; minted = $minted } -Detail $detail)
+}
+
+# save_probe (protocol 31 phase 12a): the coordinated-save runtime unknowns,
+# retired. The HOST issued engine::saveGameAs('coopresume') mid-session with
+# the SaveManager::save detour installed (saveSync coordination OFF - pure
+# measurement). Gates the LOCAL legs on the host:
+#   1. the save detour FIRED ("[save] LOCAL-SAVE name='coopresume'");
+#   2. getCurrentGame/getSavePath resolved at runtime (SAVEINFO ok=1 with a
+#      non-empty savePath - spike 39's RVAs, validated);
+#   3. the folder-quiescence completion edge was OBSERVED (SAVEDONE
+#      kind=quiesced with files > 0).
+# FINDINGs (not gated): completion latency, folder inventory, the post-save
+# getCurrentGame value (does the engine flip it to the new name?), and the
+# widest main-thread tick gap while the save wrote (the hitch measurement).
+function Test-SaveProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    # 1. the detour edge.
+    $edge = Select-String -Path $HostFile -Pattern "\[save\] LOCAL-SAVE name='coopresume' autosave=0" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $edge) { $why += "save detour never fired for 'coopresume'" }
+
+    # 2. runtime path resolution.
+    $before = Select-String -Path $HostFile -Pattern "SCENARIO SAVEINFO when=before ok=(\d) curGame='([^']*)' savePath='([^']*)'" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $before) { $why += "host never logged SAVEINFO" }
+    else {
+        $g = $before.Matches[0].Groups
+        if ($g[1].Value -ne '1' -or $g[3].Value -eq '') { $why += "getCurrentGame/getSavePath did not resolve (ok=$($g[1].Value) path='$($g[3].Value)')" }
+        else { Write-Host "    FINDING: runtime save identity - curGame='$($g[2].Value)' savePath='$($g[3].Value)' (spike 39 RVAs validated)" }
+    }
+    $after = Select-String -Path $HostFile -Pattern "SCENARIO SAVEINFO when=after ok=\d curGame='([^']*)'" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $after) {
+        $cg = $after.Matches[0].Groups[1].Value
+        Write-Host ("    FINDING: post-save getCurrentGame='" + $cg + "'" + $(if ($cg -eq 'coopresume') { " (flipped to the saved name)" } else { " (did NOT flip)" }))
+    }
+
+    # 3. completion edge + latency findings.
+    $waitMs = -1; $files = 0; $bytes = 0
+    $done = Select-String -Path $HostFile -Pattern 'SCENARIO SAVEDONE kind=(quiesced|timeout) files=(\d+) bytes=(\d+) waitMs=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $done) { $why += "folder-quiescence completion never observed (no SAVEDONE)" }
+    else {
+        $g = $done.Matches[0].Groups
+        $files = [int]$g[2].Value; $bytes = [long]$g[3].Value; $waitMs = [int]$g[4].Value
+        if ($g[1].Value -ne 'quiesced') { $why += "completion was a TIMEOUT (the save never landed on disk?)" }
+        elseif ($files -eq 0) { $why += "SAVEDONE reported an empty folder" }
+        else { Write-Host "    FINDING: save completed in ${waitMs}ms - $files files / $bytes bytes (the transfer payload + settle window sizing)" }
+    }
+    $hitchMs = -1
+    $hitch = Select-String -Path $HostFile -Pattern 'SCENARIO SAVEHITCH maxTickGapMs=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $hitch) {
+        $hitchMs = [int]$hitch.Matches[0].Groups[1].Value
+        Write-Host "    FINDING: widest main-thread tick gap during the save = ${hitchMs}ms (the gameplay hitch)"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  SAVE-PROBE $v - waitMs=$waitMs files=$files hitchMs=$hitchMs $detail"
+    return (Add-GateResult -Name "save_probe" -Status $v `
+                -Metrics @{ waitMs = $waitMs; files = $files; bytes = $bytes; hitchMs = $hitchMs } -Detail $detail)
+}
+
+# load_probe (protocol 32 phase 13a): the coordinated-load runtime unknowns,
+# retired. The HOST issued a coordinated saveGameAs('coopresume') then a
+# MID-SESSION engine::loadSave('coopresume') with the SaveManager::load
+# detour installed (loadSync coordination OFF - pure measurement). Gates the
+# LOCAL legs on the host:
+#   1. the load detour FIRED ("[load] LOCAL-LOAD name='coopresume'");
+#   2. the mid-session load was ISSUED cleanly (LOADISSUE ok=1);
+#   3. the world actually SWAPPED and came back: the scenario's live
+#      drop/return pair (LOADSWAPDONE) AND the Plugin's reload edge
+#      ("[load] WORLD-RELOAD");
+#   4. the pre-load squad hand RESOLVED again in the fresh world
+#      (LOADCENSUS when=after resolved=1) - the same-lineage guarantee.
+# FINDINGs (not gated): swap latency + whether mainLoop_hook kept ticking
+# through the load screen (hookTicksDuringSwap - the 13b session-reset
+# design hinges on it), the widest tick gap around the swap (hitch), the
+# transfer-done state at load time, and the JOIN's divergence baseline (it
+# deliberately does NOT load in 13a - its half is phase 13b).
+function Test-LoadProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    # 1. the detour edge.
+    $edge = Select-String -Path $HostFile -Pattern "\[load\] LOCAL-LOAD name='coopresume'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $edge) { $why += "load detour never fired for 'coopresume'" }
+
+    # 2. the mid-session issue (+ the deferred-signal state finding).
+    $issue = Select-String -Path $HostFile -Pattern "SCENARIO LOADISSUE name='coopresume' ok=(\d) xferDone=(\d)(?: signal=(-?\d+) delay=(-?\d+))?" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $issue) { $why += "host never issued the mid-session load" }
+    else {
+        $g = $issue.Matches[0].Groups
+        if ($g[1].Value -ne '1') { $why += "engine::loadSave returned failure" }
+        Write-Host "    FINDING: load issued with transfer done=$($g[2].Value) signal=$($g[3].Value) delay=$($g[4].Value)"
+    }
+    $exec = Select-String -Path $HostFile -Pattern 'SCENARIO LOADEXEC ok=(\d) sigBefore=(-?\d+) sigAfter=(-?\d+) liveAfter=(\d)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $exec) {
+        $g = $exec.Matches[0].Groups
+        Write-Host "    FINDING: manual execute() pump ok=$($g[1].Value) signal $($g[2].Value)->$($g[3].Value) liveAfter=$($g[4].Value) (run 1: load() only SETS the deferred signal; nothing consumes it mid-session)"
+    }
+
+    # 3. the world actually swapped - the scenario's completion latch (live
+    # drop/return edge OR the synchronous-inside-execute variant).
+    $swapDone = Select-String -Path $HostFile -Pattern 'SCENARIO LOADSWAPDONE' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $swapDone) { $why += "world swap never completed (no LOADSWAPDONE)" }
+    # The Plugin's reload edge is a FINDING, not a gate: a fully synchronous
+    # swap inside execute() never shows mainLoop a non-live frame.
+    $swapMs = -1; $hookTicks = -1
+    $reload = Select-String -Path $HostFile -Pattern '\[load\] WORLD-RELOAD swapMs=(\d+) hookTicksDuringSwap=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $reload) { Write-Host "    FINDING: no WORLD-RELOAD edge from the Plugin (swap invisible to gameplayLive polling - synchronous, or never happened)" }
+    else {
+        $g = $reload.Matches[0].Groups
+        $swapMs = [int]$g[1].Value; $hookTicks = [int]$g[2].Value
+        $ticking = if ($hookTicks -gt 0) { "mainLoop_hook KEPT TICKING through the load screen ($hookTicks ticks)" } else { "mainLoop_hook did NOT tick during the load screen" }
+        Write-Host "    FINDING: world swap took ${swapMs}ms; $ticking (13b session-reset design input)"
+    }
+
+    # 4. post-swap hand re-resolve.
+    $census = Select-String -Path $HostFile -Pattern 'SCENARIO LOADCENSUS when=after resolved=(\d) pos=([-0-9.,]+) n=(\d+) leaderChanged=(\d)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $census) { $why += "post-load census never ran" }
+    else {
+        $g = $census.Matches[0].Groups
+        if ($g[1].Value -ne '1') { $why += "pre-load squad hand did NOT resolve after the swap" }
+        else { Write-Host "    FINDING: pre-load hand resolved post-swap at pos=$($g[2].Value) (squad n=$($g[3].Value)); leader Character* changed=$($g[4].Value) (the stale-pointer hazard the session reset covers)" }
+    }
+
+    $hitchMs = -1
+    $hitch = Select-String -Path $HostFile -Pattern 'SCENARIO LOADHITCH maxTickGapMs=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $hitch) {
+        $hitchMs = [int]$hitch.Matches[0].Groups[1].Value
+        Write-Host "    FINDING: widest main-thread tick gap across the swap = ${hitchMs}ms"
+    }
+
+    # JOIN divergence baseline (not gated): the join must NOT have reloaded.
+    if ($JoinFile -and (Test-Path $JoinFile)) {
+        $joinReload = Select-String -Path $JoinFile -Pattern '\[load\] WORLD-RELOAD' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $joinReload) { Write-Host "    FINDING: UNEXPECTED - the join reloaded too (loadSync was supposed to be OFF)" }
+        else { Write-Host "    FINDING: join never reloaded (expected 13a divergence baseline - the 13b coordination closes this)" }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  LOAD-PROBE $v - swapMs=$swapMs hookTicks=$hookTicks hitchMs=$hitchMs $detail"
+    return (Add-GateResult -Name "load_probe" -Status $v `
+                -Metrics @{ swapMs = $swapMs; hookTicks = $hookTicks; hitchMs = $hitchMs } -Detail $detail)
+}
+
+# save_sync (protocol 31 phase 12c): the coordinated-save round trip, gated
+# end to end on BOTH logs:
+#   1. host: the detour edge fired for 'coopresume' (LOCAL-SAVE);
+#   2. host: the folder QUIESCED (kind=quiesced, files>0);
+#   3. host: the transfer completed (XFER-SENT id/files/bytes);
+#   4. join: the staged save VERIFIED + COMMITTED (XFER-COMMIT, badCrc=0)
+#      with files+bytes EQUAL to what the host sent (the integrity proof);
+#   5. host: the join's ACK arrived ok=1 (XFER-ACK).
+# Also used by save_stage1 (the resume_test.ps1 stage-1 variant), where the
+# host additionally baked a part-built site first - SAVEBUILD/SAVEPROG are
+# findings here; stage 2's oracle proves the same-hand claim.
+function Test-SaveSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    # 1. the detour edge on the host.
+    $edge = Select-String -Path $HostFile -Pattern "\[save\] LOCAL-SAVE name='coopresume'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $edge) { $why += "host save detour never fired for 'coopresume'" }
+
+    # 2. quiescence.
+    $q = Select-String -Path $HostFile -Pattern "\[save\] QUIESCED kind=(\w+) name='coopresume' files=(\d+) bytes=(\d+) waitMs=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $qFiles = 0
+    if ($null -eq $q) { $why += "host never logged QUIESCED for 'coopresume'" }
+    else {
+        $g = $q.Matches[0].Groups
+        $qFiles = [int]$g[2].Value
+        if ($g[1].Value -ne 'settled') { $why += "completion was a TIMEOUT, not quiescence" }
+        elseif ($qFiles -eq 0) { $why += "QUIESCED reported an empty folder" }
+        else { Write-Host "    FINDING: save quiesced in $($g[4].Value)ms - $qFiles files / $($g[3].Value) bytes" }
+    }
+
+    # 3. the transfer's DONE went out.
+    $sent = Select-String -Path $HostFile -Pattern "\[save\] XFER-SENT id=(\d+) files=(\d+) bytes=(\d+) ms=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $sFiles = 0; $sBytes = [long]0; $xferMs = -1
+    if ($null -eq $sent) { $why += "host never logged XFER-SENT (transfer incomplete)" }
+    else {
+        $g = $sent.Matches[0].Groups
+        $sFiles = [int]$g[2].Value; $sBytes = [long]$g[3].Value; $xferMs = [int]$g[4].Value
+        Write-Host "    FINDING: transfer sent $sFiles files / $sBytes bytes in ${xferMs}ms"
+    }
+
+    # 4. the join committed with EQUAL files+bytes and zero bad CRCs.
+    $commit = Select-String -Path $JoinFile -Pattern "\[save\] XFER-(COMMIT|FAILED) id=(\d+) name='coopresume' files=(\d+) bytes=(\d+) badCrc=(\d+) ms=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $cFiles = 0; $cBytes = [long]0
+    if ($null -eq $commit) { $why += "join never logged a commit/fail (transfer never finished on the join)" }
+    else {
+        $g = $commit.Matches[0].Groups
+        $cFiles = [int]$g[3].Value; $cBytes = [long]$g[4].Value
+        if ($g[1].Value -ne 'COMMIT') { $why += "join commit FAILED (badCrc=$($g[5].Value))" }
+        elseif ($g[5].Value -ne '0') { $why += "join committed with badCrc=$($g[5].Value)" }
+        if ($null -ne $sent -and $g[1].Value -eq 'COMMIT') {
+            if ($cFiles -ne $sFiles) { $why += "file count mismatch (host sent $sFiles, join committed $cFiles)" }
+            if ($cBytes -ne $sBytes) { $why += "byte count mismatch (host sent $sBytes, join committed $cBytes)" }
+        }
+    }
+
+    # 5. the ACK closed the loop on the host.
+    $ack = Select-String -Path $HostFile -Pattern "\[save\] XFER-ACK id=(\d+) ok=(\d)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $ack) { $why += "host never received the join's ACK" }
+    elseif ($ack.Matches[0].Groups[2].Value -ne '1') { $why += "join ACKed ok=0" }
+
+    # Stage-1 findings (present only for save_stage1 runs).
+    $build = Select-String -Path $HostFile -Pattern "SCENARIO SAVEBUILD rc=\d+ ok=(\d) sid='([^']*)' hand=([\d.]+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -ne $build) {
+        $g = $build.Matches[0].Groups
+        Write-Host "    FINDING: stage-1 building ok=$($g[1].Value) sid='$($g[2].Value)' hand=$($g[3].Value) (baked into the transferred save)"
+        if ($g[1].Value -ne '1') { $why += "stage-1 building placement failed (nothing to prove at resume)" }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  SAVE-SYNC $v - sent=$sFiles/$sBytes committed=$cFiles/$cBytes xferMs=$xferMs $detail"
+    return (Add-GateResult -Name "save_sync" -Status $v `
+                -Metrics @{ sentFiles = $sFiles; sentBytes = $sBytes; commitFiles = $cFiles; commitBytes = $cBytes; xferMs = $xferMs } -Detail $detail)
+}
+
+# save_resume (protocol 31 phase 12c, resume_test.ps1 stage 2): the identity-
+# reset proof. Both clients were relaunched on 'coopresume' - the save the
+# stage-1 coordinated transfer delivered to the join (stage 2 runs with NO
+# harness save mirroring, so the join really loads what the TRANSFER wrote).
+# The stage-1 building was baked PART-built (prog ~0.5), so it exists in no
+# other save; the gate is that it enumerates on BOTH sides under the SAME
+# save-stable hand with matching progress - one save, one hand, both clients.
+function Test-SaveResume {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $siteRegex = "SCENARIO RESUMESITE hand=([\d.]+) sid='([^']*)' prog=([\d.]+) complete=(\d)"
+
+    function Get-FinalSites([string]$File) {
+        $out = @{}
+        foreach ($m in @(Select-String -Path $File -Pattern $siteRegex -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $out[$g[1].Value] = @{ sid = $g[2].Value; prog = [double]$g[3].Value; complete = [int]$g[4].Value }
+        }
+        return $out
+    }
+    $hSites = Get-FinalSites $HostFile
+    $jSites = Get-FinalSites $JoinFile
+
+    if ($hSites.Count -eq 0) { $why += "host enumerated no construction sites after resume" }
+    if ($jSites.Count -eq 0) { $why += "join enumerated no construction sites after resume" }
+
+    $shared = 0
+    foreach ($hand in $hSites.Keys) {
+        if (-not $jSites.ContainsKey($hand)) {
+            $why += "host site hand=$hand missing on the join (hand diverged - the identity reset did NOT happen)"
+            continue
+        }
+        $h = $hSites[$hand]; $j = $jSites[$hand]
+        if ($h.sid -ne $j.sid) { $why += "hand=$hand sid mismatch (host '$($h.sid)' join '$($j.sid)')" }
+        elseif ([math]::Abs($h.prog - $j.prog) -gt 0.05) { $why += "hand=$hand progress diverged (host $($h.prog) join $($j.prog))" }
+        else {
+            $shared++
+            Write-Host "    FINDING: SAME-HAND site hand=$hand sid='$($h.sid)' prog=$($h.prog) on BOTH clients (the baked-identity proof)"
+        }
+    }
+    foreach ($hand in $jSites.Keys) {
+        if (-not $hSites.ContainsKey($hand)) { $why += "join-only site hand=$hand (ghost - saves not identical)" }
+    }
+    if ($shared -eq 0 -and $why.Count -eq 0) { $why += "no shared same-hand site found" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  SAVE-RESUME $v - hostSites=$($hSites.Count) joinSites=$($jSites.Count) sameHand=$shared $detail"
+    return (Add-GateResult -Name "save_resume" -Status $v `
+                -Metrics @{ hostSites = $hSites.Count; joinSites = $jSites.Count; sameHand = $shared } -Detail $detail)
+}
+
+# load_sync (protocol 32 phase 13c): the coordinated-load round trip, gated
+# end to end on BOTH logs. The host placed a session-runtime building,
+# coordinated-saved 'coopresume' (the join committed a byte-identical copy),
+# then loaded it mid-session; the coordination must have driven the join to
+# load the SAME save:
+#   1. host: the load edge broadcast the order ("[load] GO->join");
+#   2. join: the GO arrived, fingerprint MATCHed, and the join ISSUED its own
+#      load ("[load] GO ... MATCH -> loading") - a NACK/transfer fallback on
+#      this identical-copy run is a divergence bug, not a fallback;
+#   3. BOTH sides completed a world swap (SCENARIO LSSWAPDONE) and ran the
+#      protocol-32 session reset ("[load] session reset");
+#   4. the pre-load building enumerates on BOTH sides POST-swap under the
+#      SAME save-stable hand (LSSITE cross-check - the identity claim that
+#      makes all hand-keyed replication valid after a coordinated load).
+# FINDINGs: swap evidence per side (WORLD-RELOAD vs synchronous), the join's
+# suppression lever state, and any NACK/transfer leg that fired.
+function Test-LoadSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    # Pre-req: the host's build + coordinated save legs.
+    $build = Select-String -Path $HostFile -Pattern "SCENARIO LSBUILD rc=\d+ ok=(\d) sid='([^']*)' hand=([\d.]+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $build) { $why += "host never placed the pre-load building" }
+    elseif ($build.Matches[0].Groups[1].Value -ne '1') { $why += "host building placement failed (no identity evidence to carry across the load)" }
+    else { Write-Host "    FINDING: pre-load building hand=$($build.Matches[0].Groups[3].Value) sid='$($build.Matches[0].Groups[2].Value)' (exists in NO baked save)" }
+    $ackLine = Select-String -Path $HostFile -Pattern 'SCENARIO LSACK ok=(\d)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $ackLine) { $why += "host never saw the join's save-commit ACK (the coordinated save leg broke)" }
+    elseif ($ackLine.Matches[0].Groups[1].Value -ne '1') { $why += "join ACKed the pre-load save ok=0" }
+
+    # 1. the host's load edge broadcast the coordinated order.
+    $go = Select-String -Path $HostFile -Pattern "\[load\] GO->join id=(\d+) name='coopresume' fp=([0-9a-f]+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $go) { $why += "host never broadcast PKT_LOAD_GO" }
+
+    # 2. the join received it, its copy fingerprint-MATCHed, and it loaded.
+    $joinGo = Select-String -Path $JoinFile -Pattern "\[load\] GO id=(\d+) name='coopresume' fp=([0-9a-f]+) MATCH -> loading" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $joinGo) {
+        $nack = Select-String -Path $JoinFile -Pattern "\[load\] GO id=\d+ name='coopresume' hostFp=([0-9a-f]+) localFp=([0-9a-f]+) (\w+) -> NACK" -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $nack) {
+            $g = $nack.Matches[0].Groups
+            Write-Host "    FINDING: join NACKed ($($g[3].Value): hostFp=$($g[1].Value) localFp=$($g[2].Value)) - the transfer fallback leg fired"
+            # The fallback still has to LAND: the post-transfer load line.
+            $late = Select-String -Path $JoinFile -Pattern "\[load\] transfer committed -> loading 'coopresume'" -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($null -eq $late) { $why += "join's copy diverged AND the transfer fallback never completed its load" }
+            else { $why += "join's copy DIVERGED right after a verified commit (fingerprint bug or save mutated between commit and load)" }
+        } else {
+            $why += "join never received/handled PKT_LOAD_GO"
+        }
+    }
+
+    # 3. both sides swapped worlds and session-reset.
+    foreach ($side in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
+        $file = $side[0]; $tag = $side[1]
+        $swap = Select-String -Path $file -Pattern 'SCENARIO LSSWAPDONE' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $swap) { $why += "$tag never completed its world swap (no LSSWAPDONE)" }
+        else {
+            $reload = Select-String -Path $file -Pattern '\[load\] WORLD-RELOAD swapMs=(\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+            if ($null -ne $reload) { Write-Host "    FINDING: $tag world swap took $($reload.Matches[0].Groups[1].Value)ms" }
+            else { Write-Host "    FINDING: $tag swap was synchronous (no WORLD-RELOAD edge visible to polling)" }
+        }
+        $reset = Select-String -Path $file -Pattern '\[load\] session reset' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $reset) { $why += "$tag never ran the protocol-32 session reset" }
+    }
+
+    # 4. the post-load same-hand site cross-check (the identity claim).
+    $siteRegex = "SCENARIO LSSITE hand=([\d.]+) sid='([^']*)' prog=([\d.]+) complete=(\d)"
+    function Get-LsSites([string]$File) {
+        $out = @{}
+        foreach ($m in @(Select-String -Path $File -Pattern $siteRegex -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $out[$g[1].Value] = @{ sid = $g[2].Value; prog = [double]$g[3].Value }
+        }
+        return $out
+    }
+    $hSites = Get-LsSites $HostFile
+    $jSites = Get-LsSites $JoinFile
+    if ($hSites.Count -eq 0) { $why += "host enumerated no sites post-load" }
+    if ($jSites.Count -eq 0) { $why += "join enumerated no sites post-load" }
+    $shared = 0
+    foreach ($hand in $hSites.Keys) {
+        if (-not $jSites.ContainsKey($hand)) { $why += "host site hand=$hand missing on the join post-load (identity diverged)"; continue }
+        $h = $hSites[$hand]; $j = $jSites[$hand]
+        if ($h.sid -ne $j.sid) { $why += "hand=$hand sid mismatch post-load (host '$($h.sid)' join '$($j.sid)')" }
+        else {
+            $shared++
+            Write-Host "    FINDING: SAME-HAND site hand=$hand sid='$($h.sid)' on BOTH clients POST-load (the coordinated-load identity proof)"
+        }
+    }
+    foreach ($hand in $jSites.Keys) {
+        if (-not $hSites.ContainsKey($hand)) { $why += "join-only site hand=$hand post-load (ghost - the loads diverged)" }
+    }
+    if ($shared -eq 0 -and $why.Count -eq 0) { $why += "no shared same-hand site post-load" }
+
+    # Suppression-lever finding (the join's manual loads route to the host).
+    $sup = Select-String -Path $JoinFile -Pattern '\[load\] JOIN load suppression ON' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $sup) { Write-Host "    FINDING: join load suppression engaged (host arbitrates loads)" }
+    else { Write-Host "    FINDING: join load suppression NEVER engaged (peer-presence edge missing?)" }
+
+    # 5. Portrait presence (protocol 36, blank-avatars session bug): the
+    # coordinated save must have captured the portrait atlas - a quiescence
+    # that shipped without it (or any load that warned about a missing one)
+    # reproduces the blank squad-tab avatars.
+    foreach ($side in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
+        if (Select-String -Path $side[0] -Pattern 'WARN quiesced WITHOUT portraits_texture\.png' -Quiet) {
+            $why += "$($side[1]) quiesced without portraits_texture.png (portrait gate expired)"
+        }
+        if (Select-String -Path $side[0] -Pattern '\[load\] WARN save .* has no portraits_texture\.png' -Quiet) {
+            $why += "$($side[1]) loaded a save without portraits_texture.png"
+        }
+    }
+    $portrait = Join-Path $env:LOCALAPPDATA 'kenshi\save\coopresume\portraits_texture.png'
+    if (-not (Test-Path $portrait)) { $why += "committed 'coopresume' has no portraits_texture.png on disk" }
+    else { Write-Host "    FINDING: portraits_texture.png present in the committed save ($([math]::Round((Get-Item $portrait).Length / 1KB, 1)) KB)" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  LOAD-SYNC $v - hostSites=$($hSites.Count) joinSites=$($jSites.Count) sameHand=$shared $detail"
+    return (Add-GateResult -Name "load_sync" -Status $v `
+                -Metrics @{ hostSites = $hSites.Count; joinSites = $jSites.Count; sameHand = $shared } -Detail $detail)
+}
+
 # vendor_trade (protocol 22 phase 1c): the buyer-side purchase composite gate.
 # Each side performed the two buyer-side mutations of one purchase (wallet
 # debit + item into the tab leader's inventory) on the tab it OWNS; the gate is
@@ -3329,26 +5870,102 @@ function Test-SpawnSync {
                             joinLocal = $jsp.Count; joinSuppressed = $jSupp } -Detail $detail)
 }
 
+# npc_census (protocol 36): wide-radius ghost culling. The join spawns 4
+# runtime NPCs and parks them ~600 u out - beyond the ~200 u stream bubble
+# (the near suppression pass can never judge them), inside the census radius.
+# Gates:
+#   1. CHANNEL: the host logged "[census] sent" and the join "[census] recv"
+#      (the 1 Hz existence list actually flowed).
+#   2. CULL: every join-local ghost hand drew a "[census] cull NPC hand=i,s"
+#      line (existence culling reached census range).
+#   3. RESTRAINT: wide-radius culls stayed within the ghost budget - a legit
+#      census NPC being mass-suppressed would show as extra culled hands
+#      (small slack for genuine host/join boundary divergence).
+function Test-NpcCensus {
+    param([string]$HostFile, [string]$JoinFile)
+    $joinLegs = Get-SpawnHands -File $JoinFile
+    $ghosts = if ($joinLegs.ContainsKey('ghost')) { @($joinLegs['ghost']) } else { @() }
+    if ($ghosts.Count -eq 0) {
+        Write-Host "  NPC-CENSUS FAIL - join never spawned its ghost squad"
+        return (Add-GateResult -Name "npc_census" -Status FAIL -Detail "no ghost spawns")
+    }
+
+    # 1. CHANNEL evidence on both ends.
+    $sent = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[census\] sent n=(\d+)' -Quiet)
+    $recv = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[census\] recv n=(\d+)' -Quiet)
+    $chanOk = $sent -and $recv
+    Write-Host ("  NPC-CENSUS channel " + $(if ($chanOk) { "PASS" } else { "FAIL" }) +
+                " - host sent=$sent join recv=$recv")
+
+    # 2. CULL: every ghost hand suppressed by the WIDE pass.
+    $culled = @{}
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern '\[census\] cull NPC hand=(\d+,\d+)' -ErrorAction SilentlyContinue)) {
+        $culled[$m.Matches[0].Groups[1].Value] = $true
+    }
+    $gCulled = 0
+    foreach ($h in $ghosts) {
+        $p = $h.Split(',')
+        if ($p.Count -eq 5 -and $culled.ContainsKey("$($p[3]),$($p[4])")) { $gCulled++ }
+    }
+    $cullOk = ($gCulled -eq $ghosts.Count)
+    Write-Host ("  NPC-CENSUS cull " + $(if ($cullOk) { "PASS" } else { "FAIL" }) +
+                " - $gCulled/$($ghosts.Count) ghost hands culled at census range")
+
+    # 3. RESTRAINT: no mass-suppression of legitimate census NPCs.
+    $extra = $culled.Count - $gCulled
+    $restraintOk = ($extra -le 2)
+    Write-Host ("  NPC-CENSUS restraint " + $(if ($restraintOk) { "PASS" } else { "FAIL" }) +
+                " - $extra non-ghost wide-radius culls (<= 2)")
+
+    $ok = $chanOk -and $cullOk -and $restraintOk
+    $why = @()
+    if (-not $chanOk)      { $why += "census channel silent" }
+    if (-not $cullOk)      { $why += "ghost hands not culled" }
+    if (-not $restraintOk) { $why += "legitimate NPCs mass-suppressed" }
+    $detail = $why -join "; "
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  NPC-CENSUS $v $detail"
+    return (Add-GateResult -Name "npc_census" -Status $v `
+                -Metrics @{ ghosts = $ghosts.Count; ghostsCulled = $gCulled
+                            extraCulls = $extra; sent = $sent; recv = $recv } -Detail $detail)
+}
+
 # ---- Locomotion-quality oracles ----------------------------------------------------
 
 # Smoothness (zero-advance fraction while the source moved). No SMOOTH line or a
 # scenario that never drove a moving body -> SKIP.
+# Since 2026-07-10 the plugin EXCLUDES frames captured during the session-start
+# clock-slew catch-up (join sims at up to 2x while the host streams at 1x - a
+# structural zero-step source that measured the slew, not the interp pipeline;
+# it drove the historical 0.2-0.9 zeroFrac flake). The excluded count is
+# reported as slewSkip=; a run whose motion fell almost entirely inside the
+# slew window has too few scored frames for the gate to mean anything -> SKIP.
 function Test-Smoothness {
-    param([string]$File, [string]$Label = "join", [double]$MaxZeroFrac = 0.40)
+    param([string]$File, [string]$Label = "join", [double]$MaxZeroFrac = 0.40,
+          [int]$MinActiveFrames = 200)
     if (-not (Test-Path $File)) {
         return (Add-GateResult -Name "smoothness" -Status SKIP -Detail "no log")
     }
-    $line = Select-String -Path $File -Pattern "SCENARIO SMOOTH .*zeroFrac=([\d\.]+).*maxStep=([\d\.]+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $line = Select-String -Path $File -Pattern "SCENARIO SMOOTH active=(\d+) .*zeroFrac=([\d\.]+).*maxStep=([\d\.]+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($null -eq $line) {
         Write-Host "  [$Label] no SCENARIO SMOOTH line (skipped)"
         return (Add-GateResult -Name "smoothness" -Status SKIP -Detail "no SMOOTH line")
     }
-    $zeroFrac = [double]$line.Matches[0].Groups[1].Value
-    $maxStep  = [double]$line.Matches[0].Groups[2].Value
+    $active   = [int]$line.Matches[0].Groups[1].Value
+    $zeroFrac = [double]$line.Matches[0].Groups[2].Value
+    $maxStep  = [double]$line.Matches[0].Groups[3].Value
+    $slewSkip = 0
+    if ($line.Line -match "slewSkip=(\d+)") { $slewSkip = [int]$Matches[1] }
+    if ($active -lt $MinActiveFrames) {
+        Write-Host "  [$Label] smoothness SKIP - active=$active (< $MinActiveFrames scored frames; slewSkip=$slewSkip fell in the clock-slew window)"
+        return (Add-GateResult -Name "smoothness" -Status SKIP `
+                    -Metrics @{ active = $active; slewSkip = $slewSkip } `
+                    -Detail "only $active scored frames (slewSkip=$slewSkip)")
+    }
     $ok = ($zeroFrac -le $MaxZeroFrac)
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  [$Label] smoothness $v - zeroFrac=$zeroFrac (<= $MaxZeroFrac), maxStep=$maxStep"
-    return (Add-GateResult -Name "smoothness" -Status $v -Metrics @{ zeroFrac = $zeroFrac; maxStep = $maxStep })
+    Write-Host "  [$Label] smoothness $v - zeroFrac=$zeroFrac (<= $MaxZeroFrac), maxStep=$maxStep, active=$active, slewSkip=$slewSkip"
+    return (Add-GateResult -Name "smoothness" -Status $v -Metrics @{ zeroFrac = $zeroFrac; maxStep = $maxStep; active = $active; slewSkip = $slewSkip })
 }
 
 # Anim-truth (the float-bug detector). Too few translating frames -> SKIP.
@@ -3420,6 +6037,7 @@ function Invoke-OneOracle {
         "bed_pose"      { return (Test-BedPose         -HostFile $HostLog -JoinFile $JoinLog) }
         "bed_put"       { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 1) }
         "cage_put"      { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 2) }
+        "cage_peer"     { return (Test-CagePeer        -HostFile $HostLog -JoinFile $JoinLog) }
         "sneak_probe"   { return (Test-SneakProbe      -HostFile $HostLog) }
         "spawn_probe"   { return (Test-SpawnProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "shop_probe"    { return (Test-ShopProbe       -HostFile $HostLog -JoinFile $JoinLog) }
@@ -3427,7 +6045,33 @@ function Invoke-OneOracle {
         "vendor_trade"  { return (Test-VendorTrade     -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_probe" { return (Test-RecruitProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_sync"  { return (Test-RecruitSync     -HostFile $HostLog -JoinFile $JoinLog) }
+        "faction_probe" { return (Test-FactionProbe    -HostFile $HostLog -JoinFile $JoinLog) }
+        "faction_sync"  { return (Test-FactionSync     -HostFile $HostLog -JoinFile $JoinLog) }
+        "time_probe"    { return (Test-TimeProbe       -HostFile $HostLog -JoinFile $JoinLog) }
+        "time_sync"     { return (Test-TimeSync        -HostFile $HostLog -JoinFile $JoinLog) }
+        "door_probe"    { return (Test-DoorProbe       -HostFile $HostLog -JoinFile $JoinLog) }
+        "door_sync"     { return (Test-DoorSync        -HostFile $HostLog -JoinFile $JoinLog) }
+        "build_probe"   { return (Test-BuildProbe      -HostFile $HostLog -JoinFile $JoinLog) }
+        "build_sync"    { return (Test-BuildSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "bdoor_probe"   { return (Test-BdoorProbe      -HostFile $HostLog -JoinFile $JoinLog) }
+        "bdoor_sync"    { return (Test-BdoorSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "hunger_probe"  { return (Test-HungerProbe     -HostFile $HostLog -JoinFile $JoinLog) }
+        "hunger_sync"   { return (Test-HungerSync      -HostFile $HostLog -JoinFile $JoinLog) }
+        "latejoin_probe" { return (Test-LatejoinProbe  -HostFile $HostLog -JoinFile $JoinLog) }
+        "latejoin_sync"  { return (Test-LatejoinSync   -HostFile $HostLog -JoinFile $JoinLog) }
+        "save_probe"     { return (Test-SaveProbe      -HostFile $HostLog -JoinFile $JoinLog) }
+        "load_probe"     { return (Test-LoadProbe      -HostFile $HostLog -JoinFile $JoinLog) }
+        "save_sync"      { return (Test-SaveSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "save_resume"    { return (Test-SaveResume     -HostFile $HostLog -JoinFile $JoinLog) }
+        "load_sync"      { return (Test-LoadSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "prod_probe"     { return (Test-ProdProbe      -HostFile $HostLog -JoinFile $JoinLog) }
+        "prod_sync"      { return (Test-ProdSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "store_probe"    { return (Test-StoreProbe     -HostFile $HostLog -JoinFile $JoinLog) }
+        "store_sync"     { return (Test-StoreSync      -HostFile $HostLog -JoinFile $JoinLog) }
+        "squad_probe"    { return (Test-SquadProbe     -HostFile $HostLog -JoinFile $JoinLog) }
+        "squad_sync"     { return (Test-SquadSync      -HostFile $HostLog -JoinFile $JoinLog) }
         "spawn_sync"    { return (Test-SpawnSync       -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
+        "npc_census"    { return (Test-NpcCensus       -HostFile $HostLog -JoinFile $JoinLog) }
         "sneak_pose"    { return (Test-SneakPose       -HostFile $HostLog -JoinFile $JoinLog) }
         "sneak_detect"  { return (Test-SneakDetect     -HostFile $HostLog -JoinFile $JoinLog) }
         "body_state"    { return (Test-NpcBodyState    -HostFile $HostLog -JoinFile $JoinLog) }
@@ -3455,8 +6099,11 @@ function Invoke-OneOracle {
         "inv_equip"     { return (Test-InventoryEquip  -HostFile $HostLog -JoinFile $JoinLog) }
         "inv_reequip"   { return (Test-InventoryReequip -HostFile $HostLog -JoinFile $JoinLog) }
         "add_equip"     { return (Test-AddEquip        -HostFile $HostLog -JoinFile $JoinLog) }
+        "trade_probe"   { return (Test-TradeProbe      -HostFile $HostLog -JoinFile $JoinLog) }
+        "trade_peer"    { return (Test-TradePeer       -HostFile $HostLog -JoinFile $JoinLog) }
         "drop_probe"    { return (Test-DropProbe       -HostFile $HostLog) }
         "wi_sync"       { return (Test-WorldItemSync   -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
+        "wi_join"       { return (Test-WorldItemSync   -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance -JoinAuthor -GateName "wi_join") }
         "wpn_relocate"  { return (Test-WpnRelocate     -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_drop"   { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog) }
         "armor_drop"    { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "armor_drop") }
@@ -3512,6 +6159,20 @@ function Invoke-RunAnalysis {
     $cleanPattern = if ($Scenario -ne "") { "SCENARIO RESULT" } else { "test duration elapsed; exiting" }
     [void](Test-LogHealth -File $HostLog -Label "host" -Required $true -CleanPattern $cleanPattern)
     [void](Test-LogHealth -File $JoinLog -Label "join" -Required $JoinExpected -CleanPattern $cleanPattern)
+
+    # 1b. Clock catch-up visibility (always, advisory). The join closes its
+    # load skew by simming at up to 2x (protocol 25); any oracle that scores
+    # motion while the slew is engaged is measuring the transient, not the
+    # steady state (the smoothness oracle now excludes those frames itself -
+    # slewSkip=). This FINDING makes the overlap visible on every run; the
+    # time_sync scenario is where convergence is actually GATED.
+    if ($JoinLog -ne "" -and (Test-Path $JoinLog)) {
+        $slew = Get-SlewSummary -File $JoinLog
+        if ($null -ne $slew) {
+            $conv = if ($slew.converged) { "converged to 1x" } else { "STILL SLEWING at log end (slew=$($slew.lastSlew))" }
+            Write-Host "  FINDING: join clock catch-up - peakOff=$($slew.peakOffGh)gh peakSlew=$($slew.peakSlew)x for ~$($slew.slewSecs)s; $conv"
+        }
+    }
 
     $gating = @(); $advisory = @(); $primary = ""
     if ($Scenario -ne "") {
@@ -3612,18 +6273,20 @@ Export-ModuleMember -Function @(
     "Test-LimbLoss", "Test-NpcVitals",
     "Get-StatsSeries", "Test-StatsSync",
     "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry",
-    "Get-FurnSeries", "Test-FurnPut",
+    "Get-FurnSeries", "Test-FurnPut", "Test-CagePeer",
     "Test-SneakProbe",
-    "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync",
+    "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync", "Test-NpcCensus",
     "Get-WalletSeries", "Test-ShopProbe", "Test-MoneySync", "Test-VendorTrade",
     "Test-RecruitProbe", "Test-RecruitSync",
+    "Get-FacRelSeries", "Test-FactionProbe", "Test-FactionSync",
+    "Get-GTimeSeries", "Test-TimeProbe", "Test-TimeSync", "Get-SlewSummary",
     "Get-SneakSeries", "Test-SneakPose", "Test-SneakDetect",
     "Test-SpeedSync",
     "Test-SpeedProbe",
     "Test-CombatCrowd",
     "Test-SplitInterest",
     "Test-InventorySync", "Test-InventoryBidir", "Test-InventoryEquip",
-    "Test-InventoryReequip", "Test-AddEquip", "Test-DropProbe",
+    "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-WpnRelocate", "Test-WeaponDrop",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"

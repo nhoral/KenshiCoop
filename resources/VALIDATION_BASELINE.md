@@ -883,6 +883,765 @@ the copy locally and re-partition ownership); recruits are session-state (save
 instant keeps one body per machine but ownership resolves to whoever's EVT
 lands second on each side (benign for position sync, unmeasured for control).
 
+## Faction-relation sync (2026-07-08, addendum)
+
+Protocol 23 -> 24 (`PKT_FACTION`). Gap 3: relation state is per-client
+`FactionRelations`; attacking a faction flipped hostility on ONE machine only.
+
+faction_probe (run 132239, factionSync forced OFF) settled the design:
+faction GameData stringIDs are cross-client stable on the shared save (10/10
+interesting rows common, censuses identical at n=72); the engine keeps the
+two per-side tables MIRRORED (us==them in every enumerated row, before and
+after the sentinel writes); enemy/ally flags DERIVE from the value (sentinel
+-75 flipped enemy=1 both directions, +65 flipped ally=1, same tick); the
+sentinel `setRelation` sticks locally for the whole run and nothing crosses.
+Consequence: ONE f32 per faction sid is the complete wire state - no flags,
+no reciprocal row, no cause enum needed on the wire.
+
+Mechanism: both clients run the same detector inside
+`Replicator::publishFactions` - the player-faction relation table sampled at
+1 Hz (immediately when either detoured `FactionRelations::affectRelations`
+overload recorded a real engine mutation), rows that moved >= 0.5 vs the
+seeded baseline stream as `PKT_FACTION` (sid + f32 + per-sender seq,
+CH_RELIABLE, 10 s per-sid safety resend; the seeded baseline keeps a settled
+diplomacy silent). `applyFactions` writes received rows onto BOTH local table
+directions via `setRelation`, updating the baseline BEFORE the write - the
+echo guard - and skipping stale (seq) or already-converged rows.
+`KENSHICOOP_FACTION_SYNC` (default ON) is the A/B hatch; faction_probe forces
+it off.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| faction_probe (new, probe tier; factionSync forced OFF) | sync | PASS | run 132239: sids stable, tables mirrored, flags derived, sentinels stuck locally + did NOT cross; AFFECT-EV/AMT=0 (no organic mutations in a 40 s idle run) |
+| faction_sync (new, full tier) | sync | PASS | run 133734: crossed=2/2 (host -75 and join +65 each applied on the peer ~10 ms after the write, ok=1), no diverged co-visible rows at end; exactly one SEND + one RECV per leg (echo-free) |
+| coop_presence | squad1 | PASS | regression |
+| npc_sync | c | PASS | regression |
+| combat_kill | c | PASS | regression (combat still clean with the affectRelations detours installed) |
+| recruit_sync | sync | PASS | regression (protocol 23 channel unchanged) |
+
+prototest: 133/133 (adds sizeof(FactionPacket)=61 + round-trip).
+
+Accepted limitations: bounties / crime state are a separate engine system
+(the `[fac] AFFECT` detour keeps accumulating cause-attribution field
+evidence); NPC faction-vs-faction wars are world-sim (gap 6) - only rows
+involving the PLAYER faction stream; the AFFECT-triggered immediate sample
+covers engine-native mutations, while console/mod writes that bypass
+affectRelations ride the 1 Hz sample instead.
+
+## Game-clock sync (2026-07-08, addendum)
+
+Protocol 24 -> 25 (`PKT_TIME`). Gap 4 (the last Priority-1 item): each client
+integrated its own in-game clock from its own load/pause moments, so the
+calendar drifted and day/night (NPC schedules, shop hours, stealth vision)
+diverged - no packet carried game time.
+
+time_probe (run 141509, timeSync AND speedSync forced OFF) settled the design:
+`GameWorld::getTimeStamp_inGameHours` (struct-return ABI - TimeOfDay has
+user-declared ctors, so the hidden-retbuf model applies, same as
+getPositionBip01) returns the ABSOLUTE campaign clock in total in-game hours;
+the host/join offset on the shared save was exactly the load-moment skew
+(~0.3 gh, drifting further with every differential pause); hour length is
+identical on both clients (109.1 s per game hour); and the clock rate tracks
+`frameSpeedMult` EXACTLY (2x burst -> 2.00 measured ratio) - so a sim-speed
+slew is a precise clock actuator.
+
+Mechanism: the host broadcasts `PKT_TIME` (absolute f64 gameHours + seq,
+CH_RELIABLE, ~1 Hz - at 109 s/gh, 50 ms of wire latency is ~0.0005 gh, so no
+RTT compensation). `Replicator::syncTime` on the join computes offset = host -
+local per sample and steers `timeSlew_`, a proportional multiplier (gain 30
+per gh, capped +2x, floored 0.25x, engage >0.01 gh / disengage <0.002 gh
+hysteresis) that `slewedEffective()` folds into EVERY quiet speed write the
+consensus layer makes - the slew multiplies the arbitrated effective instead
+of overwriting it, so `speed_sync` enforcement and the clock correction
+compose. A direct clock STEP (write the `timeStamper` CPerfTimer base,
+self-verifying with revert) was prototyped and REJECTED: the calendar does not
+derive from that timer (run 150001) - no writable clock base exists, slew-only.
+`KENSHICOOP_TIME_SYNC` (default ON) is the A/B hatch; time_probe forces it
+off (with speedSync, so its burst applies unarbitrated), and speed_sync
+forces timeSync off (its oracle gates RAW fsm equality, which the slew
+intentionally violates during catch-up; the composition is gated by
+time_sync instead).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| time_probe (new, probe tier; both syncs forced OFF) | sync | PASS | run 141509: absolute clock, initial offset 0.302 gh, unsynced drift +0.091 gh over 40 s, burst rate ratio 2.00, hourLen 109.1 both sides |
+| time_sync (new, full tier; 65 s + 2x consensus burst t=15-25 s) | sync | PASS | run 145800s-block: ~0.3 gh skew closed in ~35 s at the 2x cap, final offset 0.00214 gh (tol 0.02), monotonic both sides, convergence held across the burst |
+| coop_presence | squad1 | PASS | regression |
+| npc_sync | c | PASS | regression (run 155343: 9/9 tracked, ratio 1.0 - earlier 4x slew cap DID dip tracking below gate, which is why the cap is 2x) |
+| speed_sync | c | PASS | regression (timeSync forced off in-scenario; combat window + transitions clean) |
+| faction_sync | sync | PASS | regression |
+
+prototest: 137/137 (adds sizeof(TimePacket)=17 + round-trip).
+
+Accepted limitations: the catch-up is a visible session-start transient (the
+join sim runs up to 2x for ~35 s per 0.3 gh of skew - the 4x cap that halved
+that window measurably disturbed NPC tracking and was rejected); differential
+pauses during play re-open small offsets that re-close within seconds; save/
+load calendar coordination across sessions is gap 8; NPC-schedule / weather
+CONSEQUENCES of the now-shared clock are gap 6 territory.
+
+## Door-state sync (2026-07-08, addendum)
+
+Protocol 25 -> 26 (`PKT_DOOR`). The first slice of gap 5 (buildings): door and
+gate open/lock state on BAKED buildings was per-client - one player walks
+through a gate the other sees closed, and door state feeds pathfinding, AI
+access, and base defense. No packet carried it.
+
+door_probe (run 160041, doorSync forced OFF) settled the design: baked-door
+hands are cross-client stable (the census intersected on the shared save -
+the furniture/bed identity precedent extends to `DoorStuff : Building`,
+enumerated via `getObjectsWithinSphere(BUILDING)` + the `imADoor` member);
+the engine's own `openDoor`/`closeDoor` entries work as the write lever and
+animate natively (DoorState walks OPENING->OPEN over ~1 s, which is why the
+channel publishes the collapsed DESTINATION state - OPENING counts as open -
+never the mid-swing transient); and with no channel the sentinel toggles
+stayed strictly local (both sides toggled the same co-visible door; neither
+write crossed).
+
+Mechanism: SYMMETRIC change-gated rows, the faction-relation shape. Both
+clients sample doors within ~100 m of their interest centers ~1 Hz and stream
+rows whose (open, locked) moved vs a seeded per-hand baseline (`PKT_DOOR`:
+hand + open + locked, CH_RELIABLE); received rows apply through the engine's
+own door actions (`writeDoorByHand`: polite `openDoor`/`closeDoor` first,
+`_forceDoorOpenUT`/`_forceDoorClosedUT` only when refused; `lockDoor`/
+`unlockDoor` when the door has a DoorLock). The baseline updates BEFORE the
+apply write, so an applied row is never re-detected as a local change
+(echo-free); per-sender seq drops stale rows; a 10 s safety resend covers
+loss; hands that fail to resolve locally are skipped silently
+(out-of-interest or a runtime-placed door - accepted edge).
+`KENSHICOOP_DOOR_SYNC` (default ON) is the A/B hatch; forced OFF inside
+`door_probe`.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| door_probe (new, probe tier; doorSync forced OFF) | sync | PASS | run 160041: census 1 door/side, common=1 (hand-stable), both sentinel writes stuck locally (polite lever), neither crossed |
+| door_sync (new, full tier; doorSync ON) | sync | PASS | run 161116: crossed 2/2 (host toggle applied on join in <20 ms wire-to-write, join toggle likewise), diverged 0, no echo ping-pong (3 packets total) |
+| coop_presence | squad1 | PASS | regression |
+| npc_sync | c | PASS | regression (run 163712; earlier same-day runs flaked npc_track in BOTH doorSync arms - zero [door] packets in that save, machine-load flake, passed after cooldown) |
+| faction_sync | sync | PASS | regression |
+| time_sync | sync | PASS | regression |
+
+prototest: 141/141 (adds sizeof(DoorPacket)=31 + round-trip).
+
+Accepted limitations: only BAKED doors stream (player-placed buildings are
+runtime hands - the protocol-21 describe/mint problem for structures stays in
+gap 5); interest-scoped (~100 m of either player's leaders), so a door that
+moved while NEITHER player was near reconciles only when someone returns and
+the change-gate sees it move again (the shared save seeds agreement at load);
+door HEALTH/broken state and lockpicking stay out of scope (doctrine 31); the
+`sync` save has a single door in range - multi-door towns exercise the same
+code path but were not separately gated.
+
+## Placed-building sync (2026-07-08, addendum)
+
+Protocol 26 -> 27 (`PKT_BUILD_PLACE` + `PKT_BUILD_STATE`). The second slice of
+gap 5 (buildings): a player-placed building is a RUNTIME object whose hand
+exists only in the placer's session - a building one player places does not
+exist AT ALL for the other, and construction progress had no channel. This is
+the protocol-21 identity problem for structures.
+
+build_probe (run 174550, buildSync forced OFF) settled the design's three open
+questions: the raw `createBuilding` factory call BYPASSES the UI's
+town-placement verification (`PreviewBuilding::placementVerification` is a
+UI-layer gate; both programmatic placements landed in the town-adjacent `sync`
+save - so a peer mint always lands where the placer's did, and the channel
+never needs placement rules relitigated); minted-site hands are RUNTIME (the
+cross-client census intersection was ZERO, unlike baked doors/furniture - the
+wire must key by the placer's hand); and the engine's own
+`setConstructionProgress` works as the progress lever on a 0..1 scale and
+SELF-COMPLETES at >= 1.0 (progress jumps to the engine's internal 4.0,
+isComplete flips, the scaffold comes off natively - no explicit completion
+call needed).
+
+Mechanism: PLACER-AUTHORITATIVE describe/mint, the protocol-21 proxy precedent
+for structures. A local placement - the `PreviewBuilding::
+placeFinalPreviewBuilding` detour catches real build-mode commits, the
+programmatic scenario place queues the same edge - announces `PKT_BUILD_PLACE`
+(template sid + transform, keyed by the PLACER's local hand, CH_RELIABLE).
+The receiver mints an INCOMPLETE local site through the same factory and keeps
+a key -> local-hand translation map (a refused mint is remembered so resends
+never retry the factory; duplicate keys dedupe). The placer then samples its
+own sites ~1 Hz and streams change-gated `PKT_BUILD_STATE` rows (10 s safety
+resend while incomplete; the complete=1 row latches that site's channel
+silent), applied through `setConstructionProgress` via the map. Echo-free BY
+CONSTRUCTION rather than by baseline ordering: a factory mint never passes
+through the placement detour, so a minted proxy cannot re-announce.
+`KENSHICOOP_BUILD_SYNC` (default ON) is the A/B hatch; forced OFF inside
+`build_probe`.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| build_probe (new, probe tier; buildSync forced OFF) | sync | PASS | run 174550: both placements rc=1 (factory bypasses town rules), own site enumerable prog 0->0.75 then complete, census hand intersection ZERO (runtime hands), nothing crossed |
+| build_sync (new, full tier; buildSync ON) | sync | PASS | run 175747: minted 2/2 (both directions), progress crossed 2/2 (4 applied rows each, complete=1 latched), channel silent after completion |
+| coop_presence | squad1 | PASS | regression (clean + wan) |
+| npc_sync | c | FLAKY->PASS | regression; first attempts failed smoothness (clean, zeroFrac 0.505) / npc_track (wan, ratio 0.778 vs 0.8) - the documented machine-load signature, zero [build] packets in that save, both retry-passed |
+| door_sync | sync | PASS | regression |
+| faction_sync | sync | PASS | regression |
+| time_sync | sync | PASS | regression |
+
+prototest: 149/149 (adds sizeof(BuildPlacePacket)=94, sizeof(BuildStatePacket)=34
++ round-trips).
+
+Accepted limitations: doors on PLACED buildings do not stream yet (the door
+channel skips unresolvable runtime hands; the translation map now exists, so
+keying PKT_DOOR through it is the natural next stitch); building
+DELETION/dismantle has no channel (a dismantled site stays on the peer until
+re-load); a peer that connects AFTER a site completed never receives the
+PLACE (announcements are session-scoped, not persisted state transfer - the
+shared-save workflow reloads from a common save anyway); the minted proxy's
+OWNER faction is unset (cosmetic; ownership semantics stay with the placer's
+client); production machines, research, farming, and door HEALTH stay in
+gap 5 / doctrine 31.
+
+## Placed-building doors + dismantle (2026-07-08, addendum)
+
+Protocol 27 -> 28 (`PKT_BUILD_DOOR` + `PKT_BUILD_REMOVE`). The two stitches
+flagged by the protocol-27 slice: doors on PLACED buildings are runtime
+objects on BOTH clients (the protocol-26 door channel skips unresolvable
+hands, so one player's shack door stayed shut on the other's proxy), and a
+dismantled/destroyed placed building left a GHOST proxy on the peer.
+
+bdoor_probe (run 195513, bdoorSync forced OFF, protocol-27 mint channel ON)
+settled the design's open questions: a minted proxy mints its own DoorStuff
+children in TEMPLATE ORDER (the shack's door sat at parent->doors index 0 on
+both clients - so (placer's building hand, door index) resolved through the
+protocol-27 build maps names the same physical door everywhere, and no raw
+door hand ever needs to cross); the engine's polite openDoor/closeDoor lever
+works on runtime doors exactly as on baked ones; `GameWorld::destroy` cleanly
+removes a placed building locally; and the peer's proxy SURVIVED the placer's
+destroy (11 ghost census samples after t+2s - the removal gap was real).
+
+Mechanism: `PKT_BUILD_DOOR` is the protocol-26 symmetric change-gated door
+row on the TRANSLATED identity - both clients sample the doors of every
+building in their build maps ~1 Hz (own placements key by our hand, minted
+proxies through a new reverse map local-mint-hand -> placer-key), seeded
+baselines, baseline-before-write echo guard, per-sender seq, 10 s safety
+resend; the protocol-26 channel now SKIPS doors whose parent building is
+session-placed (partition, no double-streaming). `PKT_BUILD_REMOVE` is
+placer-authoritative: the dismantle detour (`Building::
+notifyConstructionDismantling`, the UI path) or a programmatic destroy queues
+a removal edge; the receiver destroys its mapped proxy through the engine's
+own `GameWorld::destroy` and TOMBSTONES the map entry (late STATE/DOOR rows
+for the key skip silently). `KENSHICOOP_BDOOR_SYNC` (default ON) gates both
+halves; forced OFF inside `bdoor_probe`.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| bdoor_probe (new, probe tier; bdoorSync forced OFF) | sync | PASS | run 195513: both shacks placed + ramped to complete, proxies minted 1 door idx=0 each, toggles ok=1 locally but did NOT cross, host destroy ok=1 locally, GHOST persisted on join (11 samples) |
+| bdoor_sync (new, full tier; bdoorSync ON) | sync | PASS | run 200456: toggles CROSSED 2/2 (peer applied [bdoor] RECV ok=1 + census at the toggled state), host destroy REMOVED the join's proxy (REMOVE-RECV ok=1, 0 ghost samples) |
+| coop_presence | squad1 | PASS | regression (clean + wan) |
+| npc_sync | c | FLAKY->PASS (clean), PASS (wan) | regression; clean first attempt failed smoothness - the documented machine-load signature, zero [bdoor] packets in that save, retry-passed |
+| build_sync | sync | PASS | regression |
+| door_sync | sync | PASS | regression (the protocol-26 partition did not disturb baked doors) |
+| faction_sync | sync | PASS | regression |
+| time_sync | sync | PASS | regression |
+
+prototest: 157/157 (adds sizeof(BuildDoorPacket)=32, sizeof(BuildRemovePacket)=29
++ round-trips).
+
+Accepted limitations: gates/wall doors on placed WALLS out of scope; removal
+only covers buildings in the session's build maps (a baked building's
+dismantle logs at the detour but never streams); a peer that missed the PLACE
+also misses the REMOVE (harmless - nothing to remove); a non-placer's UI
+dismantle of a minted proxy stays local (removal is placer-authoritative; the
+forwarding intent is a future stitch); door HEALTH/broken state and
+lockpicking stay in gap 5 / doctrine 31.
+
+## Hunger sync (2026-07-08, addendum)
+
+Protocol 28 -> 29 (hunger + fed folded into `PKT_MEDICAL`). Gap 7's hunger
+half: hunger is a per-client local simulation - each engine decays EVERY
+character's hunger and eating happens only on the owner's client, so a driven
+copy starves in the peer's view (stat penalties, eventual hunger KO).
+
+hunger_probe (run 213751, hungerSync forced OFF, the rest of the medical
+snapshot streaming as usual) settled the design's open questions: the engine's
+hunger scale is ~0..3 (both squad leaders sat near 2.92 "full"); decay is
+ACTIVITY-DRIVEN per client, which makes the divergence fast - the MARCHING
+leader decayed at ~0.024/s on the client driving it while the same body's
+IDLE driven copy decayed at ~0.0002/s on the peer, a 1.16-unit (~40%)
+owner-vs-copy gap in one 50 s run; a direct `MedicalSystem::hunger` write
+STICKS (no clamp/reset from the engine's periodic update); and the sentinel
+drops stayed strictly local with the hatch off (the gap was real).
+`dazedOrAlert` measured as a 0..1 alertness-style flag at rest - NOT an
+intoxication scalar; the drunk/drug half stays unmapped (needs its own spike).
+
+Mechanism: FOLD-IN, not a new channel. The owner's hunger + fed ride the
+existing owner-authoritative medical snapshot as two f32s (engine read/write
+through the same `&c->medical` path as blood); the change-gate fingerprint
+quantizes them to 0.1 units (the heaviest measured decay flips a bucket
+slower than the 3 s safety resend, so the fold-in adds zero packets); -1 =
+field-not-carried, which is how `KENSHICOOP_HUNGER_SYNC` (default ON, forced
+OFF inside `hunger_probe`) A/Bs the fields without touching the rest of the
+medical stream - the receiver's `writeMedical` skips negative values, and the
+`ownHands_` partition already prevents self-writes (no new echo machinery).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| hunger_probe (new, probe tier; hungerSync forced OFF) | sync | PASS | run 213751: scale ~0..3, active-vs-idle decay 0.024 vs 0.0002/s (endGap 1.16 in 50 s), sentinel writes stuck locally, nothing crossed, dazedOrAlert 0..1 |
+| hunger_sync (new, full tier; hungerSync ON) | sync | PASS | run 214516: sentinel drops crossed 2/2 (9-10 peer census samples within 10 s), final owner-vs-copy hunger gap 0.000 on every shared hand |
+| coop_presence | squad1 | PASS | regression (clean + wan) |
+| npc_sync | c | PASS | regression (clean + wan, no flake this cycle) |
+| medic_order | sync | PASS | regression (the medical channel's own composite gate) |
+| limb_loss | c | PASS | regression (clean + wan; MedicalPacket layout change verified in anger) |
+| faction_sync | sync | PASS | regression |
+| time_sync | sync | PASS | regression |
+
+prototest: 157/157 (sizeof(MedicalPacket) 459 -> 467; round-trip already
+covered).
+
+Accepted limitations: drunk/drugged status effects stay unsynced (no mapped
+engine surface - `dazedOrAlert` disproven as the intox scalar by the probe;
+needs its own runtime spike after consumption); hunger KO transitions stay
+with the reliable KO/death event channel (converged hunger makes both engines
+agree on the KO organically); `fed` streams alongside hunger but eating
+ANIMATIONS on driven copies are cosmetic-local; combat-scoped NPCs (medNpc_)
+get hunger for free through the same packet - harmless (copies converge to
+host truth).
+
+## Late-join / reconnect resync (2026-07-08, addendum)
+
+Protocol 29 -> 30 (connect-edge resync; NO wire change - `PROTOCOL_VERSION`
+stays 29, "protocol 30" is doc numbering). Gap 9: a client that connects late
+(or reconnects) trusts the shared save + live streams; anything that diverged
+before the connect heals only when each channel's safety resend happens to
+cover it - and the one-shot describe/mint edges are lost forever: a
+pre-connect `PKT_BUILD_PLACE` never re-fires, so the late joiner never mints
+the building, which also strands its STATE rows, its `PKT_BUILD_DOOR` rows
+and any later `PKT_BUILD_REMOVE` (unknown keys skip silently).
+
+latejoin_probe (run 230601, latejoinSync forced OFF, everything else
+streaming) measured the unsynced baseline. The pre-arm surface works: the
+host mutated state at gameplay-start t+3-5 s through the existing
+`onGameplay` hook (a sentinel faction relation, a +777 wallet bump, a
+placed + ramped-complete building) with the connect edge landing ~14 s
+later - a reliable pre-connect window in the loopback harness (the join
+launches 8 s after host gameplay + its own load). Findings: the pre-connect
+BUILDING never minted on the join (the permanent-loss class, proven); the
+faction and money rows healed via their 5-10 s safety resends (pre-connect
+sends into the void had armed them) - already agreed by the first post-arm
+census sample; the baked-DOOR leg went findings-only: town AI owns the sync
+save's one baked door and fights any sentinel (reopens within ~1 s of every
+write, unlocks its own lock - runs 225300/230601), so holding a door
+mutation to the connect boundary is not provable in that save. The door
+CHANNEL's resync lever is the identical lastSendMs=1 code path the gated
+faction rows exercise (same row shape, same 10 s resend condition).
+
+Mechanism: `Replicator::onPeerConnected()`, called from the game-thread
+connect drain in `processNetEvents` (host on HELLO, join on WELCOME - covers
+late joins AND quick reconnects, symmetric on both sides). Two moves:
+1. one-shot edges replayed - every live `ownBuilds_` entry re-queues its
+   retained `PKT_BUILD_PLACE` (captured at edge-drain time, no engine
+   re-read) and removed ones re-queue `PKT_BUILD_REMOVE`; the receiver's
+   session maps dedupe (known key skips the mint, tombstone skips the
+   remove); the STATE row un-latches (doneSent/lastProg reset) so one fresh
+   progress row re-latches complete;
+2. force-resend pass - `lastSendMs = 1` on every row EVER SENT across
+   facRows_/doorRows_/bdoorRows_/medPub_/statsPub_/moneyPub_/invPub_/
+   worldTrack_ (each channel's own safety-resend condition fires on its next
+   sample). Rows never sent - the seeded shared-save baseline - stay silent;
+   edge-only caches (weaponCensus_, hostBody_, stealthPub_) are deliberately
+   untouched (re-seeding would author phantom drop/KO edges).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| latejoin_probe (new, probe tier; latejoinSync forced OFF) | sync | PASS | run 230601: building never minted on the join, fac/money healed only via safety resends, door leg findings-only (town-AI churn) |
+| latejoin_sync (new, full tier; latejoinSync ON) | sync | PASS | run 231429: `[latejoin] RESYNC place=1 ... fac=1 med=1 stats=1 money=1` on the host's connect edge; the pre-connect building MINTED + latched complete on the join; faction sentinel (-85) + wallet (+777) agreed from the first post-arm sample |
+| coop_presence | squad1 | PASS | regression (clean + wan) |
+| npc_sync | sync | FAIL (machine-state flake, A/B-exonerated) | npc_track PASSed 3 of the last 4 attempts; smoothness/anim_truth degraded PROGRESSIVELY across the midnight attempts with an fps-collapse signature (join translateFrames 1086 -> 567 -> 30, zeroFrac 0.32 -> 0.92 - the join window barely rendered, consistent with an idle/locked display), identical with `KENSHICOOP_LATEJOIN_SYNC=0`; the flake predates the change (all-day history incl. pre-deploy runs), and the resync's entire traffic in this scenario is 3 reliable packets once at connect (`RESYNC med=1 stats=1 money=1`) - re-run in an attended session |
+| build_sync | sync | PASS | regression |
+| bdoor_sync | sync | PASS | regression |
+| door_sync | sync | PASS | regression |
+| faction_sync | sync | PASS | regression |
+| money_sync | sync | PASS | regression |
+| time_sync | sync | PASS | regression |
+
+prototest: no change (no wire change).
+
+Accepted limitations: event HISTORY is not replayed - KO/death events,
+recruit re-keys and weapon-drop/pickup intents fired before the connect are
+gone (the medical/stats snapshots self-heal the state those events carried;
+recruit re-key replay rides gap 8's save coordination); the resync bursts one
+full snapshot per channel on CH_RELIABLE (bounded by squad size + nearby
+state); a reconnecting client keeps its session maps (`peerBuilds_`,
+`proxyByKey_`), so duplicate re-announces dedupe by design; the baked-door
+sentinel leg is findings-only in the sync save (town AI fights it - the door
+channel's resync lever is proven by the identical faction-row code path).
+
+## Coordinated save + session resume (2026-07-09, addendum)
+
+Protocol 30 -> 31 (wire version 29 -> 30). Gap 8: no coordinated save - a
+resumed session needed a manually re-mirrored save, and everything hand-keyed
+rides the shared-save lineage that live sessions erode (session-placed
+buildings/recruits exist only as runtime hands + proxies until a save bakes
+them). Design pivot recorded in the gap: the `_coop.dat` sidecar candidate was
+dropped - the HOST's save is authoritative and travels IN-BAND, so one save
+with one hand per object lands identically on both sides.
+
+Mechanism: `SaveManager::save` detour (every local save logs a `[save]
+LOCAL-SAVE` edge; spike 39's `getCurrentGame`/`getSavePath` RVAs resolve the
+live save identity/root - `save_probe` retired both runtime unknowns). A host
+edge arms a folder-quiescence watch (poll until mtimes/sizes hold still 1.5 s;
+30 s change-timeout); on QUIESCED the folder streams to the join over
+CH_RELIABLE in ~4 KB chunks paced ~32 per 50 ms burst (~2.5 MB/s ceiling):
+`PKT_SAVE_BEGIN` (name/fileCount/totalBytes), `PKT_SAVE_FILE` (stateless
+chunks - the relative path rides every chunk), `PKT_SAVE_DONE` (per-file
+FNV-1a-32 CRC table). The join stages into `save/<name>__incoming/`, folds
+CRCs incrementally as chunks land, verifies on DONE, commits ATOMICALLY over
+`save/<name>/` (old folder swapped aside, removed only after the rename
+lands; failed verify discards staging) and `PKT_SAVE_ACK`s. A JOIN-initiated
+save is suppressed locally and forwarded as `PKT_SAVE_REQ` (host arbitrates).
+`KENSHICOOP_SAVE_SYNC` (default ON; forced OFF in `save_probe`) is the A/B
+hatch.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| save_probe (probe tier; saveSync forced OFF) | sync | PASS | run 104047: spike-39 RVAs resolve live (`curGame`/`savePath` real), quiescence edge observed, 35 files / 3.7 MB fixture |
+| save_sync (new, full tier; saveSync ON) | sync | PASS | run 111007: quiesce 2078 ms, transfer 1766 ms, 35 files / 3,730,759 bytes sent = committed, badCrc=0, ACK ok=1 |
+| resume_test.ps1 stage 1 (save_stage1) | sync | PASS | run 111333: session-placed site (sid `898-gamedata.base`) ramped to prog=0.5 and baked into the coordinated save; 34 files / 3,657,786 bytes sent = committed |
+| resume_test.ps1 stage 2 (resume_check) | coopresume | PASS | run 111333: both clients relaunched on the TRANSFERRED save (no harness mirror) and enumerated the stage-1 site under the SAME hand `0.2069.11111.1053.3641357312` prog=0.5 - the identity-reset proof |
+| coop_presence | squad1 | PASS | regression |
+| build_sync | sync | PASS | regression |
+| latejoin_sync | sync | PASS | regression |
+| faction_sync | sync | PASS | regression |
+| money_sync | sync | PASS | regression |
+| time_sync | sync | PASS | regression |
+
+prototest: 184/184 (new: five `PKT_SAVE_*` struct sizes, REQ/BEGIN/ACK
+round-trips, `PKT_SAVE_FILE`/`PKT_SAVE_DONE` framing bounds incl. the
+`SAVE_CHUNK_MAX`/zero-pathLen rejections, and the incremental FNV-1a-32
+chunk-split-invariance suite - however a file is cut into chunks the final
+CRC equals the whole-file hash, which IS the reassembly correctness proof).
+
+Loopback note: host and join installs share `%LOCALAPPDATA%\kenshi\save`
+(`User save location=1` in both settings.cfg), so on one machine the join's
+commit rewrites the folder the host just wrote - byte-identical, staging/CRC/
+commit fully exercised. The two-machine kit path is where the transfer
+delivers to a genuinely separate disk (`friend_join.ps1` resume mode).
+
+Accepted limitations: join-local-only state (camera, control groups, anything
+unsynced) is lost at resume by design; the transfer ships uncompressed (the
+fixture gzips ~8:1 - an optimization, not a correctness need); autosaves also
+trigger transfers (bounded by the 10-minute autosave cadence).
+
+## Coordinated load (2026-07-09, addendum)
+
+Protocol 31 -> 32 (wire version 30 -> 31). Gap 8 addendum: a MID-SESSION load
+on the host silently forked the two worlds (the join kept playing the old
+one) until a manual restart. Now the host is load-authoritative, mirroring
+the save arbitration: a host load edge broadcasts `PKT_LOAD_GO` (save name +
+folder fingerprint = FNV-1a over sorted lower-cased relative paths +
+per-file content CRCs); the join verifies its on-disk copy - MATCH loads
+immediately (bypass-once through its suppressed detour), missing/diverged
+`PKT_LOAD_NACK`s and the host streams the folder via the protocol-31
+SaveXfer after its own reload (the join loads on the verified commit). A
+join-initiated load is suppressed and forwarded as `PKT_LOAD_REQ`.
+
+The probe retired the runtime unknowns first (`load_probe`): run 122805
+found `SaveManager::load` only SETS the deferred LOADGAME signal - mid-
+session run 1's engine never consumed it (the title-screen loop is the
+guaranteed `execute()` pump), so the plugin arms a 2 s grace-window backstop
+that pumps `SaveManager::execute()` from end-of-tick; run 124501 (with the
+pump) measured the full swap: ~4.4 s, `mainLoop_hook` KEPT TICKING through
+the load screen, the pre-load squad hand RE-RESOLVED in the fresh world, and
+the leader `Character*` CHANGED - the stale-pointer proof driving the
+session reset. On each side's own reload edge (gameplay non-live >= 400 ms
+then live) `Replicator::resetSession()` clears every pointer cache, session
+map, change-gate baseline and interp buffer while preserving the config
+gates, the ownership partition (`ownRanks_`) and every OUTBOUND seq counter
+(a peer that did NOT reload keeps its per-sender stale-row guards), plus an
+inbound world-state queue flush. `KENSHICOOP_LOAD_SYNC` (default ON; forced
+OFF in `load_probe`) is the A/B hatch.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| load_probe (probe tier; loadSync forced OFF) | sync | PASS | run 124501: mid-session load safe with the execute() backstop, swap ~4.4 s, hook ticked throughout, pre-load hand re-resolved, leader pointer changed (run 122805 = the stalled-signal finding) |
+| load_sync (new, full tier; loadSync ON) | sync | PASS | run 131521: GO broadcast -> join fingerprint MATCH -> join followed with its own load; both swaps completed (host 4844 ms, join 4454 ms) + both session resets ran; the SESSION-PLACED building (sid `898-gamedata.base`) enumerated on BOTH sides POST-load under the SAME hand `0.2069.11111.1044.2806762752` |
+| save_sync | sync | PASS | regression (run 131819) |
+| resume_test.ps1 stages 1+2 | sync / coopresume | PASS | regression (run resume_133001, both stages) |
+| coop_presence | squad1 | PASS | regression (run 132053) |
+| build_sync | sync | PASS | regression (runs 132248, 132444) |
+| latejoin_sync | sync | PASS | regression (run 132719) |
+
+prototest: 205/205 (new: `PKT_LOAD_GO`/`REQ`/`NACK` struct sizes +
+round-trips, and the folder-fingerprint suite - deterministic, nonzero,
+enumeration-order and path-case INVARIANT, perturbed by changed content /
+renamed / missing / added files, empty = 0 sentinel).
+
+Accepted limitations: a host load DISCARDS join-local unsaved progress by
+design (host-authoritative); `load_sync` does not gate `clock_sync`
+(advisory) - the mid-run world rebuild legitimately restarts the in-game
+clock series the oracle aligns on; the NACK/transfer fallback leg is
+implemented but exercised only by divergence (the identical-copy happy path
+is the gated scenario - a NACK on it would be a fingerprint bug and FAILS).
+
+## Production machine sync (2026-07-09, addendum)
+
+Protocol 32 -> 33 (wire version 31 -> 32). Gap 5's remaining base-building
+slice: production machines, power fixtures and farm growth simulated
+per-client - an ore drill, generator, crafting bench or farm ticked
+independently on each engine, so stored output, fuel, power state and crop
+growth silently forked the moment players started a base. Now the HOST is
+the machine authority (the world-simulation precedent): it samples
+machine-class buildings (`Building::classType` in PRODUCTION / CRAFTING /
+FURNACE / FARM / RESEARCH) within ~100 m of the interest centers at ~1 Hz
+and streams `PKT_PROD` rows - power bit, production state, output item sid
++ amount, up to 2 input amounts, farm growth floats (-1 = field not
+carried) - change-gated on quantized hundredths, CH_RELIABLE, keyed by
+baked hand or protocol-27 placer key (`keyKind` disambiguates). Unlike the
+symmetric door shape, FIRST sight sends (the host's state is the baseline)
+and the 10 s safety resend doubles as the drift corrector for the join's
+still-simulating copies. The join applies only diverged fields through the
+probe-validated levers: `switchPowerOn`, then `setProductionItem` to
+MATERIALIZE a still-null output buffer (a fresh bench has none until its
+first production tick), then the direct `ConsumptionItem::amount` /
+farm-float writes for exact values. Session reset clears the row cache
+(protocol 32); `onPeerConnected` ages `lastSendMs` (protocol 30).
+`KENSHICOOP_PROD_SYNC` (default ON; forced OFF in `prod_probe`) is the A/B
+hatch. Research benches are census-evidence only - the tech-unlock store
+is unmapped (follow-up spike input).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| prod_probe (probe tier; prodSync forced OFF) | sync | PASS | run 152730: both machines placed + ramped complete + minted on the join; divergence real (host bench outAmt moved under 30 operate() calls, join copy flat; power toggle never crossed); levers stick (switchPowerOn persisted, native setProductionItem materialized the null buffer, direct amount write survived the next tick) |
+| prod_sync (new, full tier; prodSync ON) | sync | PASS | run 154503: 6 [prod] rows sent / 4 applied; bench outAmt converged host=1.500 join=1.500 (gap 0.000); host power OFF crossed onto the join generator copy within 3 census samples; final power agreed (1/1) |
+| coop_presence | squad1 | PASS | regression (run 154753 clean, 154937 wan) |
+| bdoor_sync | sync | PASS | regression (run 155124) |
+| build_sync | sync | PASS | regression (run 155344) |
+| door_sync | sync | PASS | regression (run 155606) |
+| latejoin_sync | sync | PASS | regression (run 155827) |
+| save_sync | sync | PASS | regression (run 160050) |
+
+prototest: 209/209 (new: `ProdPacket` struct size 109 + round-trip +
+truncation rejection; HELLO version now 32).
+
+Accepted limitations: whole crafted items landing in a machine's INVENTORY
+ride the container-inventory channel, not this one (the row carries the
+output BUFFER only); research tech-tree unlocks are not on the wire (store
+unmapped); farm growth is wired but validated only pass-through (no farm
+reachable in the `sync` save - terrain-dependent); the join's machines
+between rows still simulate locally, so sub-second flicker between a local
+tick and the correcting row is possible (quantized change gate keeps it
+within a hundredth).
+
+## Storage & machine container sync (2026-07-09, addendum)
+
+Protocol 33 -> 34 (wire version 32 -> 33). Gap 5's final base-building
+slice: storage chests and machine inventories hold whole ITEMS that forked
+per-client - the container-inventory channel registered exactly ONE
+container (the host's nearest baked chest via `pickInventoryContainer`),
+so every other chest and every bench/drill/furnace inventory diverged the
+moment items landed in it. Now the HOST authors ALL of them: a ~1 Hz
+census (`enumContainersNear` - the `enumMachinesNear` pattern widened to
+`BCTYPE_STORAGE` + the machine classes, COMPLETE buildings only) folds
+every container-bearing building near the interest centers into the
+existing `publishInventories` authored set, so contents stream through the
+proven per-container hash + settle-window + 5 s safety-resend gate as
+`PKT_INV_SNAPSHOT`. The wire grew a `keyKind` byte: 0 = the container key
+is a raw save-stable hand (characters, baked chests - the previous
+implicit behaviour), 1 = a protocol-27 placer key for session-placed
+buildings (sender translates local hand -> placer key through the build
+maps; the receiver resolves back, dropping unresolvable keys for the
+safety resend to re-deliver once the mint lands). The join reconciles via
+`applyContainerContents` (add shortfall / remove excess per (sid, type)).
+Session reset clears the census set (protocol 32); own-squad member
+inventories keep the existing bidirectional tab partition untouched.
+`KENSHICOOP_STORE_SYNC` (default ON; forced OFF in `store_probe`) is the
+A/B hatch, layered on `invSync` (the carrier).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| store_probe (probe tier; storeSync forced OFF) | sync | PASS | run 171728: census read containers with inventories on BOTH clients (commonHands=2); fabricate-into-chest landed 0->5 (after walking type-limited candidates - a Fabric Chest refused iron plates); reconcile removal 5->2 stuck; 30 operate() calls left the bench CONTAINER empty (output rides the protocol-33 buffer until a worker collects - no reconcile churn: force-empty stayed empty); join fabricated 3 into its MINTED chest copy (translated-key apply half) |
+| store_sync (new, full tier; storeSync ON) | sync | PASS | run 173245: host census-authored the placed chest (4 [inv] SEND kind=1 rows), join applied 74 [inv] snapshots; the host's chest add crossed onto the join's minted copy and the FINAL content hashes agreed host=join=476132288 (the reconcile-removal crossed too) |
+| coop_presence | squad1 | PASS | regression (run 173725 clean, 173910 wan) |
+| inv_order | squad1 | PASS | regression (run 174132) |
+| inv_bidir | squad1 | PASS | regression (run 174355 clean, 174618 wan) |
+| build_sync | sync | PASS | regression (run 174840) |
+| latejoin_sync | sync | PASS | regression (run 175326; flaky retry-passed) |
+| prod_sync | sync | PASS | regression (run 175550) |
+| save_sync | sync | PASS | regression (run 180325) |
+
+prototest: 209/209 (`InvSnapshotHeader` grew to 27 bytes with the keyKind
+byte; HELLO version now 33).
+
+Accepted limitations: `store_sync`'s smoothness advisory read
+zeroFrac=0.406 (over the 0.40 bar) - root-caused to the protocol-25 clock
+catch-up transient, NOT the container channel: the join runs at up to 2x
+for ~40 s after connect and the 70 s scenario window is dominated by it
+(A/B evidence: npc_sync with `KENSHICOOP_TIME_SYNC=0` measured
+zeroFrac=0.204, run 175605, vs 0.30-0.41 with it on); machine containers
+only sync externally-added items (operate() output rides the protocol-33
+buffer floats until a worker collects); a chest holding more than
+`INV_ITEMS_MAX = 20` DISTINCT (sid,type) entries truncates the snapshot
+(the probe measured 1-entry rows in practice - revisit if real bases
+overflow); incomplete construction sites ride protocol 27 until finished.
+
+## Squad management sync (2026-07-09, addendum)
+
+Protocol 34 -> 35 (wire version 33 -> 34). Gap 10: moving a unit between
+squad tabs re-containers it and mints a FULLY fresh hand (squad_probe:
+container AND index/serial change - harsher than a recruit, where baked
+subjects keep their serial), so the mover streamed an unresolvable key
+while the peer's copy of the old hand went stale; and the per-tick
+sorted-container rank partition could RESHUFFLE (whole-tab ownership flip)
+or mint unowned tabs on any mid-session tab-set change. No single engine
+function owns the UI move path, so there is no detour: the engine now
+keeps a `Character*` -> hand baseline (`pollSquadRoster`, polled every
+tick by `publishSquadMoves`; the body pointer survives the re-container)
+and every diff authors a reliable `EVT_SQUAD_MOVE` (subject = old hand,
+actor = new hand; zeroed actor = left roster) with the new hand's
+ownership pinned BEFORE the wire. The receiver shares the EVT_RECRUIT
+re-key path (`rekeyPeerBody`): bind the existing local body to the new
+stream key in `proxyByKey_`, restore if authority-suppressed, pin
+peer-owned - `recruitOwned_`/`peerRecruit_` generalized into the
+`pinOwned_`/`pinPeer_` sets covering recruits AND moves. Tab ranks are
+LATCHED at first census (sorted order, so two-tab saves behave exactly as
+before) and newly-seen containers APPEND - no mid-session reshuffle;
+appended tabs inherit their author's ownership via the pins. The re-key
+retires the old key's stream state (interp tail + a 10 s REQ/mint grace)
+and repairs a duplicate proxy that beat the edge (cull + rebind).
+`KENSHICOOP_SQUAD_SYNC` (default ON; forced OFF in `squad_probe`) is the
+A/B hatch. Session reset (protocol 32) clears latch + pins + baseline.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| squad_probe (new, probe tier; squadSync forced OFF) | squad1 | PASS | runs 185825/191911: every move minted a fresh hand (containerChanged=True indexSerialSurvived=False on all 4 legs); the pointer-diff caught each within one poll; setFaction landed the move-into-existing-tab (host L1 rc=1, join L1 rc=1); solo-tab separate is an engine no-op (rc=0, run 185825); pre-existing census ranks stable (new containers sorted AFTER); unsynced peer REQ/minted the moved hand (the gap measured) |
+| squad_sync (new, full tier; squadSync ON) | squad1 | PASS | run 193304: all four scripted moves landed, each authored one EVT and one peer REKEY ok=1, proxyBound=0 and unresolved=0 for every moved hand (run 192211's two races - the 500 ms-throttled edge losing to the REQ/mint round-trip, and the old key's interp tail REQ-ing a duplicate - fixed by per-tick polling + rekeyedOld_ grace + cull-and-rebind repair), peer tracked both final hands (PROXY 78/38 samples), census ranks stable |
+| coop_presence | squad1 | PASS | regression (run 193612 clean, 193756 wan) |
+| npc_sync | sync | FAIL->PASS | run 193941 clean failed npc_track+smoothness, standalone rerun 200126 npc_track PASS with only the known time-slew smoothness advisory failing - the pre-existing flake (identical signatures 07-08 pre-protocol-35, e.g. 232442); wan variant passed (run 194314) |
+| inv_bidir | squad1 | PASS | regression (run 194500 clean, 194722 wan) |
+| latejoin_sync | sync | PASS | regression (run 194946) |
+| money_sync | squad1 | PASS | regression (run 195207) |
+| recruit_sync | sync | PASS | regression (run 195430) |
+| save_sync | sync | PASS | regression (run 195652) |
+
+prototest: 212/212 (EVT_SQUAD_MOVE pinned to id 11; HELLO version now 34).
+
+Accepted limitations: peer squad-UI roster placement stays deferred (moved
+units are visible and driven on the peer, not in its squad UI - the
+recruit stance); a late joiner misses pre-connect move edges (bounded by
+the shared-save workflow); dismissal (roster-exit) edges are wired but
+have no programmatic lever to validate; wallets/inventories of appended
+mid-session tabs are not rank-keyed (the pins own their members, but the
+per-tab money channel only streams latched session-start ranks).
+
+## Play-session bug fixes (2026-07-10, addendum)
+
+Protocol 35 -> 36 (wire version 34 -> 35). Four field bugs from the
+2026-07-09 remote session, one wire bump: the entity batch header gained a
+sender-side millisecond timestamp (`sendMs`; `ENTITY_BATCH_MAX` 18 -> 17 to
+stay under one datagram) and `PKT_NPC_CENSUS` (id 38) carries the host's
+1 Hz wide-radius NPC hand list. New env knobs, all with validated
+defaults: `KENSHICOOP_CENSUS_RADIUS` (2000 u), `KENSHICOOP_SEND_STAMP`
+(A/B lever, ON), `KENSHICOOP_INTERP_MIN/MAX_DELAY_MS`,
+`KENSHICOOP_INTERP_MAX_EXTRAP_MS`, `KENSHICOOP_INTERP_STALE_MS`,
+`KENSHICOOP_INTERP_SNAP_DIST`, `KENSHICOOP_CATCHUP_K`,
+`KENSHICOOP_SNAP_DIST`.
+
+Smoothness A/B (leader_move under the Steam-relay WAN profile 60+/-25 ms
+1% loss, runs 225628-235924 on 07-09): arrival-stamping baseline
+zeroFrac ~0.36 / extrapFrac 0.048 WAN; send-stamping with the per-peer
+min-offset clock map and lag-aware renderDelay cut interp jitter ~13 ->
+~6 ms and extrapFrac to 0.026, and stabilized the loopback zeroFrac that
+flaked 0.24-0.44 across the historical baseline. Hard-snap and
+walk-reissue counters now split squad/NPC in the `SCENARIO INTERP`
+summary; the `[interp]` stat line samples live sessions at 5 s cadence.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| npc_census (new, full tier) | sync | PASS | runs 003216/004154: 4 baked far ghosts (600 u, outside the ~200 u stream bubble) suppressed on the join via census-absence culling; zero culls of census-listed NPCs; census flow host `sent n=47` / join `recv n=47` at 1 Hz; staleness guard exercised (no wide culling before the first census) |
+| cage_peer_sync (new, full tier) | bedcage1 | PASS | run 015339: host authored `SEND PEER-ENTER` for the join's KO'd L1 (its own put ok=1), join applied to its OWN body (enterLat=509 ms), occupancy held the full 28 s window with hostZeroDwell=0 and ZERO `HEAL EXIT`s (the "kept taking it out" bug), owner-side exit clean on both ends. Runs 005941-013345 failed on system commit-memory exhaustion (steamwebhelper held ~85 GB; join instance crashed in load), not the fix |
+| cage_put | bedcage1 | PASS | regression (run 015717) |
+| carry_order | squad1 | PASS | regression (run 015936) |
+| npc_carry | sync | PASS | regression (run 020150) |
+| coop_presence | squad1 | PASS | regression (run 020331) |
+| load_sync | sync | PASS | run 022414: portrait gate green - QUIESCED with `portraits_texture.png` present (no bounded-wait WARN), no load-point WARNs, committed copy carries the 43.5 KB atlas on disk (the new oracle leg) |
+| save_sync | sync | PASS | regression (run 022640; QUIESCED settled in 2.1 s with the portrait gate active) |
+| npc_sync | sync | FAIL/PASS | runs 000313/000513/000702/003948/004417: the known pre-existing crosscheck/smoothness flake, A/B-exonerated (identical failure signature with `KENSHICOOP_SEND_STAMP=0` and with census off) |
+
+prototest: 217/217 (EntityBatchHeader 10 B with sendMs, NpcCensusHeader
+7 B framing + overrun rejection, HELLO version 35).
+
+Blank portraits: the quiescence gate now holds a settled save folder for
+`portraits_texture.png` up to 10 s past arm (bounded; a genuinely
+portrait-less save completes with a WARN), and every coordinated-load
+issue point WARNs when the target folder lacks the atlas. The 07-09
+session's join copies ('people', 'Group') did carry valid atlases, so the
+friend-host repro is unconfirmed (no host log); the WARNs turn a future
+recurrence into a one-line diagnosis - if they stay clean and avatars
+still blank, the escalation path is an engine-side PortraitManager
+investigation.
+
+## Steam MTU + starved-replica fixes (2026-07-10, addendum)
+
+No wire change (protocol stays 36 / wire v35); two architecture-review
+findings closed plus a harness-integrity overhaul the fixes' validation
+uncovered.
+
+**Steam-safe entity batch cap.** Steam's P2P transport clamps ENet's MTU
+to 1200 B, but the batch send loop filled to `ENTITY_BATCH_MAX = 17`
+entities = 1353 B - ENet ships an oversized UNRELIABLE packet as RELIABLE
+fragments, so the 20 Hz motion stream inherited retransmit/ordering
+stalls on exactly the transport real sessions use (loopback/UDP never
+sees this; default MTU ~1400). The sender now chunks by transport:
+`ENTITY_BATCH_MAX_STEAM = 14` (1116 B) on Steam, 17 on raw UDP.
+Receive bound unchanged (`len >= need` per header count), so mixed-cap
+kits interoperate. prototest asserts the Steam chunk fits 1150 B.
+
+**Starved-replica guard hold** (`KENSHICOOP_STARVE_HOLD_MS`, default
+10 s, 0 = legacy). At >2 s stream staleness, `applyTargets` used to drop
+a driven body from BOTH per-tick guard sets instantly - native AI and
+locally-simulated melee damage resumed on every WAN hiccup, silently
+diverging the local-only medical model. Now, within the hold window past
+staleness:
+- every driven body KEEPS its damage guard (the divergence protection);
+- squad-class bodies (a peer's PCs) also keep AI-suspend and stay parked
+  (engine-inert anyway; an autonomous peer PC is the worst face of the
+  bug);
+- world NPCs deliberately RELEASE to local AI as before: an A/B (runs
+  113052-114743) showed freezing stale interest-boundary wanderers
+  degraded npc_sync tracking to 0.64-0.73 vs the 0.8 gate (hold-off
+  passed) - on a shared save the local AI shadows the host's patrol
+  better than a freeze, and existence is already policed by
+  host-authority suppression + census.
+Telemetry: `starve=` (held bodies this tick) joined the `[interp]` stat
+line. netsim gained a scripted total-outage window
+(`netsim ... [seed stallAtS stallForS]`, session-relative to the first
+join datagram) surfaced as the `stall` WAN profile (regional + 4 s
+outage at +30 s); during the outage the join showed the starve spike
+(starve=12), zero `[dmg]` pass-throughs, and clean re-acquisition
+(extrap then snap) at stream resume.
+
+**Clock catch-up transparency (the flake killer).** The join closes its
+~0.3 gh load skew by simming at up to 2x for the first ~35-40 s
+(protocol 25) - and the short scenario windows sat almost entirely
+inside that transient, so motion oracles were measuring the slew, not
+the sync (user-confirmed visibly fast join NPCs; the historical
+zeroFrac 0.2-0.9 flake). Changes:
+- smoothness counters exclude slewed frames (`slewSkip=` in `SCENARIO
+  SMOOTH`); the oracle SKIPs below 200 scored frames instead of passing
+  vacuously;
+- every run analysis prints `FINDING: join clock catch-up ...` (peak
+  offset, peak slew, engaged seconds, converged-or-not) from the
+  `[time] OFFSET` trace (`Get-SlewSummary`);
+- `time_sync` now GATES the return to normal: join slew back to 1x and
+  both sides' final fsm ~1.0 (run 111420: peakOff 0.30 gh, 27 s at 2x,
+  converged, finalOffset 0.0023 gh);
+- `leader_move` 24 -> 62 s and `npc_sync` 24/44 -> 62/82 s so their
+  gates judge steady state past convergence. Effect: npc_sync crosscheck
+  went from 0.64-0.73 flake to 9/9 tracked with worstMedian 0.7 u (run
+  114753); leader_move scores 856-1961 genuine steady-state frames
+  (zeroFrac 0.30-0.38, in gate, clean + WAN regional).
+
+| Scenario | clean | Key values |
+|---|---|---|
+| prototest | 219/219 | Steam chunk 14 fits 1150 B; cap <= receive bound |
+| leader_move | PASS | 62 s window: zeroFrac 0.382 clean / 0.303 WAN-regional, slewSkip ~3.5-4.5 k excluded |
+| npc_sync | PASS | 62 s window: 9/9 tracked, worstMedian 0.7 u; starve spikes from boundary wanderers benign |
+| coop_presence | PASS | regressions on both the hold and the final split build |
+| npc_sync -Wan stall | PASS | 4 s scripted outage: starve=12 during stall, no `[dmg]` passes, snap-clean resume |
+| time_sync | PASS | new convergence gate: 2x for 27 s then 1x both sides, finalOffset 0.0023 gh |
+
 ## Known limitations (honest edges)
 
 - Both clients still share one GPU/CPU in local runs; genuinely asymmetric

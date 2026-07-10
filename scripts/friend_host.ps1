@@ -50,7 +50,13 @@ param(
     # Steam P2P transport: the JOINING player's steamid64 (or short friend code).
     # When set, Steam brokers the connection - the firewall / UPnP / public-IP
     # checklist is skipped entirely. The kit may pre-bake this (kit.json).
-    [string]$PeerSteamId = ""
+    [string]$PeerSteamId = "",
+    # Resume the previous session: load the 'coopresume' save the coordinated
+    # save (protocol 31) wrote last session instead of installing the kit's
+    # baked save. BOTH sides must resume. Defaults to free play (no scenario).
+    [switch]$Resume,
+    # Save name the coordinated-save flow writes (must match the join's).
+    [string]$ResumeSave = "coopresume"
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,6 +72,13 @@ function ConvertTo-SteamId64([string]$id) {
 # ---- Kit defaults --------------------------------------------------------------
 $kit = Get-Content (Join-Path $kitDir "kit.json") -Raw | ConvertFrom-Json
 $save = $kit.save
+if ($Resume) {
+    # The save the coordinated save (protocol 31) wrote last session; resume =
+    # both sides load the identical file. Free play unless a scenario is asked
+    # for explicitly.
+    $save = $ResumeSave
+    if ($Scenario -eq "") { $Scenario = "free" }
+}
 if ($Scenario -eq "") { $Scenario = $kit.scenario }
 if ($Scenario -eq "free") { $Scenario = "" }
 if ($Port -eq 0) { $Port = [int]$kit.port }
@@ -182,14 +195,27 @@ Write-Host "Mod installed -> $modDst"
 
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
 New-Item -ItemType Directory -Force -Path $saveRoot | Out-Null
-foreach ($destBase in @($saveRoot, (Join-Path $KenshiDir "save"))) {
-    if ($destBase -like "*\save" -and -not (Test-Path (Split-Path -Parent $destBase))) { continue }
-    New-Item -ItemType Directory -Force -Path $destBase | Out-Null
-    $dst = Join-Path $destBase $save
-    if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
-    Copy-Item -Recurse (Join-Path $kitDir "save\$save") $dst
+if ($Resume) {
+    # No install: the save was written by last session's coordinated save
+    # (protocol 31). It must already exist here or there is nothing to resume.
+    $found = (Test-Path (Join-Path $saveRoot $save)) -or
+             (Test-Path (Join-Path $KenshiDir "save\$save"))
+    if (-not $found) {
+        throw ("Resume save '$save' not found in '$saveRoot' or '$KenshiDir\save'. " +
+               "Run at least one connected session first (any save during it is " +
+               "coordinated + shared automatically), or drop -Resume.")
+    }
+    Write-Host "Resuming on coordinated save '$save' (no kit save installed)."
+} else {
+    foreach ($destBase in @($saveRoot, (Join-Path $KenshiDir "save"))) {
+        if ($destBase -like "*\save" -and -not (Test-Path (Split-Path -Parent $destBase))) { continue }
+        New-Item -ItemType Directory -Force -Path $destBase | Out-Null
+        $dst = Join-Path $destBase $save
+        if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+        Copy-Item -Recurse (Join-Path $kitDir "save\$save") $dst
+    }
+    Write-Host "Save '$save' installed."
 }
-Write-Host "Save '$save' installed."
 
 # ---- Firewall (local) + router mapping + checklist --------------------------------------
 $upnp = $null

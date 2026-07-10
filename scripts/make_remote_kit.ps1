@@ -232,8 +232,48 @@ You need:
 $howTo
 
 In free play the full sync set is active by default: positions, combat,
-health/limbs, stats, game speed, carried bodies, AND (new) inventory +
-equipment changes + items dropped on the ground.
+health/limbs, stats, game speed, carried bodies, inventory + equipment
+changes + items dropped on the ground, squad management (recruits you
+hire AND units you move between squad tabs mid-session stay tracked on
+the other machine - note they won't appear in the other player's squad
+UI, that's a known limitation), AND coordinated saves AND
+loads: any save either player makes during a connected session becomes
+ONE shared save - the host's game writes it (under the same name you
+saved with) and streams the whole save folder to the other machine
+automatically (verified + committed only when it arrives intact). Saving
+under the name 'coopresume' is the convention for the session you want
+to pick back up. Loading works the same way: when the HOST loads a save
+mid-session the other player's game automatically loads the identical
+save and the session continues from there (expect a normal load screen
+on both sides; if the other machine's copy differs it is re-sent first).
+A load made on the JOIN side is forwarded to the host, who performs it
+for both.
+
+Base-building syncs too: placed buildings, construction progress, doors,
+dismantling, production machines - power switches, generators, crafting
+bench / furnace / drill output, input fuel and farm growth - AND (new)
+container CONTENTS: every storage chest and machine inventory near the
+players holds the same items on both machines (the host's containers are
+authoritative; items you or the host store in a chest appear in the other
+player's copy automatically).
+
+Fixed since the last session (protocol 36): one-machine-only NPCs now
+disappear out to ~2000 units instead of ~200 (no more crowds that vanish
+as you walk up); the other player's characters move much more smoothly
+over a real internet connection; guards can now jail EITHER player's
+characters and the cage placement sticks on both machines; and saves
+wait for the squad-portrait image before transferring (fixes blank
+squad-tab avatars after a reload).
+
+RESUMING where you left off (after the first session): both sides add
+-Resume to their usual command, e.g.
+
+  powershell -ExecutionPolicy Bypass -File $(if ($Role -eq "host") { "friend_host.ps1" } else { "friend_join.ps1$(if (-not $steamKit) { ' -HostIp <ip>' })" }) -Resume
+
+No save copying, no new kit - the previous session's save is already on
+both machines, and -Resume loads it (free play by default). -Resume loads
+'coopresume'; saved under a different name? Add -ResumeSave <name>
+(e.g. -ResumeSave quicksave). Both sides must load the SAME save.
 
 Nothing else on your machine is touched. To remove: delete
 <Kenshi>\mods\KenshiCoop and the test save folder.

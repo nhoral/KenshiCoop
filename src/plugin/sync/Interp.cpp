@@ -25,7 +25,8 @@ InterpConfig::InterpConfig()
 
 EntityInterp::EntityInterp()
     : count_(0), head_(0), lastArrival_(0),
-      avgIntervalMs_(50.0f), jitterMs_(0.0f), haveLast_(false) {}
+      avgIntervalMs_(50.0f), jitterMs_(0.0f), lagMs_(0.0f), haveLast_(false),
+      lastMode_(SM_NONE), lastDelay_(0) {}
 
 const EntityInterp::Snap& EntityInterp::at(int i) const {
     // ring_ holds the last count_ snapshots; head_ points past the newest.
@@ -35,16 +36,50 @@ const EntityInterp::Snap& EntityInterp::at(int i) const {
     return ring_[idx];
 }
 
-void EntityInterp::push(const EntityState& e, unsigned long nowMs) {
+void EntityInterp::push(const EntityState& e, unsigned long nowMs, unsigned long arrivalMs) {
+    // Wire v35 (send-stamped snapshots): a re-sent capture carries the SAME
+    // stamp and a reordered datagram an OLDER one - recording either would
+    // insert a zero/negative-duration segment that flattens the velocity
+    // estimate and corrupts interpolation. Newest supersedes; drop the rest.
+    // A LARGE backward jump is different: the sender-clock mapping rebased
+    // (the min-offset tracker shed a connect-burst's inflated first offset),
+    // so the existing ring is stamped in the future relative to the new
+    // mapping - restart the ring instead of rejecting real snapshots for
+    // seconds (measured: entities stuck in SINGLE mode all through connect).
+    if (count_ > 0) {
+        long d = (long)(nowMs - at(count_ - 1).t);
+        if (d <= 0) {
+            if (d > -250) return; // duplicate / small reorder: drop
+            count_ = 0; head_ = 0; lastArrival_ = 0; // mapping rebased: restart
+        }
+    }
+
     // Track inter-arrival interval + jitter (EMA) to size the render delay.
+    // A long unstreamed gap (interest boundary, publish rotation) is not
+    // JITTER - clamp the sample so one multi-second hole doesn't blow the
+    // estimate (measured: jit=1923 ms after a boundary NPC returned).
     if (lastArrival_ != 0) {
         float interval = (float)(nowMs - lastArrival_);
+        if (interval > 500.0f) interval = 500.0f;
         float dev = interval - avgIntervalMs_;
         if (dev < 0) dev = -dev;
         avgIntervalMs_ = avgIntervalMs_ * 0.875f + interval * 0.125f;
         jitterMs_      = jitterMs_      * 0.875f + dev      * 0.125f;
     }
     lastArrival_ = nowMs;
+
+    // Queueing lag (v35): with send-stamped ring times the interval stats above
+    // are jitter-free, but the render delay must still cover how LATE a packet
+    // can arrive relative to its stamp, or a delayed packet starves the buffer.
+    // Peak-hold with slow decay: rises instantly to the worst recent lag,
+    // relaxes over ~seconds when the path calms down.
+    if (arrivalMs != 0 && (long)(arrivalMs - nowMs) > 0) {
+        float lag = (float)(arrivalMs - nowMs);
+        if (lag > lagMs_) lagMs_ = lag;
+        else              lagMs_ = lagMs_ * 0.99f + lag * 0.01f;
+    } else if (arrivalMs != 0) {
+        lagMs_ *= 0.99f;
+    }
 
     Snap s;
     s.t = nowMs;
@@ -58,8 +93,10 @@ void EntityInterp::push(const EntityState& e, unsigned long nowMs) {
 }
 
 unsigned long EntityInterp::renderDelay(const InterpConfig& cfg) const {
-    // One packet interval of cushion plus a couple jitter deviations, clamped.
-    float d = avgIntervalMs_ + 2.0f * jitterMs_;
+    // One packet interval of cushion plus a couple jitter deviations, plus the
+    // path's queueing lag (v35: ring times are send-stamped, so late arrivals
+    // no longer show up in the interval stats - lagMs_ carries them), clamped.
+    float d = avgIntervalMs_ + 2.0f * jitterMs_ + lagMs_;
     if (d < (float)cfg.minDelayMs) d = (float)cfg.minDelayMs;
     if (d > (float)cfg.maxDelayMs) d = (float)cfg.maxDelayMs;
     return (unsigned long)d;
@@ -107,11 +144,13 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
 
     unsigned long delay = renderDelay(cfg);
     unsigned long renderTime = (nowMs > delay) ? (nowMs - delay) : 0;
+    lastDelay_ = delay;
 
     // Only one snapshot: nothing to interpolate.
     if (count_ == 1) {
         out->x = newest.x; out->y = newest.y; out->z = newest.z;
         out->heading = newest.heading;
+        lastMode_ = SM_SINGLE;
         return true;
     }
 
@@ -121,6 +160,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     if (renderTime <= oldest.t) {
         out->x = oldest.x; out->y = oldest.y; out->z = oldest.z;
         out->heading = oldest.heading;
+        lastMode_ = SM_CLAMP_OLD;
         return true;
     }
 
@@ -131,6 +171,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
         unsigned long ahead = renderTime - newest.t;
         if (ahead > cfg.maxExtrapMs) ahead = cfg.maxExtrapMs;
         float seg = (float)(newest.t - prev.t);
+        lastMode_ = SM_EXTRAP;
         if (seg <= 0.0f) {
             out->x = newest.x; out->y = newest.y; out->z = newest.z;
             out->heading = newest.heading;
@@ -155,6 +196,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
             if (dx * dx + dy * dy + dz * dz > cfg.snapDistSq) {
                 out->x = s1.x; out->y = s1.y; out->z = s1.z;
                 out->heading = s1.heading;
+                lastMode_ = SM_SEG_SNAP;
                 return true;
             }
             float span = (float)(s1.t - s0.t);
@@ -163,6 +205,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
             out->y = lerpf(s0.y, s1.y, a);
             out->z = lerpf(s0.z, s1.z, a);
             out->heading = lerpAngle(s0.heading, s1.heading, a);
+            lastMode_ = SM_LERP;
             return true;
         }
     }
@@ -170,6 +213,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     // Fallback (shouldn't hit): newest pose.
     out->x = newest.x; out->y = newest.y; out->z = newest.z;
     out->heading = newest.heading;
+    lastMode_ = SM_LERP;
     return true;
 }
 

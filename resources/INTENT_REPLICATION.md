@@ -1010,3 +1010,493 @@ These extend the numbered doctrine in `POSTMORTEM.md`:
     prototest 129/129. `KENSHICOOP_RECRUIT_SYNC=0` is the escape hatch
     (forced off inside `recruit_probe`, which measures the unsynced
     baseline).
+
+36. **Probe for the MINIMAL state before designing the wire: faction
+    relations collapsed to one float per faction sid.** (2026-07-08,
+    protocol 23 -> 24, `PKT_FACTION`.) The naive channel for gap 3
+    would have carried both table directions, the derived enemy/ally
+    flags, and a cause enum. faction_probe (run 132239) killed all of
+    it: the engine keeps the two per-side `FactionRelations` tables
+    MIRRORED (us==them in every enumerated row), the enemy/ally flags
+    DERIVE from the value (sentinel -75 flipped enemy both directions
+    the same tick), and faction GameData stringIDs are cross-client
+    stable on the shared save - so the whole wire state is sid + f32.
+    The channel is SYMMETRIC rather than host-authoritative-with-
+    intents: both clients run the same detector (1 Hz table sample,
+    immediate when a detoured `affectRelations` overload recorded a
+    real engine mutation) and stream rows that moved vs a SEEDED
+    baseline - both sides load the same save, so the baseline is
+    shared and a settled diplomacy is wire-silent. The echo guard is
+    ordering, not bookkeeping: `applyFactions` updates the baseline
+    BEFORE calling `setRelation`, so the local change a received row
+    causes is never re-detected as ours. Per-sender seq drops stale
+    rows; a 10 s per-sid safety resend covers loss. Cause attribution
+    stays OFF the wire but in the log: both `affectRelations`
+    overloads detour to `[fac] AFFECT-EV/AMT` lines, accumulating
+    field evidence for the bounty/crime system the same way
+    `[shop] BUY-LOCAL` did for the vendor mirror. Validated by
+    `faction_sync` (crossed 2/2, ~10 ms write-to-peer-apply, exactly
+    one SEND + one RECV per leg, no diverged rows); regressions
+    `coop_presence`, `npc_sync`, `combat_kill`, `recruit_sync` green;
+    prototest 133/133. `KENSHICOOP_FACTION_SYNC=0` is the escape
+    hatch (forced off inside `faction_probe`).
+
+37. **When there is no setter, make the ACTUATOR you already own close the
+    loop: game-clock sync corrects with a sim-speed slew, not a memory
+    write.** (2026-07-08, protocol 24 -> 25, `PKT_TIME`.) Gap 4 needed the
+    absolute calendar shared, but the dumped headers expose only READS
+    (`getTimeStamp_inGameHours` - struct-return ABI, TimeOfDay has
+    user-declared ctors so it comes back via hidden retbuf, the
+    getPositionBip01 hazard again). time_probe (run 141509) turned the
+    missing setter into a design: the clock is ABSOLUTE campaign hours,
+    both clients agree on hour length, and the rate tracks
+    `frameSpeedMult` EXACTLY (2x fsm -> 2.00x clock) - so the QUIET
+    speed write that speed_sync already owns IS a precise clock
+    actuator. The host broadcasts its clock ~1 Hz; the join steers a
+    proportional slew multiplier (capped 2x, hysteresis deadband) that
+    `slewedEffective()` folds into every consensus quiet write - the
+    slew MULTIPLIES the arbitrated effective rather than overwriting
+    it, so the two channels compose instead of fighting (the speed
+    layer, which re-asserts its target continuously, must aim at the
+    SLEWED target or it reverts the correction every tick). Two
+    rejected alternatives carry the lesson: a direct STEP of the
+    `timeStamper` CPerfTimer base verified-then-reverted itself into
+    evidence that the calendar does not derive from that timer (write
+    levers must be SELF-VERIFYING so a wrong hypothesis degrades, never
+    corrupts); and a 4x slew cap converged twice as fast but disturbed
+    the join world enough to dip npc_sync tracking below gate - the
+    correction must be gentler than the sim it corrects. Validated by
+    time_sync (0.3 gh load skew closed in ~35 s, final offset 0.002 gh,
+    held across a consensus 2x burst); regressions green; prototest
+    137/137. `KENSHICOOP_TIME_SYNC=0` is the escape hatch (forced off
+    in time_probe with speedSync, and timeSync alone inside speed_sync,
+    whose oracle gates raw fsm equality the slew deliberately breaks).
+
+38. **A proven channel SHAPE is a reusable asset: door-state sync is the
+    faction-relation channel with a different key and a different write
+    lever.** (2026-07-08, protocol 25 -> 26, `PKT_DOOR`.) The first slice
+    of gap 5 (buildings) needed door/gate open+lock state on BAKED
+    buildings shared - the cheapest win in a gap whose full shape
+    (placements, construction, production) is the protocol-21 structure
+    problem. door_probe (run 160041) answered the only two questions the
+    design actually needed: baked-door hands are cross-client stable
+    (the furniture/bed identity precedent extends to `DoorStuff` -
+    enumerate `BUILDING` objects, filter `imADoor`, key by hand), and
+    the engine's own `openDoor`/`closeDoor` action entries work as the
+    apply lever (native animation/navmesh/sound; the UT force paths only
+    as fallback). Everything else was doctrine already paid for:
+    SYMMETRIC change detection against a seeded shared-save baseline,
+    baseline updated BEFORE the apply write (echo-free), per-sender seq
+    guard, safety resend, silent skip for unresolvable hands - the
+    publishFactions/applyFactions shape verbatim, keyed by hand instead
+    of sid, writing a door action instead of a relation row. One new
+    lesson is real: doors ANIMATE (DoorState walks OPENING->OPEN over
+    ~1 s), so the channel publishes the collapsed DESTINATION state -
+    open means "open or opening" - never the transient, or the change
+    gate would stream every frame of the swing and the peer would apply
+    a mid-swing state the engine cannot hold. Validated by door_sync
+    (run 161116: both sentinel toggles crossed, wire-to-write under
+    20 ms, zero divergent doors, 3 packets total - a settled town is
+    silent); regressions green; prototest 141/141.
+    `KENSHICOOP_DOOR_SYNC=0` is the escape hatch (forced off in
+    door_probe, which exists to measure the unsynced baseline).
+
+39. **When the object itself is runtime, the identity IS the message:
+    placed-building sync is describe/mint with the PLACER's hand as the
+    wire key, and echo-freedom can come from CONSTRUCTION instead of
+    baseline ordering.** (2026-07-08, protocol 26 -> 27,
+    `PKT_BUILD_PLACE` + `PKT_BUILD_STATE`.) The second slice of gap 5: a
+    player-placed building exists only in the placer's session.
+    build_probe (run 174550) answered the three questions the design
+    hinged on: the raw `createBuilding` factory BYPASSES the UI's
+    town-placement verification (the rules live in
+    `PreviewBuilding::placementVerification`, a UI-layer gate - so a
+    peer mint always lands where the placer's placement did, and the
+    user's town-restriction caveat dissolves at the mint layer);
+    minted hands are RUNTIME (census intersection zero - the
+    protocol-21 identity problem confirmed for structures, so the wire
+    keys by the placer's hand and the receiver keeps a key ->
+    local-hand translation map, the spawn-proxy precedent); and
+    `setConstructionProgress` is the progress lever (0..1) that
+    SELF-COMPLETES at >= 1.0 (the engine finishes the site natively -
+    never re-implement a completion the engine already owns). The
+    channel is PLACER-AUTHORITATIVE (the describe/mint edge names the
+    authority implicitly - whoever announced the key streams its
+    state), and unlike the symmetric door/faction channels it needs NO
+    baseline-first echo guard: a factory mint never passes through the
+    `placeFinalPreviewBuilding` detour that authors announcements, so
+    a minted proxy CANNOT re-announce - the echo path is severed
+    structurally, which is cheaper and stronger than ordering
+    discipline. One design choice worth keeping: the detour catches
+    real UI commits and the programmatic scenario place queues the
+    SAME edge record, so every placement path funnels into one
+    announce lane. Validated by build_sync (run 175747: minted 2/2
+    both directions, progress rows crossed to the complete latch,
+    channel silent after completion); regressions green; prototest
+    149/149. `KENSHICOOP_BUILD_SYNC=0` is the escape hatch (forced off
+    in build_probe, which exists to measure the unsynced baseline).
+
+40. **A runtime object's CHILDREN inherit its translated identity: placed
+    doors stream as (placer's building hand, door index), and removal is
+    the describe/mint edge run backwards.** (2026-07-08, protocol 27 -> 28,
+    `PKT_BUILD_DOOR` + `PKT_BUILD_REMOVE`.) The two stitches protocol 27
+    left open: a placed building's doors are runtime objects on BOTH
+    clients (the placer's original and the peer's mint each grow their own
+    DoorStuff children, so no raw door hand can ever cross), and a
+    dismantled placed building left a ghost proxy on the peer.
+    bdoor_probe (run 195513) proved the load-bearing fact: the factory
+    mints doors in TEMPLATE ORDER - the shack's door sat at
+    parent->doors index 0 on both clients - so the child needs no identity
+    of its own; (parent's wire key, ordinal) resolved through the
+    protocol-27 build maps names the same physical door everywhere. That
+    is the generalization worth keeping: once a runtime PARENT has a
+    translated identity, every deterministic child rides it for free -
+    no second describe/mint. The door rows themselves are the
+    protocol-26 symmetric shape unchanged (seeded baseline,
+    baseline-before-write echo guard, per-sender seq, safety resend) on
+    the translated key, and the protocol-26 channel PARTITIONS: it now
+    skips doors whose parent is session-placed, so exactly one channel
+    owns any door. Removal is the mint edge reversed and stays
+    PLACER-AUTHORITATIVE: the dismantle detour or programmatic destroy
+    queues the placer's key, the receiver destroys its mapped proxy
+    through the engine's own GameWorld::destroy and TOMBSTONES the map
+    entry (late rows for the key skip silently - a tombstone is cheaper
+    and safer than erasing, because reliable-channel stragglers can still
+    arrive). Probe also confirmed the polite door lever works on runtime
+    doors and that the peer's proxy survives the placer's destroy without
+    the channel (11 ghost census samples - the gap was real). Validated
+    by bdoor_sync (run 200456: toggles crossed 2/2 onto the proxies, host
+    destroy removed the join's proxy); regressions green; prototest
+    157/157. `KENSHICOOP_BDOOR_SYNC=0` is the escape hatch (forced off in
+    bdoor_probe, which measures the unsynced baseline with the mint
+    channel deliberately still on).
+
+41. **A scalar that already has an owner-authoritative carrier is a
+    FOLD-IN, not a channel: hunger rides the medical snapshot, and the
+    "-1 = not carried" convention makes the A/B hatch free.** (2026-07-08,
+    protocol 28 -> 29, MedicalPacket + hunger/fed.) Gap 7's hunger half:
+    each engine decays EVERY character's hunger locally and eating happens
+    only on the owner's client. hunger_probe (run 213751) turned a vague
+    "hunger diverges" into numbers that shaped the design: the scale is
+    ~0..3, and decay is ACTIVITY-DRIVEN per client - the marching leader
+    decayed ~0.024/s while its idle driven copy decayed ~0.0002/s, a 40%
+    gap in 50 s (fast enough to bite a normal session, not just long
+    campaigns); a direct member write sticks (the engine's periodic update
+    does not fight external writes - same lesson as blood); and
+    dazedOrAlert is a 0..1 alertness flag, NOT the hoped-for intox scalar
+    (the drunk/drug half needs its own spike - a probe can DISPROVE a
+    candidate surface, which is as valuable as confirming one). The
+    mechanism is deliberately boring: two f32s appended to PKT_MEDICAL,
+    read/written through the same &c->medical path as blood, quantized to
+    0.1 units in the change-gate fingerprint (the heaviest measured decay
+    flips a bucket slower than the 3 s safety resend - a fold-in that adds
+    ZERO packets; measure the rate before choosing the quantum). The
+    hatch: -1 means "field not carried" - the sender zeroes the fields out
+    of the fingerprint when off, the receiver's writeMedical skips
+    negatives, and the ownHands_ partition already provides echo-freedom,
+    so KENSHICOOP_HUNGER_SYNC costs no new machinery at either end.
+    Validated by hunger_sync (run 214516: sentinel drops crossed 2/2,
+    final owner-vs-copy gap 0.000); regressions green including
+    medic_order + limb_loss (the carrier's own gates re-proven after the
+    layout change); prototest 157/157 (sizeof 459 -> 467).
+
+42. **The connect edge is a first-class event: replay the one-shot
+    describe/mint edges from retained announce data and age every
+    change-gate's clock, and a late joiner converges through the machinery
+    the channels already have.** (2026-07-08, protocol 29 -> 30,
+    `Replicator::onPeerConnected` - NO wire change; the protocol number is
+    doc bookkeeping.) Gap 9 had two distinct failure classes the cache
+    inventory made visible: PERMANENT loss on one-shot edges (a pre-connect
+    PKT_BUILD_PLACE never re-fires, so the late joiner never mints - which
+    also strands every later row keyed by that building) and SLOW heal on
+    the periodic channels (pre-connect mutations DID send, into the void,
+    arming each row's safety resend - so they converge, but only channel by
+    channel over 5-10 s). The fix respects that split instead of inventing
+    a snapshot protocol: (1) one-shot edges become REPLAYABLE by retaining
+    the announcement packet at edge-drain time (OwnBuild.ann - no engine
+    re-read needed, the template sid lives only in the edge) and re-queuing
+    it on the connect drain, with the receiver's existing session maps as
+    the dedupe (a known key skips the mint, a tombstone skips the remove -
+    the reconnect case costs nothing); (2) every change-gated cache gets
+    its lastSendMs aged to 1 on rows EVER SENT, so each channel's own
+    safety-resend condition fires on its next sample - one lever, eight
+    caches, no new send paths, and rows never sent (the seeded shared-save
+    baseline) correctly stay silent. Deliberate non-moves: edge-only caches
+    (weaponCensus_, hostBody_, stealthPub_) stay untouched - re-seeding
+    them authors phantom drop/KO edges rather than healing state - and
+    event HISTORY is not replayed (snapshots self-heal what the events
+    carried). The probe earned two findings worth keeping: the pre-arm
+    mutation surface (onGameplay, t+3-5 s) reliably beats the ~14 s connect
+    in the loopback harness, and town AI FIGHTS baked-door sentinels
+    (reopens in ~1 s, unlocks its own lock - runs 225300/230601), so the
+    door leg is findings-only and the door channel's resync rides the
+    proof of the identical faction-row code path. Validated by
+    latejoin_sync (run 231429: pre-connect building MINTED + latched
+    complete on the join right after connect; faction sentinel + wallet
+    agreed from the first post-arm census); latejoin_probe (run 230601,
+    gate off) proved the permanent mint loss it closes.
+    KENSHICOOP_LATEJOIN_SYNC=0 is the escape hatch.
+
+43. **The save is the identity ledger: make the HOST's save authoritative
+    and ship the actual folder in-band, and cross-session identity plus
+    drift reset come for free - never invent a second persistence format.**
+    (2026-07-09, protocol 31, wire 29 -> 30, `SaveXfer` +
+    `SaveManager::save` detour.) Everything hand-keyed in this framework
+    (doctrine 14's L0) rests on ONE assumption: both clients loaded the
+    same serialized save, so container/serial-derived hands agree. Live
+    sessions ERODE that lineage - session-placed buildings and recruits
+    exist only as runtime hands + peer proxies, and every unsynced channel
+    drifts a little - and the original gap-8 candidate (per-side saves + a
+    `_coop.dat` sidecar re-describing session state) would have fought that
+    erosion by building a SECOND serialization that forever chases the
+    engine's. The pivot: the host's native save already contains the
+    join's squad state (the sync channels put it there), so a coordinated
+    save bakes ONE save with ONE hand per object, and mirroring that
+    folder to the join re-runs the shared-save-lineage guarantee from
+    scratch - runtime hands become save-stable hands identically on both
+    sides, accumulated drift in every unsynced corner resets to zero, and
+    resume is just "both load the identical file". Three mechanisms, each
+    respecting an engine reality: the save DETOUR (menu, quicksave,
+    autosave, programmatic all funnel through SaveManager::save - one edge
+    covers every trigger; the JOIN's edge is suppressed locally and
+    forwarded as PKT_SAVE_REQ so the host arbitrates exactly one
+    authoritative save); folder QUIESCENCE (the engine's save is deferred
+    + multi-file, so completion is observed, not assumed - poll until the
+    folder holds still, measured ~2 s for 3.7 MB / 35 files); and the
+    staged ATOMIC commit (chunked CH_RELIABLE stream with per-file
+    FNV-1a-32 CRCs into save/<name>__incoming/, verify everything, THEN
+    swap over the real folder - a torn transfer can never leave a
+    half-written loadable save). Validated by save_probe (run 104047:
+    spike-39 getCurrentGame/getSavePath RVAs resolve live, quiescence edge
+    real), save_sync (run 111007: 35 files / 3,730,759 bytes sent =
+    committed, badCrc=0, ACK ok=1), and the resume_test.ps1 two-stage
+    proof (run 111333: a SESSION-PLACED half-built site baked into the
+    coordinated save enumerated after relaunch on BOTH clients as
+    hand=0.2069.11111.1053.3641357312 prog=0.5 - the same-hand
+    identity-reset claim, proven end to end); regressions green.
+    KENSHICOOP_SAVE_SYNC=0 is the escape hatch (forced OFF in save_probe).
+
+44. **A world swap orphans every pointer the session ever cached: make the
+    reload edge a first-class event that resets session state to
+    as-if-freshly-launched - and keep the load itself host-arbitrated so
+    both sides swap to the SAME world.** (2026-07-09, protocol 32, wire
+    30 -> 31, `SaveManager::load` detour + `Replicator::resetSession`.)
+    Doctrine 43 made the save the identity ledger; a MID-SESSION load is
+    the ledger being re-read - and before this protocol it forked the
+    session (the host loaded, the join kept playing the old world). The
+    load half mirrors the save arbitration exactly: the detour catches
+    every local load (menu, title screen, programmatic - one edge covers
+    every trigger); a HOST edge broadcasts PKT_LOAD_GO and loads natively
+    (never delayed); the JOIN's loads are suppressed + forwarded as
+    PKT_LOAD_REQ. The new problem the save never had is VERIFICATION
+    before following: the join must not load a same-named save with
+    different bytes, so the GO carries a folder FINGERPRINT (FNV-1a over
+    sorted lower-cased relative paths + per-file content CRCs - the
+    prototest proves it enumeration-order/path-case invariant and
+    perturbed by any content/name/set change), and a mismatch NACKs into
+    the existing SaveXfer machinery (doctrine 43's transfer, reused whole)
+    with the load latched on the verified commit. Two probe findings
+    shaped the runtime: the engine's load only SETS a deferred LOADGAME
+    signal whose guaranteed consumer is the TITLE-SCREEN loop (run 122805
+    saw it sit forever mid-session; run 124501's engine happened to eat it
+    in ~0.5 s), so a 2 s grace-window backstop pumps SaveManager::execute()
+    from end-of-tick; and the swap REALLOCATES every Character* while
+    mainLoop_hook keeps ticking through the ~4.5 s load screen - live code
+    can touch dangling pointers DURING the swap. Hence the reset: on each
+    side's own reload edge (gameplay non-live >= 400 ms then live - the
+    flicker floor keeps sub-second dips from wiping a live session) the
+    Replicator clears every pointer cache, session map, change-gate
+    baseline and interp buffer, and the inbound world-state queues flush.
+    The preservation list is the subtle half: config gates, the ownership
+    partition, and every OUTBOUND seq counter survive - the PEER never
+    reloaded, so restarting a counter would make every new row look stale
+    to its per-sender guards. Validated by load_sync (run 131521: GO ->
+    fingerprint MATCH -> join followed, both sides swapped + reset, and a
+    SESSION-PLACED building enumerated on BOTH sides POST-load under the
+    SAME hand - doctrine 43's identity proof, now surviving a mid-session
+    reload); regressions green. KENSHICOOP_LOAD_SYNC=0 is the escape
+    hatch (forced OFF in load_probe).
+
+45. **A machine is world-simulation, so its state is HOST-authoritative -
+    and when the authority only flows one way, the first sight SENDS and
+    the safety resend IS the convergence loop.** (2026-07-09, protocol
+    33, wire 31 -> 32, `PKT_PROD`.) Production machines, power fixtures
+    and farms tick independently per client: `prod_probe` (run 152730)
+    measured the host's operate()-driven bench output moving while the
+    join's minted copy stayed flat, and a power toggle never crossing.
+    The symmetric door/faction shape (both sides detect, seed silently,
+    stream only deltas) is WRONG here - a machine's state changes from
+    ENGINE SIMULATION, not user clicks, so both engines drift apart with
+    no local "change author" to arbitrate between. Instead the host
+    samples machine-class buildings ~1 Hz (the `enumDoorsNear` census
+    pattern filtered on `Building::classType`) and streams rows the join
+    applies through the probe-validated levers; the join's own engine
+    keeps simulating - the channel does not suppress it, it CORRECTS it,
+    which is why first sight sends (the host's state is the baseline,
+    not the shared save's) and the 10 s safety resend doubles as the
+    drift-correction floor for a converged-but-still-simulating copy.
+    Identity reuses both prior solutions verbatim: baked machines have
+    save-stable hands (the furniture/door precedent), session-placed
+    ones ride the protocol-27 placer key (a `keyKind` byte on the wire
+    disambiguates the namespaces). Two probe findings shaped the apply:
+    a fresh machine's output buffer (`productionItem`) is NULL until the
+    first production tick, so the row carries the output item sid and
+    the receiver MATERIALIZES the buffer with the native
+    `setProductionItem` (whose stack/progress split makes it the wrong
+    lever for exact amounts) before landing the exact float with the
+    direct `ConsumptionItem::amount` write (which update() does not
+    clamp - probe-proven); and `-1` sentinels carry "not this machine
+    class / no buffer yet" (the hunger fold-in trick), so one packet
+    shape spans generators, benches, drills, furnaces and farms.
+    Research benches are deliberately census-only: `getTechLevel()`
+    reads progress but the unlock STORE is unmapped - no wire commitment
+    until a spike finds the setter (doctrine 36: probe for the minimal
+    state first).     Validated by prod_sync (run 154503: bench output
+    converged gap=0.000 after 30 host-side ops, the power OFF crossed
+    within 3 join census samples, final power agreed); regressions
+    green. KENSHICOOP_PROD_SYNC=0 is the escape hatch (forced OFF in
+    prod_probe).
+
+46. **When a new class of state fits an EXISTING channel, widen the
+    channel's registration instead of minting a new packet - and carry
+    the identity namespace on the wire so both key kinds can ride it.**
+    (2026-07-09, protocol 34, wire 32 -> 33, `PKT_INV_SNAPSHOT` +
+    `keyKind`.) Storage chests and machine inventories hold whole ITEMS
+    that forked per-client: the container-inventory channel had all the
+    machinery (per-container hash change-gate, mid-drag settle window,
+    5 s safety resend, multiset reconcile) but registered exactly ONE
+    container - the host's nearest baked chest. The fix is not a new
+    protocol shape: it is a ~1 Hz HOST census (`enumContainersNear`,
+    the machine-census pattern widened to BCTYPE_STORAGE) feeding the
+    existing authored set, plus ONE new wire byte - `keyKind` - that
+    says whether the container key is a raw save-stable hand or a
+    protocol-27 placer key (session-placed buildings translate through
+    the build maps both ways; an unresolvable key is dropped, the
+    safety resend re-delivers once the mint lands). Three probe
+    findings de-risked the apply: storage buildings are item-type-
+    LIMITED (a Fabric Chest refuses iron plates - harmless, the
+    reconcile only fabricates items the author's copy already holds,
+    accepted by definition); a template NAME does not reveal its
+    BuildingClassType (place-and-verify, destroy on mismatch); and
+    operate() never lands whole items in the machine container (output
+    rides the protocol-33 buffer until a worker collects), so the
+    feared reconcile-vs-update() churn cannot occur. Validated by
+    store_sync (run 173245: the placed chest census-authored under its
+    placer key, the add AND the reconcile-removal crossed, final
+    content hashes agreed); regressions green. KENSHICOOP_STORE_SYNC=0
+    is the escape hatch (forced OFF in store_probe); the channel rides
+    invSync.
+
+47. **When no single engine function owns a mutation, DIFF the surviving
+    pointer instead of hunting a detour - and LATCH any identity-derived
+    partition so mid-session churn appends instead of reshuffling.**
+    (2026-07-09, protocol 35, wire 33 -> 34, `EVT_SQUAD_MOVE` +
+    `pollSquadRoster` + the container-rank latch.) A squad-tab move
+    (UI drag, split-into-new-squad, createSquad) re-containers the body
+    and mints a FULLY fresh hand - container AND index/serial change
+    (squad_probe; harsher than a recruit, where baked subjects keep
+    their serial) - but no one engine function carries every move
+    flavor, so there is nothing to detour. The `Character*` body
+    pointer SURVIVES the re-container (the protocol-23 re-key
+    evidence), so a per-tick pointer->hand baseline diff in the engine
+    (`pollSquadRoster`/`drainSquadMoveEdges`) catches every flavor with
+    one mechanism; each edge rides the proven EVT_RECRUIT shape
+    (subject = old hand, actor = new hand, zeroed actor = left roster)
+    and the receiver shares the re-key path (`rekeyPeerBody`: bind the
+    old body to the new stream key, restore if suppressed, pin). Two
+    partition hazards die with the LATCH: ranks are assigned once at
+    first census (sorted order, identical to the legacy ranking at
+    session start) and newly-seen containers APPEND - so a mid-session
+    tab can neither reshuffle existing ranks (silent whole-tab
+    ownership flip) nor float unowned: the per-hand ownership pins
+    (`pinOwned_`/`pinPeer_`, protocol 23's recruit pins generalized)
+    give every authored hand exactly one publisher regardless of rank.
+    Edge cadence is PER-TICK, not throttled: run 192211 showed a
+    500 ms-throttled edge losing to the peer's REQ/mint round-trip
+    (duplicate proxy) - the reliable edge must leave in the SAME flush
+    as the new hand's first entity batch. The re-key also retires the
+    OLD key's stream state (interp tail erased, a grace stamp keeps its
+    in-flight batches from authoring REQs/mints) and REPAIRS a
+    duplicate that still slipped through (cull the mint, rebind the
+    real body). Validated by squad_sync (run 193304: four moves, four
+    REKEY ok=1, zero duplicates, census ranks stable); regressions
+    green. KENSHICOOP_SQUAD_SYNC=0 is the escape hatch (forced OFF in
+    squad_probe); peer squad-UI roster placement stays deferred (the
+    recruit stance).
+
+48. **Split EXISTENCE from POSITION when the interest radius and the
+    render radius disagree.** (2026-07-10, protocol 36, wire 34 -> 35,
+    `PKT_NPC_CENSUS`.) The join culls ghost NPCs (local spawns the host
+    doesn't have) by comparing its own enumeration against the host's
+    stream - but the stream bubble is ~200 u while render range is 10x
+    that, so a ghost stood visible until a player nearly touched it
+    (the 07-09 session bug). Scaling the positional stream to render
+    range would blow the 20 Hz budget (MAX_PUBLISH, datagram size,
+    query truncation). The fix streams the CHEAP invariant wide and the
+    EXPENSIVE one narrow: existence is 20 B/NPC at 1 Hz (the census -
+    hands only, no transforms), position stays at the proven bubble.
+    Two guards make wide culling safe: the host publishes 25% WIDER
+    than the join culls against (an unstreamed far NPC simulates on
+    BOTH sides, so its two positions legitimately diverge - without
+    the margin a real NPC wandering the boundary would false-cull),
+    and a STALE census (>5 s) disables wide culling entirely rather
+    than mass-suppressing a loaded area on a hiccup. The existing
+    75/150-frame suppress/restore hysteresis is reused verbatim.
+    Validated by npc_census; KENSHICOOP_CENSUS_RADIUS=0 is the escape
+    hatch.
+
+49. **Index remote motion on SENDER time, not arrival time - the wire's
+    jitter is not the mover's jitter.** (2026-07-10, protocol 36, the
+    entity batch `sendMs` stamp.) The interpolation buffer stamped
+    samples with local receipt time, so relay-path jitter (queueing,
+    coalesced datagrams, loss retransmits) was indistinguishable from
+    actual motion irregularity: the buffer starved into extrapolation/
+    snap cycles under WAN profiles ("jumpy movement", 07-09). The
+    sender stamps each batch with its monotonic capture time; the
+    receiver maps it through a per-peer MIN-offset clock (min of
+    arrival-send across the window - creep-resistant because clock
+    drift only lowers the floor, resnapped on >2 s breaks) and the
+    interp indexes on mapped send time. Queueing lag doesn't vanish -
+    it moves into the mapped timestamps' lateness, so renderDelay must
+    absorb PEAK observed lag alongside cadence jitter (the first A/B
+    regressed extrapolation until the lag term joined the formula).
+    A/B evidence, not faith: KENSHICOOP_SEND_STAMP=0 restores
+    arrival stamping live; the WAN A/B halved interp jitter and cut
+    extrapFrac 0.088 -> 0.026. Every interp/drive constant became an
+    env knob in the same pass - tuning claims need a lever, not a
+    rebuild.
+
+50. **The world authority may author an occupant-owner event FOR the
+    owner when the action ran on a sim the owner never executes.**
+    (2026-07-10, protocol 36, the third-party furniture placement.)
+    Furniture enter/exit is occupant-owner-authored (doctrine: the
+    owner's stream is truth for its own bodies) - but a guard jailing
+    an arrested player runs ENTIRELY on the host sim; the owner never
+    sees the action, can't author the event, and its stream keeps
+    reporting no-cage, so the host's own self-heal EJECTED the
+    placement every 3 s. The occupant-owner rule has a principled
+    exception: when the CAUSE is a host-sim NPC acting on a peer-owned
+    body, the host (world authority for NPC actions) authors the enter
+    FOR the owner, holds its self-heal while the event crosses, and
+    re-authors on a 5 s cadence until the owner's stream carries the
+    bit. The owner relaxes its own-hand skip ONLY for the narrow case
+    (body down, not already placed) and a recent owner-side exit vetoes
+    a stale in-flight enter (the race guard both directions). Conscious
+    voluntary use stays owner-authored - the exception is scoped to
+    actions the owner cannot observe. Validated by cage_peer_sync
+    (occupancy held 28 s, zero heal-ejects, clean owner exit).
+
+51. **Gate completion detection on the LAST artifact the producer
+    writes, not the first loadable one - bounded, with a WARN when the
+    bound expires.** (2026-07-10, protocol 36, the portrait quiescence
+    gate.) The save-folder quiescence watch declared completion at
+    "quick.save present + folder stable 1.5 s", but the engine writes
+    `portraits_texture.png` as a late separate step - a settled-looking
+    folder could ship to the join (and be reloaded) without its
+    portrait atlas, blanking every squad-tab avatar (07-09). The gate
+    now additionally waits for the atlas, BOUNDED at 10 s past arm so
+    a genuinely portrait-less save still completes - with a WARN line,
+    and every coordinated-load issue point WARNs when its target folder
+    lacks the file. The bound + WARN pattern is the doctrine: a
+    completeness gate keyed on an optional artifact must degrade to
+    loud, not to stuck.

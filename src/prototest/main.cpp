@@ -52,16 +52,18 @@ static void testSizes() {
     CHECK_EQ("sizeof(WelcomePacket)",           sizeof(WelcomePacket),           7);
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             54);
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
-    CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       6);
+    CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       10); // v35: +sendMs
     CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            156);
-    CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       26);
+    CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       27); // v33: +keyKind
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
     CHECK_EQ("sizeof(WorldItemRemoveHeader)",   sizeof(WorldItemRemoveHeader),   6);
     CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         191);
     CHECK_EQ("sizeof(WorldPickupPacket)",       sizeof(WorldPickupPacket),       83);
+    CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           201); // v36
+
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
-    CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           459);
+    CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
     CHECK_EQ("sizeof(TreatmentPacket)",         sizeof(TreatmentPacket),         77);
     CHECK_EQ("sizeof(SpeedPacket)",             sizeof(SpeedPacket),             14);
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
@@ -69,9 +71,33 @@ static void testSizes() {
     CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          25);
     CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         139);
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
+    CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
+    CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              17);
+    CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              31);
+    CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),        94);
+    CHECK_EQ("sizeof(BuildStatePacket)",        sizeof(BuildStatePacket),        34);
+    CHECK_EQ("sizeof(BuildDoorPacket)",         sizeof(BuildDoorPacket),         32);
+    CHECK_EQ("sizeof(BuildRemovePacket)",       sizeof(BuildRemovePacket),       29);
+    CHECK_EQ("sizeof(SaveReqPacket)",           sizeof(SaveReqPacket),           57);
+    CHECK_EQ("sizeof(SaveBeginPacket)",         sizeof(SaveBeginPacket),         67);
+    CHECK_EQ("sizeof(SaveFileHeader)",          sizeof(SaveFileHeader),          19);
+    CHECK_EQ("sizeof(SaveDoneHeader)",          sizeof(SaveDoneHeader),          11);
+    CHECK_EQ("sizeof(SaveAckPacket)",           sizeof(SaveAckPacket),           20);
+    CHECK_EQ("sizeof(LoadGoPacket)",            sizeof(LoadGoPacket),            61);
+    CHECK_EQ("sizeof(LoadReqPacket)",           sizeof(LoadReqPacket),           57);
+    CHECK_EQ("sizeof(LoadNackPacket)",          sizeof(LoadNackPacket),          61);
+    CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              109);
+    CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
+    // The Steam sender chunk must fit the 1200 B clamped Steam MTU with room
+    // for ENet's per-packet overhead (an oversized UNRELIABLE packet would be
+    // sent as RELIABLE fragments - motion-stream stalls; review 2026-07-10).
+    CHECK("steam entity batch fits clamped MTU",
+          sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX_STEAM * sizeof(EntityState) <= 1150);
+    CHECK("steam cap under hard receive bound",
+          ENTITY_BATCH_MAX_STEAM <= ENTITY_BATCH_MAX);
     CHECK("world-item batch fits datagram",
           sizeof(WorldItemSnapshotHeader) + WORLD_ITEMS_MAX * sizeof(WorldItemEntry) <= 1400);
 
@@ -149,6 +175,14 @@ static void testSizes() {
           EVT_RECRUIT != EVT_AMPUTATE && EVT_RECRUIT != EVT_CRUSH &&
           EVT_RECRUIT != EVT_PICKUP_BODY && EVT_RECRUIT != EVT_DROP_BODY &&
           EVT_RECRUIT != EVT_ENTER_FURNITURE && EVT_RECRUIT != EVT_EXIT_FURNITURE);
+
+    // Squad management sync (protocol 35, v34): the move re-key event rides
+    // the EventPacket shape unchanged; both ends must agree on its id, and
+    // the HELLO version gates the mismatch.
+    CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
+    CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
+          EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
+    CHECK_EQ("PROTOCOL_VERSION (v36: cross-owner transfer intents)", (int)PROTOCOL_VERSION, 36);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -191,15 +225,30 @@ static void testRoundTrips() {
     roundTrip<EventPacket>("EventPacket", (u8)PKT_EVENT);
     roundTrip<WorldDropPacket>("WorldDropPacket", (u8)PKT_WORLD_DROP);
     roundTrip<WorldPickupPacket>("WorldPickupPacket", (u8)PKT_WORLD_PICKUP);
+    roundTrip<InvXferPacket>("InvXferPacket", (u8)PKT_INV_XFER);
     roundTrip<MedicalPacket>("MedicalPacket", (u8)PKT_MEDICAL);
     roundTrip<TreatmentPacket>("TreatmentPacket", (u8)PKT_TREATMENT);
     roundTrip<SpeedPacket>("SpeedPacket(REQ)", (u8)PKT_SPEED_REQ);
     roundTrip<SpeedPacket>("SpeedPacket(SET)", (u8)PKT_SPEED_SET);
     roundTrip<StatsPacket>("StatsPacket", (u8)PKT_STATS);
     roundTrip<MoneyPacket>("MoneyPacket", (u8)PKT_MONEY);
+    roundTrip<FactionPacket>("FactionPacket", (u8)PKT_FACTION);
+    roundTrip<TimePacket>("TimePacket", (u8)PKT_TIME);
+    roundTrip<DoorPacket>("DoorPacket", (u8)PKT_DOOR);
+    roundTrip<BuildPlacePacket>("BuildPlacePacket", (u8)PKT_BUILD_PLACE);
+    roundTrip<BuildStatePacket>("BuildStatePacket", (u8)PKT_BUILD_STATE);
+    roundTrip<BuildDoorPacket>("BuildDoorPacket", (u8)PKT_BUILD_DOOR);
+    roundTrip<BuildRemovePacket>("BuildRemovePacket", (u8)PKT_BUILD_REMOVE);
     roundTrip<StealthPacket>("StealthPacket", (u8)PKT_STEALTH);
     roundTrip<SpawnReqPacket>("SpawnReqPacket", (u8)PKT_SPAWN_REQ);
     roundTrip<SpawnInfoPacket>("SpawnInfoPacket", (u8)PKT_SPAWN_INFO);
+    roundTrip<SaveReqPacket>("SaveReqPacket", (u8)PKT_SAVE_REQ);
+    roundTrip<SaveBeginPacket>("SaveBeginPacket", (u8)PKT_SAVE_BEGIN);
+    roundTrip<SaveAckPacket>("SaveAckPacket", (u8)PKT_SAVE_ACK);
+    roundTrip<LoadGoPacket>("LoadGoPacket", (u8)PKT_LOAD_GO);
+    roundTrip<LoadReqPacket>("LoadReqPacket", (u8)PKT_LOAD_REQ);
+    roundTrip<LoadNackPacket>("LoadNackPacket", (u8)PKT_LOAD_NACK);
+    roundTrip<ProdPacket>("ProdPacket", (u8)PKT_PROD);
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };
@@ -230,7 +279,7 @@ static void testFraming() {
     const unsigned N = 3;
     unsigned char buf[sizeof(EntityBatchHeader) + 3 * sizeof(EntityState)];
     EntityBatchHeader hdr;
-    hdr.type = (u8)PKT_ENTITY_BATCH; hdr.ownerId = 42; hdr.count = (u8)N;
+    hdr.type = (u8)PKT_ENTITY_BATCH; hdr.ownerId = 42; hdr.sendMs = 123456u; hdr.count = (u8)N;
     std::memcpy(buf, &hdr, sizeof(hdr));
     EntityState src[N];
     for (unsigned i = 0; i < N; ++i) {
@@ -241,7 +290,8 @@ static void testFraming() {
     EntityBatchHeader rh;
     std::memcpy(&rh, buf, sizeof(rh));
     unsigned need = (unsigned)sizeof(EntityBatchHeader) + (unsigned)rh.count * (unsigned)sizeof(EntityState);
-    CHECK("entity batch: full payload accepted", len >= need && rh.count == N && rh.ownerId == 42);
+    CHECK("entity batch: full payload accepted",
+          len >= need && rh.count == N && rh.ownerId == 42 && rh.sendMs == 123456u);
     bool all = true;
     for (unsigned i = 0; i < N; ++i) {
         EntityState e;
@@ -253,6 +303,174 @@ static void testFraming() {
     rh.count = (u8)(N + 1);
     need = (unsigned)sizeof(EntityBatchHeader) + (unsigned)rh.count * (unsigned)sizeof(EntityState);
     CHECK("entity batch: overrun count rejected by len>=need", !(len >= need));
+
+    // NPC census framing (protocol 36): [NpcCensusHeader][u32 hand[5] * count],
+    // the exact "len >= need" bound NetLink applies plus the NPC_CENSUS_MAX cap.
+    {
+        const unsigned CN = 4;
+        unsigned char cbuf[sizeof(NpcCensusHeader) + CN * 5 * sizeof(u32)];
+        NpcCensusHeader ch;
+        ch.type = (u8)PKT_NPC_CENSUS; ch.ownerId = 1; ch.count = (u16)CN;
+        std::memcpy(cbuf, &ch, sizeof(ch));
+        u32 hands[CN * 5];
+        for (unsigned i = 0; i < CN * 5; ++i) hands[i] = 1000u + i;
+        std::memcpy(cbuf + sizeof(ch), hands, sizeof(hands));
+        NpcCensusHeader cr;
+        std::memcpy(&cr, cbuf, sizeof(cr));
+        unsigned clen  = (unsigned)sizeof(cbuf);
+        unsigned cneed = (unsigned)sizeof(NpcCensusHeader) + (unsigned)cr.count * 5 * (unsigned)sizeof(u32);
+        CHECK("npc census: full payload accepted",
+              clen >= cneed && cr.count == CN && cr.count <= NPC_CENSUS_MAX);
+        u32 back[CN * 5];
+        std::memcpy(back, cbuf + sizeof(cr), sizeof(back));
+        CHECK("npc census: hands round-trip", std::memcmp(back, hands, sizeof(hands)) == 0);
+        cr.count = (u16)(CN + 1);
+        cneed = (unsigned)sizeof(NpcCensusHeader) + (unsigned)cr.count * 5 * (unsigned)sizeof(u32);
+        CHECK("npc census: overrun count rejected by len>=need", !(clen >= cneed));
+        CHECK("npc census: cap sane", NPC_CENSUS_MAX >= 256 && NPC_CENSUS_MAX <= 2048);
+    }
+
+    // Save-file chunk framing (protocol 31): [SaveFileHeader][path][payload],
+    // the exact "len >= need" bound NetLink applies, plus the pathLen/dataLen
+    // sanity caps that reject a malformed chunk.
+    {
+        const char* relPath = "platoon\\Drifters_0.platoon";
+        const unsigned pl = (unsigned)std::strlen(relPath);
+        const unsigned dl = 100;
+        unsigned char sbuf[sizeof(SaveFileHeader) + 64 + 100];
+        SaveFileHeader fh;
+        fh.type = (u8)PKT_SAVE_FILE; fh.ownerId = 0; fh.xferId = 7;
+        fh.fileIdx = 3; fh.pathLen = (u16)pl; fh.offset = 4096; fh.dataLen = (u16)dl;
+        std::memcpy(sbuf, &fh, sizeof(fh));
+        std::memcpy(sbuf + sizeof(fh), relPath, pl);
+        for (unsigned i = 0; i < dl; ++i) sbuf[sizeof(fh) + pl + i] = (unsigned char)i;
+        unsigned slen = (unsigned)(sizeof(fh) + pl + dl);
+
+        SaveFileHeader rfh;
+        std::memcpy(&rfh, sbuf, sizeof(rfh));
+        unsigned sneed = (unsigned)sizeof(SaveFileHeader) + rfh.pathLen + rfh.dataLen;
+        CHECK("save chunk: full payload accepted",
+              slen >= sneed && rfh.pathLen > 0 && rfh.pathLen <= SAVE_PATH_MAX &&
+              rfh.dataLen <= SAVE_CHUNK_MAX);
+        CHECK("save chunk: path bytes at header end",
+              std::memcmp(sbuf + sizeof(SaveFileHeader), relPath, pl) == 0);
+        CHECK("save chunk: payload follows path",
+              sbuf[sizeof(SaveFileHeader) + pl + 42] == 42);
+        // Lying dataLen: claims more payload than the packet carries.
+        rfh.dataLen = (u16)(dl + 1);
+        sneed = (unsigned)sizeof(SaveFileHeader) + rfh.pathLen + rfh.dataLen;
+        CHECK("save chunk: overrun dataLen rejected by len>=need", !(slen >= sneed));
+        // Oversized dataLen: above the chunk cap even if the bytes were there.
+        rfh.dataLen = (u16)(SAVE_CHUNK_MAX + 1);
+        CHECK("save chunk: dataLen above SAVE_CHUNK_MAX rejected",
+              !(rfh.dataLen <= SAVE_CHUNK_MAX));
+        // Zero pathLen: a chunk with no relative path is malformed.
+        rfh.pathLen = 0;
+        CHECK("save chunk: zero pathLen rejected", !(rfh.pathLen > 0));
+    }
+
+    // Save-done framing: [SaveDoneHeader][u32 crc * fileCount].
+    {
+        const unsigned FC = 5;
+        unsigned char dbuf[sizeof(SaveDoneHeader) + FC * sizeof(u32)];
+        SaveDoneHeader dh;
+        dh.type = (u8)PKT_SAVE_DONE; dh.ownerId = 0; dh.xferId = 7; dh.fileCount = FC;
+        std::memcpy(dbuf, &dh, sizeof(dh));
+        u32 crcs[FC] = { 1, 2, 3, 4, 5 };
+        std::memcpy(dbuf + sizeof(dh), crcs, sizeof(crcs));
+        unsigned dlen = (unsigned)sizeof(dbuf);
+        SaveDoneHeader rdh;
+        std::memcpy(&rdh, dbuf, sizeof(rdh));
+        unsigned dneed = (unsigned)sizeof(SaveDoneHeader) + rdh.fileCount * (unsigned)sizeof(u32);
+        CHECK("save done: full CRC table accepted", dlen >= dneed && rdh.fileCount == FC);
+        rdh.fileCount = (u16)(FC + 1);
+        dneed = (unsigned)sizeof(SaveDoneHeader) + rdh.fileCount * (unsigned)sizeof(u32);
+        CHECK("save done: overrun fileCount rejected by len>=need", !(dlen >= dneed));
+    }
+}
+
+// ---- 3b. Save-transfer CRC (protocol 31): incremental FNV-1a-32 ------------------
+// The receiver folds each arriving chunk into the file's running CRC; the
+// sender does the same while reading. Chunk-split invariance IS the
+// reassembly correctness proof: however the file is cut into chunks, the
+// final CRC equals the whole-file hash the sender put in the DONE table.
+
+static void testSaveCrc() {
+    std::printf("== save-transfer CRC (fnv1a incremental) ==\n");
+    unsigned char data[10000];
+    for (unsigned i = 0; i < sizeof(data); ++i)
+        data[i] = (unsigned char)(i * 31 + (i >> 8));
+
+    // One-shot reference.
+    unsigned ref = fnv1aUpdate(fnv1aInit(), data, sizeof(data));
+    CHECK("crc deterministic", fnv1aUpdate(fnv1aInit(), data, sizeof(data)) == ref);
+
+    // 4 KB chunking (the wire chunk size) folds to the same value.
+    unsigned h = fnv1aInit();
+    for (unsigned off = 0; off < sizeof(data); off += SAVE_CHUNK_MAX) {
+        unsigned n = sizeof(data) - off;
+        if (n > SAVE_CHUNK_MAX) n = SAVE_CHUNK_MAX;
+        h = fnv1aUpdate(h, data + off, n);
+    }
+    CHECK("crc chunk-split invariant (4 KB chunks)", h == ref);
+
+    // Pathological 1-byte chunks fold to the same value too.
+    h = fnv1aInit();
+    for (unsigned i = 0; i < sizeof(data); ++i) h = fnv1aUpdate(h, data + i, 1);
+    CHECK("crc chunk-split invariant (1 B chunks)", h == ref);
+
+    // A single flipped byte perturbs the CRC (corruption is caught).
+    data[5000] ^= 1;
+    CHECK("crc detects a flipped byte", fnv1aUpdate(fnv1aInit(), data, sizeof(data)) != ref);
+    data[5000] ^= 1;
+
+    // Empty file: CRC = the FNV offset basis, same on both ends.
+    CHECK("crc of empty file = fnv basis", fnv1aInit() == 2166136261u);
+}
+
+// ---- 3b. Folder fingerprint (protocol 32 coordinated load) --------------------
+// The join compares the host's LOAD_GO fingerprint against its own on-disk
+// copy - equality must mean "byte-identical folder" regardless of directory
+// enumeration order or path case, and any divergence must perturb it.
+
+static void testFolderFingerprint() {
+    std::printf("== folder fingerprint (coordinated load) ==\n");
+    const char* paths[4] = { "quick.save", "platoon\\a.platoon",
+                             "platoon\\b.platoon", "zone\\zone.1.2.zone" };
+    unsigned int crcs[4] = { 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u };
+    unsigned ref = folderFingerprintOf(paths, crcs, 4);
+
+    CHECK("fp deterministic", folderFingerprintOf(paths, crcs, 4) == ref);
+    CHECK("fp nonzero (0 reserved for missing)", ref != 0);
+
+    // Enumeration-order invariance: FindFirstFile order differs by filesystem;
+    // the same (path, crc) SET must fingerprint identically.
+    const char* paths2[4] = { paths[2], paths[0], paths[3], paths[1] };
+    unsigned int crcs2[4] = { crcs[2], crcs[0], crcs[3], crcs[1] };
+    CHECK("fp enumeration-order invariant",
+          folderFingerprintOf(paths2, crcs2, 4) == ref);
+
+    // Windows path case-insensitivity: the same folder listed with different
+    // case must agree cross-machine.
+    const char* paths3[4] = { "QUICK.SAVE", "Platoon\\A.platoon",
+                              "platoon\\b.PLATOON", "zone\\ZONE.1.2.zone" };
+    CHECK("fp path-case invariant", folderFingerprintOf(paths3, crcs, 4) == ref);
+
+    // Sensitivity: one changed file content, a renamed path, a missing file
+    // and an added file must all perturb the value.
+    unsigned int crcs4[4] = { crcs[0], crcs[1] ^ 1u, crcs[2], crcs[3] };
+    CHECK("fp detects changed file content",
+          folderFingerprintOf(paths, crcs4, 4) != ref);
+    const char* paths5[4] = { "quick.save", "platoon\\a.platoon",
+                              "platoon\\c.platoon", "zone\\zone.1.2.zone" };
+    CHECK("fp detects renamed path", folderFingerprintOf(paths5, crcs, 4) != ref);
+    CHECK("fp detects missing file", folderFingerprintOf(paths, crcs, 3) != ref);
+    const char* paths6[5] = { paths[0], paths[1], paths[2], paths[3], "extra.bin" };
+    unsigned int crcs6[5] = { crcs[0], crcs[1], crcs[2], crcs[3], 0x55555555u };
+    CHECK("fp detects added file", folderFingerprintOf(paths6, crcs6, 5) != ref);
+
+    // Empty folder = 0 (the "missing/unreadable" sentinel).
+    CHECK("fp of empty set = 0", folderFingerprintOf(paths, crcs, 0) == 0);
 }
 
 // ---- 4. Content hash (the inventory convergence key) -----------------------------
@@ -412,6 +630,8 @@ int main() {
     testSizes();
     testRoundTrips();
     testFraming();
+    testSaveCrc();
+    testFolderFingerprint();
     testContentHash();
     testInterp();
     std::printf("\nprototest: %d/%d checks passed%s\n",

@@ -17,6 +17,7 @@
 #include <kenshi/GameWorld.h>       // GameWorld::player
 #include <kenshi/PlayerInterface.h> // PlayerInterface::playerCharacters
 #include <kenshi/SaveManager.h>     // SaveManager::getSingleton/load/savesExist
+#include <kenshi/SaveInfo.h>        // SaveInfo (the in-game load menu's load(SaveInfo&) overload)
 #include <kenshi/Character.h>       // Character (handle/getPosition/getOrientation/movement)
 #include <kenshi/CharMovement.h>    // CharMovement::_setPositionDirectionAndTeleport/setDestination
 #include <kenshi/Enums.h>           // itemType, MoveSpeed { RUN }
@@ -33,7 +34,13 @@
 #include <kenshi/util/hand.h>       // hand (5-field identity, getRootObject)
 #include <kenshi/util/lektor.h>     // lektor<T> (playerCharacters, interest query)
 #include <kenshi/Faction.h>         // Faction::getData / FactionManager::getFactionByStringID (protocol 21)
+#include <kenshi/FactionRelations.h> // FactionRelations (protocol 24 faction-relation sync)
 #include <kenshi/Platoon.h>         // Platoon / ActivePlatoon / Ownerships (wallet, protocol 22)
+#include <kenshi/Building/DoorStuff.h> // DoorStuff (door/gate state, protocol 26)
+#include <kenshi/Building/FarmBuilding.h>      // FarmBuilding growth floats (protocol 33; pulls Production/Storage/UseableStuff)
+#include <kenshi/Building/CraftingBuilding.h>  // CraftingBuilding::operate override (protocol 33)
+#include <kenshi/Building/GeneratorBuilding.h> // GeneratorBuilding::getPowerOutput override (protocol 33)
+#include <kenshi/Building/ResearchBuilding.h>  // ResearchBuilding tech-level evidence (protocol 33)
 #include <kenshi/ShopTrader.h>      // ShopTrader (vendor stock, protocol 22)
 #include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
 #include <kenshi/gui/ForgottenGUI.h> // ForgottenGUI::mainbar
@@ -43,6 +50,7 @@
 #include <ogre/OgreQuaternion.h>
 #include <cmath>
 #include <cstdlib> // getenv (KENSHICOOP_INV_DUMP reconcile-trace gate)
+#include <map>     // squad roster pointer->hand baseline (protocol 35)
 #include <set>
 #include <utility>
 
@@ -62,6 +70,146 @@ SaveMgrGetFn        g_getFn        = 0;
 SaveMgrLoadNameFn   g_loadFn       = 0;
 SaveMgrSavesExistFn g_savesExistFn = 0;
 SaveMgrSaveNameFn   g_saveFn       = 0;
+
+// Protocol 31 (coordinated save): SaveManager::getCurrentGame / getSavePath.
+// Both return `const std::string&` - a member returning a reference puts `this`
+// in RCX and the referent's ADDRESS in RAX, so model them as pointer-returning
+// (the TaskerDescFn precedent). Spike 39 quoted their RVAs from SaveManager.h
+// but they were never called at runtime until now (save_probe validates them).
+typedef const std::string* (__fastcall* SaveMgrStrFn)(SaveManager* self);
+SaveMgrStrFn g_saveMgrCurGameFn = 0;
+SaveMgrStrFn g_saveMgrPathFn    = 0;
+
+// Protocol 32: SaveManager::execute - the deferred-signal consumer (performs
+// the actual save/load/import/new-game named by the pending signal). The
+// title-screen loop calls it; mid-session nothing does, so the coordinated
+// load pumps it manually from the end of the main-loop tick.
+typedef void (__fastcall* SaveMgrExecFn)(SaveManager* self);
+SaveMgrExecFn g_saveMgrExecFn = 0;
+
+// Protocol 31: SaveManager::save detour. save(name, autosave) is the ONE entry
+// every save takes - the in-game save menu, quicksave, the autosave timer AND
+// the mod's own saveGameAs (KenshiLib's inline patch means even the direct
+// g_saveFn call re-enters the detour; the trampoline below is the real body).
+// Every call queues a SaveEdgeRec the Plugin drains once per tick (engine tick
+// and plugin tick share the main thread - no lock, the recruit-edge pattern).
+// g_saveSuppressAll (JOIN under save-sync): the local write is SKIPPED - the
+// host's save is authoritative and arrives via the in-band transfer; a manual
+// edge is forwarded to the host as PKT_SAVE_REQ by the Plugin instead.
+struct SaveEdgeRec { char name[48]; int autosave; int suppressed; };
+static std::vector<SaveEdgeRec> g_saveEdges;
+static bool g_saveSuppressAll = false;
+SaveMgrSaveNameFn g_saveHookOrig = 0;
+
+void __fastcall saveMgrSave_hook(SaveManager* self, const std::string* name,
+                                 bool autosave) {
+    char nm[48];
+    nm[0] = '\0';
+    __try {
+        if (name) {
+            strncpy(nm, name->c_str(), sizeof(nm) - 1);
+            nm[sizeof(nm) - 1] = '\0';
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { nm[0] = '\0'; }
+    const bool suppress = g_saveSuppressAll;
+    if (!suppress) g_saveHookOrig(self, name, autosave);
+    __try {
+        SaveEdgeRec r;
+        memset(&r, 0, sizeof(r));
+        strncpy(r.name, nm, sizeof(r.name) - 1);
+        r.autosave   = autosave ? 1 : 0;
+        r.suppressed = suppress ? 1 : 0;
+        if (g_saveEdges.size() < 8) g_saveEdges.push_back(r);
+        char b[144];
+        _snprintf(b, sizeof(b) - 1,
+                  "[save] LOCAL-SAVE name='%s' autosave=%d suppressed=%d",
+                  r.name, r.autosave, r.suppressed);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Protocol 32: SaveManager::load detours. There are TWO public load entries
+// and every trigger takes one of them: load(name) - the title screen's
+// auto-load and the mod's own loadSave (KenshiLib's inline patch means even
+// the direct g_loadFn call re-enters the detour; the trampoline below is the
+// real body) - and load(SaveInfo&, resetPos) - the IN-GAME LOAD MENU (field
+// evidence 2026-07-09: a menu load produced a world swap with NO edge from
+// the name detour, so the menu never funnels through load(name)). BOTH are
+// detoured into the same edge/suppression logic; a reentry latch keeps one
+// overload calling the other (either direction) from double-counting the
+// edge. The engine's load is DEFERRED (sets LOADGAME; the world swaps a few
+// frames later), so passing it through is safe from the hook context - the
+// probe validates the mid-session case. g_loadSuppressAll (JOIN under
+// load-sync): the local load is SWALLOWED - the host arbitrates and the
+// edge forwards as PKT_LOAD_REQ. g_loadBypassOnce lets the join's own
+// coordinated load (issued on PKT_LOAD_GO) pass through while suppression
+// is armed.
+struct LoadEdgeRec { char name[48]; int suppressed; };
+static std::vector<LoadEdgeRec> g_loadEdges;
+static bool g_loadSuppressAll = false;
+static bool g_loadBypassOnce  = false;
+static bool g_inLoadDetour    = false; // reentry latch (outer hook owns the edge)
+SaveMgrLoadNameFn g_loadHookOrig = 0;
+typedef void (__fastcall* SaveMgrLoadInfoFn)(SaveManager* self, const SaveInfo* info,
+                                             bool resetPos);
+SaveMgrLoadInfoFn g_loadInfoHookOrig = 0;
+
+// Shared edge/suppression body. Returns true when the original must run
+// (i.e. the load was NOT suppressed). 'via' tags the log with the entry.
+static bool loadDetourEdge(const char* nm, const char* via) {
+    const bool bypass   = g_loadBypassOnce;
+    const bool suppress = g_loadSuppressAll && !bypass;
+    g_loadBypassOnce = false;
+    __try {
+        LoadEdgeRec r;
+        memset(&r, 0, sizeof(r));
+        strncpy(r.name, nm, sizeof(r.name) - 1);
+        r.suppressed = suppress ? 1 : 0;
+        if (g_loadEdges.size() < 8) g_loadEdges.push_back(r);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[load] LOCAL-LOAD name='%s' suppressed=%d bypass=%d via=%s",
+                  r.name, r.suppressed, bypass ? 1 : 0, via);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return !suppress;
+}
+
+void __fastcall saveMgrLoad_hook(SaveManager* self, const std::string* name) {
+    if (g_inLoadDetour) { g_loadHookOrig(self, name); return; }
+    char nm[48];
+    nm[0] = '\0';
+    __try {
+        if (name) {
+            strncpy(nm, name->c_str(), sizeof(nm) - 1);
+            nm[sizeof(nm) - 1] = '\0';
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { nm[0] = '\0'; }
+    if (loadDetourEdge(nm, "name")) {
+        g_inLoadDetour = true;
+        g_loadHookOrig(self, name);
+        g_inLoadDetour = false;
+    }
+}
+
+// The in-game load menu's entry: load(SaveInfo&, resetPos).
+void __fastcall saveMgrLoadInfo_hook(SaveManager* self, const SaveInfo* info,
+                                     bool resetPos) {
+    if (g_inLoadDetour) { g_loadInfoHookOrig(self, info, resetPos); return; }
+    char nm[48];
+    nm[0] = '\0';
+    __try {
+        if (info) {
+            strncpy(nm, info->name.c_str(), sizeof(nm) - 1);
+            nm[sizeof(nm) - 1] = '\0';
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { nm[0] = '\0'; }
+    if (loadDetourEdge(nm, "menu")) {
+        g_inLoadDetour = true;
+        g_loadInfoHookOrig(self, info, resetPos);
+        g_inLoadDetour = false;
+    }
+}
 
 // hand::getCharacter resolves a save-stable handle back to the local Character*.
 // The 5-arg hand constructor builds a proper hand (sets the vptr) from received
@@ -235,6 +383,85 @@ SetGameSpeedFn      g_setGameSpeedFn      = 0;
 UserPauseFn         g_userPauseFn         = 0;
 UserPauseFn         g_togglePauseFn       = 0;
 SetFrameSpeedMultFn g_setFrameSpeedMultFn = 0;
+
+// Door/gate state (protocol 26). DoorStuff : Building carries the whole door
+// model: `state` (DoorState, animates through OPENING/CLOSING), a DoorLock,
+// and the engine's own action entries - openDoor/closeDoor (the polite path:
+// animation, navmesh, sound; returns false when refused) with
+// _forceDoorOpenUT/_forceDoorClosedUT as the blunt fallback, and
+// lockDoor/unlockDoor for the lock bit. Doors are found among BUILDING
+// spatial-query results by the Building::imADoor member (0x1A0).
+typedef bool (__fastcall* DoorBoolFn)(const DoorStuff* self);
+typedef bool (__fastcall* DoorActFn)(DoorStuff* self);
+typedef void (__fastcall* DoorVoidFn)(DoorStuff* self);
+DoorBoolFn g_doorIsOpenFn      = 0;
+DoorBoolFn g_doorIsLockedFn    = 0;
+DoorActFn  g_doorOpenFn        = 0;
+DoorActFn  g_doorCloseFn       = 0;
+DoorActFn  g_doorForceOpenFn   = 0;
+DoorActFn  g_doorForceCloseFn  = 0;
+DoorVoidFn g_doorLockFn        = 0;
+DoorVoidFn g_doorUnlockFn      = 0;
+
+// Placed-building construction levers (protocol 27). Building carries a public
+// ConstructionState `_buildState` at 0x160 (isComplete + constructionProgress
+// float); the engine's own progress entries (used by builder labor) are the
+// write levers - notifyConstructionComplete finishes a site natively
+// (scaffold off, materials restored, pathfinding updated).
+typedef void (__fastcall* BuildProgFn)(Building* self, float amount);
+typedef void (__fastcall* BuildDoneFn)(Building* self);
+BuildProgFn g_buildSetProgFn  = 0;
+BuildProgFn g_buildAddProgFn  = 0;
+BuildDoneFn g_buildNotifyDoneFn = 0;
+
+// Production machine levers (protocol 33). All machine classes derive from
+// UseableStuff (power bit @0x3B5, switchPowerOn = the engine's own toggle);
+// production classes add productionState @0x468, the output ConsumptionItem*
+// @0x448 and the consumptionItems lektor @0x478 (plain members - direct
+// reads). setProductionItem is the native output-buffer write lever; operate()
+// is the worker-production entry, resolved PER OVERRIDE because we call the
+// non-virtual addresses (classType selects which one - the same dispatch the
+// vtable would do). getPowerOutput has a generator override (base returns the
+// consumer-side draw), picked via the engine's own isGenerator().
+typedef void  (__fastcall* MachPowerSetFn)(UseableStuff* self, bool on);
+typedef float (__fastcall* MachPowerOutFn)(const UseableStuff* self);
+typedef bool  (__fastcall* MachIsGenFn)(const UseableStuff* self);
+typedef void  (__fastcall* MachSetProdItemFn)(ProductionBuilding* self,
+                                              GameData* item, int stack,
+                                              float progress01);
+typedef int   (__fastcall* MachTechLvlFn)(ResearchBuilding* self);
+typedef void  (__fastcall* MachOperateFn)(Building* self, Character* who,
+                                          float amount);
+MachPowerSetFn    g_machPowerFn          = 0;
+MachPowerOutFn    g_machPowerOutBaseFn   = 0;
+MachPowerOutFn    g_machPowerOutGenFn    = 0;
+MachIsGenFn       g_machIsGenFn          = 0;
+MachSetProdItemFn g_machSetProdItemFn    = 0;
+MachTechLvlFn     g_machTechLvlFn        = 0;
+MachOperateFn     g_machOperateProdFn    = 0; // ProductionBuilding (generator/drill/base)
+MachOperateFn     g_machOperateCraftFn   = 0; // CraftingBuilding override
+MachOperateFn     g_machOperateFarmFn    = 0; // FarmBuilding override
+MachOperateFn     g_machOperateResearchFn = 0; // ResearchBuilding override
+// getProductionItemData: the TEMPLATE the machine produces (available even
+// while productionItem is still null - the buffer only materializes on the
+// first actual production tick, a prod_probe run-151948 finding). Per-class
+// overrides resolved like operate().
+typedef GameData* (__fastcall* MachProdItemDataFn)(Building* self);
+MachProdItemDataFn g_machProdDataBaseFn  = 0; // StorageBuilding base
+MachProdItemDataFn g_machProdDataCraftFn = 0; // CraftingBuilding override
+
+// Game-clock read (protocol 25). GameWorld::getTimeStamp_inGameHours returns
+// TimeOfDay BY VALUE, and TimeOfDay has user-declared constructors + copy
+// assignment - NON-trivial for the MSVC x64 return ABI, so it comes back via
+// a hidden retbuf pointer with `this` staying in RCX (the documented
+// getPositionBip01 hazard: model as fn(self, retbuf), NEVER as a by-value
+// return). TimeOfDay is one double (total in-game hours) at offset 0, so the
+// retbuf is modeled as a raw double. getLengthOfHourInRealSeconds gives the
+// real-seconds-per-game-hour conversion (a plain float return).
+typedef double* (__fastcall* GetTimeHoursFn)(GameWorld* self, double* ret);
+typedef float   (__fastcall* GetHourLenFn)(GameWorld* self);
+GetTimeHoursFn g_getTimeHoursFn = 0;
+GetHourLenFn   g_getHourLenFn   = 0;
 
 // Speed-intent capture (the vote source). Detours on the three user-reachable
 // speed entries record every call NOT made by our own quiet writer as user
@@ -430,6 +657,114 @@ bool __fastcall recruit_hook(PlayerInterface* self, Character* c, bool editor) {
     return ok;
 }
 
+// Squad-move edge detection (protocol 35). A squad-tab MOVE re-containers the
+// body exactly like a recruit, but there is no single engine function to
+// detour for the UI drag - so the roster is POLLED instead: the Character*
+// pointer survives re-containering (the protocol-23 re-key evidence), so a
+// pointer -> hand baseline diff catches every move flavor. Exits report the
+// STORED hand with a zeroed after (never dereferencing the possibly-freed
+// pointer); brand-new pointers just seed the baseline (recruit ENTRY is the
+// protocol-23 detour's story - double-reporting it here would race the
+// EVT_RECRUIT re-key on the peer).
+struct SquadHandRec { unsigned int h[5]; };
+static std::map<Character*, SquadHandRec> g_squadRoster;
+static std::vector<SquadMoveEdge> g_squadMoveEdges;
+
+// Programmatic squad-move levers (probe tier). PlayerInterface::getFaction
+// feeds Character::setFaction(faction, targetPlatoon) - the header-documented
+// re-platoon path; ActivePlatoon::addCharacterAt is the raw container insert
+// fallback. Both non-fatal: unresolved -> lever returns -1 and the probe logs
+// the gap.
+typedef Faction* (__fastcall* PlayerFactionFn)(const PlayerInterface* self);
+typedef void     (__fastcall* AddCharacterAtFn)(ActivePlatoon* self,
+                                                RootObject* c, int index);
+PlayerFactionFn  g_playerFactionFn = 0;
+AddCharacterAtFn g_addCharacterAtFn = 0;
+
+// Build-placement edge detour (protocol 27). PreviewBuilding::
+// placeFinalPreviewBuilding is the ONE engine path a player's build-mode
+// commit lands on: it constructs the real Building and parks it in
+// `justBeenBuilt`. A placed building is a RUNTIME object (host-only hand -
+// the protocol-21 identity problem for structures), so the peer can never
+// resolve it from its save; the detour captures every successful placement
+// (template sid + transform + the placer's local hand as the wire key) into
+// a small queue the Replicator drains once per tick into PKT_BUILD_PLACE.
+// Engine tick and plugin tick share the main thread - no lock needed.
+struct BuildEdgeRec {
+    unsigned int hand[5];
+    float x, y, z, yaw;
+    int   floorNum;
+    int   fromUi;
+    char  sid[48];
+};
+static std::vector<BuildEdgeRec> g_buildEdges;
+typedef void (__fastcall* PlaceFinalFn)(PreviewBuilding* self);
+PlaceFinalFn g_placeFinalOrig = 0;
+void __fastcall placeFinal_hook(PreviewBuilding* self) {
+    g_placeFinalOrig(self);
+    __try {
+        if (!self) return;
+        Building* b = self->justBeenBuilt;
+        if (!b) return; // commit refused (placement rules) - nothing placed
+        BuildEdgeRec e;
+        memset(&e, 0, sizeof(e));
+        RootObject* ro = static_cast<RootObject*>(b);
+        if (!readObjectHand(ro, e.hand)) return;
+        GameData* gd = ro->getGameData();
+        if (gd) {
+            strncpy(e.sid, gd->stringID.c_str(), sizeof(e.sid) - 1);
+            e.sid[sizeof(e.sid) - 1] = '\0';
+        }
+        Ogre::Vector3 p = ro->getPosition();
+        e.x = p.x; e.y = p.y; e.z = p.z;
+        e.yaw = self->yaw;
+        e.floorNum = self->floorNum;
+        e.fromUi = 1;
+        if (g_buildEdges.size() < 32) g_buildEdges.push_back(e);
+        char lb[224];
+        _snprintf(lb, sizeof(lb) - 1,
+                  "[build] LOCAL-PLACE ui=1 sid='%s' hand=%u.%u.%u.%u.%u pos=%.1f,%.1f,%.1f yaw=%.2f floor=%d",
+                  e.sid, e.hand[0], e.hand[1], e.hand[2], e.hand[3], e.hand[4],
+                  e.x, e.y, e.z, e.yaw, e.floorNum);
+        lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Dismantle edge detour (protocol 28). Building::notifyConstructionDismantling
+// is the engine's dismantle-complete notification (the counterpart of
+// notifyConstructionComplete). Capturing the hand here catches the UI
+// dismantle path; the probe's programmatic destroy queues its edge manually
+// (GameWorld::destroy never passes through this notification). The Replicator
+// drains the queue into PKT_BUILD_REMOVE and only acts on hands it PLACED -
+// baked-building dismantles log but never stream.
+static std::vector<unsigned int> g_removeEdges; // flat, 5 u32 per edge
+typedef void (__fastcall* DismantleFn)(Building* self);
+DismantleFn g_dismantleOrig = 0;
+static void pushRemoveEdge(const unsigned int h[5]) {
+    if (g_removeEdges.size() >= 5 * 32) return;
+    for (int i = 0; i < 5; ++i) g_removeEdges.push_back(h[i]);
+}
+void __fastcall dismantle_hook(Building* self) {
+    unsigned int h[5] = { 0, 0, 0, 0, 0 };
+    bool haveHand = false;
+    __try {
+        // Read the hand BEFORE the original runs: the notification may tear
+        // the building down and the hand is unreadable afterwards.
+        if (self) haveHand = readObjectHand(static_cast<RootObject*>(self), h);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_dismantleOrig(self);
+    if (haveHand) {
+        __try {
+            pushRemoveEdge(h);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] LOCAL-DISMANTLE hand=%u.%u.%u.%u.%u",
+                      h[0], h[1], h[2], h[3], h[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
+
 // AI decision-layer detour. Character::periodicUpdate() is the per-character AI
 // "think" tick that re-scores/re-assigns autonomous town tasks (and thus keeps
 // overwriting whatever pose we set). Detouring it lets us SUSPEND just the
@@ -539,6 +874,14 @@ typedef Item* (__fastcall* GetWeaponFn)(Inventory* self);
 // non-virtual, so resolved like every other engine call).
 typedef Faction*  (__fastcall* FacBySidFn)(FactionManager* self, const std::string* sid);
 typedef GameData* (__fastcall* FacGetDataFn)(const Faction* self);
+// Protocol 24 faction-relation sync: read/write the relation table between the
+// player faction and world factions. All non-virtual (or called via their _NV_
+// RVA), resolved like every other engine call. setRelation writes the raw
+// relation float on ONE side's table; isEnemy/isAlly are the derived flags the
+// AI actually consults.
+typedef float (__fastcall* RelGetFn)(FactionRelations* self, Faction* p);
+typedef void  (__fastcall* RelSetFn)(FactionRelations* self, Faction* who, float setTo);
+typedef bool  (__fastcall* RelBoolFn)(FactionRelations* self, Faction* c);
 
 CreateCharFn     g_createCharFn   = 0;
 CreateBuildingFn g_createBldgFn   = 0;
@@ -552,6 +895,84 @@ GetWeaponFn      g_getPrimaryWeaponFn   = 0;
 GetWeaponFn      g_getSecondaryWeaponFn = 0;
 FacBySidFn       g_facBySidFn     = 0; // protocol 21 proxy spawn (join)
 FacGetDataFn     g_facGetDataFn   = 0; // protocol 21 describe (host)
+RelGetFn         g_relGetFn       = 0; // protocol 24 relation read
+RelSetFn         g_relSetFn       = 0; // protocol 24 relation write
+RelBoolFn        g_relIsEnemyFn   = 0; // protocol 24 derived hostility flag
+RelBoolFn        g_relIsAllyFn    = 0; // protocol 24 derived alliance flag
+
+// The faction's GameData stringID - the save-stable cross-client identity
+// (protocol 21 already round-trips it for proxy spawns). "" when unreadable.
+void facSidOf(Faction* f, char* out, unsigned int outLen) {
+    if (!out || outLen == 0) return;
+    out[0] = '\0';
+    if (!f || !g_facGetDataFn) return;
+    __try {
+        GameData* gd = g_facGetDataFn(f);
+        if (gd) {
+            strncpy(out, gd->stringID.c_str(), outLen - 1);
+            out[outLen - 1] = '\0';
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = '\0'; }
+}
+
+// Faction-relation mutation detours (protocol 24). FactionRelations::
+// affectRelations is the engine's own relation-change path and has TWO
+// overloads: the EVENT one (cause enum -> computed amount) and the raw AMOUNT
+// one (dialog effects, direct adjustments). Both are detoured: each fires a
+// "[fac] AFFECT-EV/AMT" log line (cause-attribution evidence) and records a
+// delta the Replicator can drain (the join forwards its local mutations to
+// the host, the treatments pattern). If one overload calls the other
+// internally the log exposes the call graph - the forwarder dedupes by only
+// draining what the sync layer decides to forward.
+struct FactionDeltaRec {
+    char  meSid[48];   // whose relation table mutated (relations->me)
+    char  whomSid[48]; // toward which faction
+    int   isEvent;     // 1 = FactionEvent overload, 0 = raw-amount overload
+    int   ev;          // FactionEvent (isEvent=1)
+    float amount;      // raw amount (isEvent=0)
+    float mult;
+    float after;       // relation value after the engine ran its own math
+};
+static std::vector<FactionDeltaRec> g_facDeltas;
+typedef void (__fastcall* AffectRelEvFn)(FactionRelations* self, Faction* p, int e, float mult);
+typedef void (__fastcall* AffectRelAmtFn)(FactionRelations* self, Faction* p, float amount, float mult);
+AffectRelEvFn  g_affectEvOrig  = 0;
+AffectRelAmtFn g_affectAmtOrig = 0;
+
+void recordFactionDelta(FactionRelations* self, Faction* p, int isEvent,
+                        int ev, float amount, float mult) {
+    __try {
+        FactionDeltaRec r;
+        memset(&r, 0, sizeof(r));
+        facSidOf(self ? self->me : 0, r.meSid, sizeof(r.meSid));
+        facSidOf(p, r.whomSid, sizeof(r.whomSid));
+        r.isEvent = isEvent; r.ev = ev; r.amount = amount; r.mult = mult;
+        r.after = -999.0f;
+        if (self && p && g_relGetFn) r.after = g_relGetFn(self, p);
+        if (g_facDeltas.size() < 64) g_facDeltas.push_back(r);
+        char b[224];
+        if (isEvent) {
+            _snprintf(b, sizeof(b) - 1,
+                      "[fac] AFFECT-EV me='%s' whom='%s' event=%d mult=%.3f after=%.2f",
+                      r.meSid, r.whomSid, ev, mult, r.after);
+        } else {
+            _snprintf(b, sizeof(b) - 1,
+                      "[fac] AFFECT-AMT me='%s' whom='%s' amount=%.3f mult=%.3f after=%.2f",
+                      r.meSid, r.whomSid, amount, mult, r.after);
+        }
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void __fastcall affectRelEv_hook(FactionRelations* self, Faction* p, int e, float mult) {
+    g_affectEvOrig(self, p, e, mult);
+    recordFactionDelta(self, p, 1, e, 0.0f, mult);
+}
+
+void __fastcall affectRelAmt_hook(FactionRelations* self, Faction* p, float amount, float mult) {
+    g_affectAmtOrig(self, p, amount, mult);
+    recordFactionDelta(self, p, 0, 0, amount, mult);
+}
 
 // Honest pose oracle. getPositionBip01 is non-virtual (no vtable), so it must be
 // resolved + called through a pointer (returns Ogre::Vector3 BY VALUE). isIdle /
@@ -614,8 +1035,17 @@ void resolve() {
         static_cast<void (SaveManager::*)(const std::string&)>(&SaveManager::load));
     g_savesExistFn = (SaveMgrSavesExistFn)KenshiLib::GetRealAddress(&SaveManager::savesExist);
     g_saveFn = (SaveMgrSaveNameFn)KenshiLib::GetRealAddress(&SaveManager::save);
+    g_saveMgrExecFn = (SaveMgrExecFn)KenshiLib::GetRealAddress(&SaveManager::execute);
     if (!g_getFn || !g_loadFn)
         coop::logErrLine("engine: could not resolve SaveManager load functions");
+
+    // Protocol 31: locate the active save on disk (spike 39 RVAs, runtime-
+    // validated by save_probe). Non-fatal: saveInfo falls back to the
+    // %LOCALAPPDATA%\kenshi\save convention the harness already assumes.
+    g_saveMgrCurGameFn = (SaveMgrStrFn)KenshiLib::GetRealAddress(&SaveManager::getCurrentGame);
+    g_saveMgrPathFn    = (SaveMgrStrFn)KenshiLib::GetRealAddress(&SaveManager::getSavePath);
+    if (!g_saveMgrCurGameFn || !g_saveMgrPathFn)
+        coop::logErrLine("engine: could not resolve getCurrentGame/getSavePath (save-path fallback)");
 
     // Entity resolve path: hand->Character lookup and the 5-arg hand ctor
     // (overloaded, so disambiguate via an explicit member-pointer cast).
@@ -705,9 +1135,74 @@ void resolve() {
     if (!g_setFrameSpeedMultFn)
         coop::logErrLine("engine: could not resolve setFrameSpeedMultiplier (quiet speed apply off)");
 
+    // Door/gate state (protocol 26; non-fatal: unresolved -> door sync off).
+    g_doorIsOpenFn     = (DoorBoolFn)KenshiLib::GetRealAddress(&DoorStuff::isOpen);
+    g_doorIsLockedFn   = (DoorBoolFn)KenshiLib::GetRealAddress(&DoorStuff::isLocked);
+    g_doorOpenFn       = (DoorActFn)KenshiLib::GetRealAddress(&DoorStuff::openDoor);
+    g_doorCloseFn      = (DoorActFn)KenshiLib::GetRealAddress(&DoorStuff::closeDoor);
+    g_doorForceOpenFn  = (DoorActFn)KenshiLib::GetRealAddress(&DoorStuff::_forceDoorOpenUT);
+    g_doorForceCloseFn = (DoorActFn)KenshiLib::GetRealAddress(&DoorStuff::_forceDoorClosedUT);
+    g_doorLockFn       = (DoorVoidFn)KenshiLib::GetRealAddress(&DoorStuff::lockDoor);
+    g_doorUnlockFn     = (DoorVoidFn)KenshiLib::GetRealAddress(&DoorStuff::unlockDoor);
+    if (!g_doorIsOpenFn || !g_doorOpenFn || !g_doorCloseFn)
+        coop::logErrLine("engine: could not resolve DoorStuff functions (door sync off)");
+
+    // Construction progress (protocol 27; non-fatal: unresolved -> build sync off).
+    g_buildSetProgFn = (BuildProgFn)KenshiLib::GetRealAddress(
+        &Building::_NV_setConstructionProgress);
+    g_buildAddProgFn = (BuildProgFn)KenshiLib::GetRealAddress(
+        &Building::_NV_addConstructionProgress);
+    g_buildNotifyDoneFn = (BuildDoneFn)KenshiLib::GetRealAddress(
+        &Building::_NV_notifyConstructionComplete);
+    if (!g_buildSetProgFn || !g_buildAddProgFn)
+        coop::logErrLine("engine: could not resolve construction-progress setters (build sync off)");
+
+    // Production machine levers (protocol 33; non-fatal: unresolved -> prod sync off).
+    g_machPowerFn        = (MachPowerSetFn)KenshiLib::GetRealAddress(
+        &UseableStuff::_NV_switchPowerOn);
+    g_machPowerOutBaseFn = (MachPowerOutFn)KenshiLib::GetRealAddress(
+        &UseableStuff::_NV_getPowerOutput);
+    g_machPowerOutGenFn  = (MachPowerOutFn)KenshiLib::GetRealAddress(
+        &GeneratorBuilding::_NV_getPowerOutput);
+    g_machIsGenFn        = (MachIsGenFn)KenshiLib::GetRealAddress(
+        &UseableStuff::isGenerator);
+    g_machSetProdItemFn  = (MachSetProdItemFn)KenshiLib::GetRealAddress(
+        &ProductionBuilding::_NV_setProductionItem);
+    g_machTechLvlFn      = (MachTechLvlFn)KenshiLib::GetRealAddress(
+        &ResearchBuilding::_NV_getTechLevel);
+    g_machOperateProdFn  = (MachOperateFn)KenshiLib::GetRealAddress(
+        &ProductionBuilding::_NV_operate);
+    g_machOperateCraftFn = (MachOperateFn)KenshiLib::GetRealAddress(
+        &CraftingBuilding::_NV_operate);
+    g_machOperateFarmFn  = (MachOperateFn)KenshiLib::GetRealAddress(
+        &FarmBuilding::_NV_operate);
+    g_machOperateResearchFn = (MachOperateFn)KenshiLib::GetRealAddress(
+        &ResearchBuilding::_NV_operate);
+    g_machProdDataBaseFn  = (MachProdItemDataFn)KenshiLib::GetRealAddress(
+        &StorageBuilding::_NV_getProductionItemData);
+    g_machProdDataCraftFn = (MachProdItemDataFn)KenshiLib::GetRealAddress(
+        &CraftingBuilding::_NV_getProductionItemData);
+    if (!g_machPowerFn || !g_machSetProdItemFn || !g_machOperateProdFn)
+        coop::logErrLine("engine: could not resolve machine levers (prod sync off)");
+
+    // Game-clock reads (protocol 25; non-fatal: unresolved -> time sync off).
+    g_getTimeHoursFn = (GetTimeHoursFn)KenshiLib::GetRealAddress(
+        &GameWorld::getTimeStamp_inGameHours);
+    g_getHourLenFn = (GetHourLenFn)KenshiLib::GetRealAddress(
+        &GameWorld::getLengthOfHourInRealSeconds);
+    if (!g_getTimeHoursFn || !g_getHourLenFn)
+        coop::logErrLine("engine: could not resolve game-clock reads (time sync off)");
+
     // AI-gating probe lever (non-fatal: only used when the probe is enabled).
     g_recruitFn = (RecruitFn)KenshiLib::GetRealAddress(
         static_cast<bool (PlayerInterface::*)(Character*, bool)>(&PlayerInterface::recruit));
+
+    // Squad-move probe levers (protocol 35; non-fatal: unresolved -> the
+    // probeMoveSquadMember lever returns -1 and squad_probe logs the gap).
+    g_playerFactionFn = (PlayerFactionFn)KenshiLib::GetRealAddress(
+        &PlayerInterface::getFaction);
+    g_addCharacterAtFn = (AddCharacterAtFn)KenshiLib::GetRealAddress(
+        &ActivePlatoon::addCharacterAt);
 
     // Money + vendor trading (protocol 22 groundwork; non-fatal: unresolved ->
     // wallet reads return -1 and the shop_probe logs the gap).
@@ -749,6 +1244,15 @@ void resolve() {
     g_facBySidFn   = (FacBySidFn)KenshiLib::GetRealAddress(
         &FactionManager::getFactionByStringID);
     g_facGetDataFn = (FacGetDataFn)KenshiLib::GetRealAddress(&Faction::getData);
+
+    // Faction-relation accessors (protocol 24 groundwork; non-fatal: unresolved
+    // -> relation reads return sentinel -999 and the faction_probe logs the gap).
+    g_relGetFn     = (RelGetFn)KenshiLib::GetRealAddress(&FactionRelations::getFactionRelation);
+    g_relSetFn     = (RelSetFn)KenshiLib::GetRealAddress(&FactionRelations::setRelation);
+    g_relIsEnemyFn = (RelBoolFn)KenshiLib::GetRealAddress(&FactionRelations::isEnemy);
+    g_relIsAllyFn  = (RelBoolFn)KenshiLib::GetRealAddress(&FactionRelations::isAlly);
+    if (!g_relGetFn || !g_relSetFn)
+        coop::logErrLine("engine: could not resolve faction-relation accessors (faction sync off)");
 
     // Honest pose oracle reads (non-fatal).
     g_getBip01Fn   = (GetBip01Fn)KenshiLib::GetRealAddress(&Character::getPositionBip01);
@@ -797,6 +1301,31 @@ bool loadSave(const std::string& name) {
     }
 }
 
+int saveMgrSignal(int* outDelay) {
+    if (outDelay) *outDelay = -1;
+    if (!g_getFn) return -1;
+    __try {
+        SaveManager* mgr = g_getFn();
+        if (!mgr) return -1;
+        if (outDelay) *outDelay = mgr->delay;
+        return mgr->signal;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+bool saveMgrExecute() {
+    if (!g_getFn || !g_saveMgrExecFn) return false;
+    __try {
+        SaveManager* mgr = g_getFn();
+        if (!mgr) return false;
+        g_saveMgrExecFn(mgr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool savesReady() {
     if (!g_getFn || !g_savesExistFn) return true; // unresolved: don't block auto-load
     __try {
@@ -818,6 +1347,85 @@ bool saveGameAs(const std::string& name) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+bool saveInfo(char* curGame, unsigned int curLen,
+              char* savePath, unsigned int pathLen) {
+    if (curGame && curLen)   curGame[0]  = '\0';
+    if (savePath && pathLen) savePath[0] = '\0';
+    if (!g_getFn) return false;
+    bool any = false;
+    __try {
+        SaveManager* mgr = g_getFn();
+        if (!mgr) return false;
+        if (curGame && curLen && g_saveMgrCurGameFn) {
+            const std::string* s = g_saveMgrCurGameFn(mgr);
+            if (s) {
+                strncpy(curGame, s->c_str(), curLen - 1);
+                curGame[curLen - 1] = '\0';
+                any = true;
+            }
+        }
+        if (savePath && pathLen && g_saveMgrPathFn) {
+            const std::string* s = g_saveMgrPathFn(mgr);
+            if (s) {
+                strncpy(savePath, s->c_str(), pathLen - 1);
+                savePath[pathLen - 1] = '\0';
+                any = true;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return any;
+}
+
+bool installSaveHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(&SaveManager::save);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&saveMgrSave_hook,
+                              (void**)&g_saveHookOrig) == KenshiLib::SUCCESS;
+}
+
+void setSaveSuppress(bool on) { g_saveSuppressAll = on; }
+
+unsigned int drainSaveEdges(SaveEdge* out, unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < g_saveEdges.size() && n < maxOut; ++i, ++n) {
+        memcpy(out[n].name, g_saveEdges[i].name, sizeof(out[n].name));
+        out[n].autosave   = g_saveEdges[i].autosave;
+        out[n].suppressed = g_saveEdges[i].suppressed;
+    }
+    g_saveEdges.clear();
+    return n;
+}
+
+bool installLoadHook() {
+    // Both public load entries (field evidence: the in-game load menu takes
+    // the SaveInfo overload and never funnels through load(name)).
+    intptr_t addrName = KenshiLib::GetRealAddress(
+        static_cast<void (SaveManager::*)(const std::string&)>(&SaveManager::load));
+    intptr_t addrInfo = KenshiLib::GetRealAddress(
+        static_cast<void (SaveManager::*)(const SaveInfo&, bool)>(&SaveManager::load));
+    if (!addrName || !addrInfo) return false;
+    if (KenshiLib::AddHook(addrName, (void*)&saveMgrLoad_hook,
+                           (void**)&g_loadHookOrig) != KenshiLib::SUCCESS)
+        return false;
+    return KenshiLib::AddHook(addrInfo, (void*)&saveMgrLoadInfo_hook,
+                              (void**)&g_loadInfoHookOrig) == KenshiLib::SUCCESS;
+}
+
+void setLoadSuppress(bool on) { g_loadSuppressAll = on; }
+void setLoadBypassOnce()      { g_loadBypassOnce = true; }
+
+unsigned int drainLoadEdges(LoadEdge* out, unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < g_loadEdges.size() && n < maxOut; ++i, ++n) {
+        memcpy(out[n].name, g_loadEdges[i].name, sizeof(out[n].name));
+        out[n].suppressed = g_loadEdges[i].suppressed;
+    }
+    g_loadEdges.clear();
+    return n;
 }
 
 // ---- Entity capture / resolve / apply --------------------------------------
@@ -1272,6 +1880,50 @@ bool installRecruitHook() {
                               (void**)&g_recruitHookOrig) == KenshiLib::SUCCESS;
 }
 
+bool installBuildHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(
+        &PreviewBuilding::_NV_placeFinalPreviewBuilding);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&placeFinal_hook,
+                              (void**)&g_placeFinalOrig) == KenshiLib::SUCCESS;
+}
+
+bool installDismantleHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(
+        &Building::_NV_notifyConstructionDismantling);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&dismantle_hook,
+                              (void**)&g_dismantleOrig) == KenshiLib::SUCCESS;
+}
+
+unsigned int drainRemoveEdges(unsigned int (*out)[5], unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i + 5 <= g_removeEdges.size() && n < maxOut; i += 5, ++n)
+        for (int j = 0; j < 5; ++j) out[n][j] = g_removeEdges[i + j];
+    g_removeEdges.clear();
+    return n;
+}
+
+void queueRemoveEdge(const unsigned int bHand[5]) {
+    if (bHand) pushRemoveEdge(bHand);
+}
+
+unsigned int drainBuildEdges(BuildEdge* out, unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < g_buildEdges.size() && n < maxOut; ++i, ++n) {
+        memcpy(out[n].hand, g_buildEdges[i].hand, sizeof(out[n].hand));
+        out[n].x = g_buildEdges[i].x;
+        out[n].y = g_buildEdges[i].y;
+        out[n].z = g_buildEdges[i].z;
+        out[n].yaw = g_buildEdges[i].yaw;
+        out[n].floorNum = g_buildEdges[i].floorNum;
+        out[n].fromUi = g_buildEdges[i].fromUi;
+        memcpy(out[n].sid, g_buildEdges[i].sid, sizeof(out[n].sid));
+    }
+    g_buildEdges.clear();
+    return n;
+}
+
 unsigned int drainRecruitEdges(RecruitEdge* out, unsigned int maxOut) {
     unsigned int n = 0;
     for (unsigned int i = 0; i < g_recruitEdges.size() && n < maxOut; ++i, ++n) {
@@ -1280,6 +1932,136 @@ unsigned int drainRecruitEdges(RecruitEdge* out, unsigned int maxOut) {
     }
     g_recruitEdges.clear();
     return n;
+}
+
+// SEH-guarded roster snapshot into POD arrays (the map diff below must live
+// OUTSIDE the SEH frame - C2712). readObjectHand carries its own SEH.
+static unsigned int snapshotRoster(GameWorld* gw, Character** outC,
+                                   unsigned int (*outH)[5], unsigned int maxOut) {
+    unsigned int n = 0;
+    __try {
+        if (!gw->player) return 0;
+        unsigned int size = (unsigned int)gw->player->playerCharacters.size();
+        for (unsigned int i = 0; i < size && n < maxOut; ++i) {
+            Character* c = gw->player->playerCharacters[i];
+            if (!c) continue;
+            if (!readObjectHand(static_cast<RootObject*>(c), outH[n])) continue;
+            outC[n] = c;
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+void pollSquadRoster(GameWorld* gw) {
+    if (!gw) return;
+    const unsigned int MAXR = 160; // matches publishOwned's MAX_PUBLISH bound
+    static Character*   cs[MAXR];    // main-thread only
+    static unsigned int hs[MAXR][5];
+    unsigned int n = snapshotRoster(gw, cs, hs, MAXR);
+    if (n == 0) return; // mid-load/world-swap: never sweep a whole squad out
+    // Mark: diff each surviving pointer's hand against the baseline.
+    for (unsigned int i = 0; i < n; ++i) {
+        std::map<Character*, SquadHandRec>::iterator it = g_squadRoster.find(cs[i]);
+        if (it == g_squadRoster.end()) {
+            // New pointer: seed only. A recruit ENTRY is the protocol-23
+            // detour's edge; a session-start census is not an edge at all.
+            SquadHandRec r;
+            memcpy(r.h, hs[i], sizeof(r.h));
+            g_squadRoster[cs[i]] = r;
+            continue;
+        }
+        if (memcmp(it->second.h, hs[i], sizeof(hs[i])) != 0) {
+            if (g_squadMoveEdges.size() < 64) {
+                SquadMoveEdge e;
+                memcpy(e.before, it->second.h, sizeof(e.before));
+                memcpy(e.after, hs[i], sizeof(e.after));
+                g_squadMoveEdges.push_back(e);
+            }
+            memcpy(it->second.h, hs[i], sizeof(it->second.h));
+        }
+    }
+    // Sweep: pointers gone from the roster (dismissed/dead). Report the STORED
+    // hand only - the pointer may already be freed. Linear membership scan is
+    // fine (a squad is tens of bodies at 1 Hz).
+    for (std::map<Character*, SquadHandRec>::iterator it = g_squadRoster.begin();
+         it != g_squadRoster.end(); ) {
+        bool present = false;
+        for (unsigned int i = 0; i < n; ++i)
+            if (cs[i] == it->first) { present = true; break; }
+        if (present) { ++it; continue; }
+        if (g_squadMoveEdges.size() < 64) {
+            SquadMoveEdge e;
+            memcpy(e.before, it->second.h, sizeof(e.before));
+            memset(e.after, 0, sizeof(e.after));
+            g_squadMoveEdges.push_back(e);
+        }
+        g_squadRoster.erase(it++);
+    }
+}
+
+void clearSquadRoster() {
+    g_squadRoster.clear();
+    g_squadMoveEdges.clear();
+}
+
+unsigned int drainSquadMoveEdges(SquadMoveEdge* out, unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < g_squadMoveEdges.size() && n < maxOut; ++i, ++n) {
+        memcpy(out[n].before, g_squadMoveEdges[i].before, sizeof(out[n].before));
+        memcpy(out[n].after,  g_squadMoveEdges[i].after,  sizeof(out[n].after));
+    }
+    g_squadMoveEdges.clear();
+    return n;
+}
+
+int probeMoveSquadMember(GameWorld* gw, const unsigned int mHand[5],
+                         const unsigned int tHand[5], int lever,
+                         unsigned int outBefore[5], unsigned int outAfter[5]) {
+    if (outBefore) memset(outBefore, 0, 5 * sizeof(unsigned int));
+    if (outAfter)  memset(outAfter, 0, 5 * sizeof(unsigned int));
+    if (!gw || !mHand) return -1;
+    // Wire layout [type, container, containerSerial, index, serial] ->
+    // resolveCharByHand(index, serial, type, container, containerSerial).
+    Character* c = resolveCharByHand(mHand[3], mHand[4], mHand[0], mHand[1], mHand[2]);
+    if (!c) return -1;
+    Character* t = 0;
+    if (lever != 0) {
+        if (!tHand) return -1;
+        t = resolveCharByHand(tHand[3], tHand[4], tHand[0], tHand[1], tHand[2]);
+        if (!t) return -1;
+    }
+    __try {
+        unsigned int hb[5];
+        if (!readObjectHand(static_cast<RootObject*>(c), hb)) return -1;
+        if (outBefore) memcpy(outBefore, hb, sizeof(hb));
+        if (lever == 0) {
+            if (!g_separateSquadFn) return -1;
+            g_separateSquadFn(c, true);
+        } else {
+            if (!g_getPlatoonFn || !gw->player) return -1;
+            ActivePlatoon* ap = g_getPlatoonFn(t);
+            if (!ap) return -1;
+            if (lever == 1) {
+                if (!g_playerFactionFn) return -1;
+                Faction* f = g_playerFactionFn(gw->player);
+                if (!f) return -1;
+                // Virtual (vtable slot 0 per the header) - dispatch directly.
+                c->setFaction(f, ap);
+            } else {
+                if (!g_addCharacterAtFn) return -1;
+                // Index semantics are the probe's question; a large index is
+                // the safest "append" guess (the engine clamps list inserts).
+                g_addCharacterAtFn(ap, static_cast<RootObject*>(c), 999);
+            }
+        }
+        unsigned int ha[5];
+        if (!readObjectHand(static_cast<RootObject*>(c), ha)) return -1;
+        if (outAfter) memcpy(outAfter, ha, sizeof(ha));
+        return (memcmp(hb, ha, sizeof(hb)) != 0) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
 }
 
 void clearDamageGuard()           { g_damageGuarded.clear(); }
@@ -1487,6 +2269,41 @@ unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outState
                 RootObject* obj = g_npcQuery[i];
                 if (!obj) continue;
                 if (isPlayerSquad(gw, obj)) continue; // never suppress our own squad
+                Character* ch = static_cast<Character*>(obj);
+                bool dup = false;
+                for (unsigned int k = 0; k < n; ++k)
+                    if (outChars[k] == ch) { dup = true; break; }
+                if (dup) continue;
+                if (captureOne(ch, &outStates[n])) { outChars[n] = ch; ++n; }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
+unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
+                          EntityState* outStates, unsigned int maxOut) {
+    if (!g_getCharsFn || !gw || !outChars || !outStates || maxOut == 0) return 0;
+    if (radius <= 0.0f) return 0;
+    unsigned int n = 0;
+    __try {
+        // Same dual-interest centers as the stream bubble, but the query
+        // reaches the census radius (uniform in all axes, like the proven
+        // findNearbyNonPlayerFaction whole-block scan) with wide limits.
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], radius, radius, radius,
+                         512, 512, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* obj = g_npcQuery[i];
+                if (!obj) continue;
+                if (isPlayerSquad(gw, obj)) continue; // never census our own squad
                 Character* ch = static_cast<Character*>(obj);
                 bool dup = false;
                 for (unsigned int k = 0; k < n; ++k)
@@ -2316,6 +3133,56 @@ int addTestItemsToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
     return ok ? qty : 0;
 }
 
+int probeAddAnyToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
+                           char* outStringID, unsigned int outLen) {
+    if (outStringID && outLen) outStringID[0] = '\0';
+    if (!gw || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    // Storage buildings are usually item-type-LIMITED (run-171231: a Fabric
+    // Chest refused the iron-plate sentinel), so walk the common stackables
+    // until tryAddItem accepts one. This mirrors the protocol-34 apply path,
+    // which only ever fabricates items the AUTHOR's copy of the container
+    // already holds - i.e. items the container accepts by definition.
+    const char* prefs[] = {
+        "iron plate", "copper", "building materials", "raw meat", "dustwich",
+        "foodcube", "ration", "rock", "cotton", "fabric"
+    };
+    const unsigned int np = sizeof(prefs) / sizeof(prefs[0]);
+    for (unsigned int k = 0; k < np; ++k) {
+        char sid[48]; sid[0] = '\0';
+        __try {
+            g_dataScratch.clear();
+            g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, ITEM);
+            unsigned int n = g_dataScratch.size();
+            for (unsigned int i = 0; i < n; ++i) {
+                GameData* gd = g_dataScratch[i];
+                if (gd && ciContains(gd->name.c_str(), prefs[k])) {
+                    const char* s = gd->stringID.c_str();
+                    strncpy(sid, s ? s : "", sizeof(sid) - 1);
+                    sid[sizeof(sid) - 1] = '\0';
+                    break;
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { sid[0] = '\0'; }
+        if (!sid[0]) continue;
+        // createItemAndAdd is SEH-guarded; false = template miss OR the
+        // container refused it (type filter) - try the next candidate.
+        if (createItemAndAdd(gw, inv, sid, (unsigned int)ITEM, qty, 0,
+                             /*equip=*/false)) {
+            if (outStringID && outLen) {
+                strncpy(outStringID, sid, outLen - 1);
+                outStringID[outLen - 1] = '\0';
+            }
+            return qty;
+        }
+    }
+    return 0;
+}
+
 int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int qty) {
     if (!gw || qty <= 0) return 0;
     RootObject* ro = resolveObjectByHand(cHand);
@@ -2340,6 +3207,86 @@ int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int
     Item* curItems[64];
     unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
     return removeByKey(inv, curItems, cur, ncur, sid, typeCat, qty, /*wantEquipped=*/0);
+}
+
+int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
+                      unsigned int* outType) {
+    if (outSid && outLen) outSid[0] = '\0';
+    if (outType) *outType = 0;
+    if (!gw || !outSid || outLen == 0) return 0;
+    unsigned int typeCat = 0;
+    GameData* gd = findCommonItemTemplate(gw, &typeCat);
+    if (!gd) return 0;
+    __try {
+        const char* s = gd->stringID.c_str();
+        if (!s || !s[0]) return 0;
+        strncpy(outSid, s, outLen - 1); outSid[outLen - 1] = '\0';
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    if (outType) *outType = typeCat;
+    return 1;
+}
+
+int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
+                             const char* sid, unsigned int typeCat, int qty,
+                             int qualityBucket, const char* manufacturer,
+                             const char* material) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = 0;
+    __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+    if (!inv) return 0;
+    bool ok = createItemAndAdd(gw, inv, sid, typeCat, qty, qualityBucket,
+                               /*equip=*/false, manufacturer, material);
+    return ok ? qty : 0;
+}
+
+int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
+                              const unsigned int dstHand[5],
+                              const char* sid, unsigned int typeCat, int qty) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    RootObject* srcRo = resolveObjectByHand(srcHand);
+    RootObject* dstRo = resolveObjectByHand(dstHand);
+    if (!srcRo || !dstRo || srcRo == dstRo) return 0;
+    Inventory* src = 0;
+    Inventory* dst = 0;
+    __try {
+        src = srcRo->getInventory();
+        dst = dstRo->getInventory();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (!src || !dst) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    Item* curItems[64];
+    unsigned int ncur = readInvItems(src, cur, curItems, MAXC);
+    int moved = 0;
+    __try {
+        // Loose stacks first (the ordinary bag-to-bag drag), then worn copies (the
+        // "drag straight out of an equip slot" trade the field report describes).
+        for (int pass = 0; pass < 2 && moved < qty; ++pass) {
+            for (unsigned int i = 0; i < ncur && moved < qty; ++i) {
+                if (!curItems[i]) continue;
+                if (cur[i].itemType != typeCat) continue;
+                if ((int)cur[i].equipped != pass) continue;
+                if (strcmp(cur[i].stringID, sid) != 0) continue;
+                int have = cur[i].quantity; if (have < 1) have = 1;
+                int take = qty - moved; if (take > have) take = have;
+                Item* taken = src->removeItemDontDestroy_returnsItem(curItems[i], take, false); // virtual
+                if (!taken) continue;
+                if (!dst->tryAddItem(taken, take)) {          // virtual: real-object relocation
+                    src->tryAddItem(taken, take);             // destination refused - put it back
+                    return moved;
+                }
+                curItems[i] = 0; // detached; never touch this stack again
+                moved += take;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return moved;
+    }
+    return moved;
 }
 
 // SEH-guarded DIAGNOSTIC: log the full inventory of the object at cHand - every loose
@@ -4560,6 +5507,7 @@ bool readMedical(Character* c, MedicalRead* out) {
         out->limbFlesh[i] = -1.0f; out->limbBand[i] = -1.0f; out->limbMax[i] = -1.0f;
         out->limbState[i] = 0xFF;
     }
+    out->hunger = -1.0f; out->fed = -1.0f; out->dazed = -1.0f;
     if (!c) return false;
     __try {
         MedicalSystem* med = &c->medical;
@@ -4567,6 +5515,11 @@ bool readMedical(Character* c, MedicalRead* out) {
         out->bleedRate   = med->currentBleedRate;
         out->unconscious = med->unconcious;
         out->dead        = med->dead;
+        // Protocol 29: the hunger scalars ride the same snapshot; dazedOrAlert
+        // is read for probe diagnostics only (unlabeled semantics).
+        out->hunger = med->hunger;
+        out->fed    = med->fed;
+        out->dazed  = med->dazedOrAlert;
         // Limb order = RobotLimbs::Limb (LEFT_ARM, RIGHT_ARM, LEFT_LEG, RIGHT_LEG).
         MedicalSystem::HealthPartStatus* parts[4] = {
             med->leftArm, med->rightArm, med->leftLeg, med->rightLeg
@@ -4670,8 +5623,27 @@ bool writeMedical(Character* c, const MedicalRead& in) {
                 if (in.limbBand[i]  >= 0.0f) parts[i]->bandaging = in.limbBand[i];
             }
         }
+        // Protocol 29: hunger scalars (-1 = not carried / owner unreadable -
+        // never write that). dazedOrAlert is deliberately NOT written (its
+        // semantics are unconfirmed; it rides the read for diagnostics only).
+        if (in.hunger >= 0.0f) med->hunger = in.hunger;
+        if (in.fed    >= 0.0f) med->fed    = in.fed;
         // unconscious/dead deliberately NOT written: the reliable KO/death/revive
         // event channel (+ bodyState latches) owns those transitions.
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool writeHungerByHand(const unsigned int hand[5], float hunger, float fed) {
+    if (!hand) return false;
+    Character* c = resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+    if (!c) return false;
+    __try {
+        MedicalSystem* med = &c->medical;
+        if (hunger >= 0.0f) med->hunger = hunger;
+        if (fed    >= 0.0f) med->fed    = fed;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -5525,6 +6497,938 @@ int probeRecruit(GameWorld* gw, bool runtimeSubject,
     }
 }
 
+unsigned int listPlayerRelations(GameWorld* gw, FactionRead* out, unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0 || !g_relGetFn) return 0;
+    unsigned int n = 0;
+    __try {
+        if (!gw->player || !gw->factionMgr) return 0;
+        Faction* pf = gw->player->getFaction();
+        if (!pf || !pf->relations) return 0;
+        lektor<Faction*>& all = gw->factionMgr->participants;
+        unsigned int total = all.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            Faction* f = all[i];
+            if (!f || f == pf || f->notARealFaction || !f->relations) continue;
+            FactionRead& r = out[n];
+            memset(&r, 0, sizeof(r));
+            facSidOf(f, r.sid, sizeof(r.sid));
+            if (r.sid[0] == '\0') continue; // no GameData = not addressable cross-client
+            strncpy(r.name, f->name.c_str(), sizeof(r.name) - 1);
+            r.name[sizeof(r.name) - 1] = '\0';
+            // BOTH rows: the player's table toward them AND their table toward
+            // the player - the probe must show which side guard aggro consults
+            // (and whether the engine keeps them mirrored).
+            r.usToThem = g_relGetFn(pf->relations, f);
+            r.themToUs = g_relGetFn(f->relations, pf);
+            r.enemy      = g_relIsEnemyFn ? (g_relIsEnemyFn(pf->relations, f) ? 1 : 0) : -1;
+            r.enemyRecip = g_relIsEnemyFn ? (g_relIsEnemyFn(f->relations, pf) ? 1 : 0) : -1;
+            r.ally       = g_relIsAllyFn  ? (g_relIsAllyFn(pf->relations, f)  ? 1 : 0) : -1;
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+// std::string construction cannot share a frame with __try (C2712), so the
+// sid -> Faction* lookup lives in this unguarded shim (the callee is guarded).
+static Faction* factionBySidC(GameWorld* gw, const char* sid) {
+    std::string s(sid);
+    return factionBySidGuarded(gw, &s);
+}
+
+bool readRelationBySid(GameWorld* gw, const char* sid, float* outUs, float* outThem) {
+    if (outUs)   *outUs   = -999.0f;
+    if (outThem) *outThem = -999.0f;
+    if (!gw || !sid || !g_relGetFn) return false;
+    __try {
+        if (!gw->player) return false;
+        Faction* pf = gw->player->getFaction();
+        if (!pf || !pf->relations) return false;
+        Faction* f = factionBySidC(gw, sid);
+        if (!f || !f->relations) return false;
+        if (outUs)   *outUs   = g_relGetFn(pf->relations, f);
+        if (outThem) *outThem = g_relGetFn(f->relations, pf);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writeRelationBySid(GameWorld* gw, const char* sid, float value, bool reciprocal,
+                        float* outBefore, float* outAfter) {
+    if (outBefore) *outBefore = -999.0f;
+    if (outAfter)  *outAfter  = -999.0f;
+    if (!gw || !sid || !g_relGetFn || !g_relSetFn) return false;
+    __try {
+        if (!gw->player) return false;
+        Faction* pf = gw->player->getFaction();
+        if (!pf || !pf->relations) return false;
+        Faction* f = factionBySidC(gw, sid);
+        if (!f || !f->relations) return false;
+        if (outBefore) *outBefore = g_relGetFn(pf->relations, f);
+        g_relSetFn(pf->relations, f, value);
+        // The reciprocal row (their table toward the player) is what THEIR AI
+        // consults; the probe writes both so the evidence covers either design.
+        if (reciprocal) g_relSetFn(f->relations, pf, value);
+        if (outAfter) *outAfter = g_relGetFn(pf->relations, f);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[fac] write SEH-except");
+        return false;
+    }
+}
+
+bool installFactionHooks() {
+    typedef void (FactionRelations::*EvMemFn)(Faction*, FactionRelations::FactionEvent, float);
+    typedef void (FactionRelations::*AmtMemFn)(Faction*, float, float);
+    intptr_t evAddr = KenshiLib::GetRealAddress(
+        static_cast<EvMemFn>(&FactionRelations::_NV_affectRelations));
+    intptr_t amtAddr = KenshiLib::GetRealAddress(
+        static_cast<AmtMemFn>(&FactionRelations::_NV_affectRelations));
+    bool ok = true;
+    if (!evAddr || KenshiLib::AddHook(evAddr, (void*)&affectRelEv_hook,
+                                      (void**)&g_affectEvOrig) != KenshiLib::SUCCESS)
+        ok = false;
+    if (!amtAddr || KenshiLib::AddHook(amtAddr, (void*)&affectRelAmt_hook,
+                                       (void**)&g_affectAmtOrig) != KenshiLib::SUCCESS)
+        ok = false;
+    return ok;
+}
+
+unsigned int drainFactionDeltas(FactionDelta* out, unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < g_facDeltas.size() && n < maxOut; ++i, ++n) {
+        const FactionDeltaRec& r = g_facDeltas[i];
+        memcpy(out[n].meSid,   r.meSid,   sizeof(out[n].meSid));
+        memcpy(out[n].whomSid, r.whomSid, sizeof(out[n].whomSid));
+        out[n].isEvent = r.isEvent; out[n].ev = r.ev;
+        out[n].amount = r.amount; out[n].mult = r.mult; out[n].after = r.after;
+    }
+    g_facDeltas.clear();
+    return n;
+}
+
+// ---- Protocol 26: door/gate state --------------------------------------------
+
+// Fill a DoorRead from a live door Building. Callers hold the SEH frame.
+// `open` collapses the animated DoorState: a door in motion reports its
+// DESTINATION (OPENING = open, CLOSING = closed) so the channel never
+// publishes the transient mid-swing state.
+static void fillDoorRead(DoorStuff* d, DoorRead* r) {
+    memset(r, 0, sizeof(*r));
+    readObjectHand(static_cast<RootObject*>(d), r->hand);
+    Ogre::Vector3 p = d->getPosition();
+    r->x = p.x; r->y = p.y; r->z = p.z;
+    DoorState st = d->state;
+    r->state   = (int)st;
+    r->open    = (st == DOORSTATE_OPEN || st == DOORSTATE_OPENING) ? 1 : 0;
+    r->hasLock = d->doorLock ? 1 : 0;
+    r->locked  = (r->hasLock && g_doorIsLockedFn && g_doorIsLockedFn(d)) ? 1 : 0;
+    r->gate    = 0; // filled by the caller (isGate is a virtual we avoid here)
+    // Protocol 28: the door-to-building link. parent + the index in the
+    // parent's ordered `doors` list give a placed door its translatable wire
+    // identity (the runtime door hand itself never crosses usefully).
+    r->doorIndex = -1;
+    Building* par = d->parent;
+    if (par) {
+        readObjectHand(static_cast<RootObject*>(par), r->parentHand);
+        unsigned int nd = par->doors.size();
+        for (unsigned int i = 0; i < nd; ++i) {
+            if (par->doors[i] == static_cast<Building*>(d)) {
+                r->doorIndex = (int)i;
+                break;
+            }
+        }
+    }
+    GameData* gd = d->getGameData();
+    if (gd) {
+        strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+        // Town gates are DoorStuff too; the name carries the distinction well
+        // enough for diagnostics without touching the isGate vtable slot.
+        r->gate = ciContains(r->name, "gate") ? 1 : 0;
+    }
+}
+
+unsigned int enumDoorsNear(GameWorld* gw, float radius, DoorRead* out, unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0 || !g_getObjsFn || !g_doorIsOpenFn) return 0;
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &centers[ci], radius, BUILDING, 256, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                Building* b = static_cast<Building*>(o);
+                if (!b->imADoor) continue;
+                DoorStuff* d = static_cast<DoorStuff*>(b);
+                unsigned int h[5];
+                if (!readObjectHand(o, h)) continue;
+                bool dup = false; // the two interest spheres can overlap
+                for (unsigned int k = 0; k < n; ++k)
+                    if (out[k].hand[3] == h[3] && out[k].hand[4] == h[4] &&
+                        out[k].hand[1] == h[1]) { dup = true; break; }
+                if (dup) continue;
+                fillDoorRead(d, &out[n]);
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+bool readDoorByHand(const unsigned int dHand[5], DoorRead* out) {
+    if (!dHand || !out) return false;
+    RootObject* ro = resolveObjectByHand(dHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        if (!b->imADoor) return false;
+        fillDoorRead(static_cast<DoorStuff*>(b), out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
+                     DoorRead* outAfter) {
+    if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
+    if (!dHand || !g_doorOpenFn || !g_doorCloseFn) return false;
+    RootObject* ro = resolveObjectByHand(dHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        if (!b->imADoor) return false;
+        DoorStuff* d = static_cast<DoorStuff*>(b);
+        DoorState st = d->state;
+        int curOpen = (st == DOORSTATE_OPEN || st == DOORSTATE_OPENING) ? 1 : 0;
+        if (wantOpen != curOpen) {
+            // Polite path first (animation + navmesh + sound - what a local
+            // click does); the blunt UT force paths only when it refuses.
+            bool ok = wantOpen ? g_doorOpenFn(d) : g_doorCloseFn(d);
+            if (!ok) {
+                if (wantOpen && g_doorForceOpenFn)       g_doorForceOpenFn(d);
+                else if (!wantOpen && g_doorForceCloseFn) g_doorForceCloseFn(d);
+            }
+        }
+        if (wantLocked >= 0 && d->doorLock && g_doorLockFn && g_doorUnlockFn) {
+            int curLocked = (g_doorIsLockedFn && g_doorIsLockedFn(d)) ? 1 : 0;
+            if (wantLocked != curLocked) {
+                if (wantLocked) g_doorLockFn(d); else g_doorUnlockFn(d);
+            }
+        }
+        if (outAfter) fillDoorRead(d, outAfter);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[door] write SEH-except");
+        return false;
+    }
+}
+
+// ---- Protocol 27: placed-building sync -----------------------------------
+
+// Fill a BuildRead from a live Building. Callers hold the SEH frame.
+static void fillBuildRead(Building* b, BuildRead* r) {
+    memset(r, 0, sizeof(*r));
+    RootObject* ro = static_cast<RootObject*>(b);
+    readObjectHand(ro, r->hand);
+    Ogre::Vector3 p = ro->getPosition();
+    r->x = p.x; r->y = p.y; r->z = p.z;
+    r->progress = b->_buildState.constructionProgress;
+    r->complete = b->_buildState.isComplete ? 1 : 0;
+    GameData* gd = ro->getGameData();
+    if (gd) {
+        strncpy(r->sid, gd->stringID.c_str(), sizeof(r->sid) - 1);
+        r->sid[sizeof(r->sid) - 1] = '\0';
+        strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+    }
+}
+
+unsigned int enumSitesNear(GameWorld* gw, float radius, BuildRead* out, unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &centers[ci], radius, BUILDING, 256, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                Building* b = static_cast<Building*>(o);
+                // Only sites UNDER CONSTRUCTION: complete/baked buildings are
+                // legion (whole towns) and never stream through this channel.
+                if (b->_buildState.isComplete) continue;
+                unsigned int h[5];
+                if (!readObjectHand(o, h)) continue;
+                bool dup = false; // the two interest spheres can overlap
+                for (unsigned int k = 0; k < n; ++k)
+                    if (out[k].hand[3] == h[3] && out[k].hand[4] == h[4] &&
+                        out[k].hand[1] == h[1]) { dup = true; break; }
+                if (dup) continue;
+                fillBuildRead(b, &out[n]);
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+bool readBuildingByHand(const unsigned int bHand[5], BuildRead* out) {
+    if (!bHand || !out) return false;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return false;
+    __try {
+        fillBuildRead(static_cast<Building*>(ro), out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
+                              BuildRead* outAfter) {
+    if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
+    if (!bHand || !g_buildSetProgFn) return false;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        bool wasComplete = b->_buildState.isComplete;
+        if (!wasComplete) {
+            g_buildSetProgFn(b, progress);
+            // If the engine's setter does not self-complete at the threshold,
+            // fire the completion notification exactly once ourselves so the
+            // site finishes NATIVELY (scaffold off, navmesh, materials).
+            if (progress >= 1.0f && !b->_buildState.isComplete && g_buildNotifyDoneFn)
+                g_buildNotifyDoneFn(b);
+        }
+        if (outAfter) fillBuildRead(b, outAfter);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[build] progress-write SEH-except");
+        return false;
+    }
+}
+
+int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
+                    float heading, bool completed, unsigned int outHand[5]) {
+    if (outHand) memset(outHand, 0, 5 * sizeof(unsigned int));
+    if (!gw || !gw->theFactory || !g_createBldgFn || !sid || !sid[0]) return 0;
+    GameData* tmpl = findItemTemplateImpl(gw, sid, (unsigned int)BUILDING);
+    if (!tmpl) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "[build] mint template MISS sid='%s'", sid);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return 0;
+    }
+    __try {
+        Ogre::Quaternion rot(Ogre::Radian(heading), Ogre::Vector3::UNIT_Y);
+        Ogre::Vector3 pos(x, y, z); // createBuilding re-grounds vertically
+        Building* bld = g_createBldgFn(
+            gw->theFactory, tmpl, pos, /*town*/0, /*owner*/0, rot, /*cb*/0,
+            /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
+            /*invisible*/false, completed, /*isFoliage*/false,
+            /*floor*/0, /*isOutsideFurniture*/false);
+        if (!bld) {
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] mint REFUSED sid='%s' pos=%.1f,%.1f,%.1f (factory null)",
+                      sid, x, y, z);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return 0;
+        }
+        RootObject* ro = static_cast<RootObject*>(bld);
+        unsigned int h[5] = { 0, 0, 0, 0, 0 };
+        bool haveHand = readObjectHand(ro, h);
+        if (outHand && haveHand) memcpy(outHand, h, sizeof(h));
+        Ogre::Vector3 ap = ro->getPosition();
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] mint OK sid='%s' completed=%d hand=%u.%u.%u.%u.%u(%d) "
+                  "pos=%.1f,%.1f,%.1f prog=%.3f",
+                  sid, completed ? 1 : 0, h[0], h[1], h[2], h[3], h[4],
+                  haveHand ? 1 : 0, ap.x, ap.y, ap.z,
+                  bld->_buildState.constructionProgress);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[build] mint FAULTED");
+        return -1;
+    }
+}
+
+// Deterministic small BUILDING template for the probe's programmatic
+// placement: buildable, tiny footprint, no power/inputs. Caller holds SEH.
+// wantDoor selects the shack class instead (a real walk-in building whose
+// template mints DoorStuff children - the protocol-28 subject).
+static GameData* findBuildTemplate(GameWorld* gw, bool wantDoor) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    const char* fixturePrefs[] = { "training dummy", "camp bed", "storage", "well" };
+    const char* doorPrefs[]    = { "small shack", "shack", "storm house", "small house" };
+    const char** prefs = wantDoor ? doorPrefs : fixturePrefs;
+    for (unsigned int k = 0; k < 4; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
+int probePlaceBuilding(GameWorld* gw, float fwd, float side, bool wantDoor,
+                       unsigned int outHand[5], char* outSid, unsigned int sidLen,
+                       float* outX, float* outY, float* outZ, float* outYaw) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (!gw) return 0;
+    GameData* tmpl = 0;
+    Ogre::Vector3 pos(0, 0, 0); float yaw = 0.0f; bool anchored = false;
+    __try {
+        tmpl = findBuildTemplate(gw, wantDoor);
+        anchored = leaderAnchor(gw, fwd, side, &pos, &yaw);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    if (!tmpl || !anchored) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[build] probe-place no %s",
+                  tmpl ? "leader anchor" : "template");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return 0;
+    }
+    const char* sid = 0;
+    __try { sid = tmpl->stringID.c_str(); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    if (outSid && sidLen) {
+        strncpy(outSid, sid, sidLen - 1);
+        outSid[sidLen - 1] = '\0';
+    }
+    if (outX) *outX = pos.x;
+    if (outY) *outY = pos.y;
+    if (outZ) *outZ = pos.z;
+    if (outYaw) *outYaw = yaw;
+    unsigned int localHand[5] = { 0, 0, 0, 0, 0 };
+    int rc = placeBuildingAt(gw, sid, pos.x, pos.y, pos.z, yaw,
+                             /*completed*/false, localHand);
+    if (outHand) memcpy(outHand, localHand, sizeof(localHand));
+    // A successful PROGRAMMATIC placement queues the same edge the UI detour
+    // would (fromUi=0), so the sync layer announces it. Peer-side MINTS call
+    // placeBuildingAt directly and never land here - echo-free.
+    if (rc == 1) {
+        BuildEdgeRec e;
+        memset(&e, 0, sizeof(e));
+        memcpy(e.hand, localHand, sizeof(e.hand));
+        strncpy(e.sid, sid, sizeof(e.sid) - 1);
+        e.sid[sizeof(e.sid) - 1] = '\0';
+        e.x = pos.x; e.y = pos.y; e.z = pos.z; e.yaw = yaw;
+        e.fromUi = 0;
+        if (g_buildEdges.size() < 32) g_buildEdges.push_back(e);
+    }
+    return rc;
+}
+
+// ---- Protocol 28: placed-building doors + dismantle ------------------------
+
+bool readDoorOfBuilding(const unsigned int bHand[5], unsigned int doorIndex,
+                        DoorRead* out) {
+    if (!bHand || !out) return false;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        if (doorIndex >= b->doors.size()) return false;
+        Building* db = b->doors[doorIndex];
+        if (!db || !db->imADoor) return false;
+        fillDoorRead(static_cast<DoorStuff*>(db), out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool destroyBuildingByHand(GameWorld* gw, const unsigned int bHand[5]) {
+    if (!gw || !bHand || !g_destroyObjFn) return false;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return false;
+    __try {
+        return g_destroyObjFn(gw, ro, /*justUnloaded*/false, "coop-build-remove");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[build] destroy FAULTED");
+        return false;
+    }
+}
+
+// ---- Protocol 33: production machine sync ---------------------------------
+
+// Machine-class filter for the census. STORAGE is excluded (containers ride
+// the container-inventory channel); TURRET/WALL/DOOR/FLUFF are not machines.
+static bool isMachineClassType(int t) {
+    return t == (int)BCTYPE_PRODUCTION || t == (int)BCTYPE_CRAFTING ||
+           t == (int)BCTYPE_ITEM_FURNACE || t == (int)BCTYPE_FARM ||
+           t == (int)BCTYPE_RESEARCH;
+}
+
+// True when the classType is ProductionBuilding-derived (has productionState /
+// output buffer / input lektor). RESEARCH is UseableStuff-derived - power and
+// tech level only.
+static bool isProductionClassType(int t) {
+    return t == (int)BCTYPE_PRODUCTION || t == (int)BCTYPE_CRAFTING ||
+           t == (int)BCTYPE_ITEM_FURNACE || t == (int)BCTYPE_FARM;
+}
+
+// Fill a ProdRead from a live machine Building. Callers hold the SEH frame
+// and have already verified isMachineClassType(b->classType).
+static void fillProdRead(Building* b, ProdRead* r) {
+    memset(r, 0, sizeof(*r));
+    RootObject* ro = static_cast<RootObject*>(b);
+    readObjectHand(ro, r->hand);
+    Ogre::Vector3 p = ro->getPosition();
+    r->x = p.x; r->y = p.y; r->z = p.z;
+    r->classType = (int)b->classType;
+    r->complete  = b->_buildState.isComplete ? 1 : 0;
+    // sentinels: "not this class / no buffer"
+    r->powerOn = -1; r->powerOutput = -1.0f; r->productionState = -1;
+    r->miningLevel = -1.0f; r->outAmount = -1.0f; r->outCap = -1;
+    r->nInputs = 0; r->inAmount[0] = -1.0f; r->inAmount[1] = -1.0f;
+    r->techLevel = -1;
+    r->grown = -1.0f; r->died = -1.0f; r->growStart = -1.0f; r->harvested = -1;
+    // Every machine class derives from UseableStuff: power bit is a plain
+    // member (0x3B5), output watts via the engine's own getter (generator
+    // override reports production, the base reports the consumer draw).
+    UseableStuff* us = static_cast<UseableStuff*>(b);
+    r->powerOn = us->powerOn ? 1 : 0;
+    if (g_machPowerOutBaseFn) {
+        bool gen = g_machIsGenFn ? g_machIsGenFn(us) : false;
+        r->powerOutput = (gen && g_machPowerOutGenFn)
+            ? g_machPowerOutGenFn(us) : g_machPowerOutBaseFn(us);
+    }
+    if (r->classType == (int)BCTYPE_RESEARCH && g_machTechLvlFn)
+        r->techLevel = g_machTechLvlFn(static_cast<ResearchBuilding*>(b));
+    if (isProductionClassType(r->classType)) {
+        ProductionBuilding* pb = static_cast<ProductionBuilding*>(b);
+        r->productionState = (int)pb->productionState;
+        r->miningLevel     = pb->_resourceMiningLevel;
+        StorageBuilding::ConsumptionItem* outBuf = pb->productionItem;
+        if (outBuf) {
+            r->outAmount = outBuf->amount;
+            r->outCap    = outBuf->maxCapacity;
+            if (outBuf->item) {
+                strncpy(r->outSid, outBuf->item->stringID.c_str(),
+                        sizeof(r->outSid) - 1);
+                r->outSid[sizeof(r->outSid) - 1] = '\0';
+            }
+        }
+        // The buffer only materializes on the first production tick; until
+        // then report the TEMPLATE the machine produces (run-151948 finding:
+        // out='' outAmt=-1 on a freshly minted bench).
+        if (r->outSid[0] == '\0') {
+            MachProdItemDataFn pf = (r->classType == (int)BCTYPE_CRAFTING &&
+                                     g_machProdDataCraftFn)
+                ? g_machProdDataCraftFn : g_machProdDataBaseFn;
+            GameData* pd = pf ? pf(b) : 0;
+            if (pd) {
+                strncpy(r->outSid, pd->stringID.c_str(), sizeof(r->outSid) - 1);
+                r->outSid[sizeof(r->outSid) - 1] = '\0';
+            }
+        }
+        unsigned int ni = pb->consumptionItems.size();
+        for (unsigned int i = 0; i < ni && i < 2; ++i) {
+            StorageBuilding::ConsumptionItem& ci = pb->consumptionItems[i];
+            r->inAmount[i] = ci.amount;
+            if (ci.item) {
+                strncpy(r->inSid[i], ci.item->stringID.c_str(),
+                        sizeof(r->inSid[i]) - 1);
+                r->inSid[i][sizeof(r->inSid[i]) - 1] = '\0';
+            }
+            r->nInputs = (int)(i + 1);
+        }
+    }
+    if (r->classType == (int)BCTYPE_FARM) {
+        FarmBuilding* fb = static_cast<FarmBuilding*>(b);
+        r->grown     = fb->grown;
+        r->died      = fb->died;
+        r->growStart = fb->growStart;
+        r->harvested = fb->harvested;
+    }
+    GameData* gd = ro->getGameData();
+    if (gd) {
+        strncpy(r->sid, gd->stringID.c_str(), sizeof(r->sid) - 1);
+        r->sid[sizeof(r->sid) - 1] = '\0';
+        strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+    }
+}
+
+unsigned int enumMachinesNear(GameWorld* gw, float radius, ProdRead* out,
+                              unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &centers[ci], radius, BUILDING, 256, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                Building* b = static_cast<Building*>(o);
+                if (!isMachineClassType((int)b->classType)) continue;
+                // Incomplete sites ride protocol 27 until finished.
+                if (!b->_buildState.isComplete) continue;
+                unsigned int h[5];
+                if (!readObjectHand(o, h)) continue;
+                bool dup = false; // the two interest spheres can overlap
+                for (unsigned int k = 0; k < n; ++k)
+                    if (out[k].hand[3] == h[3] && out[k].hand[4] == h[4] &&
+                        out[k].hand[1] == h[1]) { dup = true; break; }
+                if (dup) continue;
+                fillProdRead(b, &out[n]);
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+bool readMachineByHand(const unsigned int mHand[5], ProdRead* out) {
+    if (!mHand || !out) return false;
+    RootObject* ro = resolveObjectByHand(mHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        if (!isMachineClassType((int)b->classType)) return false;
+        fillProdRead(b, out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writeMachineByHand(const unsigned int mHand[5], int wantPower,
+                        float outAmount, bool useSetItem,
+                        const float inAmount[2], const float farm[4],
+                        ProdRead* outAfter) {
+    if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
+    if (!mHand) return false;
+    RootObject* ro = resolveObjectByHand(mHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        int ct = (int)b->classType;
+        if (!isMachineClassType(ct)) return false;
+        UseableStuff* us = static_cast<UseableStuff*>(b);
+        if (wantPower >= 0 && g_machPowerFn) {
+            int cur = us->powerOn ? 1 : 0;
+            if (wantPower != cur) g_machPowerFn(us, wantPower != 0);
+        }
+        if (isProductionClassType(ct)) {
+            ProductionBuilding* pb = static_cast<ProductionBuilding*>(b);
+            StorageBuilding::ConsumptionItem* outBuf = pb->productionItem;
+            if (outAmount >= 0.0f) {
+                if (useSetItem && g_machSetProdItemFn) {
+                    // The native lever: item template stays the machine's own
+                    // (buffer item when materialized, else the machine's
+                    // production template), amount splits into whole stack +
+                    // fractional progress. setProductionItem is also the
+                    // buffer-materializing path.
+                    GameData* item = (outBuf && outBuf->item) ? outBuf->item : 0;
+                    if (!item) {
+                        MachProdItemDataFn pf = (ct == (int)BCTYPE_CRAFTING &&
+                                                 g_machProdDataCraftFn)
+                            ? g_machProdDataCraftFn : g_machProdDataBaseFn;
+                        item = pf ? pf(b) : 0;
+                    }
+                    if (item) {
+                        int stack = (int)outAmount;
+                        float prog = outAmount - (float)stack;
+                        g_machSetProdItemFn(pb, item, stack, prog);
+                    }
+                } else if (outBuf) {
+                    outBuf->amount = outAmount; // direct write (clamp probe)
+                }
+            }
+            if (inAmount) {
+                unsigned int ni = pb->consumptionItems.size();
+                for (unsigned int i = 0; i < ni && i < 2; ++i)
+                    if (inAmount[i] >= 0.0f)
+                        pb->consumptionItems[i].amount = inAmount[i];
+            }
+        }
+        if (ct == (int)BCTYPE_FARM && farm) {
+            FarmBuilding* fb = static_cast<FarmBuilding*>(b);
+            if (farm[0] >= 0.0f) fb->grown     = farm[0];
+            if (farm[1] >= 0.0f) fb->died      = farm[1];
+            if (farm[2] >= 0.0f) fb->growStart = farm[2];
+            if (farm[3] >= 0.0f) fb->harvested = (int)farm[3];
+        }
+        if (outAfter) fillProdRead(b, outAfter);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[prod] write SEH-except");
+        return false;
+    }
+}
+
+bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amount) {
+    if (!gw || !mHand) return false;
+    RootObject* ro = resolveObjectByHand(mHand);
+    if (!ro) return false;
+    __try {
+        if (!gw->player || gw->player->playerCharacters.size() == 0) return false;
+        Character* worker = gw->player->playerCharacters[0];
+        if (!worker) return false;
+        Building* b = static_cast<Building*>(ro);
+        int ct = (int)b->classType;
+        if (!isMachineClassType(ct)) return false;
+        // The vtable's dispatch, done by hand: we call resolved NON-virtual
+        // addresses, so classType picks the right override.
+        MachOperateFn fn = g_machOperateProdFn;
+        if (ct == (int)BCTYPE_CRAFTING && g_machOperateCraftFn)  fn = g_machOperateCraftFn;
+        if (ct == (int)BCTYPE_FARM && g_machOperateFarmFn)       fn = g_machOperateFarmFn;
+        if (ct == (int)BCTYPE_RESEARCH && g_machOperateResearchFn) fn = g_machOperateResearchFn;
+        if (!fn) return false;
+        fn(b, worker, amount);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[prod] operate SEH-except");
+        return false;
+    }
+}
+
+// Deterministic machine template for the probe's programmatic placement.
+// kind 0 = power generator (BCTYPE_PRODUCTION, has getPowerOutput), kind 1 =
+// crafting bench (BCTYPE_CRAFTING, has input/output buffers), kind 2 =
+// storage container (BCTYPE_STORAGE - protocol 34's chest subject). `skip`
+// selects the skip-th DISTINCT candidate in preference order: a template's
+// NAME does not reveal its BuildingClassType (run-170508: the first
+// "general storage" match placed as a non-STORAGE class), so the kind-2
+// caller places candidates in turn and verifies the LIVE building's class,
+// destroying rejects. All candidates buildable anywhere - drills/farms need
+// terrain resources so the probe never spawns them. Caller holds SEH.
+static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    const char* genPrefs[]   = { "small wind generator", "wind generator",
+                                 "small generator", "generator" };
+    const char* craftPrefs[] = { "armour crafting bench", "weapon smithing bench",
+                                 "weapon smith", "engineering bench" };
+    const char* storePrefs[] = { "general storage", "storage box", "storage chest",
+                                 "chest", "storage" };
+    const char** prefs;
+    unsigned int nPrefs;
+    if (kind == 0)      { prefs = genPrefs;   nPrefs = 4; }
+    else if (kind == 2) { prefs = storePrefs; nPrefs = 5; }
+    else                { prefs = craftPrefs; nPrefs = 4; }
+    GameData* seen[16];
+    unsigned int nSeen = 0;
+    for (unsigned int k = 0; k < nPrefs; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (!gd || !ciContains(gd->name.c_str(), prefs[k])) continue;
+            bool dup = false; // a name can match several prefs
+            for (unsigned int s = 0; s < nSeen; ++s)
+                if (seen[s] == gd) { dup = true; break; }
+            if (dup) continue;
+            if ((int)nSeen == skip) return gd;
+            if (nSeen < 16) seen[nSeen++] = gd;
+        }
+    }
+    return 0;
+}
+
+// SEH-guarded: the live Building's classType at the hand, or -1.
+static int readBuildingClassByHand(const unsigned int h[5]) {
+    RootObject* ro = resolveObjectByHand(h);
+    if (!ro) return -1;
+    __try {
+        return (int)static_cast<Building*>(ro)->classType;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
+                      unsigned int outHand[5], char* outSid, unsigned int sidLen) {
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (!gw) return 0;
+    Ogre::Vector3 pos(0, 0, 0); float yaw = 0.0f; bool anchored = false;
+    __try {
+        anchored = leaderAnchor(gw, fwd, side, &pos, &yaw);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    if (!anchored) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[prod] probe-place kind=%d no leader anchor",
+                  kind);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return 0;
+    }
+    // A template NAME does not reveal its BuildingClassType (run-170508: the
+    // first "general storage" name-match placed as a non-STORAGE class the
+    // container census rightly skipped), so walk the preference-ordered
+    // candidates: place, verify the LIVE building's class, destroy + retry on
+    // mismatch. kinds 0/1 accept any machine class (the original behaviour);
+    // kind 2 demands BCTYPE_STORAGE.
+    const int MAX_CANDIDATES = 8;
+    for (int cand = 0; cand < MAX_CANDIDATES; ++cand) {
+        GameData* tmpl = 0;
+        __try {
+            tmpl = findProdTemplate(gw, kind, cand);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        if (!tmpl) {
+            char b[96];
+            _snprintf(b, sizeof(b) - 1,
+                      "[prod] probe-place kind=%d no template (tried %d)",
+                      kind, cand);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return 0;
+        }
+        const char* sid = 0;
+        __try { sid = tmpl->stringID.c_str(); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        unsigned int localHand[5] = { 0, 0, 0, 0, 0 };
+        int rc = placeBuildingAt(gw, sid, pos.x, pos.y, pos.z, yaw,
+                                 /*completed*/false, localHand);
+        if (rc != 1) {
+            if (outHand) memcpy(outHand, localHand, sizeof(localHand));
+            if (outSid && sidLen) {
+                strncpy(outSid, sid, sidLen - 1);
+                outSid[sidLen - 1] = '\0';
+            }
+            return rc;
+        }
+        int liveClass = readBuildingClassByHand(localHand);
+        bool classOk = (kind == 2) ? (liveClass == (int)BCTYPE_STORAGE)
+                                   : true;
+        if (!classOk) {
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "[prod] probe-place kind=%d REJECT sid='%s' class=%d "
+                      "(want STORAGE) - destroy + next candidate",
+                      kind, sid, liveClass);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            destroyBuildingByHand(gw, localHand);
+            continue;
+        }
+        if (outHand) memcpy(outHand, localHand, sizeof(localHand));
+        if (outSid && sidLen) {
+            strncpy(outSid, sid, sidLen - 1);
+            outSid[sidLen - 1] = '\0';
+        }
+        // Queue the protocol-27 edge so the peer mints the same site (the
+        // probe then ramps it complete through writeBuildProgressByHand).
+        BuildEdgeRec e;
+        memset(&e, 0, sizeof(e));
+        memcpy(e.hand, localHand, sizeof(e.hand));
+        strncpy(e.sid, sid, sizeof(e.sid) - 1);
+        e.sid[sizeof(e.sid) - 1] = '\0';
+        e.x = pos.x; e.y = pos.y; e.z = pos.z; e.yaw = yaw;
+        e.fromUi = 0;
+        if (g_buildEdges.size() < 32) g_buildEdges.push_back(e);
+        return 1;
+    }
+    char b[96];
+    _snprintf(b, sizeof(b) - 1,
+              "[prod] probe-place kind=%d no class-matching candidate", kind);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return 0;
+}
+
+// ---- Protocol 34: storage/machine container sync ---------------------------
+
+// Container-bearing filter for the census: STORAGE chests plus the machine
+// classes - a machine's crafted whole ITEMS land in the same Building
+// inventory the chest uses, so both ride the container channel.
+static bool isContainerClassType(int t) {
+    return t == (int)BCTYPE_STORAGE || isMachineClassType(t);
+}
+
+// Fill a ContRead from a live container-bearing Building. Callers hold the
+// SEH frame and have already verified isContainerClassType(b->classType).
+// The contents summary reads up to 64 entries (readInvItems carries its own
+// SEH) - the census's capacity measuring stick vs INV_ITEMS_MAX.
+static void fillContRead(Building* b, ContRead* r) {
+    memset(r, 0, sizeof(*r));
+    RootObject* ro = static_cast<RootObject*>(b);
+    readObjectHand(ro, r->hand);
+    Ogre::Vector3 p = ro->getPosition();
+    r->x = p.x; r->y = p.y; r->z = p.z;
+    r->classType = (int)b->classType;
+    r->complete  = b->_buildState.isComplete ? 1 : 0;
+    Inventory* inv = ro->getInventory();
+    r->hasInv = inv ? 1 : 0;
+    if (inv) {
+        InvItemEntry ent[64];
+        unsigned int n = readInvItems(inv, ent, 0, 64);
+        r->nEntries = (int)n;
+        unsigned int h = 0; int qt = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            h += invEntryHash(ent[i]);
+            qt += (int)ent[i].quantity;
+        }
+        r->hash = h; r->qtyTotal = qt;
+        if (n > 0) {
+            strncpy(r->firstSid, ent[0].stringID, sizeof(r->firstSid) - 1);
+            r->firstSid[sizeof(r->firstSid) - 1] = '\0';
+            r->firstQty = (int)ent[0].quantity;
+        }
+    }
+    GameData* gd = ro->getGameData();
+    if (gd) {
+        strncpy(r->sid, gd->stringID.c_str(), sizeof(r->sid) - 1);
+        r->sid[sizeof(r->sid) - 1] = '\0';
+        strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+    }
+}
+
+unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
+                                unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &centers[ci], radius, BUILDING, 256, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                Building* b = static_cast<Building*>(o);
+                if (!isContainerClassType((int)b->classType)) continue;
+                // Incomplete sites ride protocol 27 until finished.
+                if (!b->_buildState.isComplete) continue;
+                unsigned int h[5];
+                if (!readObjectHand(o, h)) continue;
+                bool dup = false; // the two interest spheres can overlap
+                for (unsigned int k = 0; k < n; ++k)
+                    if (out[k].hand[3] == h[3] && out[k].hand[4] == h[4] &&
+                        out[k].hand[1] == h[1]) { dup = true; break; }
+                if (dup) continue;
+                fillContRead(b, &out[n]);
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+bool readContainerByHand(const unsigned int cHand[5], ContRead* out) {
+    if (!cHand || !out) return false;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        if (!isContainerClassType((int)b->classType)) return false;
+        fillContRead(b, out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]) {
     (void)gw;
     if (!vHand) return -1;
@@ -5638,6 +7542,28 @@ bool readGameSpeed(GameWorld* gw, float* mult, bool* paused) {
         return false;
     }
 }
+
+bool readGameClock(GameWorld* gw, double* outHours, float* outHourLenSec) {
+    if (outHours)      *outHours      = -1.0;
+    if (outHourLenSec) *outHourLenSec = -1.0f;
+    if (!gw || !g_getTimeHoursFn || !g_getHourLenFn) return false;
+    __try {
+        double hours = -1.0;
+        g_getTimeHoursFn(gw, &hours); // retbuf ABI: this in RCX, retbuf in RDX
+        if (outHours)      *outHours      = hours;
+        if (outHourLenSec) *outHourLenSec = g_getHourLenFn(gw);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// NOTE: a clock STEP lever was prototyped here (write GameWorld::timeStamper's
+// CPerfTimer base, self-verifying with revert-on-mismatch) and REJECTED: the
+// verify never passed - getTimeStamp_inGameHours does not derive from that
+// timer (run 150001), the absolute calendar is advanced elsewhere by the frame
+// tick. The Replicator's slew (scale the join's sim speed until the offset
+// closes) is the correction path; no engine clock writer exists.
 
 bool writeGameSpeed(GameWorld* gw, float mult, bool paused) {
     if (!gw || !g_setGameSpeedFn || !g_userPauseFn) return false;

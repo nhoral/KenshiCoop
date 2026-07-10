@@ -160,9 +160,15 @@ if ($Wan -ne "") {
     $proxyPort = $Port + 1
     Write-Host "Starting WAN relay proxy '$Wan' (delay $($wp.DelayMs)ms +/-$($wp.JitterMs)ms, loss $($wp.LossPct)%) on port $proxyPort -> ${Ip}:$Port"
     $wanLog = Join-Path $OutDir "netsim.log"
+    $wanArgs = @("$proxyPort", $Ip, "$Port", "$($wp.DelayMs)", "$($wp.JitterMs)", "$($wp.LossPct)")
+    if ($wp.ContainsKey('StallForS') -and [int]$wp.StallForS -gt 0) {
+        # Scripted total outage (starved-replica validation): seed + stall window.
+        $wanArgs += @("$(Get-Random -Maximum 1000000)", "$($wp.StallAtS)", "$($wp.StallForS)")
+        Write-Host "  (scripted stall: $($wp.StallForS)s total outage at +$($wp.StallAtS)s after first join datagram)"
+    }
     $wanProc = Start-Process -FilePath $netsimExe -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $wanLog `
-        -ArgumentList @("$proxyPort", $Ip, "$Port", "$($wp.DelayMs)", "$($wp.JitterMs)", "$($wp.LossPct)")
+        -ArgumentList $wanArgs
     Start-Sleep -Milliseconds 500
     if ($wanProc.HasExited) { throw "netsim.exe exited immediately (see $wanLog)" }
     $joinIp   = "127.0.0.1"
@@ -207,7 +213,7 @@ function Set-CoopEnv {
     $env:KENSHICOOP_LOG          = $Log
     $env:KENSHICOOP_SCENARIO     = $Scenario
     # Reconcile/world-item trace gate (diagnostic scenarios need the [recon]/[wi] traces).
-    $env:KENSHICOOP_INV_DUMP     = if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -eq "world_armor_drop" -or $Scenario -like "world_item_*") { "1" } else { "" }
+    $env:KENSHICOOP_INV_DUMP     = if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -eq "world_armor_drop" -or $Scenario -eq "trade_probe" -or $Scenario -eq "trade_peer" -or $Scenario -like "world_item_*") { "1" } else { "" }
     # Join-only AI-suspend probe.
     $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
     # Host-only setup/re-arm scene.
