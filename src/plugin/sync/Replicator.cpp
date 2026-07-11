@@ -43,6 +43,12 @@ namespace {
 const float MOVE_EPS    = 0.20f;  // source speed above which we treat it as moving
 const float SNAP_DIST   = 8.0f;   // gap beyond which we hard-snap (teleport)
                                   // (default for snapDist_ - env-tunable, proto 36)
+const float SNAP_SECONDS = 0.75f; // velocity-aware snap gate default: hard-snap
+                                  // only when the body trails the source by more
+                                  // than this much travel time (measured steady-
+                                  // state trail while tracking a sprinter: ~0.17s;
+                                  // WAN adds ~0.3s - 0.75s only fires on genuine
+                                  // fell-behind/warp) (KENSHICOOP_SNAP_SECONDS)
 const float REPARK_DIST = 1.0f;   // at rest, re-place if it drifts past this
 const float CATCHUP_K   = 2.0f;   // gap-proportional speed boost (chase a moving tgt)
                                   // (default for catchupK_ - env-tunable, proto 36)
@@ -124,8 +130,8 @@ float dist3(float ax, float ay, float az, float bx, float by, float bz) {
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-// Conservation channel item types. itemType 2 = WEAPON (createItem can't rebuild a proxy)
-// and 3 = ARMOUR/clothing. Both are non-stackable EQUIPPABLE gear, so each unit is a distinct
+// Conservation channel item types. itemType 2 = WEAPON and 3 = ARMOUR/clothing.
+// Both are non-stackable EQUIPPABLE gear, so each unit is a distinct
 // object the peer already mirrors (weapons via shared save; armour also reconstructed by inv
 // sync) - the real object can be relocated bag<->ground on every client and re-homed on pickup
 // WITHOUT fabrication. The W1 host-authored proxy stream handles everything else (stacks, loot)
@@ -135,7 +141,8 @@ inline bool isGearType(unsigned int t) { return t == 2u || t == 3u; }
 } // namespace
 
 Replicator::Replicator()
-    : catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), sendStamp_(true),
+    : catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), snapSeconds_(SNAP_SECONDS),
+      sendStamp_(true),
       starveHoldMs_(10000), starveHeldNow_(0),
       leaderOnly_(true), streamNpcs_(false),
       activeFrames_(0), zeroWhileActive_(0), maxStep_(0.0f), slewSkipFrames_(0),
@@ -168,6 +175,7 @@ Replicator::Replicator()
       bdoorSeqOut_(1), bdoorSampleMs_(0), bdoorSync_(true),
       hungerSync_(true),
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
+      researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f) {}
@@ -197,6 +205,7 @@ void Replicator::resetSession() {
     bdoorRows_.clear();
     doorRows_.clear();
     prodRows_.clear();
+    researchRows_.clear(); // protocol 38: re-baselined from the new world's store
     facRows_.clear();
     invPub_.clear();
     invRecv_.clear();
@@ -254,6 +263,7 @@ void Replicator::resetSession() {
     // Sample-cadence clocks restart.
     facSampleMs_ = doorSampleMs_ = buildSampleMs_ = bdoorSampleMs_ = 0;
     prodSampleMs_ = 0;
+    researchSampleMs_ = 0;
     contCensusMs_ = 0;
     authReassertMs_ = 0;
     // Config gates, ownRanks_ and every OUTBOUND seq counter are deliberately
@@ -1641,6 +1651,75 @@ void Replicator::applyProd(GameWorld* gw, Inbound& in) {
     }
 }
 
+void Replicator::publishResearch(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (!researchSync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // unlocks are rare; 1 Hz is plenty
+    const unsigned long RESEND_MS = 15000; // lost-row / late-prereq corrector
+    unsigned long now = nowMs();
+    if (researchSampleMs_ != 0 && (now - researchSampleMs_) < SAMPLE_MS) return;
+    researchSampleMs_ = now;
+
+    // The known set is bounded by the RESEARCH record count (384 on the sync
+    // save); 512 rows x 48 B of main-thread-only scratch covers modded trees.
+    const unsigned int MAX_KNOWN = 512;
+    const unsigned int SID_CAP   = 48;
+    static char sids[MAX_KNOWN * SID_CAP]; // main-thread only
+    unsigned int n = engine::researchEnumKnown(gw, sids, SID_CAP, MAX_KNOWN);
+    for (unsigned int i = 0; i < n; ++i) {
+        const char* sid = sids + (size_t)i * SID_CAP;
+        ResearchRow& rr = researchRows_[std::string(sid)];
+        bool first  = !rr.sent;
+        bool resend = rr.sent && (now - rr.lastSendMs) >= RESEND_MS;
+        if (!first && !resend) continue;
+        rr.sent = true; rr.lastSendMs = now;
+        ResearchPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_RESEARCH;
+        pkt.ownerId = ownerId;
+        pkt.seq     = researchSeqOut_++;
+        strncpy(pkt.sid, sid, sizeof(pkt.sid) - 1);
+        net.queueResearch(pkt);
+        if (first) { // resends stay silent; the new unlock is the signal
+            char b[128];
+            _snprintf(b, sizeof(b) - 1, "[research] SEND sid='%s' seq=%u",
+                      pkt.sid, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyResearch(GameWorld* gw, Inbound& in) {
+    std::deque<InboundResearch> got;
+    in.drainResearch(got);
+    if (got.empty()) return;
+    if (!researchSync_) return;
+    for (std::deque<InboundResearch>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const ResearchPacket& p = it->pkt;
+        char sid[sizeof(p.sid)];
+        strncpy(sid, p.sid, sizeof(sid) - 1);
+        sid[sizeof(sid) - 1] = '\0';
+        if (!sid[0]) continue;
+        ResearchRow& rr = researchRows_[std::string(sid)];
+        if (rr.seqSeen != 0 && p.seq <= rr.seqSeen) continue; // stale row
+        rr.seqSeen = p.seq;
+        if (rr.applied) continue; // landed earlier; resends are no-ops
+        int known = -1, can = -1;
+        int rc = engine::researchQueryBySid(gw, sid, &known, &can);
+        if (rc != 1) continue; // store/levers not up yet; the resend retries
+        if (known == 1) { rr.applied = true; continue; } // already converged
+        int started = engine::researchStartBySid(gw, sid);
+        int knownAfter = -1;
+        engine::researchQueryBySid(gw, sid, &knownAfter, &can);
+        if (knownAfter == 1) rr.applied = true;
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[research] RECV sid='%s' known %d->%d start=%d seq=%u",
+                  sid, known, knownAfter, started, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId) {
     (void)gw;
     if (!buildSync_) return;
@@ -2728,10 +2807,10 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     // REARRANGES or ADDS (entry count >= last sent) settles fast. A change that REMOVES an
     // entry settles much longer: mid-drag the UI holds the dragged item on the CURSOR, out
     // of the inventory entirely, for up to ~1 s - a transient "item gone" the peer would act
-    // on by DESTROYING a worn item it cannot refabricate (createItemAndAdd is unreliable for
-    // weapons; equipped fabrication is non-persistent, d25), losing it for good. Equip and
-    // unequip-to-bag keep the entry count (a MOVE), so they still replicate promptly; only
-    // genuine removals (and the in-cursor flicker) wait out the longer window.
+    // on by DESTROYING a worn item. Weapons DO refabricate now (spike 451 recipe), but a
+    // destroy+refabricate round-trip still loses identity/quality and churns, so the long
+    // window stays. Equip and unequip-to-bag keep the entry count (a MOVE), so they still
+    // replicate promptly; only genuine removals (and the in-cursor flicker) wait it out.
     const unsigned long INV_SETTLE_MS        = 350;
     const unsigned long INV_REMOVE_SETTLE_MS = 1800;
     InvItemEntry items[INV_ITEMS_MAX];
@@ -3566,13 +3645,20 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, u32 localId) {
         int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
                                                       p.itemType, (int)p.quantity);
         int fab = 0;
-        if (moved < (int)p.quantity && !isGearType(p.itemType)) {
-            // Our src copy is short (desync) - non-gear can be fabricated into dst so
-            // the trade still lands. Gear never fabricates (the sender's latch + the
-            // authoritative snapshots repair the miss instead).
-            fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
-                                                   (int)p.quantity - moved, (int)p.quality,
-                                                   p.manufacturer, p.material);
+        if (moved < (int)p.quantity) {
+            // Our src copy is short (desync) - fabricate the shortfall into dst so the
+            // trade still lands. Non-gear always did this; gear joined once spike 451
+            // made weapon fabrication work (armour always could). Dupe safety: the
+            // latch below keeps stale snapshots from reconciling the fab away, and
+            // wdSuppress_ keeps the W2 weapon census from reading the count edge as a
+            // ground pickup. KENSHICOOP_WEAPON_FAB=0 restores gear-never-fabricates
+            // (weapons also die inside createItemAndAdd on the same env).
+            static int gearFab = -1;
+            if (gearFab < 0) { const char* e = getenv("KENSHICOOP_WEAPON_FAB"); gearFab = (e && e[0] == '0') ? 0 : 1; }
+            if (!isGearType(p.itemType) || gearFab)
+                fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
+                                                       (int)p.quantity - moved, (int)p.quality,
+                                                       p.manufacturer, p.material);
         }
         XKey key(std::string(p.stringID), p.itemType);
         // Latch OUR peer end(s) too: an in-flight stale snapshot (captured by its
@@ -3866,6 +3952,27 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
 }
 
+void Replicator::logHardSnap(Character* c, const EntityState& out, const char* kind,
+                             float gap, float srcVel, float gate, bool hadDest) {
+    // Throttle to ~4 lines/s so a snap storm (the thing under investigation)
+    // stays legible; skipped lines are accounted for in the next one.
+    static unsigned long tick = 0;      // main-thread only
+    static unsigned long skipped = 0;
+    unsigned long now = nowMs();
+    if (tick != 0 && (now - tick) < 250) { ++skipped; return; }
+    tick = now;
+    char nm[48];
+    engine::charName(c, nm, sizeof(nm));
+    char b[240];
+    _snprintf(b, sizeof(b) - 1,
+              "[snap] %s hand=%u,%u name='%s' gap=%.1f gate=%.1f srcVel=%.1f "
+              "cSpeed=%.1f mult=%.2f slew=%.2f dest=%d skipped=%lu",
+              kind, out.hIndex, out.hSerial, nm, gap, gate, srcVel, out.cSpeed,
+              speedLastSet_, timeSlew_, hadDest ? 1 : 0, skipped);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    skipped = 0;
+}
+
 void Replicator::applyTargets(GameWorld* gw) {
     (void)gw;
     unsigned long now = nowMs();
@@ -3980,6 +4087,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             continue;
         }
         drivenChars_.insert(c);
+        debugMark(c, 0, "DRV");
 
         // Every driven body is damage-guarded (locally-simulated hits must not
         // mutate the local-only medical model; outcomes arrive as host events).
@@ -4497,6 +4605,30 @@ void Replicator::applyTargets(GameWorld* gw) {
         float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
         bool npcMoving = haveNewest && (vlen > NPC_MOVE_VEL);
 
+        // Velocity-aware hard-snap gate (2026-07-11 rubber-banding fix). The
+        // walk-drive's natural trailing distance behind 'newest' scales with the
+        // source's WALL-CLOCK speed (render delay + batch cadence are time, not
+        // distance): a sprinter at ~50 u/s trails ~8-9 u in steady state, which
+        // sat exactly on the old fixed 8 u gate ([snap] measured gap=8.6 with
+        // srcVel~50 repeatedly), and any game-speed multiplier scales measured
+        // velocity the same way (5x turned the gate into a per-sample teleport).
+        // Gate on TIME behind the source instead - snap only when the body
+        // trails by more than snapSeconds_ of travel. Two hardenings from the
+        // fast_march validation run:
+        //   * the velocity estimate is a slow-decaying PEAK (~1 s half-life),
+        //     not the instantaneous sample - a source stopping at a leg end
+        //     deflated the gate to the floor while the body was still tens of
+        //     units out, turning every stop into a teleport;
+        //   * the distance floor scales with the consensus game speed - at 5x
+        //     every trailing distance is 5x in world units for the same time
+        //     lag, and burst onsets outrun the engine's real max locomotion
+        //     speed for a moment regardless of the commanded catch-up.
+        if (vlen > d.velPeak) d.velPeak = vlen;
+        else                  d.velPeak *= 0.99f; // ~1 s half-life at 75 fps
+        float multEff = (speedLastSet_ > 1.0f) ? speedLastSet_ : 1.0f;
+        float snapGate = snapDist_ * multEff;
+        if (d.velPeak * snapSeconds_ > snapGate) snapGate = d.velPeak * snapSeconds_;
+
         // AI-suspend probe: for a host-driven world NPC, suspend its AI decision
         // layer (faction-safe) so it stops self-tasking but keeps animating. The
         // host stream is the sole task authority; the body holds + animates its
@@ -4529,9 +4661,10 @@ void Replicator::applyTargets(GameWorld* gw) {
             //     where the fidget-in-place drift came from.
             // removeFromUpdateList is NOT used: it freezes the movement controller
             // (walk + teleport both no-op). Real sit/idle poses come in Stage 5.
-            if (npcMoving && haveActual && gapNewest > snapDist_) {
+            if (npcMoving && haveActual && gapNewest > snapGate) {
                 engine::applyRaw(c, newest);
                 ++hardSnapNpc_;
+                logHardSnap(c, out, "npc", gapNewest, vlen, snapGate, d.haveDest);
                 d.parked = false; d.haveDest = false;
             } else if (npcMoving) {
                 float tx = newest.x, ty = newest.y, tz = newest.z;
@@ -4564,11 +4697,12 @@ void Replicator::applyTargets(GameWorld* gw) {
                 applyRest(c, d, out, haveActual, ax, ay, az, now, /*isSquad*/false);
                 d.haveDest = false;
             }
-        } else if (hostMoving && haveActual && haveNewest && gapNewest > snapDist_) {
+        } else if (hostMoving && haveActual && haveNewest && gapNewest > snapGate) {
             // Fell behind / source warped: hard-snap to the true position (no-halt
             // teleport keeps the clip phase advancing rather than freezing).
             engine::applyRaw(c, newest);
             ++hardSnapSquad_;
+            logHardSnap(c, out, "squad", gapNewest, vlen, snapGate, d.haveDest);
             d.parked = false;
             d.haveDest = false;
         } else if (hostMoving) {
@@ -4794,6 +4928,51 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         char b[96];
         _snprintf(b, sizeof(b) - 1, "[census] sent n=%u radius=%.0f", n, censusRadius_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the
+        // same 10 s cadence, so a join-side cull can be classified against the
+        // host's actual membership (true ghost vs host enumeration miss).
+        static int dump = -1;
+        if (dump < 0) {
+            const char* e = getenv("KENSHICOOP_DEBUG_CENSUS");
+            dump = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (dump == 1) {
+            for (unsigned int i = 0; i < n; ++i) {
+                char nm[48];
+                engine::charName(chars[i], nm, sizeof(nm));
+                char r[160];
+                _snprintf(r, sizeof(r) - 1,
+                          "[census] row %u hand=%u,%u pos=%.0f,%.0f,%.0f name='%s'",
+                          i, states[i].hIndex, states[i].hSerial,
+                          states[i].x, states[i].y, states[i].z, nm);
+                r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+            }
+        }
+    }
+}
+
+void Replicator::debugMark(Character* c, int colorId, const char* tag) {
+    static int en = -1;
+    if (en < 0) {
+        const char* e = getenv("KENSHICOOP_DEBUG_MARKERS");
+        en = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (en != 1 || !c) return;
+    std::map<Character*, DebugMarker>::iterator it = debugMarkers_.find(c);
+    if (it != debugMarkers_.end() && it->second.color == colorId) return;
+    char nm[40];
+    engine::charName(c, nm, sizeof(nm));
+    char cap[64];
+    _snprintf(cap, sizeof(cap) - 1, "%s %s", tag, nm);
+    cap[sizeof(cap) - 1] = '\0';
+    if (it == debugMarkers_.end()) {
+        void* l = engine::markerCreate(c, cap, colorId);
+        if (l) {
+            DebugMarker m; m.label = l; m.color = colorId;
+            debugMarkers_[c] = m;
+        }
+    } else if (engine::markerUpdate(it->second.label, cap, colorId)) {
+        it->second.color = colorId;
     }
 }
 
@@ -4879,27 +5058,43 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
         // suppress an actively-driven combatant (crowd copies froze mid-brawl).
         bool streamed = (keep.find(k) != keep.end()) ||
                         (drivenChars_.find(chars[i]) != drivenChars_.end());
+        // Pop-out fix (2026-07-11 field report): existence authority is the
+        // CENSUS, drive authority is the STREAM. An NPC at the ~200 u stream-
+        // bubble boundary flickers in/out of the host's fresh set (the two
+        // clients disagree slightly on its position), and the old streamed-only
+        // signal hid REAL host-present NPCs ('Saint'/'Kumo' measured churning
+        // suppress->restore->suppress every few seconds). While the census is
+        // fresh, a census-present NPC is never suppressed - its local AI copy
+        // may drift, but it EXISTS; only census-absent ghosts get hidden. With
+        // no fresh census (hatch off / host lagging) the legacy streamed-only
+        // behavior stands.
+        bool exists = streamed ||
+                      (censusFresh && censusHands_.find(k) != censusHands_.end());
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
         AuthCount& ac = authCount_[k];
-        if (streamed) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
-        else          { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
-        if (streamed) {
+        if (exists) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
+        else        { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
+        if (exists) {
             // Host owns it again: hand it back once the stream has DWELLED (a
             // boundary NPC that flickers into the set for a frame stays hidden).
             if (s != suppressed_.end() && ac.streamed >= RESTORE_AFTER_FRAMES) {
                 engine::restoreNpc(gw, chars[i]);
                 suppressed_.erase(s);
+                s = suppressed_.end();
                 ++authRestores_;
-                { char b[112]; _snprintf(b, sizeof(b) - 1,
-                    "[authority] restore NPC hand=%u,%u (supp=%u churn=%lu/%lu)",
-                    states[i].hIndex, states[i].hSerial,
+                { char nm[48]; engine::charName(chars[i], nm, sizeof(nm));
+                  char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] restore NPC hand=%u,%u name='%s' (supp=%u churn=%lu/%lu)",
+                    states[i].hIndex, states[i].hSerial, nm,
                     (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
                   b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             }
+            if (s == suppressed_.end())
+                debugMark(chars[i], streamed ? 0 : 2, streamed ? "DRV" : "LOC");
         } else {
-            // Host isn't streaming it: after the debounce, hide + freeze so the
-            // local AI can't run a divergent (standing) copy on top of the
-            // host-driven world.
+            // Host neither streams nor lists it (census-absent ghost): after
+            // the debounce, hide + freeze so the local AI can't run a divergent
+            // copy on top of the host-driven world.
             if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
                 // Phase 2 hardening: only RECORD the suppression when the engine
                 // call actually landed. A faulted hide used to be booked as done,
@@ -4910,9 +5105,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                 if (engine::suppressNpc(gw, chars[i])) {
                     suppressed_[k] = chars[i];
                     ++authSuppresses_;
-                    { char b[128]; _snprintf(b, sizeof(b) - 1,
-                        "[authority] suppress NPC hand=%u,%u (streamed=%u local=%u supp=%u churn=%lu/%lu)",
-                        states[i].hIndex, states[i].hSerial, (unsigned)keep.size(), n,
+                    debugMark(chars[i], 1, "HID");
+                    { char nm[48]; engine::charName(chars[i], nm, sizeof(nm));
+                      char b[192]; _snprintf(b, sizeof(b) - 1,
+                        "[authority] suppress NPC hand=%u,%u name='%s' (streamed=%u local=%u supp=%u churn=%lu/%lu)",
+                        states[i].hIndex, states[i].hSerial, nm, (unsigned)keep.size(), n,
                         (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
                 } else if (ac.unstreamed == SUPPRESS_AFTER_FRAMES) {
@@ -4949,9 +5146,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                     engine::restoreNpc(gw, wChars[i]);
                     suppressed_.erase(s);
                     ++authRestores_;
-                    { char b[112]; _snprintf(b, sizeof(b) - 1,
-                        "[census] restore NPC hand=%u,%u (supp=%u culls=%lu)",
-                        wStates[i].hIndex, wStates[i].hSerial,
+                    debugMark(wChars[i], 2, "LOC");
+                    { char nm[48]; engine::charName(wChars[i], nm, sizeof(nm));
+                      char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[census] restore NPC hand=%u,%u name='%s' (supp=%u culls=%lu)",
+                        wStates[i].hIndex, wStates[i].hSerial, nm,
                         (unsigned)suppressed_.size(), censusCulls_);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
                 }
@@ -4960,9 +5159,13 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                     suppressed_[k] = wChars[i];
                     ++authSuppresses_;
                     ++censusCulls_;
-                    { char b[128]; _snprintf(b, sizeof(b) - 1,
-                        "[census] cull NPC hand=%u,%u (census=%u wide=%u supp=%u culls=%lu)",
-                        wStates[i].hIndex, wStates[i].hSerial,
+                    debugMark(wChars[i], 1, "HID");
+                    { char nm[48]; engine::charName(wChars[i], nm, sizeof(nm));
+                      char b[192]; _snprintf(b, sizeof(b) - 1,
+                        "[census] cull NPC hand=%u,%u name='%s' pos=%.0f,%.0f,%.0f "
+                        "(census=%u wide=%u supp=%u culls=%lu)",
+                        wStates[i].hIndex, wStates[i].hSerial, nm,
+                        wStates[i].x, wStates[i].y, wStates[i].z,
                         (unsigned)censusHands_.size(), wn,
                         (unsigned)suppressed_.size(), censusCulls_);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }

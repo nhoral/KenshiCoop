@@ -15,7 +15,9 @@ poses/rest/furniture/crafting; body state + reliable KO/death/revive events;
 combat stance/attribution/damage-guard; full-anatomy medical + treatment
 forwarding + limb loss; character stats; carried bodies; bed/cage occupancy;
 stealth + detection feedback; inventory incl. equipped gear + weapon slots;
-world ground items (drop/pickup conservation); consensus game speed/pause;
+weapon fabrication (spike-451 manufacturer-first recipe - mid-session
+acquisitions cross, entry 12); world ground items (drop/pickup
+conservation); consensus game speed/pause;
 runtime NPC spawn proxies + suppression hardening (protocol 21); squad
 management (tab moves re-keyed, latched rank partition - protocol 35); Steam
 P2P transport. See the doctrine list (14-35) for the mechanism of each.
@@ -143,7 +145,7 @@ P2P transport. See the doctrine list (14-35) for the mechanism of each.
 
 ## Priority 2 - structural, bites longer campaigns
 
-### 5. Buildings and base-building [DOOR + PLACEMENT + PLACED-DOOR/DISMANTLE + PRODUCTION-MACHINE SLICES DONE 2026-07-09 - protocols 26/27/28/33]
+### 5. Buildings and base-building [DOOR + PLACEMENT + PLACED-DOOR/DISMANTLE + PRODUCTION-MACHINE + STORAGE + RESEARCH SLICES DONE 2026-07-10 - protocols 26/27/28/33/34/38]
 
 - **Symptom:** player-placed buildings, construction progress, production
   machines, research, farming, and door/gate states exist per-client.
@@ -279,9 +281,35 @@ P2P transport. See the doctrine list (14-35) for the mechanism of each.
   agreed - so the reconcile-removal crossed too); regressions green.
   `KENSHICOOP_STORE_SYNC` (default ON) is the A/B hatch; forced OFF
   inside `store_probe`; layered on `invSync` (the carrier channel).
-- **Remaining (the rest of the gap):** research tech-tree unlocks (the
-  progress store is unmapped - `getTechLevel` reads it but no
-  writable surface found yet; probe evidence collected), gates/wall
+- **Research tech-tree slice (protocol 38, wire 36 -> 37, DONE):**
+  research unlocks - the store is `PlayerInterface::technology` (a
+  per-client `Research` object), so a tech the host researched never
+  unlocked on the join. Spike 401 mapped it from the on-disk exe (the
+  research-UI click handler at 0x2b65d0 via the "Research already
+  known" string xref) and recovered the engine's own levers:
+  `Research::isKnown(GameData*)`, `canResearch(GameData*,bool,bool)`
+  and `startResearch(GameData*)` - the last is a working WRITE lever
+  (flips isKnown in the same tick). CRITICAL build note: the running
+  1.0.65 image is BASE-SKEWED from the on-disk file, so base+RVA calls
+  hit unrelated code (crashed both clients) - the levers are located
+  at runtime by a unique 24-byte prologue scan of `.text`. Probe
+  findings (`research_probe`, run 220036): both clients pick the SAME
+  subject sid by shared RESEARCH enumeration (the wire-key leg), the
+  host's unlock stayed off the join for the whole hatch-OFF window
+  (divergence real), and the join's own startResearch flipped AND
+  stuck (the apply lever). Mechanism: HOST-AUTHORITATIVE - the host
+  samples its known set ~1 Hz (`isKnown` over the RESEARCH
+  enumeration) and streams one reliable `PKT_RESEARCH` row per known
+  stringID (first sight = the session baseline, 15 s safety resend =
+  the lost-row/late-prereq corrector); the join applies via
+  `startResearch`, idempotent behind an isKnown pre-check. Un-learning
+  does not exist in the engine, so rows only ever ADD knowledge.
+  Session-reset clears the row cache (protocol 32). Validated:
+  `research_sync` run 220320 (host sent 3 rows, join applied the
+  subject, unlock CROSSED in 1000 ms and stuck; finals agree);
+  regressions green. `KENSHICOOP_RESEARCH_SYNC` (default ON) is the
+  A/B hatch; forced OFF inside `research_probe`.
+- **Remaining (the rest of the gap):** gates/wall
   doors on placed WALLS, door HEALTH/broken state and lockpicking
   (doctrine 31 out-of-scope list); a peer that missed the PLACE also
   misses the REMOVE (harmless - the shared-save workflow reloads from a
@@ -571,6 +599,87 @@ Four field bugs from the first real remote session, shipped as one bump
   committed copy without the file on disk. If a future session log shows
   the WARNs clean AND blank avatars anyway, escalate to the engine-side
   PortraitManager investigation.
+
+### 12. Weapon fabrication - the last trading loss vector [DONE 2026-07-10]
+
+- **Symptom (was):** a weapon acquired mid-session (loot, vendor purchase,
+  container grab) existed only on the acquiring client - the engine factory
+  refused to instantiate weapon templates (`createItem` null for all 24 base
+  templates), so the peer could never reconstruct one. All weapon sync was
+  conservation-only (relocate real objects already in the shared save); a
+  weapon NOT in the shared save was unreachable, and if a peer's real copy
+  was ever destroyed (e.g. the settle-window race), it was gone for good.
+- **Root cause (spike 451):** for WEAPONS the 6-arg `createItem`'s first two
+  GameData roles are SWAPPED - the engine passes the `WEAPON_MANUFACTURER`
+  record first and the weapon template in the third ("weaponMesh") slot.
+  Template-first (the header's reading) returns null for every weapon.
+- **Shipped:** manufacturer-first weapon branch in `createItemAndAdd`
+  (24/24 templates fabricate; generic-manufacturer fallback when the wire
+  carried no provenance), weapon CREATE in the container reconcile (the
+  snapshot already carried manufacturer/material sids - no wire change),
+  gear joins the cross-owner transfer shortfall fallback (the existing
+  latch/`wdSuppress_`/rebase plumbing suppresses dupes), and a new-weapon
+  acquisition propagates on the snapshot channel alone (the W2 PICKUP
+  intent is a deliberate no-op without a tracked ground copy).
+  `KENSHICOOP_WEAPON_FAB=0` is the escape hatch (restores conservation-only
+  gear sync at every fabrication site). Doctrine 52; spike doc
+  `resources/spikes/451-weapon-mint-recipe.md`.
+- **Gates:** `weapon_loot` (new, full tier - novel-sid acquisition crosses
+  with exactly one copy per side, matching quality, zero dupes; run
+  182239); regressions `inv_reequip` (182544), `trade_peer` (182828),
+  `inv_wpnseq` (183111), `trade_probe` baseline signature unchanged
+  (183353: TAKE:DUPE / GIVE:WIPED with xfer off - the documented unfixed
+  baseline - and WEAPON:CLEAN).
+
+### 13. Play-session bugs 2026-07-11: NPC pop-outs + rubber banding [DONE 2026-07-11]
+
+Two field reports from manual town testing after the research sync, diagnosed
+with name-annotated authority logging + a host census dump
+(`KENSHICOOP_DEBUG_CENSUS=1`) and `[snap]` attribution lines at both hard-snap
+sites.
+
+- **Join-side NPCs popping out of existence.** Two mechanisms found:
+  1. *True ghosts (correct culls):* a Dust Bandit raid squad the join's world
+     sim spawned locally - absent from the host census by construction, culled
+     ~30 s in. Working as designed (each client's spawn sim is independent;
+     existence authority is the host census).
+  2. *The real bug - stream-boundary suppression of REAL NPCs:* town NPCs at
+     the ~200 u stream-bubble edge ('Saint'/'Kumo' measured) sat inside the
+     join's near-pass query but outside the host's fresh stream set, so the
+     near pass hid census-present NPCs, then restored them when the host
+     streamed again - the observed pop-out/pop-in churn. Shipped: existence
+     authority = CENSUS, drive authority = STREAM. The near pass suppresses
+     only when the hand is BOTH unstreamed AND absent from a fresh census;
+     with no fresh census the legacy streamed-only logic stands. Gate:
+     `suppress_churn` (join log; any hand hidden more than once fails) wired
+     into coop_presence (smoke), npc_sync, npc_census.
+- **Rubber banding at every game speed.** `[snap]` attribution showed the
+  fixed 8 u hard-snap gate false-firing: the walk-drive's steady-state
+  trailing distance scales with the source's wall-clock speed (render delay +
+  batch cadence are TIME), so a sprinter (~50 u/s) trails ~8-9 u and sat
+  exactly on the gate (measured gap=8.6 repeatedly), and any speed multiplier
+  scales measured velocity the same way - at 5x the gate teleported every
+  sample (~35/s). Shipped: velocity-aware snap gate - teleport only when the
+  body trails by more than `KENSHICOOP_SNAP_SECONDS` (default 0.75 s) of
+  travel, where the velocity estimate is a slow-decaying peak (~1 s half-life;
+  the instantaneous 2-sample estimate collapses on source stops and deflated
+  the gate mid-convergence), and the `KENSHICOOP_SNAP_DIST` floor (8 u)
+  scales by the consensus speed multiplier. `[snap]` lines carry
+  gap/gate/srcVel/cSpeed/mult/slew for future attribution. Gates: `snap_rate`
+  (join `[interp]` snap counters per minute, slew window excluded, <= 3/min)
+  on coop_presence + npc_sync; new full-tier `fast_march` scenario (both
+  sides vote 5x, host marches in bursts) gating `snap_rate_squad` - squad
+  snaps zero at 5x; background-NPC snaps stay un-gated there (a bar NPC
+  resting between updates legitimately falls 100+ u behind at 5x and the
+  teleport is the correct convergence tool).
+- **Visual debugging:** `KENSHICOOP_DEBUG_MARKERS=1` (spike-47 ScreenLabel
+  substrate, `engine::markerCreate/Update/Destroy`) pins colored labels to
+  every judged body on the join - green DRV = host-driven, red HID =
+  suppressed/culled, yellow LOC = local-sim copy present in census.
+  `manual_session.ps1 -DebugMarkers` sets it on both clients; pair with the
+  'zoom' save (outside town, camera far out) for long-run wide-camera
+  inspection. Render-verified in run 111215 (green DRV labels tracking both
+  driven squad members).
 
 ## Accepted edges (documented, deliberately out of scope)
 

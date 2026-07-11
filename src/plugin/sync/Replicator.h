@@ -48,9 +48,10 @@ public:
     // the walk-drive's hard-snap / catch-up gains for WAN A/B runs without a
     // rebuild. Defaults match the historical constants.
     void setInterpConfig(const InterpConfig& c) { cfg_ = c; }
-    void setDriveTuning(float catchupK, float snapDist) {
+    void setDriveTuning(float catchupK, float snapDist, float snapSeconds) {
         if (catchupK > 0.0f) catchupK_ = catchupK;
         if (snapDist > 0.0f) snapDist_ = snapDist;
+        if (snapSeconds > 0.0f) snapSeconds_ = snapSeconds;
     }
     // KENSHICOOP_SEND_STAMP=0: ignore the batch sendMs and index interp rings
     // on arrival time (the legacy scheme) - a receiver-local A/B lever.
@@ -400,6 +401,24 @@ public:
     // Production machine sync master enable (KENSHICOOP_PROD_SYNC).
     void setProdSync(bool v) { prodSync_ = v; }
 
+    // BEFORE engine (protocol 38, HOST only - the tech-tree authority):
+    // sample the Research store's known set ~1 Hz (Research::isKnown over
+    // the shared RESEARCH GameData enumeration) and stream one PKT_RESEARCH
+    // row per known sid - first sight sends (the host's known set IS the
+    // session baseline), then a safety resend covers a lost row / a join
+    // whose apply lever needed prerequisites that arrived later.
+    void publishResearch(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 38, join side): drain received known-research
+    // rows; sids already known locally are skipped (idempotent), the rest
+    // apply through Research::startResearch - the exact lever a research-UI
+    // click commits (flips isKnown in the same tick, spike 401). Per-sid
+    // seq guard drops stale rows.
+    void applyResearch(GameWorld* gw, Inbound& in);
+
+    // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
+    void setResearchSync(bool v) { researchSync_ = v; }
+
     // Storage/machine container sync (protocol 34, KENSHICOOP_STORE_SYNC):
     // when set (HOST only - host-authoritative world containers), a ~1 Hz
     // census of container-bearing buildings (STORAGE + the machine classes)
@@ -573,6 +592,11 @@ private:
         unsigned long furnPeerTick;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
+        // Velocity-aware snap gate (2026-07-11): slow-decaying peak of the
+        // source's wall-clock speed. The instantaneous 2-sample estimate
+        // collapses to ~0 the moment the source halts, deflating the snap
+        // gate while the driven body is still converging on the stop point.
+        float        velPeak;
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), lastSeenMs(0),
@@ -586,7 +610,7 @@ private:
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
-                   sneakTick(0) {}
+                   sneakTick(0), velPeak(0.0f) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
@@ -679,7 +703,12 @@ private:
     std::map<Key, unsigned long> ownFurnExit_;
     InterpConfig          cfg_;
     float                 catchupK_;  // walk-drive gap-proportional speed gain
-    float                 snapDist_;  // moving-body hard-snap distance (u)
+    float                 snapDist_;  // moving-body hard-snap distance floor (u)
+    float                 snapSeconds_; // velocity-aware snap gate: teleport only
+                                        // when the body trails the newest sample
+                                        // by more than this much TRAVEL TIME (the
+                                        // fixed distance gate false-fired on
+                                        // sprinters and any game speed > 2x)
     bool                  sendStamp_; // index interp rings on sender stamps (v35)
     unsigned long         starveHoldMs_;  // guard-hold window past staleness
     unsigned int          starveHeldNow_; // bodies in the hold this tick (stat line)
@@ -1050,6 +1079,22 @@ private:
     u32           prodSeqOut_;
     unsigned long prodSampleMs_;
     bool          prodSync_;
+    // Protocol 38 known-research rows, keyed by the RESEARCH stringID (the
+    // cross-client-stable wire identity, spike 401). HOST: sent/lastSendMs =
+    // first-sight send + safety resend. JOIN: seqSeen = stale-row guard,
+    // applied = the local startResearch landed (isKnown flipped) so resends
+    // stop re-applying.
+    struct ResearchRow {
+        unsigned long lastSendMs;
+        u32  seqSeen;
+        bool sent;
+        bool applied;
+        ResearchRow() : lastSendMs(0), seqSeen(0), sent(false), applied(false) {}
+    };
+    std::map<std::string, ResearchRow> researchRows_;
+    u32           researchSeqOut_;
+    unsigned long researchSampleMs_;
+    bool          researchSync_;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the
@@ -1088,6 +1133,23 @@ private:
     // tag selects the log prefix ("recruit" / "squad").
     void rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
                        const char* tag);
+    // Hard-snap attribution diagnostics (rubber-banding investigation): one
+    // throttled [snap] line per applyRaw teleport with everything needed to
+    // classify the cause (gap, source speed+velocity, game speed, slew,
+    // whether a walk destination was live). ~4 lines/s max; skipped snaps are
+    // counted into the next line.
+    void logHardSnap(Character* c, const EntityState& out, const char* kind,
+                     float gap, float srcVel, float gate, bool hadDest);
+
+    // Debug marker HUD labels (KENSHICOOP_DEBUG_MARKERS=1, spike-47 substrate):
+    // pin a colored label to each judged body so authority states are visible
+    // live - green DRV = host-driven, red HID = suppressed/culled, yellow
+    // LOC = local-sim copy that exists in the host census. No-op (single env
+    // check) unless the flag is set. Labels are created once per body and
+    // re-captioned only on state change.
+    struct DebugMarker { void* label; int color; };
+    std::map<Character*, DebugMarker> debugMarkers_;
+    void debugMark(Character* c, int colorId, const char* tag);
     // Phase B: combat-scoped world-NPC vitals (host side). Keys of streamed
     // NPCs that are fighting / being fought / down, with last-qualified time;
     // publishMedical streams their vitals at ~1 Hz while fresh. The join's

@@ -241,6 +241,94 @@ private:
 
 const float LeaderMoveScenario::LEG = 14.0f;
 
+// fast_march (2026-07-11 rubber-banding validation): leader_move at 5x game
+// speed. Speed consensus is min(host, join), so BOTH sides vote 5x through the
+// loud simulated-click path (writeGameSpeed - the intent hooks capture it as a
+// user request, exactly like the manual-session repro). The host marches its
+// leader in oscillating legs; the join drives its copy from the stream. The
+// verdict rides the join's [interp] counters via the snap_rate oracle: before
+// the velocity-aware snap gate, 5x wall-clock velocities turned the fixed 8 u
+// hard-snap gate into a per-sample teleport (~35 snaps/s measured 2026-07-11).
+class FastMarchScenario : public Scenario {
+public:
+    FastMarchScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastVoteMs_(0),
+          haveStart_(false), sx_(0), sy_(0), sz_(0) {}
+
+    virtual const char* name() const { return "fast_march"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        engine::writeGameSpeed(ctx.gw, 5.0f, false); // our 5x vote (both sides)
+        if (ctx.isHost) {
+            Character* ld = engine::leader(ctx.gw);
+            if (ld && engine::readPos(ld, &sx_, &sy_, &sz_)) {
+                haveStart_ = true;
+                engine::orderMoveTo(ld, sx_ + LEG, sy_, sz_ + LEG);
+            }
+        }
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO FASTMARCH vote=5.0 haveStart=%d",
+                  haveStart_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        bool settling = ctx.elapsedMs >= DURATION_MS - SETTLE_MS;
+        // Re-vote 5x every 5 s (an engine event may have reset our request);
+        // in the settle window vote back to 1x so the session ends sane.
+        if (ctx.elapsedMs - lastVoteMs_ >= 5000 || lastVoteMs_ == 0) {
+            lastVoteMs_ = ctx.elapsedMs;
+            engine::writeGameSpeed(ctx.gw, settling ? 1.0f : 5.0f, false);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            Character* ld = engine::leader(ctx.gw);
+            if (ctx.isHost) {
+                if (haveStart_ && ld) {
+                    if (settling) {
+                        engine::orderMoveTo(ld, sx_, sy_, sz_);
+                    } else {
+                        // Time-based oscillation: at 5x the leader covers a leg
+                        // in ~1 s and rests until the flip - bursts of genuine
+                        // 5x sprinting are exactly the old snap-storm repro.
+                        bool legB = ((ctx.elapsedMs / LEG_MS) % 2) != 0;
+                        engine::orderMoveTo(ld, legB ? sx_ + LEG : sx_, sy_,
+                                                legB ? sz_ + LEG : sz_);
+                    }
+                }
+                logScenarioLine("MEMBER", ld);
+            } else {
+                if (logScenarioLine("RECV", ld)) ++recvCount_;
+            }
+        }
+
+        if (ctx.elapsedMs >= DURATION_MS) {
+            engine::writeGameSpeed(ctx.gw, 1.0f, false); // leave the world at 1x
+            passed_ = ctx.isHost ? (engine::leader(ctx.gw) != 0)
+                                 : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long DURATION_MS = 62000; // outlast the clock slew
+    static const unsigned long SETTLE_MS   = 8000;  // final 1x halt window
+    static const unsigned long LEG_MS      = 4000;  // oscillation half-period
+    static const float         LEG;                 // leg length (units)
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastVoteMs_;
+    bool          haveStart_;
+    float         sx_, sy_, sz_;
+};
+
+const float FastMarchScenario::LEG = 25.0f;
+
 // npc_sync (Stage 4): the HOST streams nearby world NPCs (host-authoritative);
 // the JOIN resolves each by hand and drives it (walk-drive while moving, park +
 // AI-quiet at rest). Neither side scripts the NPCs - they do their own bar AI -
@@ -2714,6 +2802,106 @@ private:
     unsigned int gearCat_;
 };
 
+// weapon_loot (weapon-fabrication sync validation): a weapon that exists in NO shared-save
+// inventory enters play mid-session on the ACQUIRING client - the loot / vendor-buy /
+// container-grab shape that used to exist ONLY on that client (the last trading loss
+// vector). The HOST fabricates one NOVEL-sid weapon into its OWN leader's bag through the
+// engine primitive (the same end-state mutation a UI acquisition produces: a brand-new
+// Item in an owned inventory); the acquisition must cross to the JOIN through the
+// per-character inventory snapshot channel + the peer-side weapon CREATE (spike-451
+// recipe) with EXACTLY one copy on each side - fabrication racing the W2 conservation
+// channel or the snapshot echo into dupes is the design risk this scenario gates.
+// Both sides pick the sid deterministically (same gamedata + same save), so the join
+// gates on the exact template appearing. WLOOT log contract; judged by Test-WeaponLoot.
+class WeaponLootScenario : public Scenario {
+public:
+    WeaponLootScenario()
+        : passed_(false), have_(false), isHost_(false),
+          step_(0), added_(0), maxCount_(0), finalCount_(0), qual_(-1) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        sid_[0] = '\0';
+    }
+    virtual const char* name() const { return "weapon_loot"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        // The squad LEADER (index 0 = tab 0, host-owned) - deterministic across
+        // clients (same save), so the host acquires and the join mirrors.
+        EntityState sq[32];
+        unsigned int n = engine::captureSquad(ctx.gw, /*leaderOnly*/ true, sq, 32);
+        if (n > 0) {
+            hand_[0] = sq[0].hType; hand_[1] = sq[0].hContainer;
+            hand_[2] = sq[0].hContainerSerial; hand_[3] = sq[0].hIndex;
+            hand_[4] = sq[0].hSerial;
+            have_ = engine::commonNovelWeaponSid(ctx.gw, hand_, sid_, sizeof(sid_)) != 0;
+        }
+        char b[220];
+        _snprintf(b, sizeof(b) - 1,
+            "WLOOT start role=%s have=%d sid='%s' hand=%u,%u,%u,%u,%u",
+            isHost_ ? "host" : "join", have_ ? 1 : 0, sid_[0] ? sid_ : "(none)",
+            hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_) { if (ctx.elapsedMs >= 6000) { passed_ = false; return true; } return false; }
+
+        // ACQUIRE (host @8s): fabricate ONE novel weapon into the OWNED leader's bag.
+        if (isHost_ && step_ == 0 && ctx.elapsedMs >= 8000) {
+            step_ = 1;
+            added_ = engine::addItemsToContainerBySid(ctx.gw, hand_, sid_,
+                                                      /*WEAPON*/ 2u, 1, 0, "", "");
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "WLOOT host-acquired sid='%s' added=%d", sid_, added_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Census the leader's copies of the sid each tick (arrival + dupe watch).
+        {
+            int c = 0, q = -1;
+            InvItemEntry it[INV_ITEMS_MAX];
+            unsigned int n = engine::captureContainerContents(ctx.gw, hand_, it, INV_ITEMS_MAX, 0);
+            for (unsigned int i = 0; i < n; ++i)
+                if (it[i].itemType == 2u && strcmp(it[i].stringID, sid_) == 0) {
+                    int qty = it[i].quantity; if (qty < 1) qty = 1;
+                    c += qty; q = (int)it[i].quality;
+                }
+            if (c > maxCount_) maxCount_ = c;
+            finalCount_ = c;
+            if (q >= 0) qual_ = q;
+        }
+
+        if (ctx.elapsedMs >= 30000) {
+            if (isHost_) {
+                // Acquisition landed, persisted, and nothing (peer echo, W2 census,
+                // reconcile churn) ever duplicated or destroyed it locally.
+                passed_ = (added_ == 1) && (finalCount_ == 1) && (maxCount_ == 1);
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "WLOOT verdict role=host pass=%d sid='%s' added=%d final=%d max=%d qual=%d",
+                    passed_ ? 1 : 0, sid_, added_, finalCount_, maxCount_, qual_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                // The peer copy appeared (snapshot -> weapon CREATE), exactly once,
+                // and never transiently duplicated.
+                passed_ = (finalCount_ == 1) && (maxCount_ == 1);
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "WLOOT verdict role=join pass=%d sid='%s' final=%d max=%d qual=%d",
+                    passed_ ? 1 : 0, sid_, finalCount_, maxCount_, qual_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+    virtual bool passed() const { return passed_; }
+
+private:
+    bool         passed_, have_, isHost_;
+    unsigned int hand_[5];
+    char         sid_[48];
+    int          step_, added_, maxCount_, finalCount_, qual_;
+};
+
 // drop_probe (Phase W0, DIAGNOSTIC): characterize what a player DROP produces, with no
 // protocol changes. The host seeds a known loose item into its leader's bag, enumerates
 // nearby world items (WEAPON/ARMOUR/ITEM/CONTAINER) as a BEFORE baseline, drops the item,
@@ -2941,9 +3129,15 @@ class SpikeScenario : public Scenario {
 public:
     SpikeScenario()
         : passed_(false), passedSet_(false), started_(false), smokeDone_(false),
-          lastLogMs_(0), durMs_(30000) {
+          lastLogMs_(0), durMs_(30000), wmStep_(0),
+          r4Step_(0), r4Ops_(0), r4NextMs_(0), r4Have_(false), r4Placed_(false),
+          r4Started_(false) {
         const char* id = std::getenv("KENSHICOOP_SPIKE");
         id_ = id ? id : "0";
+        wmSid_[0] = '\0';
+        r4Sid_[0] = '\0';
+        r4ResSid_[0] = '\0';
+        for (int i = 0; i < 5; ++i) r4Hand_[i] = 0;
     }
     virtual const char* name() const { return "spike"; }
 
@@ -2993,7 +3187,19 @@ private:
     void dispatchStart(const ScenarioContext& ctx) {
         // id "0" = smoke probe (baseline): prove the harness runs end to end.
         // Concrete spikes are added as additional id branches per batch.
-        (void)ctx;
+        if (id_ == "451" && ctx.isHost) {
+            // Weapon-mint recipe trace: watch the ENGINE create weapons (armed
+            // runtime NPC spawn), compare with our failing diag calls, then
+            // replay the captured recipe from plugin context - all one run.
+            bool ok = engine::installCreateItemTraceHook();
+            logSpike("mkspy install ok=%d", ok ? 1 : 0);
+            durMs_ = 38000;
+        }
+        if (id_ == "401") {
+            // Research tech-tree store map: both sides run the script (the host
+            // drives operate(); both census + diff their own store).
+            durMs_ = 40000;
+        }
     }
 
     void dispatchTick(const ScenarioContext& ctx) {
@@ -3011,6 +3217,201 @@ private:
             }
             setPass(true);
         }
+        if (id_ == "451" && ctx.isHost) tick451(ctx);
+        if (id_ == "401") tick401(ctx);
+    }
+
+    // Spike 401 (research tech-tree store): locate/place a research bench,
+    // baseline-snapshot PlayerInterface::technology (hex + GameData-slot
+    // classification), then drive the bench's own operate() at 1 Hz while
+    // dword-diffing the store each second - the moving dwords are the progress
+    // scalar, the mutating region the completed-set container. The join runs
+    // the same census + store-diff WITHOUT driving (does its store move at all
+    // while only the host researches? that silence/motion IS the gap evidence).
+    void r4Census(const ScenarioContext& ctx) {
+        engine::ProdRead rows[32];
+        unsigned int n = engine::enumMachinesNear(ctx.gw, 100.0f, rows, 32);
+        for (unsigned int i = 0; i < n && !r4Have_; ++i)
+            if (rows[i].classType == 5 /*BCTYPE_RESEARCH*/) {
+                memcpy(r4Hand_, rows[i].hand, sizeof(r4Hand_));
+                strncpy(r4Sid_, rows[i].sid, sizeof(r4Sid_) - 1);
+                r4Sid_[sizeof(r4Sid_) - 1] = '\0';
+                r4Have_ = true;
+                logSpike("bench found sid='%s' hand=%u,%u,%u,%u,%u (of %u)",
+                         r4Sid_, r4Hand_[0], r4Hand_[1], r4Hand_[2],
+                         r4Hand_[3], r4Hand_[4], n);
+            }
+    }
+
+    void tick401(const ScenarioContext& ctx) {
+        // @3s: latch the first baked research bench in census range; when the
+        // save has none (no captured sync run ever logged class=5), the HOST
+        // places one (kind 3) and ramps it complete on the next step.
+        if (r4Step_ == 0 && ctx.elapsedMs >= 3000) {
+            r4Step_ = 1;
+            r4Census(ctx);
+            if (!r4Have_) {
+                logSpike("bench baked=0 (none in 100m)");
+                if (ctx.isHost) {
+                    int rc = engine::probePlaceMachine(ctx.gw, 8.0f, 2.0f,
+                                                       /*kind*/3, r4Hand_,
+                                                       r4Sid_, sizeof(r4Sid_));
+                    r4Placed_ = r4Have_ = (rc == 1);
+                    logSpike("bench place rc=%d sid='%s'", rc,
+                             r4Sid_[0] ? r4Sid_ : "(none)");
+                }
+            }
+        }
+        // @5s: ramp the placed site complete (>= 1.0 self-completes natively).
+        if (r4Step_ == 1 && ctx.elapsedMs >= 5000) {
+            r4Step_ = 2;
+            if (r4Placed_) {
+                engine::BuildRead post;
+                bool ok = engine::writeBuildProgressByHand(r4Hand_, 1.0f, &post);
+                logSpike("bench ramp ok=%d complete=%d", ok ? 1 : 0,
+                         ok ? post.complete : -1);
+            }
+        }
+        // @7s: store baseline (hex + slot classification), enumerate the first
+        // RESEARCH records with the engine's own known/can predicates, and pick
+        // the SUBJECT: the first not-known researchABLE record (deterministic -
+        // gamedata order is shared, so host and join pick the same sid).
+        if (r4Step_ == 2 && ctx.elapsedMs >= 7000) {
+            r4Step_ = 3;
+            int rs = engine::probeResearchStore(ctx.gw, 0);
+            unsigned int total = engine::probeResearchEnum(ctx.gw, 24);
+            int picked = engine::researchPickSubject(ctx.gw, r4ResSid_,
+                                                     sizeof(r4ResSid_));
+            char sel[48];
+            int hasSel = engine::probeCurrentResearchSid(sel, sizeof(sel));
+            logSpike("store baseline rs=%d research-total=%u picked=%d "
+                     "subject='%s' current='%s'",
+                     rs, total, picked, r4ResSid_[0] ? r4ResSid_ : "(none)",
+                     hasSel ? sel : "(none)");
+            r4NextMs_ = ctx.elapsedMs + 1000;
+        }
+        // Host @10s: SELECT via the engine's own lever (startResearch - the
+        // UI click's commit) so the operate() bursts have something to
+        // progress. Bracketing store diffs isolate what SELECT itself writes.
+        if (r4Step_ == 3 && ctx.isHost && !r4Started_ &&
+            ctx.elapsedMs >= 10000 && r4ResSid_[0]) {
+            r4Started_ = true;
+            engine::probeResearchStore(ctx.gw, 1); // pre-select diff marker
+            int rc = engine::researchStartBySid(ctx.gw, r4ResSid_);
+            logSpike("select rc=%d sid='%s'", rc, r4ResSid_);
+            engine::probeResearchStore(ctx.gw, 1); // what did SELECT change?
+        }
+        // 8..34s @1 Hz: host drives operate(), both read the bench + diff the
+        // store + track the subject's known flag. The join keeps re-censusing
+        // until the (possibly minted) bench copy appears locally.
+        if (r4Step_ == 3 && ctx.elapsedMs < 34000 &&
+            ctx.elapsedMs >= r4NextMs_) {
+            r4NextMs_ = ctx.elapsedMs + 1000;
+            if (!r4Have_) r4Census(ctx);
+            int op = -1;
+            if (ctx.isHost && r4Have_)
+                op = engine::operateMachineByHand(ctx.gw, r4Hand_, 1.0f) ? 1 : 0;
+            int tech = -1, power = -1;
+            float prog = -1.0f;
+            if (r4Have_)
+                engine::probeResearchBenchRead(r4Hand_, &tech, &prog, &power);
+            int known = -1, can = -1;
+            if (r4ResSid_[0])
+                engine::researchQueryBySid(ctx.gw, r4ResSid_, &known, &can);
+            ++r4Ops_;
+            char sel[48];
+            int hasSel = engine::probeCurrentResearchSid(sel, sizeof(sel));
+            logSpike("bench n=%u op=%d tech=%d prog=%.4f power=%d known=%d "
+                     "cur='%s' t=%lu",
+                     r4Ops_, op, tech, prog, power, known,
+                     hasSel ? sel : "", ctx.elapsedMs);
+            engine::probeResearchStore(ctx.gw, 1);
+        }
+        // @35s: final state + summary.
+        if (r4Step_ == 3 && ctx.elapsedMs >= 35000) {
+            r4Step_ = 4;
+            int known = -1, can = -1;
+            if (r4ResSid_[0])
+                engine::researchQueryBySid(ctx.gw, r4ResSid_, &known, &can);
+            char sel[48];
+            int hasSel = engine::probeCurrentResearchSid(sel, sizeof(sel));
+            logSpike("summary have=%d placed=%d samples=%u subject='%s' "
+                     "known=%d current='%s'",
+                     r4Have_ ? 1 : 0, r4Placed_ ? 1 : 0, r4Ops_,
+                     r4ResSid_[0] ? r4ResSid_ : "(none)", known,
+                     hasSel ? sel : "(none)");
+            setPass(true);
+        }
+    }
+
+    // Spike 451 script (host only): @3s spawn 2 armed runtime NPCs (the engine
+    // mints their weapons - the trace captures its recipe); @14s run the failing
+    // diag matrix (its calls now trace too, for arg-by-arg comparison); @20s
+    // replay the captured engine recipe from plugin context onto the leader.
+    void tick451(const ScenarioContext& ctx) {
+        if (wmStep_ == 0 && ctx.elapsedMs >= 3000) {
+            wmStep_ = 1;
+            unsigned int hands[4][5];
+            unsigned int n = engine::spawnRuntimeSquad(ctx.gw, 2, hands);
+            logSpike("spawned n=%u", n);
+        }
+        // Leader hand via pickInventoryContainer: readObjectHand layout
+        // [type,container,containerSerial,index,serial] - what resolveObjectByHand
+        // expects (run 1 passed readHand's [index,serial,...] layout -> "no inv").
+        if (wmStep_ == 1 && ctx.elapsedMs >= 14000) {
+            wmStep_ = 2;
+            unsigned int h[5];
+            if (engine::pickInventoryContainer(ctx.gw, h)) {
+                logSpike("diag begin");
+                engine::diagWeaponCreate(ctx.gw, h, 24);
+            } else {
+                logSpike("diag SKIP leader unresolved");
+            }
+        }
+        if (wmStep_ == 2 && ctx.elapsedMs >= 20000) {
+            wmStep_ = 3;
+            unsigned int h[5];
+            int res = -2;
+            if (engine::pickInventoryContainer(ctx.gw, h))
+                res = engine::probeReplayWeaponMint(ctx.gw, h);
+            logSpike("replay res=%d", res);
+        }
+        // Phase-2 persistence legs: fabricate LOOSE via the wire path, equip the
+        // REAL loose copy a tick later (the reconcile MOVE-UP path), then census -
+        // does the fabricated weapon persist worn (the d25 revisit)?
+        if (wmStep_ == 3 && ctx.elapsedMs >= 24000) {
+            wmStep_ = 4;
+            unsigned int h[5];
+            int res = 0;
+            if (engine::pickInventoryContainer(ctx.gw, h))
+                res = engine::probeFabricateWeaponLoose(ctx.gw, h, wmSid_, sizeof(wmSid_));
+            logSpike("fab loose res=%d sid='%s'", res, wmSid_[0] ? wmSid_ : "(none)");
+        }
+        if (wmStep_ == 4 && ctx.elapsedMs >= 27000) {
+            wmStep_ = 5;
+            unsigned int h[5];
+            int eq = -1;
+            if (wmSid_[0] && engine::pickInventoryContainer(ctx.gw, h))
+                eq = engine::reequipLooseItem(ctx.gw, h, wmSid_, 2 /*WEAPON*/, 1);
+            logSpike("fab equip eq=%d", eq);
+        }
+        if (wmStep_ == 5 && ctx.elapsedMs >= 32000) {
+            wmStep_ = 6;
+            unsigned int h[5];
+            int loose = 0, worn = 0;
+            if (wmSid_[0] && engine::pickInventoryContainer(ctx.gw, h)) {
+                InvItemEntry items[INV_ITEMS_MAX];
+                unsigned int n = engine::captureContainerContents(ctx.gw, h, items,
+                                                                  INV_ITEMS_MAX, 0);
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (strcmp(items[i].stringID, wmSid_) != 0) continue;
+                    if (items[i].equipped) worn += items[i].quantity;
+                    else                   loose += items[i].quantity;
+                }
+            }
+            logSpike("fab persist loose=%d worn=%d", loose, worn);
+            setPass(true);
+        }
     }
 
     std::string   id_;
@@ -3020,6 +3421,17 @@ private:
     bool          smokeDone_;
     unsigned long lastLogMs_;
     unsigned long durMs_;
+    int           wmStep_;     // spike 451 script step
+    char          wmSid_[48];  // spike 451 fabricated-weapon template sid
+    int           r4Step_;     // spike 401 script step
+    unsigned int  r4Ops_;      // spike 401 drive/diff samples taken
+    unsigned long r4NextMs_;   // spike 401 next 1 Hz sample time
+    bool          r4Have_;     // spike 401 research bench latched
+    bool          r4Placed_;   // spike 401 bench was probe-placed (needs ramp)
+    bool          r4Started_;  // spike 401 startResearch lever fired (host)
+    unsigned int  r4Hand_[5];  // spike 401 research bench local hand
+    char          r4Sid_[48];  // spike 401 research bench template sid
+    char          r4ResSid_[48]; // spike 401 subject RESEARCH record sid
 };
 
 // player_combat (player-combat validation, phase 1): real combat damage TO
@@ -8901,6 +9313,124 @@ private:
     char          benchSid_[48];
 };
 
+// research_probe (protocol 38 phase 0, probe tier; researchSync forced OFF) /
+// research_sync (probe=false, full tier; researchSync ON). The tech tree is
+// per-client (spike 401: PlayerInterface::technology never crosses), so a tech
+// the host researches stays un-known on the join forever. The probe's DESIGN
+// questions:
+//   * shared subject: do both clients independently pick the SAME
+//     not-known-researchable RESEARCH sid (the wire-key stability leg)?
+//   * divergence baseline: after the host's startResearch flips its own
+//     isKnown, does the join's stay 0 with the hatch OFF (the gap is real)?
+//   * apply lever on the JOIN: does startResearch on the join's own store
+//     flip isKnown AND stick (the exact call applyResearch makes)?
+// Script: BOTH sides pick the deterministic subject at t=8s and log
+// known/can 1 Hz; the HOST fires startResearch at t=10s; the JOIN (probe
+// tier only) fires its own startResearch at t=25s - so join known=0 across
+// t=10..24s is the divergence window, and known=1 after t=25s is the
+// apply-lever proof. In the sync tier the join never self-starts: only
+// PKT_RESEARCH can flip it (crossing gated by the oracle AND the join's
+// local pass). 45s duration.
+// Pass: host = picked + startResearch rc=1 + final known=1. Join =
+// picked + final known=1 (probe: via its own lever; sync: via the wire) -
+// probe additionally requires its self-start rc=1.
+class ResearchProbeScenario : public Scenario {
+public:
+    explicit ResearchProbeScenario(bool probe)
+        : probe_(probe), passed_(false), lastEvidenceMs_(0), picked_(false),
+          pickRc_(0), startDone_(false), startRc_(0), lastKnown_(-1),
+          lastCan_(-1) {
+        sid_[0] = '\0';
+    }
+
+    virtual const char* name() const {
+        return probe_ ? "research_probe" : "research_sync";
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO RESEARCHPROBE start host=%d probe=%d",
+                  ctx.isHost ? 1 : 0, probe_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!picked_ && ctx.elapsedMs >= PICK_AT_MS) {
+            picked_ = true;
+            pickRc_ = engine::researchPickSubject(ctx.gw, sid_, sizeof(sid_));
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO RESEARCHPICK who=%s rc=%d sid='%s' t=%lu",
+                      ctx.isHost ? "host" : "join", pickRc_, sid_, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (picked_ && pickRc_ == 1 &&
+            (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0)) {
+            lastEvidenceMs_ = ctx.elapsedMs;
+            engine::researchQueryBySid(ctx.gw, sid_, &lastKnown_, &lastCan_);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO RESEARCH who=%s sid='%s' known=%d can=%d t=%lu",
+                      ctx.isHost ? "host" : "join", sid_, lastKnown_, lastCan_,
+                      ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // The driving edge: host always; join only in the probe tier (the
+        // apply-lever stickiness leg - in the sync tier the WIRE must do it).
+        bool mayStart = ctx.isHost || probe_;
+        unsigned long startAt = ctx.isHost ? HOST_START_MS : JOIN_START_MS;
+        if (mayStart && picked_ && pickRc_ == 1 && !startDone_ &&
+            ctx.elapsedMs >= startAt) {
+            startDone_ = true;
+            startRc_ = engine::researchStartBySid(ctx.gw, sid_);
+            int k = -1, c = -1;
+            engine::researchQueryBySid(ctx.gw, sid_, &k, &c);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO RESEARCHSTART who=%s rc=%d sid='%s' known=%d t=%lu",
+                      ctx.isHost ? "host" : "join", startRc_, sid_, k,
+                      ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (ctx.elapsedMs >= DURATION_MS) {
+            int k = -1, c = -1;
+            if (picked_ && pickRc_ == 1)
+                engine::researchQueryBySid(ctx.gw, sid_, &k, &c);
+            bool localOk = picked_ && pickRc_ == 1 && k == 1;
+            if (ctx.isHost || probe_) localOk = localOk && startRc_ == 1;
+            passed_ = localOk;
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO RESEARCHRESULT who=%s pick=%d start=%d "
+                      "known=%d pass=%d sid='%s'",
+                      ctx.isHost ? "host" : "join", pickRc_, startRc_, k,
+                      passed_ ? 1 : 0, sid_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long PICK_AT_MS    = 8000;
+    static const unsigned long HOST_START_MS = 10000;
+    static const unsigned long JOIN_START_MS = 25000;
+    static const unsigned long DURATION_MS   = 45000;
+
+    bool          probe_;
+    bool          passed_;
+    unsigned long lastEvidenceMs_;
+    bool          picked_;
+    int           pickRc_;
+    bool          startDone_;
+    int           startRc_;
+    int           lastKnown_;
+    int           lastCan_;
+    char          sid_[48];
+};
+
 // store_probe (protocol 34 phase 0, probe tier; storeSync forced OFF, the
 // protocol-27 mint channel deliberately ON so host-placed buildings exist on
 // both sides) / store_sync (probe=false, full tier; storeSync ON). Storage
@@ -9278,6 +9808,7 @@ private:
 Scenario* makeScenario(const std::string& name) {
     if (name == "spike")        return new SpikeScenario();
     if (name == "leader_move")  return new LeaderMoveScenario();
+    if (name == "fast_march")   return new FastMarchScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();
     if (name == "split_interest") return new SplitInterestScenario();
     if (name == "npc_sync")     return new NpcSyncScenario();
@@ -9311,6 +9842,7 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "npc_carry")    return new NpcCarryScenario();
     if (name == "world_weapon_drop") return new WorldGearDropScenario("world_weapon_drop", 2);
     if (name == "world_armor_drop")  return new WorldGearDropScenario("world_armor_drop", 3);
+    if (name == "weapon_loot")  return new WeaponLootScenario();
     if (name == "bed_pose")     return new BedPoseScenario();
     if (name == "bed_put")      return new FurnPutScenario(1);
     if (name == "cage_put")     return new FurnPutScenario(2);
@@ -9350,6 +9882,8 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "load_sync")      return new LoadSyncScenario();
     if (name == "prod_probe")     return new ProdProbeScenario(true);
     if (name == "prod_sync")      return new ProdProbeScenario(false);
+    if (name == "research_probe") return new ResearchProbeScenario(true);
+    if (name == "research_sync")  return new ResearchProbeScenario(false);
     if (name == "store_probe")    return new StoreProbeScenario(true);
     if (name == "store_sync")     return new StoreProbeScenario(false);
     return 0;

@@ -99,10 +99,13 @@
             # 0.42-0.44 vs the 0.4 gate; crosscheck still green at base tolerance).
             WanDemote = @('smoothness')
         }
+        # suppress_churn gates here (town save): the 2026-07-11 pop-in/out fix -
+        # census-present town NPCs must never cycle hidden->restored->hidden at
+        # the stream-bubble boundary ('Saint'/'Kumo' churned before the veto).
         coop_presence = @{
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'coop_presence'
-            Gating   = @('coop_presence', 'march', 'clock_sync')
+            Gating   = @('coop_presence', 'suppress_churn', 'snap_rate', 'march', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth')
             Tier = 'smoke'; WanVariant = $true
         }
@@ -132,7 +135,8 @@
             Save = 'sync'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'npc_track'
             Gating   = @('npc_track', 'pose', 'pose_state', 'body_state',
-                         'smoothness', 'anim_truth', 'march', 'clock_sync')
+                         'smoothness', 'anim_truth', 'march', 'suppress_churn',
+                         'snap_rate', 'clock_sync')
             Advisory = @()
             Tier = 'smoke'; WanVariant = $true
             # DELIBERATE WAN-regime adjustments (re-validation matrix, 2026-07-05):
@@ -842,6 +846,40 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # research_probe: tech-tree phase-0 diagnostic (protocol 38 -
+        # researchSync forced OFF). Both sides pick the deterministic
+        # not-known-researchable RESEARCH subject at t=8s and poll
+        # isKnown/canResearch 1 Hz; the HOST fires Research::startResearch at
+        # t=10s (its isKnown flips - the spike-401 write lever); the JOIN
+        # fires its OWN startResearch at t=25s. Gates: matching subject sids
+        # (wire-key stability), host lever landed, join known=0 across the
+        # t=10-25s divergence window (the unlock must NOT cross with the
+        # hatch off), join self-lever landed AND stuck to run end.
+        research_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'research_probe'
+            Gating   = @('research_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # research_sync: protocol-38 host-authoritative tech-tree sync
+        # (researchSync ON - the same script as research_probe minus the
+        # join's self-start, so the WIRE must flip the join's isKnown).
+        # publishResearch streams one reliable PKT_RESEARCH row per known
+        # sid (~1 Hz sample, first sight = baseline, 15 s safety resend);
+        # applyResearch lands each via Research::startResearch. Gates: the
+        # probe's local legs PLUS [research] rows sent AND applied, the
+        # join's subject known=1 within 6 s of the host's start, sticky to
+        # run end, and both finals known=1.
+        research_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'research_sync'
+            Gating   = @('research_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # store_probe: storage/machine container phase-0 diagnostic (protocol
         # 34 - storeSync forced OFF, the protocol-27 mint channel ON). The
         # HOST places a crafting bench + a general-storage chest leader-
@@ -895,8 +933,27 @@
         npc_census = @{
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'npc_census'
-            Gating   = @('npc_census', 'clock_sync')
+            Gating   = @('npc_census', 'suppress_churn', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # fast_march (2026-07-11 rubber-banding validation): leader_move at 5x
+        # game speed (both sides vote 5x; consensus takes it). Gates on the
+        # join's PLAYER-SQUAD hard-snap RATE - before the velocity-aware snap
+        # gate, 5x wall-clock velocities teleported the driven leader every
+        # sample (~35 snaps/s measured in the 2026-07-11 manual session), and a
+        # sprinting leader false-snapped even at 1x (gap=8.6 vs the fixed 8 u
+        # gate). Background-NPC snaps stay un-gated at 5x: a bar NPC resting
+        # between stream updates legitimately falls 100+ u behind and the
+        # teleport is the correct convergence tool (measured gaps 128-1826 u).
+        # Crosscheck stays advisory: at 5x the driven copy legitimately trails
+        # by ~1 wall-clock update interval * 5x velocity.
+        fast_march = @{
+            Save = 'sync'; Setup = ''; Tolerance = 18.0
+            PrimaryGate = 'snap_rate_squad'
+            Gating   = @('snap_rate_squad', 'suppress_churn', 'clock_sync')
+            Advisory = @('snap_rate', 'crosscheck', 'smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
 
@@ -1017,6 +1074,21 @@
             Gating   = @('trade_peer', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
+        }
+
+        # weapon_loot: weapon-fabrication sync validation (the last trading loss
+        # vector). The HOST's owned leader ACQUIRES a weapon that exists in NO
+        # shared-save inventory (novel sid, engine-fabricated - the loot/vendor-buy
+        # shape); the join's driven copy must gain EXACTLY one copy of the same
+        # template via the inventory snapshot channel + the spike-451 weapon CREATE,
+        # with zero dupes on either side (fabrication must not race the W2
+        # conservation channel or the snapshot echo).
+        weapon_loot = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'weapon_loot'
+            Gating   = @('weapon_loot', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
         }
 
         # ---- world items ------------------------------------------------------------

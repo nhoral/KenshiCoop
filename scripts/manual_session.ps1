@@ -23,6 +23,11 @@
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -Save "c" -AutoSpawn 5 -SkipBuild -Sync
+
+.EXAMPLE
+  # Long-run visual pop/snap inspection: 'zoom' save (outside town, camera far
+  # out) + colored authority markers on the join (green DRV / red HID / yellow LOC).
+  powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -Save "zoom" -Inhabit -DebugMarkers -Tile
 #>
 [CmdletBinding()]
 param(
@@ -77,6 +82,12 @@ param(
     # accessors) on each inventory SEND (host capture) and APPLY (peer reconcile result),
     # so we can see exactly where an unequipped weapon goes. Sets KENSHICOOP_INV_DUMP=1.
     [switch]$InvDump,
+    # Debug authority markers (KENSHICOOP_DEBUG_MARKERS=1, spike-47 HUD labels):
+    # the JOIN pins a colored label to every judged body - green DRV = host-
+    # driven, red HID = suppressed/culled, yellow LOC = local-sim copy present
+    # in the host census. Makes pops and ghosts self-explaining on screen
+    # (pair with -Save zoom for long-run wide-camera inspection).
+    [switch]$DebugMarkers,
     # Tile the two game windows side-by-side (host left, join right) the same way the
     # automated tests do (scripts\arrange_windows.ps1, re-pinned through the load
     # screen). Requires windowed mode (kenshi.cfg Full Screen=No).
@@ -203,6 +214,8 @@ function Set-CoopEnv {
     # clients (host publishes, join applies), so enable it on BOTH.
     $env:KENSHICOOP_WORLD_SYNC   = if ($WorldSync) { "1" } else { "" }
     $env:KENSHICOOP_INV_DUMP     = if ($InvDump) { "1" } else { "" }
+    # Authority markers render on the DRIVEN side; harmless on both, so set both.
+    $env:KENSHICOOP_DEBUG_MARKERS = if ($DebugMarkers) { "1" } else { "" }
     # Per-mode log next to the install so host/join don't clobber each other.
     $env:KENSHICOOP_LOG          = if ($Mode -eq "join") { "KenshiCoop_join.log" } else { "KenshiCoop_host.log" }
 }

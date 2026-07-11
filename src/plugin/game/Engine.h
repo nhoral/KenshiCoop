@@ -193,6 +193,20 @@ unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outState
 unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
                           EntityState* outStates, unsigned int maxOut);
 
+// SEH-guarded: copy a character's display name into 'out' (always NUL-
+// terminated; empty string on any fault). Diagnostics only - cull/suppress
+// logs need a human-readable identity to classify pop-out reports.
+void charName(Character* c, char* out, unsigned int cap);
+
+// Debug marker HUD labels (KENSHICOOP_DEBUG_MARKERS, spike-47 substrate): mint
+// a colored text label pinned to a character; the engine's own projection
+// tracks the body every frame. colorId: 0 = green (host-driven), 1 = red
+// (hidden/suppressed), 2 = yellow (local-only ghost). Returns an opaque
+// ScreenLabel handle (null on fault / GUI not up). Main-thread only.
+void* markerCreate(Character* c, const char* text, int colorId);
+bool  markerUpdate(void* label, const char* text, int colorId);
+void  markerDestroy(void* label);
+
 // ---- Deterministic test-scene setup (host-side; baked into a save) ---------
 // These spawn objects into the live world so the user can SAVE the result. Once
 // saved, the spawned chair/NPC become ordinary save entities with save-stable
@@ -464,9 +478,11 @@ int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
                       unsigned int* outType);
 
 // SEH-guarded (protocol 37 fallback): create `qty` of the template (sid, typeCat) and
-// add it to the container at cHand - the fabricate path for a NON-GEAR transfer whose
-// local source copy is missing (desync). manufacturer/material ride along for
-// completeness though non-gear needs neither. Returns the number added.
+// add it to the container at cHand - the fabricate path for a transfer whose local
+// source copy is missing (desync). Weapons need the manufacturer (and optionally the
+// material) sid - the spike-451 recipe inside createItemAndAdd consumes them; other
+// types ignore both. KENSHICOOP_WEAPON_FAB=0 disables the weapon branch entirely.
+// Returns the number added.
 int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
                              const char* sid, unsigned int typeCat, int qty,
                              int qualityBucket, const char* manufacturer,
@@ -648,6 +664,81 @@ int seedEquippedItem(GameWorld* gw, const unsigned int cHand[5],
 // the first `maxTry` weapon templates with no/man/man+mat and logs [wpndiag] success
 // counts. Trials are added to cHand's inventory and immediately destroyed.
 void diagWeaponCreate(GameWorld* gw, const unsigned int cHand[5], int maxTry);
+
+// Spike 451 (weapon fabrication recipe): detour BOTH RootObjectFactory::createItem
+// overloads + copyItem and log every WEAPON-template call the ENGINE itself makes -
+// full args, caller RVA and result ("[mkspy] ..." lines) - so the plugin can mimic
+// the engine's own weapon-mint recipe (our 6-arg call returns null for every weapon
+// template; diagWeaponCreate measured 0/24). The last SUCCESSFUL engine weapon mint's
+// args are captured for probeReplayWeaponMint. Install once (host side).
+bool installCreateItemTraceHook();
+// Replay the last captured engine weapon mint from PLUGIN context: same GameData
+// pointers/level/faction, a fresh blank hand, tryAddItem into cHand's inventory.
+// Returns 1 created+added / 0 nothing captured or create returned null / -1 fault.
+int probeReplayWeaponMint(GameWorld* gw, const unsigned int cHand[5]);
+// Phase-2 persistence check: fabricate ONE weapon LOOSE through the normal wire
+// path (createItemAndAdd, spike-451 recipe, first WEAPON template + fallback
+// manufacturer) into cHand's inventory, writing the template sid to outSid so the
+// caller can equip it later (reequipLooseItem) and re-census for persistence.
+// Returns 1 on success.
+int probeFabricateWeaponLoose(GameWorld* gw, const unsigned int cHand[5],
+                              char* outSid, unsigned int outLen);
+// SEH-guarded (weapon_loot): deterministically pick a NOVEL weapon template - the
+// first WEAPON GameData (enumeration order is gamedata-stable, so both clients pick
+// the same one) that is not FISTS and whose sid is not currently in cHand's
+// container. Fabricating it simulates a mid-session weapon acquisition (loot /
+// vendor buy) of a weapon that exists in NO shared-save inventory. Returns 1 and
+// writes the sid on success.
+int commonNovelWeaponSid(GameWorld* gw, const unsigned int cHand[5],
+                         char* outSid, unsigned int outLen);
+
+// Spike 401 (research tech-tree store): the unlock store is
+// PlayerInterface::technology - a `Research*` with NO KenshiLib header (forward
+// declaration only), the documented "progress store unmapped" gap. The probe
+// maps it dynamically from plugin context:
+//   phase 0  - locate + baseline: log the pointer, hex-dump the first 0x100
+//              bytes, classify every qword slot in the first 0x400 that points
+//              at a readable GameData record (type + sid), and remember an
+//              0x800-byte snapshot.
+//   phase 1+ - re-snapshot and log every changed dword vs the previous snapshot
+//              ("[r401] diff ..." with a float view). Run between operate()
+//              bursts and across a tech completion: the moving dwords are the
+//              progress scalar, the mutating region is the completed-set
+//              container.
+// Returns 1 ok / 0 store unresolved / -1 fault.
+int probeResearchStore(GameWorld* gw, int phase);
+// ManagementScreen::currentResearch - the tech UI's selected research GameData.
+// Writes its sid ('' when none/unresolvable); returns 1 when a sid was written.
+int probeCurrentResearchSid(char* outSid, unsigned int outLen);
+// Query the live Research store for one RESEARCH GameData by sid, through the
+// engine's own predicates (recovered 1.0.65 RVAs: isKnown 0x82f300, canResearch
+// 0x832fa0 - the exact calls the research UI's click handler makes). Returns
+// 1 ok / 0 unresolvable (no store, sid unknown) / -1 fault.
+int researchQueryBySid(GameWorld* gw, const char* sid, int* outKnown,
+                       int* outCan);
+// The engine's own selection lever: Research::startResearch(GameData*)
+// (recovered RVA 0x834550) - what a research-UI click commits after its
+// canResearch/isKnown gauntlet. The CALLER checks those first (this replays
+// the click, not the gauntlet). Returns 1 called / 0 unresolvable / -1 fault.
+int researchStartBySid(GameWorld* gw, const char* sid);
+// Deterministic subject pick: the FIRST RESEARCH record that is not known and
+// canResearch (gamedata enumeration order is shared, so every client picks the
+// same sid). Returns 1 picked / 0 none / -1 fault.
+int researchPickSubject(GameWorld* gw, char* outSid, unsigned int outLen);
+// Enumerate every RESEARCH GameData: log the first maxLog rows (sid, name,
+// known, can) plus a total/known summary. Returns the total record count.
+unsigned int probeResearchEnum(GameWorld* gw, unsigned int maxLog);
+// Collect the sids of every KNOWN research (Research::isKnown over the shared
+// RESEARCH enumeration) into outSids (each entry sidCap bytes, NUL-terminated).
+// The protocol-38 publish sampler. Returns the number written (<= maxN);
+// 0 also covers store-unresolved/fault.
+unsigned int researchEnumKnown(GameWorld* gw, char* outSids,
+                               unsigned int sidCap, unsigned int maxN);
+// Research-bench read beyond ProdRead: techLevel (getTechLevel), the
+// UseableStuff progress-bar float (0x3A4 - candidate bench-local progress
+// scalar) and the power bit. Returns 1 ok / 0 not a research bench / -1 fault.
+int probeResearchBenchRead(const unsigned int mHand[5], int* outTech,
+                           float* outProg, int* outPower);
 
 // ---- Honest pose oracle (downstream of the actual body, not the task flag) --
 // SEH-guarded: read pose signals that reflect the RENDERED body, so a pose check
@@ -1280,8 +1371,8 @@ bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amou
 // protocol-27 build edge (so the peer mints a proxy when buildSync is on); the
 // caller ramps it complete via writeBuildProgressByHand. kind: 0 = power
 // generator, 1 = crafting bench, 2 = storage container (BCTYPE_STORAGE -
-// protocol 34's chest subject). Returns 1 placed, 0 template-miss/refused,
-// -1 fault.
+// protocol 34's chest subject), 3 = research bench (BCTYPE_RESEARCH - spike
+// 401's subject). Returns 1 placed, 0 template-miss/refused, -1 fault.
 int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
                       unsigned int outHand[5], char* outSid, unsigned int sidLen);
 

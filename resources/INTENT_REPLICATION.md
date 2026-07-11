@@ -87,8 +87,13 @@ doctrine `POSTMORTEM.md` records, named here so new classes follow it):
    order (sitters), `endAction` + relapse re-quiet (standers). The sit/stand work
    proved these are **not interchangeable** - see the asymmetry rule below.
 3. **Authority/drift guard** - bound divergence. Existing: `TASK_DRIFT_MAX`
-   abandon-to-park, `SNAP_DIST` hard teleport, `enforceHostAuthority`
-   suppress/restore for world NPCs the host is/ is not streaming.
+   abandon-to-park, the velocity-aware hard-snap gate (teleport only when the
+   body trails the source by more than `KENSHICOOP_SNAP_SECONDS` of travel;
+   the fixed-distance-only gate false-fired on sprinters and at every game
+   speed above ~2x - 2026-07-11), `enforceHostAuthority` suppress/restore for
+   world NPCs where existence authority is the CENSUS and drive authority is
+   the STREAM (a census-present NPC is never hidden; the streamed-only near
+   pass churned real boundary NPCs - 2026-07-11).
 
 ### The asymmetry rule (the hardest-won lesson)
 
@@ -109,8 +114,9 @@ reusing the last one blindly.
 ## Behavior taxonomy
 
 - **Locomotion (moving).** Lever: lead-point walk-drive (`walkTo`) + catch-up
-  speed; engine animates the gait itself. Guard: `SNAP_DIST` teleport. STATUS:
-  DONE.
+  speed; engine animates the gait itself. Guard: velocity-aware hard-snap
+  (trail time > `SNAP_SECONDS`, decaying-peak velocity, `SNAP_DIST` floor
+  scaled by the consensus speed multiplier). STATUS: DONE.
 - **Fixture-bound task pose** (sit, operate, **craft, gather**). Lever:
   `detachFromTownAI` + `applyTaskOrder(subject)` so the body walks-and-poses at the
   exact fixture (a player order, not the autonomous goal that re-searches for any
@@ -341,9 +347,10 @@ new lever-set instance validated by its own conformance oracle:
     count DECREASE (`n < lastSentN`) uses `INV_REMOVE_SETTLE_MS` (1800 ms). Mid-drag the UI
     holds the dragged item on the CURSOR, so the inventory briefly reports it FULLY GONE - and
     a *human* re-equip holds that for ~960 ms (measured), far past a flat 350 ms. Without the
-    long removal window the peer acts on that transient by DESTROYING the worn item, and it
-    cannot refabricate a worn weapon (createItemAndAdd fails for weapons; equipped fabrication
-    is non-persistent, d25), losing it permanently. Gating only DECREASES on the long window
+    long removal window the peer acts on that transient by DESTROYING the worn item - at the
+    time unrecoverable (createItemAndAdd failed for weapons until the spike-451 recipe, d52;
+    even now a destroy+refabricate round-trip loses identity/quality, so the window stays).
+    Gating only DECREASES on the long window
     swallows the cursor-hold (peer keeps + MOVES its real item) while keeping equip/unequip
     snappy; the cost is a ~1.8 s lag before a genuine drop shows on the peer. Manually
     validated (host removals/unequips, weapon included, reflected on the join; join trace
@@ -1351,7 +1358,8 @@ These extend the numbered doctrine in `POSTMORTEM.md`:
     Research benches are deliberately census-only: `getTechLevel()`
     reads progress but the unlock STORE is unmapped - no wire commitment
     until a spike finds the setter (doctrine 36: probe for the minimal
-    state first).     Validated by prod_sync (run 154503: bench output
+    state first; spike 401 later found it - protocol 38, doctrine 53).
+    Validated by prod_sync (run 154503: bench output
     converged gap=0.000 after 30 host-side ops, the power OFF crossed
     within 3 join census samples, final power agreed); regressions
     green. KENSHICOOP_PROD_SYNC=0 is the escape hatch (forced OFF in
@@ -1500,3 +1508,63 @@ These extend the numbered doctrine in `POSTMORTEM.md`:
     lacks the file. The bound + WARN pattern is the doctrine: a
     completeness gate keyed on an optional artifact must degrade to
     loud, not to stuck.
+52. **When a factory refuses a template class, watch the ENGINE mint one
+    and copy its argument shape - then let fabrication join conservation
+    behind the existing dupe suppression.** (2026-07-10, weapon
+    fabrication - the last trading loss vector.) `RootObjectFactory::
+    createItem` returned null for every WEAPON template (0/24) with the
+    documented template-first arguments; a detour on both `createItem`
+    overloads (spike 451) showed the engine's own weapon mints pass the
+    `WEAPON_MANUFACTURER` GameData FIRST and the weapon template in the
+    third ("weaponMesh") slot - the header's parameter names were the
+    misdirection. With the roles swapped, fabrication works (24/24), a
+    generic manufacturer substitutes when the wire carried no provenance
+    (`fallbackWeaponManufacturer` - a generic maker beats a lost weapon),
+    and a fabricated weapon added loose PERSISTS (tryAddItem's auto-equip
+    into an empty slot survives ticks, revising the old "fabricated equips
+    are discarded" reading of d25 - only `create+equipItem` on a blank
+    handle is discarded). Wiring it in needed NO new packet: the inventory
+    snapshot already carried weapon provenance (manufacturer/material sids,
+    protocol 37), so the container reconcile's CREATE now covers weapons,
+    the cross-owner transfer shortfall fallback fabricates gear like
+    non-gear (the xfer latch + `wdSuppress_` + `xferRebase` plumbing
+    already keeps the W2 census and stale snapshots blind to it), and a
+    brand-new weapon acquisition propagates on the snapshot channel alone
+    (the W2 PICKUP intent stays a no-op without a tracked ground copy -
+    no acquire intent needed). `KENSHICOOP_WEAPON_FAB=0` restores
+    conservation-only gear sync at every fabrication site at once (the
+    gate lives inside `createItemAndAdd`'s weapon branch). Gate:
+    `weapon_loot` (novel-sid acquisition crosses with exactly one copy
+    per side, matching quality, zero transient dupes).
+
+53. **When the header RVAs lie, disassemble the installed exe and locate
+    functions at runtime by unique prologue scan - never by base+RVA.**
+    (2026-07-10, protocol 38, wire 36 -> 37, `PKT_RESEARCH` - the
+    research tech-tree slice.) The unlock store is `PlayerInterface::
+    technology`, a per-client `Research` object with no KenshiLib
+    header; the levers (`isKnown`/`canResearch`/`startResearch`) were
+    recovered by string-xref ("Research already known") + disassembly
+    of the research-UI click handler in the on-disk 1.0.65 exe. Two
+    wrong ways to call them crashed BOTH clients through the SEH
+    guards: deriving a base from a KenshiLib-resolved neighbour
+    (GetRealAddress lives in a remapped space, not base+headerRVA),
+    and GetModuleHandle+onDiskRVA (the RUNNING image is base-skewed
+    from the file - klib's getTechLevel sat 0x470 past its on-disk
+    offset; a mid-instruction jump can land on __fastfail, which no
+    SEH frame catches). The reliable recipe: extract a 24-byte
+    prologue per function, verify it appears EXACTLY ONCE in the
+    file's .text offline, then scan the live module's .text for it at
+    session start - each function is found at its true runtime address
+    no matter the skew, and a miss REFUSES the whole lever set instead
+    of guessing. The wire slice itself is the world-simulation shape
+    at its simplest: the host streams one reliable row per known
+    RESEARCH stringID (the cross-client-stable key - both clients
+    enumerate identical record sets from the shared save), first sight
+    is the baseline, the 15 s safety resend doubles as the
+    late-prerequisite retry; the join applies via `startResearch`
+    behind an isKnown pre-check (idempotent - and un-learning does not
+    exist, so rows only ADD). Validated by research_probe (divergence
+    real with the hatch off; the join's own lever flipped and stuck)
+    and research_sync (run 220320: unlock crossed in 1000 ms, sticky,
+    finals agree). KENSHICOOP_RESEARCH_SYNC=0 is the escape hatch
+    (forced OFF in research_probe).

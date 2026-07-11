@@ -300,7 +300,21 @@ typedef double         f64;
 // reconcile it back in the interim. Gear transfers also suppress the W2
 // weapon-census drop/pickup interpretation for that sid on both ends (a
 // bag-to-bag trade is not a ground drop).
-const u16 PROTOCOL_VERSION = 36;
+//
+// v37 (protocol 38): RESEARCH TECH-TREE sync (PKT_RESEARCH). The unlock store
+// (PlayerInterface::technology, a per-client Research object) never crossed:
+// a tech the host researched stayed un-known on the join forever (spike 401 -
+// host isKnown(subject) 0->1 after startResearch while the join read 0 for
+// the whole run). Host-authoritative snapshot rows (the world-simulation
+// precedent): the host samples its known set ~1 Hz through the engine's own
+// Research::isKnown over the shared RESEARCH GameData enumeration and streams
+// one reliable row per known stringID (first sight sends the whole set as the
+// baseline, then a lost-row safety resend); the join applies each row through
+// Research::startResearch - the exact lever a research-UI click commits, which
+// flips isKnown in the same tick and is idempotent against already-known sids.
+// The engine levers are located at runtime by unique prologue scan (the
+// running image is base-skewed from the on-disk exe, spike 401).
+const u16 PROTOCOL_VERSION = 37;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -342,7 +356,8 @@ enum PacketType {
     PKT_LOAD_NACK        = 36,// RELIABLE join copy missing/diverged (join -> host, protocol 32); LoadNackPacket
     PKT_PROD             = 37,// RELIABLE host-authoritative machine state row (protocol 33); ProdPacket
     PKT_NPC_CENSUS       = 38,// RELIABLE wide-radius NPC existence list (protocol 36); NpcCensusHeader
-    PKT_INV_XFER         = 39 // RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
+    PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
+    PKT_RESEARCH         = 40 // RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1333,6 +1348,22 @@ struct ProdPacket {
     f32 died;
     f32 growStart;
     f32 harvested; // int on the engine side; carried as f32 (-1 = not a farm)
+};
+
+// ---- Protocol 38: research tech-tree sync -------------------------------------
+// One KNOWN-research row, HOST-authoritative (world-simulation precedent: the
+// host's tech tree is the party's). Identity is the RESEARCH GameData stringID
+// - cross-client stable (both clients enumerate the identical record set from
+// the shared save, spike 401). The host streams a row for every sid its
+// Research store reports known (first sight = the session baseline, then a
+// safety resend); the join applies via Research::startResearch, which is
+// idempotent (already-known sids are skipped by an isKnown pre-check).
+// Un-learning does not exist in the engine, so rows only ever ADD knowledge.
+struct ResearchPacket {
+    u8  type;      // = PKT_RESEARCH
+    u32 ownerId;   // network player id of the sender (the host)
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    char sid[48];  // RESEARCH GameData stringID (the wire key)
 };
 
 // NPC existence census (protocol 36): the host's 1 Hz wide-radius hand list.

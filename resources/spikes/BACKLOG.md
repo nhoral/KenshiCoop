@@ -507,7 +507,7 @@ nameplates, follow-peer cam, GameData custom-save blob, etc.).
 |---|-------|------|
 | 399 | Building construction-placement sync | RUN |
 | 400 | Construction-progress sync | RUN |
-| 401 | Research-bench progress sync | RUN |
+| 401 | Research-bench progress sync | RUN | DONE (401-research-bench-progress-sync.md) |
 | 402 | Production-machine output sync | RUN |
 | 403 | Building-ownership sync | RUN |
 | 404 | Door/gate open-close sync | RUN |

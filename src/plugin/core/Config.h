@@ -61,6 +61,11 @@ struct Config {
     float        interpSnapDist;    // KENSHICOOP_INTERP_SNAP_DIST     (50 u)
     float        catchupK;          // KENSHICOOP_CATCHUP_K            (2.0)
     float        snapDist;          // KENSHICOOP_SNAP_DIST            (8 u)
+    float        snapSeconds;       // KENSHICOOP_SNAP_SECONDS         (0.75 s)
+                                    // velocity-aware hard-snap gate: teleport a
+                                    // driven body only when it trails the newest
+                                    // sample by more than this much travel time
+                                    // (snapDist stays the slow-mover floor)
 
     // Protocol 36 NPC existence census: wide-radius ghost-culling reach in
     // world units. The host broadcasts the hand list of every world NPC within
@@ -319,6 +324,18 @@ struct Config {
     // OFF for prod_probe (it measures the unsynced baseline). "0" is the A/B
     // escape hatch.
     bool          prodSync;
+
+    // KENSHICOOP_RESEARCH_SYNC (default ON): research tech-tree sync
+    // (protocol 38) - the HOST samples its Research store's known set ~1 Hz
+    // (Research::isKnown over the shared RESEARCH GameData enumeration) and
+    // streams one reliable PKT_RESEARCH row per known stringID (first sight
+    // is the session baseline, then a safety resend); the join applies each
+    // row via Research::startResearch - idempotent against already-known
+    // sids. Without it the tech tree is per-client: a tech the host
+    // researches never unlocks on the join (spike 401). Forced OFF for
+    // research_probe (it measures the unsynced baseline). "0" is the A/B
+    // escape hatch.
+    bool          researchSync;
 
     // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
     // (protocol 34) - the HOST censuses container-bearing buildings (storage

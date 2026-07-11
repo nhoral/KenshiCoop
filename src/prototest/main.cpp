@@ -88,6 +88,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(LoadNackPacket)",          sizeof(LoadNackPacket),          61);
     CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              109);
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
+    CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -182,7 +183,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v36: cross-owner transfer intents)", (int)PROTOCOL_VERSION, 36);
+    CHECK_EQ("PROTOCOL_VERSION (v37: research tech-tree sync)", (int)PROTOCOL_VERSION, 37);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -249,6 +250,7 @@ static void testRoundTrips() {
     roundTrip<LoadReqPacket>("LoadReqPacket", (u8)PKT_LOAD_REQ);
     roundTrip<LoadNackPacket>("LoadNackPacket", (u8)PKT_LOAD_NACK);
     roundTrip<ProdPacket>("ProdPacket", (u8)PKT_PROD);
+    roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };

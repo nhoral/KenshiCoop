@@ -218,6 +218,12 @@ void NetLink::queueProd(const ProdPacket& pkt) {
     LeaveCriticalSection(&outCs_);
 }
 
+void NetLink::queueResearch(const ResearchPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outResearch_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) {
     EnterCriticalSection(&outCs_);
     outBuildPlace_.push_back(pkt);
@@ -733,6 +739,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pp)
                             && inbound_) {
                             inbound_->pushProd(pp.ownerId, pp);
+                        }
+                    } else if (type == PKT_RESEARCH) {
+                        // Reliable host-authoritative known-research row
+                        // (protocol 38), applied via Research::startResearch.
+                        ResearchPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
+                            && inbound_) {
+                            inbound_->pushResearch(rp.ownerId, rp);
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -1296,6 +1310,26 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < prodPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&prodPkts[i], sizeof(ProdPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued known-research rows on CH_RELIABLE
+        // (protocol 38). Host -> joins only (the Replicator only publishes on
+        // the host); first-sight + safety-resent by the caller, so a settled
+        // tech tree is near-silent.
+        std::vector<ResearchPacket> researchPkts;
+        EnterCriticalSection(&outCs_);
+        researchPkts.swap(outResearch_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < researchPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&researchPkts[i], sizeof(ResearchPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

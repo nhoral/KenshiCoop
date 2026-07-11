@@ -197,6 +197,14 @@ struct InboundProd {
     ProdPacket pkt;
 };
 
+// One received known-research row (protocol 38): the HOST reports a RESEARCH
+// stringID as known; the join applies via Research::startResearch (idempotent
+// against already-known sids).
+struct InboundResearch {
+    u32            ownerId;
+    ResearchPacket pkt;
+};
+
 // One received stealth detection-map snapshot (protocol 20): the detection
 // AUTHORITY (the host's world, where the sneaker is a driven copy) streams who
 // notices the sneaker; the sneaker's OWNER replays the entries between its
@@ -404,6 +412,11 @@ public:
         InboundProd ip; ip.ownerId = ownerId; ip.pkt = pkt;
         EnterCriticalSection(&cs_); prod_.push_back(ip); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received known-research row (protocol 38), owner-tagged.
+    void pushResearch(u32 ownerId, const ResearchPacket& pkt) {
+        InboundResearch ir; ir.ownerId = ownerId; ir.pkt = pkt;
+        EnterCriticalSection(&cs_); research_.push_back(ir); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
     void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
         InboundBuildPlace ibp; ibp.ownerId = ownerId; ibp.pkt = pkt;
@@ -540,6 +553,9 @@ public:
     void drainProd(std::deque<InboundProd>& out) {
         EnterCriticalSection(&cs_); out.swap(prod_); LeaveCriticalSection(&cs_);
     }
+    void drainResearch(std::deque<InboundResearch>& out) {
+        EnterCriticalSection(&cs_); out.swap(research_); LeaveCriticalSection(&cs_);
+    }
     void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
         EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
     }
@@ -604,6 +620,7 @@ public:
         buildPlace_.clear(); buildState_.clear(); buildDoor_.clear();
         buildRemove_.clear(); stealth_.clear();   spawnReq_.clear();
         spawnInfo_.clear(); prod_.clear();       npcCensus_.clear();
+        research_.clear();
         LeaveCriticalSection(&cs_);
     }
 
@@ -630,6 +647,7 @@ private:
     std::deque<InboundTime>        time_;
     std::deque<InboundDoor>        door_;
     std::deque<InboundProd>        prod_;
+    std::deque<InboundResearch>    research_;
     std::deque<InboundBuildPlace>  buildPlace_;
     std::deque<InboundBuildState>  buildState_;
     std::deque<InboundBuildDoor>   buildDoor_;

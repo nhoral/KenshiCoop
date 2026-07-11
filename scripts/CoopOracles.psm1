@@ -3114,6 +3114,56 @@ function Test-WeaponDrop {
                 -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; authored = $authored; applied = $applied })
 }
 
+# weapon_loot: the host's owned leader acquires a NOVEL weapon (a sid in no shared-save
+# inventory); the join must fabricate exactly one copy onto its driven leader via the
+# inventory snapshot channel + the spike-451 weapon CREATE. Gates: both verdicts pass
+# (arrived, persisted, max count never exceeded 1 - the zero-dupe requirement), the
+# sids MATCH across clients, and the quality buckets agree within tolerance.
+function Test-WeaponLoot {
+    param([string]$HostFile, [string]$JoinFile)
+    $rxHost = 'WLOOT verdict role=host pass=(\d+) sid=''([^'']*)'' added=(-?\d+) final=(-?\d+) max=(-?\d+) qual=(-?\d+)'
+    $rxJoin = 'WLOOT verdict role=join pass=(\d+) sid=''([^'']*)'' final=(-?\d+) max=(-?\d+) qual=(-?\d+)'
+    $hostOk = $false; $hostSid = ""; $hostQual = -1
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $hostSid = $g[2].Value; $hostQual = [int]$g[6].Value
+            $added = [int]$g[3].Value; $final = [int]$g[4].Value; $max = [int]$g[5].Value
+            $hostOk = ($added -eq 1) -and ($final -eq 1) -and ($max -eq 1)
+            Write-Host ("  WEAPON-LOOT [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - acquired novel weapon sid='$hostSid' (added=$added final=$final max=$max qual=$hostQual)")
+        } else { Write-Host "  WEAPON-LOOT [host] FAIL - no host WLOOT verdict" }
+    }
+    $joinOk = $false; $joinSid = ""; $joinQual = -1
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $joinSid = $g[2].Value; $joinQual = [int]$g[5].Value
+            $final = [int]$g[3].Value; $max = [int]$g[4].Value
+            $joinOk = ($final -eq 1) -and ($max -eq 1)
+            Write-Host ("  WEAPON-LOOT [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - peer copy fabricated sid='$joinSid' (final=$final max=$max qual=$joinQual)")
+            if (-not $joinOk -and $final -eq 0) {
+                Write-Host "    NOTE: weapon never appeared on the join => acquisition did not propagate (snapshot or CREATE failed)"
+            }
+            if (-not $joinOk -and $max -gt 1) {
+                Write-Host "    NOTE: transient count $max > 1 => fabrication raced the conservation channel into a dupe"
+            }
+        } else { Write-Host "  WEAPON-LOOT [join] FAIL - no join WLOOT verdict" }
+    }
+    $sidMatch = ($hostSid -ne "") -and ($hostSid -eq $joinSid)
+    if (-not $sidMatch) { Write-Host "  WEAPON-LOOT sid MISMATCH host='$hostSid' join='$joinSid'" }
+    $qualOk = ($hostQual -ge 0) -and ($joinQual -ge 0) -and ([Math]::Abs($hostQual - $joinQual) -le 5)
+    Write-Host ("  WEAPON-LOOT quality host=$hostQual join=$joinQual match=" + $(if ($qualOk) { "yes" } else { "NO" }))
+    $ok = $hostOk -and $joinOk -and $sidMatch -and $qualOk
+    Write-Host ("  WEAPON-LOOT " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "weapon_loot" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; sid = $hostSid;
+                            sidMatch = $sidMatch; hostQual = $hostQual; joinQual = $joinQual })
+}
+
 # ---- Runtime-spawn sync oracles (protocol 21) ---------------------------------------
 
 # Parse "SCENARIO SPAWN leg=<leg> hand=t,c,cs,i,s" lines from $File into a
@@ -4875,6 +4925,152 @@ function Test-ProdSync {
                 -Metrics @{ outGap = $outGap; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
 }
 
+# Parse the 1 Hz SCENARIO RESEARCH subject poll into ordered samples
+# @{known; can; t} (protocol 38).
+function Get-ResearchSeries {
+    param([string]$File)
+    $rows = @()
+    $m = @(Select-String -Path $File -Pattern "SCENARIO RESEARCH who=\w+ sid='([^']*)' known=(-?\d+) can=(-?\d+) t=(\d+)" -ErrorAction SilentlyContinue)
+    foreach ($r in $m) {
+        $g = $r.Matches[0].Groups
+        $rows += @{ sid = $g[1].Value; known = [int]$g[2].Value; can = [int]$g[3].Value; t = [long]$g[4].Value }
+    }
+    return ,$rows
+}
+
+# research_probe (protocol 38 phase 0): tech-tree baseline diagnostic
+# (researchSync forced OFF). Gates:
+#   * both clients picked a subject and the sids MATCH (the wire-key
+#     stability leg - shared RESEARCH enumeration order);
+#   * host startResearch rc=1 and its isKnown flipped to 1 (the write lever);
+#   * DIVERGENCE: every join sample between the host's start and the join's
+#     own self-start reads known=0 (the unlock must NOT cross with the hatch
+#     off - the gap protocol 38 exists to close);
+#   * join self-start rc=1 and its isKnown flipped AND stuck to run end
+#     (the exact lever applyResearch drives).
+function Test-ResearchProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $pickRe = "SCENARIO RESEARCHPICK who=(\w+) rc=(-?\d+) sid='([^']*)' t=(\d+)"
+    $hPick = Select-String -Path $HostFile -Pattern $pickRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $jPick = Select-String -Path $JoinFile -Pattern $pickRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hPick -or $hPick.Matches[0].Groups[2].Value -ne '1') { $why += "host never picked a subject" }
+    if ($null -eq $jPick -or $jPick.Matches[0].Groups[2].Value -ne '1') { $why += "join never picked a subject" }
+    if ($null -ne $hPick -and $null -ne $jPick) {
+        $hSid = $hPick.Matches[0].Groups[3].Value
+        $jSid = $jPick.Matches[0].Groups[3].Value
+        Write-Host "    FINDING: subject host='$hSid' join='$jSid'"
+        if ($hSid -ne $jSid) { $why += "subject sids differ (wire key unstable)" }
+    }
+    $startRe = "SCENARIO RESEARCHSTART who=(\w+) rc=(-?\d+) sid='([^']*)' known=(-?\d+) t=(\d+)"
+    $hStart = Select-String -Path $HostFile -Pattern $startRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $jStart = Select-String -Path $JoinFile -Pattern $startRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hStart -or $hStart.Matches[0].Groups[2].Value -ne '1') { $why += "host startResearch missing/failed" }
+    if ($null -eq $jStart -or $jStart.Matches[0].Groups[2].Value -ne '1') { $why += "join self startResearch missing/failed" }
+    $jSeries = Get-ResearchSeries -File $JoinFile
+    if ($jSeries.Count -eq 0) { $why += "join subject poll empty" }
+    # Divergence window: host starts ~10 s, join self-starts ~25 s; every join
+    # sample in between must be known=0 (hatch OFF = the unlock cannot cross).
+    if ($null -ne $hStart -and $null -ne $jStart) {
+        $ht = [long]$hStart.Matches[0].Groups[5].Value
+        $jt = [long]$jStart.Matches[0].Groups[5].Value
+        $win = @($jSeries | Where-Object { $_.t -gt $ht -and $_.t -lt $jt })
+        $leaked = @($win | Where-Object { $_.known -eq 1 })
+        Write-Host "    FINDING: join divergence window samples=$($win.Count) leaked=$($leaked.Count) (host start t=$ht, join self-start t=$jt)"
+        if ($win.Count -eq 0) { $why += "no join samples in the divergence window" }
+        elseif ($leaked.Count -gt 0) { $why += "unlock CROSSED with the hatch OFF ($($leaked.Count) samples)" }
+        # Stickiness: every join sample >= 2 s after its self-start is known=1.
+        $stick = @($jSeries | Where-Object { $_.t -ge ($jt + 2000) })
+        $bad = @($stick | Where-Object { $_.known -ne 1 })
+        Write-Host "    FINDING: join post-start samples=$($stick.Count) notKnown=$($bad.Count)"
+        if ($stick.Count -eq 0) { $why += "no join samples after its self-start" }
+        elseif ($bad.Count -gt 0) { $why += "join unlock did not STICK ($($bad.Count) samples reverted)" }
+    }
+    $resRe = "SCENARIO RESEARCHRESULT who=(\w+) pick=(-?\d+) start=(-?\d+) known=(-?\d+) pass=(\d)"
+    foreach ($pair in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
+        $r = Select-String -Path $pair[0] -Pattern $resRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $r) { $why += "$($pair[1]) never logged its RESEARCHRESULT" }
+        else {
+            $g = $r.Matches[0].Groups
+            Write-Host "    FINDING: $($pair[1]) result pick=$($g[2].Value) start=$($g[3].Value) known=$($g[4].Value) pass=$($g[5].Value)"
+            if ($g[4].Value -ne '1') { $why += "$($pair[1]) final isKnown != 1" }
+        }
+    }
+    $sent = @(Select-String -Path $HostFile -Pattern '\[research\] SEND sid=' -ErrorAction SilentlyContinue)
+    Write-Host "    FINDING: [research] rows sent with hatch OFF = $($sent.Count) (expected 0)"
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  RESEARCH-PROBE $v - $detail"
+    return (Add-GateResult -Name "research_probe" -Status $v -Metrics @{} -Detail $detail)
+}
+
+# research_sync (protocol 38 full tier): host-authoritative tech-tree sync.
+# Same scenario script as research_probe minus the join's self-start - the
+# WIRE must flip the join's isKnown. Gates:
+#   * both clients picked the SAME subject;
+#   * host startResearch rc=1 + final isKnown=1 (the driving edge);
+#   * the wire ran: host sent [research] rows, the join received + applied;
+#   * crossing: the join's subject poll reads known=1 within 6 s of the
+#     host's start (1 Hz publish + reliable row + same-tick apply) and every
+#     later sample stays 1 (stickiness);
+#   * join final isKnown=1.
+function Test-ResearchSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $pickRe = "SCENARIO RESEARCHPICK who=(\w+) rc=(-?\d+) sid='([^']*)' t=(\d+)"
+    $hPick = Select-String -Path $HostFile -Pattern $pickRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $jPick = Select-String -Path $JoinFile -Pattern $pickRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hPick -or $hPick.Matches[0].Groups[2].Value -ne '1') { $why += "host never picked a subject" }
+    if ($null -eq $jPick -or $jPick.Matches[0].Groups[2].Value -ne '1') { $why += "join never picked a subject" }
+    if ($null -ne $hPick -and $null -ne $jPick -and
+        $hPick.Matches[0].Groups[3].Value -ne $jPick.Matches[0].Groups[3].Value) {
+        $why += "subject sids differ (wire key unstable)"
+    }
+    $startRe = "SCENARIO RESEARCHSTART who=host rc=(-?\d+) sid='([^']*)' known=(-?\d+) t=(\d+)"
+    $hStart = Select-String -Path $HostFile -Pattern $startRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $hStart -or $hStart.Matches[0].Groups[1].Value -ne '1') { $why += "host startResearch missing/failed" }
+    # The wire ran on both ends.
+    $sent = @(Select-String -Path $HostFile -Pattern '\[research\] SEND sid=' -ErrorAction SilentlyContinue)
+    $recv = @(Select-String -Path $JoinFile -Pattern '\[research\] RECV sid=' -ErrorAction SilentlyContinue)
+    if ($sent.Count -eq 0) { $why += "host never sent a [research] row" }
+    if ($recv.Count -eq 0) { $why += "join never received/applied a [research] row" }
+    Write-Host "    FINDING: [research] rows host sent=$($sent.Count) join applied=$($recv.Count)"
+    # Crossing + stickiness on the join's subject poll.
+    $jSeries = Get-ResearchSeries -File $JoinFile
+    $crossMs = -1
+    if ($jSeries.Count -eq 0) { $why += "join subject poll empty" }
+    elseif ($null -ne $hStart) {
+        $ht = [long]$hStart.Matches[0].Groups[4].Value
+        $hit = @($jSeries | Where-Object { $_.t -ge $ht -and $_.known -eq 1 }) | Select-Object -First 1
+        if ($null -eq $hit) { $why += "host unlock never crossed onto the join" }
+        else {
+            $crossMs = $hit.t - $ht
+            Write-Host "    FINDING: unlock CROSSED in ${crossMs} ms (host start t=$ht, join known=1 t=$($hit.t))"
+            if ($crossMs -gt 6000) { $why += "crossing too slow ($crossMs ms > 6000)" }
+            $after = @($jSeries | Where-Object { $_.t -gt $hit.t })
+            $bad = @($after | Where-Object { $_.known -ne 1 })
+            if ($bad.Count -gt 0) { $why += "join unlock did not STICK ($($bad.Count) samples reverted)" }
+        }
+    }
+    $resRe = "SCENARIO RESEARCHRESULT who=(\w+) pick=(-?\d+) start=(-?\d+) known=(-?\d+) pass=(\d)"
+    foreach ($pair in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
+        $r = Select-String -Path $pair[0] -Pattern $resRe -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $r) { $why += "$($pair[1]) never logged its RESEARCHRESULT" }
+        else {
+            $g = $r.Matches[0].Groups
+            Write-Host "    FINDING: $($pair[1]) result pick=$($g[2].Value) start=$($g[3].Value) known=$($g[4].Value) pass=$($g[5].Value)"
+            if ($g[4].Value -ne '1') { $why += "$($pair[1]) final isKnown != 1" }
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  RESEARCH-SYNC $v - crossMs=$crossMs sent=$($sent.Count) applied=$($recv.Count) $detail"
+    return (Add-GateResult -Name "research_sync" -Status $v `
+                -Metrics @{ crossMs = $crossMs; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
+}
+
 # Parse the 1 Hz SCENARIO CONT container census into hand -> ordered samples
 # @{class; complete; inv; n; qty; hash; firstSid; firstQty; sid; name; t}
 # (protocol 34).
@@ -6014,6 +6210,101 @@ function Test-MarchInPlace {
     return (Add-GateResult -Name "march" -Status $v -Metrics @{ marchFrac = $marchFrac; restSamples = $rest })
 }
 
+# Snap-rate (2026-07-11 rubber-banding validation): hard teleports per minute of
+# steady-state run, from the join's cumulative [interp] counters (snapSq+snapNpc).
+# The session-start clock-slew window is excluded (the 2x catch-up legitimately
+# outruns the walk-drive): counting starts at the last [interp] sample before the
+# first slew=1.0 OFFSET report. When the slew never converges (fast_march holds
+# 5x, which pins the slew at its cap) the whole run is scored - the velocity-
+# aware snap gate must hold regardless of game speed.
+function Test-SnapRate {
+    param([string]$File, [string]$Label = "join", [double]$MaxPerMin = 3.0,
+          [int]$MinWindowSec = 20, [switch]$SquadOnly,
+          [string]$GateName = "snap_rate")
+    if (-not (Test-Path $File)) {
+        return (Add-GateResult -Name $GateName -Status SKIP -Detail "no log")
+    }
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[interp\] .*snapSq=(\d+) snapNpc=(\d+)"
+    $lines = @(Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)
+    if ($lines.Count -lt 2) {
+        Write-Host "  [$Label] snap-rate SKIP - no [interp] counter series"
+        return (Add-GateResult -Name $GateName -Status SKIP -Detail "no [interp] series")
+    }
+    $series = @(foreach ($m in $lines) {
+        $g = $m.Matches[0].Groups
+        [pscustomobject]@{
+            t   = Convert-StampToMs -Groups $g -OffsetMs 0
+            sq  = [long]$g[5].Value
+            npc = [long]$g[6].Value
+        }
+    })
+    # Skip the clock catch-up window: baseline at the last sample before the
+    # first slew=1.0 report (same exclusion the smoothness oracle applies).
+    $startIdx = 0
+    $om = Select-String -Path $File -Pattern "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[time\] OFFSET .*slew=1\.0" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $om) {
+        $slewT = Convert-StampToMs -Groups $om.Matches[0].Groups -OffsetMs 0
+        for ($i = 0; $i -lt $series.Count; $i++) {
+            if ($series[$i].t -le $slewT) { $startIdx = $i }
+        }
+    }
+    $base = $series[$startIdx]
+    $last = $series[$series.Count - 1]
+    $winSec = ($last.t - $base.t) / 1000.0
+    if ($winSec -lt $MinWindowSec) {
+        Write-Host "  [$Label] snap-rate SKIP - scored window ${winSec}s (< ${MinWindowSec}s past the slew)"
+        return (Add-GateResult -Name $GateName -Status SKIP `
+                    -Metrics @{ windowSec = $winSec } -Detail "window too short")
+    }
+    $dSq  = $last.sq - $base.sq
+    $dNpc = $last.npc - $base.npc
+    # SquadOnly (fast_march): at 5x a background NPC resting between stream
+    # updates legitimately falls 100+ u behind, and the far-behind teleport is
+    # the correct convergence tool - only PLAYER-SQUAD snaps (the visible
+    # rubber banding) gate there. At 1x both classes gate.
+    $gated = if ($SquadOnly) { $dSq } else { $dSq + $dNpc }
+    $rate  = [math]::Round($gated / ($winSec / 60.0), 2)
+    $ok = ($rate -le $MaxPerMin)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $scope = if ($SquadOnly) { "squad" } else { "squad+npc" }
+    Write-Host "  [$Label] snap-rate $v - $gated $scope hard snap(s) over $([math]::Round($winSec,0))s = $rate/min (<= $MaxPerMin/min; sq=$dSq npc=$dNpc)"
+    return (Add-GateResult -Name $GateName -Status $v `
+                -Metrics @{ snapsSq = $dSq; snapsNpc = $dNpc; windowSec = [math]::Round($winSec, 1); ratePerMin = $rate })
+}
+
+# Suppress-churn (2026-07-11 pop-in/out fix): a join-side NPC must never cycle
+# hidden -> restored -> hidden (the 'Saint'/'Kumo' stream-boundary flicker the
+# census-existence veto eliminates). Counts suppress/cull events per hand; any
+# hand hidden more than once is churn. Zero suppression activity passes - the
+# invariant holds vacuously (ghost culls of join-only spawns stay legitimate,
+# each firing once per hand).
+function Test-SuppressChurn {
+    param([string]$File, [string]$Label = "join", [int]$MaxPerHand = 1)
+    if (-not (Test-Path $File)) {
+        return (Add-GateResult -Name "suppress_churn" -Status SKIP -Detail "no log")
+    }
+    $counts = @{}
+    foreach ($p in @('\[authority\] suppress NPC hand=(\d+,\d+)',
+                     '\[census\] cull NPC hand=(\d+,\d+)')) {
+        foreach ($m in @(Select-String -Path $File -Pattern $p -ErrorAction SilentlyContinue)) {
+            $h = $m.Matches[0].Groups[1].Value
+            if ($counts.ContainsKey($h)) { $counts[$h]++ } else { $counts[$h] = 1 }
+        }
+    }
+    $restores = @(Select-String -Path $File -Pattern '\[(?:authority|census)\] restore NPC hand=' -ErrorAction SilentlyContinue).Count
+    $worst = 0; $churned = @()
+    foreach ($k in $counts.Keys) {
+        if ($counts[$k] -gt $worst) { $worst = $counts[$k] }
+        if ($counts[$k] -gt $MaxPerHand) { $churned += $k }
+    }
+    $ok = ($churned.Count -eq 0)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $detail = if ($ok) { "" } else { "churned hands: " + ($churned -join " ") }
+    Write-Host "  [$Label] suppress-churn $v - $($counts.Count) hand(s) hidden, worst=$worst per hand (<= $MaxPerHand), restores=$restores $detail"
+    return (Add-GateResult -Name "suppress_churn" -Status $v `
+                -Metrics @{ hands = $counts.Count; worstPerHand = $worst; restores = $restores } -Detail $detail)
+}
+
 # ---- Manifest + top-level analysis ---------------------------------------------------
 
 # Load scripts/scenarios.psd1 (or an explicit path).
@@ -6066,6 +6357,8 @@ function Invoke-OneOracle {
         "load_sync"      { return (Test-LoadSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "prod_probe"     { return (Test-ProdProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "prod_sync"      { return (Test-ProdSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "research_probe" { return (Test-ResearchProbe  -HostFile $HostLog -JoinFile $JoinLog) }
+        "research_sync"  { return (Test-ResearchSync   -HostFile $HostLog -JoinFile $JoinLog) }
         "store_probe"    { return (Test-StoreProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "store_sync"     { return (Test-StoreSync      -HostFile $HostLog -JoinFile $JoinLog) }
         "squad_probe"    { return (Test-SquadProbe     -HostFile $HostLog -JoinFile $JoinLog) }
@@ -6107,9 +6400,13 @@ function Invoke-OneOracle {
         "wpn_relocate"  { return (Test-WpnRelocate     -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_drop"   { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog) }
         "armor_drop"    { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "armor_drop") }
+        "weapon_loot"   { return (Test-WeaponLoot      -HostFile $HostLog -JoinFile $JoinLog) }
         "smoothness"    { return (Test-Smoothness      -File $JoinLog) }
         "anim_truth"    { return (Test-AnimTruth       -File $JoinLog) }
         "march"         { return (Test-MarchInPlace    -File $JoinLog) }
+        "snap_rate"     { return (Test-SnapRate        -File $JoinLog) }
+        "snap_rate_squad" { return (Test-SnapRate      -File $JoinLog -SquadOnly -GateName "snap_rate_squad") }
+        "suppress_churn" { return (Test-SuppressChurn  -File $JoinLog) }
         "clock_sync"    { return (Test-ClockSync       -HostFile $HostLog -JoinFile $JoinLog -ExpectedSkewMs $ExpectedSkewMs) }
         default {
             Write-Host "  WARNING: unknown oracle id '$Id' (manifest error)"
@@ -6289,5 +6586,6 @@ Export-ModuleMember -Function @(
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-WpnRelocate", "Test-WeaponDrop",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
+    "Test-SnapRate", "Test-SuppressChurn",
     "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"
 )
