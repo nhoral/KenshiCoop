@@ -6520,6 +6520,27 @@ function Get-WnpcRows {
     return $rows
 }
 
+# Parse timestamped "SCENARIO WORLD n=.. cls=.." dump-summary rows into a list of
+# @{t; n; ghost}. One row per 5 s worldstate dump, emitted even when the dump is
+# EMPTY (n=0) - the hop corridor is mostly wilderness, so empty dumps are the
+# common case and still count as judged parity samples (0 ghosts vs 0 host rows).
+# The join row carries the class counts; the host row is just n= (cls=host).
+function Get-WorldRows {
+    param([string]$File)
+    $rows = New-Object System.Collections.ArrayList
+    if (-not (Test-Path $File)) { return $rows }
+    $off = Get-LogClockOffsetMs -File $File
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO WORLD n=(\d+) cls=(\w+)(?: drv=\d+ cen=\d+ hid=\d+ ghost=(\d+))?"
+    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $t = Convert-StampToMs -Groups $g -OffsetMs $off
+        $ghost = 0
+        if ($g[7].Success) { $ghost = [int]$g[7].Value }
+        [void]$rows.Add(@{ t = $t; n = [int]$g[5].Value; cls = $g[6].Value; ghost = $ghost })
+    }
+    return $rows
+}
+
 # Group WNPC rows into dump samples: rows closer than $GapMs to the previous row
 # belong to the same 5 s worldstate dump.
 function Group-WnpcSamples {
@@ -6537,18 +6558,18 @@ function Group-WnpcSamples {
 }
 
 # travel_parity gate 1: the pair actually traveled. The JOIN's own MEMBER series
-# must cover >= $MinTravel from its first sample, and the host's SCENARIO FOLLOW
-# series (self/peer/gap each ~1 s) must show the follow HOLDING: median gap
-# <= $MaxMedianGap after the grace window and p75 gap <= $MaxP75Gap (p75, not
-# the last sample - the host window outlives the join's by 10 s, and once the
-# join stops ordering its PC the far-point wildlife can yank it, which is
-# post-scenario noise, run 210715). If the follow never holds, the parity
-# numbers describe two separated worlds and the run is meaningless - this
-# gates before travel_parity for that reason.
+# must cover >= $MinTravel from its first sample (the hop trek is ~60,000 u),
+# and the host's SCENARIO FOLLOW series (self/peer/gap each ~1 s) must show the
+# follow HOLDING: median gap <= $MaxMedianGap after the grace window, and every
+# hop-opened gap (a teleport leg legitimately opens ~4000 u for a sample or
+# two) must CLOSE within $MaxLagRun consecutive samples above $LagGap - the
+# host's teleport catch-up has to actually land. If the follow never holds,
+# the parity numbers describe two separated worlds and the run is meaningless -
+# this gates before travel_parity for that reason.
 function Test-FollowTravel {
     param([string]$HostFile, [string]$JoinFile,
-          [double]$MinTravel = 400.0, [double]$MaxMedianGap = 80.0,
-          [double]$MaxP75Gap = 120.0, [int]$GraceMs = 20000)
+          [double]$MinTravel = 40000.0, [double]$MaxMedianGap = 120.0,
+          [double]$LagGap = 300.0, [int]$MaxLagRun = 6, [int]$GraceMs = 20000)
     # Join travel: the mover is the join's MEMBER hand with the most samples.
     $mem = Get-ScenarioSeries -File $JoinFile -Kind "MEMBER"
     $best = $null
@@ -6589,13 +6610,20 @@ function Test-FollowTravel {
     }
     $sorted = @($gaps | Sort-Object)
     $median = [math]::Round($sorted[[int]($sorted.Count / 2)], 1)
-    $p75    = [math]::Round($sorted[[int]($sorted.Count * 3 / 4)], 1)
-    $ok = ($travel -ge $MinTravel) -and ($median -le $MaxMedianGap) -and ($p75 -le $MaxP75Gap)
+    # Lag runs: consecutive samples above $LagGap. A hop legitimately opens a
+    # ~4000 u gap; the host's teleport catch-up must close it within
+    # $MaxLagRun samples (~seconds) or the follow is not actually holding.
+    $maxRun = 0; $run = 0
+    foreach ($g in $gaps) {
+        if ($g -gt $LagGap) { $run++; if ($run -gt $maxRun) { $maxRun = $run } }
+        else { $run = 0 }
+    }
+    $ok = ($travel -ge $MinTravel) -and ($median -le $MaxMedianGap) -and ($maxRun -le $MaxLagRun)
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  follow-travel $v - join traveled $travel u (>= $MinTravel), host follow median gap $median u (<= $MaxMedianGap), p75 $p75 u (<= $MaxP75Gap), $($gaps.Count) samples"
+    Write-Host "  follow-travel $v - join traveled $travel u (>= $MinTravel), host follow median gap $median u (<= $MaxMedianGap), max lag run $maxRun (<= $MaxLagRun samples > $LagGap u), $($gaps.Count) samples"
     return (Add-GateResult -Name "follow_travel" -Status $v `
                 -Metrics @{ travel = $travel; medianGap = $median
-                            p75Gap = $p75; followSamples = $gaps.Count })
+                            maxLagRun = $maxRun; followSamples = $gaps.Count })
 }
 
 # travel_parity gate 2: worldstate cross-comparison while traveling. Every 5 s
@@ -6619,8 +6647,14 @@ function Test-TravelParity {
           [double]$MaxGhostFrac = 0.35, [int]$MaxGhostRun = 4,
           [double]$MaxDiverge = 250.0, [double]$HostOnlyRange = 400.0,
           [int]$WinMs = 6000, [int]$MinSamples = 6)
-    $joinSamples = Group-WnpcSamples -Rows (Get-WnpcRows -File $JoinFile)
-    $hostRows    = Get-WnpcRows -File $HostFile
+    # Samples are anchored on the WORLD summary rows, NOT the WNPC row groups:
+    # a WORLD row is emitted even for an EMPTY dump (n=0), and the hop corridor
+    # is mostly wilderness - an empty join dump aligned with an empty host dump
+    # is a perfectly judged parity sample (nothing there on either side).
+    $joinWorld = Get-WorldRows -File $JoinFile | Where-Object { $_.cls -ne "host" }
+    $hostWorld = Get-WorldRows -File $HostFile | Where-Object { $_.cls -eq "host" }
+    $joinRows  = Get-WnpcRows -File $JoinFile
+    $hostRows  = Get-WnpcRows -File $HostFile
     # Join leader position over time (for the hostOnly range limit): the join's
     # MEMBER hand with the most samples is the traveling mover.
     $mem = Get-ScenarioSeries -File $JoinFile -Kind "MEMBER"
@@ -6628,23 +6662,27 @@ function Test-TravelParity {
     foreach ($h in $mem.Keys) {
         if ($null -eq $mover -or $mem[$h].Count -gt $mem[$mover].Count) { $mover = $h }
     }
-    if ($joinSamples.Count -lt $MinSamples -or $hostRows.Count -eq 0) {
-        Write-Host "  travel-parity SKIP - $($joinSamples.Count) join dump(s), $($hostRows.Count) host row(s)"
+    if ($joinWorld.Count -lt $MinSamples -or $hostWorld.Count -eq 0) {
+        Write-Host "  travel-parity SKIP - $($joinWorld.Count) join dump(s), $($hostWorld.Count) host dump(s)"
         return (Add-GateResult -Name "travel_parity" -Status SKIP `
-                    -Metrics @{ joinSamples = $joinSamples.Count; hostRows = $hostRows.Count } `
+                    -Metrics @{ joinSamples = $joinWorld.Count; hostSamples = $hostWorld.Count } `
                     -Detail "too few worldstate dumps")
     }
     $ghostSamples = 0; $run = 0; $maxRun = 0; $used = 0
     $laggards = 0; $diverged = 0; $hostOnly = 0; $trueGhosts = 0; $peakGhost = 0
-    foreach ($js in $joinSamples) {
-        $hwin = @($hostRows | Where-Object { [math]::Abs($_.t - $js.t) -le $WinMs })
-        if ($hwin.Count -eq 0) { continue } # no host dump nearby - can't judge
+    foreach ($ws in $joinWorld) {
+        $hostAligned = @($hostWorld | Where-Object { [math]::Abs($_.t - $ws.t) -le $WinMs })
+        if ($hostAligned.Count -eq 0) { continue } # no host dump nearby - can't judge
         $used++
+        # Detail rows for this sample: WNPC rows within the dump's burst window
+        # on the join side, within $WinMs of the sample on the host side.
+        $jrows = @($joinRows | Where-Object { [math]::Abs($_.t - $ws.t) -le 1500 })
+        $hwin  = @($hostRows | Where-Object { [math]::Abs($_.t - $ws.t) -le $WinMs })
         $hByHand = @{}
         foreach ($hr in $hwin) { $hByHand[$hr.hand] = $hr }
         $ghosts = 0
         $joinHands = @{}
-        foreach ($jr in $js.rows) {
+        foreach ($jr in $jrows) {
             $joinHands[$jr.hand] = $true
             if ($jr.cls -eq "ghost") {
                 $ghosts++
@@ -6659,7 +6697,7 @@ function Test-TravelParity {
         $jl = $null
         if ($null -ne $mover) {
             foreach ($s in $mem[$mover]) {
-                if ($null -eq $jl -or [math]::Abs($s.t - $js.t) -lt [math]::Abs($jl.t - $js.t)) { $jl = $s }
+                if ($null -eq $jl -or [math]::Abs($s.t - $ws.t) -lt [math]::Abs($jl.t - $ws.t)) { $jl = $s }
             }
         }
         foreach ($hr in $hwin) {
@@ -6979,6 +7017,6 @@ Export-ModuleMember -Function @(
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",
-    "Get-WnpcRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
+    "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
     "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"
 )

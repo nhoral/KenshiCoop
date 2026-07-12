@@ -1853,29 +1853,40 @@ scenario moved HOST-side bodies; in free play it is the JOIN that wanders
 and drags interest/census coverage with it - `travel_parity` is that
 direction, automated.
 
-- **Script:** the join marches its own rank-1 tab leader ~600 u out under a
-  3x speed vote (re-voted 5 s, 1x in the 10 s settle); the host re-targets
-  its rank-0 leader at the join leader's LOCAL driven copy every second
-  (`SCENARIO FOLLOW self/peer/gap`), stopping 12 u short. Durations 85/75 s
-  (the spawn_far kill-grace precedent: a 100 s host window was killed before
-  RESULT, run 205832).
+- **Script (far-hop rev, same day):** the join TELEPORT-HOPS its own rank-1
+  tab leader across the map - 15 hops x 4000 u = 60,000 u total, ~9 s dwell
+  each (`engine::park`, the split_interest precedent; a short walk order
+  inside each dwell re-grounds the body and keeps it a live mover). Every
+  hop lands entirely OUTSIDE the previous 2000 u census bubble, so existence
+  coverage rebuilds from nothing at each stop - a compressed cross-map trek.
+  The host follows its LOCAL driven copy of the join leader: teleport
+  catch-up (park) past a 150 u gap, `orderMoveTo` inside it, stand inside
+  12 u (`SCENARIO FOLLOW self/peer/gap` each second). Durations 160/150 s;
+  the manifest raises the runner backstops (Seconds=220, KillGraceSec=190 -
+  the spawn_far kill-grace precedent, run 205832). The first rev (walked
+  ~600 u at 3x, then 2400 u at 5x) is superseded: the walk could never
+  cover free-play distances inside a test window.
 - **Worldstate rows:** both sides dump `SCENARIO WORLD` + per-NPC
   `SCENARIO WNPC hand=.. pos=.. cls=.. name=..` every 5 s
   (`Replicator::setAuditRows`, armed only for this scenario) - the host from
   its census walk (cls=host), the join from the existence audit with the
   drv/cen/hid/ghost class.
-- **Oracles:** `Test-FollowTravel` gates first (travel >= 400 u, median
-  follow gap <= 80 u, p75 <= 120 u after a 20 s grace; p75 not final-sample -
-  the host outlives the join's window and far-point wildlife can yank the
-  stopped PC, run 210715). `Test-TravelParity` time-aligns the two dumps
-  (+-6 s) and gates the ghost fraction (<= 0.35) + longest ghost run (<= 4),
-  with trueGhost/laggard/diverged/hostOnly metrics (hostOnly range-limited
-  to 400 u of the join leader - the host census reaches 2500 u, far past
-  what the join has loaded).
+- **Oracles:** `Test-FollowTravel` gates first (travel >= 40,000 u, median
+  follow gap <= 120 u after a 20 s grace, and every hop-opened gap must
+  close within 6 consecutive samples above 300 u - the teleport catch-up
+  has to actually land). `Test-TravelParity` anchors on the `SCENARIO
+  WORLD` summary rows (emitted even for EMPTY dumps - the hop corridor is
+  mostly wilderness, and an empty join dump aligned with an empty host dump
+  is a perfectly judged sample; anchoring on WNPC rows starved the gate to
+  SKIP, run 215803), time-aligns join and host dumps (+-6 s) and gates the
+  ghost fraction (<= 0.35) + longest ghost run (<= 4), with
+  trueGhost/laggard/diverged/hostOnly metrics (hostOnly range-limited to
+  400 u of the join leader - the host census reaches 2500 u, far past what
+  the join has loaded).
 
 | Scenario | Save | clean | Key values |
 |---|---|---|---|
-| travel_parity (new, full tier) | sync | PASS x2 | travel 609 u, follow median gap 12.4-12.5 u, p75 12.6 u; ghostFrac 0-0.06, maxRun <= 1, hostOnly 0-1; diverged 127-138 (3x park-lag texture: census <= 1 s stale + 5 s per-key cooldown at 3x wall-speed = legit 100-450 u between parks) |
+| travel_parity (far-hop, full tier) | sync | PASS x3 | travel 60,006-60,014 u (15 x 4000 u hops), follow median gap 12.6-14.7 u, max lag run 1 sample; ghostFrac 0-0.22 maxRun <= 2 (peak 42-ghost burst at a hop landing, judged then cleared), trueGhost 0-44, hostOnly 0, diverged 5-10 |
 | npc_sync (regression) | sync | PASS | npc_track/pose/march/snap_rate/rest_flap green, existence_parity ghostFrac 0 |
 | coop_presence (regression) | squad1 | PASS | all gating green |
 

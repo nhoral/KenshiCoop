@@ -1195,10 +1195,16 @@ const float CoopPresenceScenario::LEG = 12.0f;
 // JOIN's player character travels FAR from the start while the HOST's PC
 // follows - the roaming direction no automated test exercised (every mover so
 // far was host-side, but in free play it is the JOIN that wanders and drags
-// the interest/census coverage with it). The join marches its OWN rank-1 tab
-// leader ~600 u out under a 3x speed vote; the host re-targets its rank-0
-// leader at the join leader's LOCAL driven copy every cycle and logs
-// "SCENARIO FOLLOW self=.. peer=.. gap=.." for the follow-quality gate.
+// the interest/census coverage with it). The join TELEPORT-HOPS its OWN
+// rank-1 tab leader across the map (the split_interest engine::park
+// precedent): HOPS legs of HOP u with a HOP_DWELL_MS dwell each, ~60,000 u
+// total - every hop lands entirely OUTSIDE the previous 2000 u census
+// bubble, so existence coverage must rebuild from nothing at each stop
+// (zone streaming, census re-centering, mint/cull churn - a compressed
+// cross-map trek). The host follows its LOCAL driven copy of the join
+// leader: teleport catch-up (park) when the gap exceeds FOLLOW_SNAP,
+// orderMoveTo otherwise, logging "SCENARIO FOLLOW self=.. peer=.. gap=.."
+// for the follow-quality gate.
 // While the pair travels, BOTH sides dump a 5 s worldstate (SCENARIO WORLD /
 // WNPC rows - the host from its census walk with cls=host, the join from the
 // existence audit with each NPC's authority class; enabled via
@@ -1208,13 +1214,12 @@ const float CoopPresenceScenario::LEG = 12.0f;
 class TravelParityScenario : public Scenario {
 public:
     TravelParityScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastVoteMs_(0),
+        : passed_(false), recvCount_(0), lastLogMs_(0), hopsDone_(0),
           haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
 
     virtual const char* name() const { return "travel_parity"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
-        engine::writeGameSpeed(ctx.gw, 3.0f, false); // our 3x vote (both sides)
         // Anchor = the MOVER's start: the join's rank-1 tab leader (both
         // clients resolve it locally from the shared save).
         EntityState sq[MAX_SQUAD];
@@ -1224,10 +1229,11 @@ public:
             haveAnchor_ = true;
             ax_ = sq[mv].x; ay_ = sq[mv].y; az_ = sq[mv].z;
         }
-        char b[128];
+        char b[160];
         _snprintf(b, sizeof(b) - 1,
-                  "SCENARIO TRAVEL anchor=%.1f,%.1f,%.1f have=%d vote=3.0 target=%.0f",
-                  ax_, ay_, az_, haveAnchor_ ? 1 : 0, TRAVEL);
+                  "SCENARIO TRAVEL anchor=%.1f,%.1f,%.1f have=%d hop=%.0f hops=%u dwell=%lums",
+                  ax_, ay_, az_, haveAnchor_ ? 1 : 0, HOP,
+                  (unsigned)HOPS, HOP_DWELL_MS);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         if (!haveAnchor_)
             coop::logLine("SCENARIO TRAVEL needs a 2-tab save (rank-1 member missing)");
@@ -1235,14 +1241,6 @@ public:
 
     virtual bool onTick(const ScenarioContext& ctx) {
         unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
-        bool settling = ctx.elapsedMs >= dur - SETTLE_MS;
-
-        // Re-vote 3x every 5 s (an engine event may reset our request); vote
-        // back to 1x in the settle window so the session ends sane.
-        if (ctx.elapsedMs - lastVoteMs_ >= 5000 || lastVoteMs_ == 0) {
-            lastVoteMs_ = ctx.elapsedMs;
-            engine::writeGameSpeed(ctx.gw, settling ? 1.0f : 3.0f, false);
-        }
 
         if (haveAnchor_ &&
             (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0)) {
@@ -1253,30 +1251,51 @@ public:
             int fl = tabLeaderIdx(sq, n, 0); // the host's follower
 
             if (!ctx.isHost) {
-                // JOIN: march our own tab leader toward the far target. The
-                // order is re-issued every second - pathing legs, combat or a
-                // speed change can drop it, and re-ordering the same dest is
-                // a no-op for a character already en route.
+                // JOIN: hop our own tab leader one HOP further out every
+                // HOP_DWELL_MS (park = halt + teleport; the dwell gives zone
+                // streaming + census/mint a re-coverage window at each stop,
+                // and a short walk order after the park re-grounds the body
+                // and keeps it a live, moving subject rather than a statue).
+                unsigned int wantHops = (unsigned int)(ctx.elapsedMs / HOP_DWELL_MS);
+                if (wantHops > HOPS) wantHops = HOPS;
                 if (mv >= 0) {
                     Character* c = engine::resolve(sq[mv]);
                     if (c) {
-                        if (settling)
-                            engine::orderMoveTo(c, sq[mv].x, sq[mv].y, sq[mv].z);
-                        else
-                            engine::orderMoveTo(c, ax_ + TRAVEL, ay_, az_);
+                        if (wantHops > hopsDone_) {
+                            hopsDone_ = wantHops;
+                            float hx = ax_ + (float)hopsDone_ * HOP;
+                            engine::park(c, hx, sq[mv].y, az_, 0.0f);
+                            char b[96];
+                            _snprintf(b, sizeof(b) - 1,
+                                      "SCENARIO HOP n=%u to=%.0f,%.0f,%.0f",
+                                      hopsDone_, hx, sq[mv].y, az_);
+                            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        } else {
+                            // Walk a short leg inside the dwell (re-grounds
+                            // the parked body; a genuinely moving mover).
+                            float hx = ax_ + (float)hopsDone_ * HOP;
+                            bool legB = ((ctx.elapsedMs / 3000) % 2) != 0;
+                            engine::orderMoveTo(c, hx + (legB ? 15.0f : 0.0f),
+                                                sq[mv].y, az_);
+                        }
                     }
                     logScenarioEntity("MEMBER", sq[mv]);
                 }
                 if (fl >= 0) { logScenarioEntity("RECV", sq[fl]); ++recvCount_; }
             } else {
                 // HOST: chase the join leader's LOCAL driven copy - the same
-                // body free-play players follow on screen. Stop short of the
-                // peer (don't shove the driven copy around).
+                // body free-play players follow on screen. A hop opens a
+                // multi-thousand-unit gap no walk can close: teleport
+                // catch-up past FOLLOW_SNAP, walk inside it, stand inside
+                // FOLLOW_STOP (don't shove the driven copy around).
                 if (mv >= 0 && fl >= 0) {
                     float dx = sq[mv].x - sq[fl].x, dz = sq[mv].z - sq[fl].z;
                     float gap = (float)sqrt((double)(dx * dx + dz * dz));
                     Character* c = engine::resolve(sq[fl]);
-                    if (c && !settling && gap > FOLLOW_STOP) {
+                    if (c && gap > FOLLOW_SNAP) {
+                        engine::park(c, sq[mv].x - FOLLOW_STOP, sq[mv].y,
+                                     sq[mv].z, 0.0f);
+                    } else if (c && gap > FOLLOW_STOP) {
                         float f = (gap - FOLLOW_STOP) / gap;
                         engine::orderMoveTo(c, sq[fl].x + dx * f, sq[mv].y,
                                                 sq[fl].z + dz * f);
@@ -1294,7 +1313,6 @@ public:
         }
 
         if (ctx.elapsedMs >= dur) {
-            engine::writeGameSpeed(ctx.gw, 1.0f, false); // leave the world at 1x
             passed_ = haveAnchor_ && recvCount_ >= 1;
             return true;
         }
@@ -1304,24 +1322,28 @@ public:
     virtual bool passed() const { return passed_; }
 
 private:
-    // 85/75 s (the spawn_far precedent): the runner's kill grace is 90 s from
-    // the screenshot anchors, so a host window longer than ~85 s gets killed
-    // before it can log RESULT. The travel itself takes ~40 s at 3x.
-    static const unsigned long JOIN_DURATION_MS = 75000;  // travel + dwell
-    static const unsigned long HOST_DURATION_MS = 85000;  // outlive the join
-    static const unsigned long SETTLE_MS        = 10000;  // final 1x halt window
+    // Long windows: the manifest entry raises the runner's self-exit backstop
+    // (Seconds=220) and kill grace (KillGraceSec=190) for this scenario, so
+    // the 160 s host window survives. 15 hops x 4000 u = 60,000 u in ~135 s
+    // of hop cadence, then a dwell at the far point.
+    static const unsigned long JOIN_DURATION_MS = 150000; // hops + far dwell
+    static const unsigned long HOST_DURATION_MS = 160000; // outlive the join
+    static const unsigned long HOP_DWELL_MS     = 9000;   // per-stop coverage window
+    static const unsigned int  HOPS             = 15;     // total legs
     static const unsigned int  MAX_SQUAD        = 32;
-    static const float         TRAVEL;      // total outbound distance (units)
+    static const float         HOP;         // leg length (units)
     static const float         FOLLOW_STOP; // stop short of the peer (units)
+    static const float         FOLLOW_SNAP; // teleport catch-up past this gap
     bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
-    unsigned long lastVoteMs_;
+    unsigned int  hopsDone_;
     bool          haveAnchor_;
     float         ax_, ay_, az_;
 };
-const float TravelParityScenario::TRAVEL      = 600.0f;
+const float TravelParityScenario::HOP         = 4000.0f;
 const float TravelParityScenario::FOLLOW_STOP = 12.0f;
+const float TravelParityScenario::FOLLOW_SNAP = 150.0f;
 
 // split_interest (step 5, dual-interest conformance): the players SPLIT UP and the
 // shared world must keep streaming around BOTH of them. The HOST relocates its

@@ -975,19 +975,26 @@
         }
 
         # travel_parity (2026-07-11 free-play "yellow packs while roaming"
-        # report): the JOIN's PC travels ~600 u out at a 3x speed vote while
-        # the HOST's PC follows its local driven copy - the roaming direction
+        # report): the JOIN's PC teleport-hops ~60,000 u across the map (15
+        # hops x 4000 u, ~9 s dwell each - every hop lands entirely outside
+        # the previous 2000 u census bubble, so existence coverage rebuilds
+        # from nothing at each stop: zone streams, census re-centering,
+        # mint/cull churn) while the HOST's PC follows its local driven copy
+        # (teleport catch-up past 150 u, walk inside) - the roaming direction
         # (join drags the interest/census coverage) no other scenario moves.
-        # Both sides dump a 5 s worldstate (SCENARIO WORLD/WNPC rows; the join
-        # rows carry the drv/cen/hid/ghost authority class). follow_travel
-        # gates first: if the follow never held, the parity numbers describe
-        # two separated worlds and mean nothing. travel_parity gates the
-        # visible-on-join-only (ghost) fraction + persistence while moving;
-        # crosscheck stays advisory (a traveling driven copy legitimately
-        # trails at 3x). snap_rate advisory: the walk-drive teleports on
-        # bubble-crossing wildlife are the convergence tool, not a bug.
+        # Both sides dump a 5 s worldstate (SCENARIO WORLD/WNPC rows; the
+        # join rows carry the drv/cen/hid/ghost authority class).
+        # follow_travel gates first: if the follow never held, the parity
+        # numbers describe two separated worlds and mean nothing.
+        # travel_parity gates the visible-on-join-only (ghost) fraction +
+        # persistence while moving; crosscheck stays advisory (hop legs open
+        # multi-thousand-unit transients). snap_rate advisory: the hard snap
+        # IS the convergence tool on every hop. Seconds/KillGraceSec: the
+        # 160 s host window outlives the default 150 s self-exit + 90 s kill
+        # grace.
         travel_parity = @{
             Save = 'sync'; Setup = ''; Tolerance = 18.0
+            Seconds = 220; KillGraceSec = 190
             PrimaryGate = 'follow_travel'
             Gating   = @('follow_travel', 'travel_parity', 'clock_sync')
             Advisory = @('existence_parity', 'suppress_churn', 'snap_rate',

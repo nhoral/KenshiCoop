@@ -820,24 +820,29 @@ in the host's world but stayed carried on the join - the join PC was then
 being attacked in one world only.
 
 - **(a) Roaming coverage is now a measured, gated scenario** [DONE
-  2026-07-11]: `travel_parity` - the JOIN's PC travels ~600 u out at a 3x
-  speed vote while the HOST's PC follows its local driven copy (the roaming
-  direction no other scenario moved; every prior mover was host-side). Both
-  sides dump a 5 s worldstate (`SCENARIO WORLD`/`WNPC` rows, join rows
-  carrying the drv/cen/hid/ghost authority class - `Replicator::
-  setAuditRows`, armed only for this scenario). Gates: `follow_travel`
-  (travel >= 400 u, follow median gap <= 80 u, p75 <= 120 u) then
-  `travel_parity` (ghost fraction <= 0.35, run <= 4, plus trueGhost /
-  laggard / diverged / hostOnly metrics from the cross-dump comparison).
-  Baseline on the `sync` save: travel 609 u, median gap ~12 u, ghostFrac
-  0-0.06, hostOnly 0-1 - the wilderness baseline is CLEAN, so the field
-  yellow-pack density likely needs town/raid geography; the scenario is the
-  canary and the manual repro tool (`KENSHICOOP_DEBUG_MARKERS` + audit rows).
-  Known texture: the `diverged` metric runs 100-140 at 3x (census rows are
-  <= 1 s stale + the 5 s per-key park cooldown; wanderers legitimately cover
-  100-450 u between parks at 3x wall-speed) - a 1x free-play divergence is
-  a third of that. snap_rate/smoothness stay advisory on this scenario (the
-  walk-drive teleport IS the convergence tool on bubble-crossing wildlife).
+  2026-07-11, far-hop rev same day]: `travel_parity` - the JOIN's PC
+  teleport-hops ~60,000 u across the map (15 hops x 4000 u, ~9 s dwell
+  each; every hop lands entirely outside the previous 2000 u census bubble,
+  so existence coverage rebuilds from nothing at each stop) while the
+  HOST's PC follows its local driven copy (teleport catch-up past 150 u,
+  walk inside) - the roaming direction no other scenario moved; every
+  prior mover was host-side. Both sides dump a 5 s worldstate
+  (`SCENARIO WORLD`/`WNPC` rows, join rows carrying the drv/cen/hid/ghost
+  authority class - `Replicator::setAuditRows`, armed only for this
+  scenario). Gates: `follow_travel` (travel >= 40,000 u, follow median gap
+  <= 120 u, hop gaps must close within 6 samples above 300 u) then
+  `travel_parity` (samples anchored on the WORLD summary rows so EMPTY
+  wilderness dumps count as judged; ghost fraction <= 0.35, run <= 4, plus
+  trueGhost / laggard / diverged / hostOnly metrics from the cross-dump
+  comparison). Baseline on the `sync` save (PASS x3): follow median gap
+  ~13 u across the whole trek, ghostFrac 0-0.22 with runs <= 2 (a 42-ghost
+  burst at one hop landing was judged and cleared within ~5 s), hostOnly 0
+  - the wilderness trek is CLEAN even across 15 census-bubble rebuilds, so
+  the field yellow-pack density likely needs town/raid geography; the
+  scenario is the canary and the manual repro tool
+  (`KENSHICOOP_DEBUG_MARKERS` + audit rows). snap_rate/smoothness stay
+  advisory on this scenario (the hard snap IS the convergence tool on
+  every hop).
 - **(b) Join-PC carried-by-NPC put-down divergence** [OPEN backlog]: carry
   edges are CARRIER-authored (`EVT_PICKUP_BODY`/`EVT_DROP_BODY` from the
   host for world-NPC carriers, doctrine 28), and the carried join PC is
