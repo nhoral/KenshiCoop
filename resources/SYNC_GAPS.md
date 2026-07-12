@@ -681,6 +681,135 @@ sites.
   inspection. Render-verified in run 111215 (green DRV labels tracking both
   driven squad members).
 
+### 14. Play-session bugs 2026-07-11 (second round): on-top spawn-ins + choppy NPC walk [DONE 2026-07-11]
+
+Two field reports from the zoom-save manual session that validated entry 13,
+diagnosed from the preserved session logs (`tools/manual-sessions/`).
+
+- **Host NPCs materialize on top of the join player.** A runtime squad
+  walking in from afar only got a join-side proxy once it was already inside
+  the ~200 u stream bubble: streaming is gated by the host's capture radius,
+  and the join's `PKT_SPAWN_REQ` author was gated by `SPAWN_REQ_RADIUS`
+  (250 u) from a STREAMED position. The census (2000 u) already told the join
+  those NPCs exist but was only used to veto suppression, never to mint.
+  Shipped: census-range minting - a 2 s census-missing scan records census
+  hands with no local body; those hands skip the streamed-position gate and
+  send `PKT_SPAWN_REQ` immediately; the mint gate moves to the REPLY, whose
+  `PKT_SPAWN_INFO` carries the authoritative position - mint only within
+  `KENSHICOOP_SPAWN_MINT_RADIUS` (default 600 u) of a local squad member
+  (any baked NPC that close is in a loaded block and would have resolved, so
+  a resolve-fail inside the radius is a genuine runtime spawn - the
+  duplicate hazard the old 250 u gate existed for is preserved). A too-far
+  reply is a soft deferral retried ~5 s (never the 30 s denied cooldown - a
+  walking raid covers ~300 u in that), so the proxy binds right as the squad
+  crosses the mint radius and walks the remaining ~600 u in plain view.
+  Bind-time hardening: `enforceHostAuthority` exempts proxy bodies from both
+  suppression passes (a minted proxy's local hand is never in the census, so
+  the wide pass culled-and-froze it at the mint point; frozen bodies then
+  no-op every `applyRaw` = a permanent per-frame snap storm) and instantly
+  restores any suppressed body that becomes a proxy or driven.
+- **Choppy NPC movement outside combat.** The walk/rest classifier used the
+  instantaneous 2-sample stream velocity, which dips below `NPC_MOVE_VEL` at
+  every sample-pair boundary of a walking source - the classifier FLAPPED
+  walk/rest several times a second, and each rest entry parked/halted the
+  body while each walk re-entry restarted the path (the stutter). Shipped:
+  time-debounced classifier - the walking verdict holds 1 s past the last
+  genuinely-moving sample (`restFlip` counter added to `[interp]` telemetry).
+  A velPeak-based debounce was tried and reverted same-day: the decaying
+  peak is magnitude-sensitive, so one teleport-artifact velocity spike
+  (srcVel 90-150 u/s on a seg snap) held a genuinely seated divergent NPC in
+  the walk branch ~7 s per spike, hard-snapping every frame. Second cause:
+  NPCs at the 200 u capture-bubble edge dropped in/out of the host's stream
+  set, starving the join's interp buffer - `captureNpcs` now has hysteresis
+  (query 260 u; acquire < 200 u unconditionally, retain the 200-260 u band
+  only for hands already captured last tick). Related seat-break fix: a
+  rest-pose apply commits a PLAYER-rank order, and a seated body both
+  ignores goal-level movement and re-places itself at the fixture (applyRaw
+  teleports no-op on it) - when the host copy starts moving, the join now
+  flushes the order once via the player move-order path (`walkTo`) before
+  the drive resumes.
+- **Validation:** new full-tier scenario `spawn_far` (host spawns a runtime
+  squad 620 u out, parks it, walks it to the leader at jog speed) with
+  oracle `Test-SpawnFarBind` gating: every far hand minted, all binds
+  >= 400 u from the join anchor, no duplicate mints, and the SAME proxy
+  driven into the stream bubble (closest approach <= 350 u). New oracle
+  `Test-RestFlap` gates walk-to-rest flips per minute on `npc_sync`.
+
+### 15. Play-session bugs 2026-07-11 (third round): join crash + pack visible on join only [DONE 2026-07-11]
+
+Field session 17:25-17:53 on the shared free-play save: the join crashed with
+an unspecified error after ~28 minutes, a wildlife pack stayed visible on the
+join with no host counterpart (preserved as save `pack hidden`), and the host
+world looked empty.
+
+- **Join crash = engine walking a freed body while we held 93 stale
+  suppress bookings.** Minidump verdict (`crashDump1.0.65_x64.dmp`, parsed
+  with python-minidump): `0xC0000005` reading `0xFFFFFFFFFFFFFFFF` at
+  `kenshi_x64.exe+0x9FA5E0` = `ZoneManager::findOverlappingActiveZones`,
+  reached from `GameWorld::charsUpdate -> Character::_NV_threadedUpdatePeriodic
+  -> SensoryData::periodicUpdate -> getRagdollPhysicsRootPos` - the engine's
+  own sensory pass dereferencing a stale body during zone streaming, with a
+  1,840-event faction war running and 93 suppressed wildlife booked in
+  `suppressed_` by raw `Character*`. Shipped pointer-lifetime hardening,
+  all three long-lived pointer maps:
+  - `suppressed_` re-assert pass: before ANY touch, prove each entry live
+    with a hand ROUND-TRIP (SEH-read the pointer's current hand, resolve it
+    back; same pointer = alive). Dead entries (despawned bodies) are pruned
+    with their markers/counters, never touched (`[authority] pruned N`,
+    `pruned=` on `SCENARIO INTERP`). A live body whose hand CHANGED (combat
+    detach re-containers while hidden) MIGRATES its entry to the new key so
+    the 2 s re-assert keeps holding it down - previously the old key stopped
+    resolving and the hide silently lapsed (one suspected pack-hidden path).
+  - `proxyByKey_`: same round-trip on a ~1 s sweep in `syncSpawns`; a
+    despawned proxy unbinds (`[spawn] proxy DESPAWNED`) and clears its
+    request state so the census-missing machinery can re-mint.
+  - `debugMarkers_` (raw `Character*` keys AND engine `ScreenLabel*`): pruned
+    against the vouched-live set each re-assert pass; labels destroyed on
+    prune and on `resetSession` (the map previously survived session swaps
+    with dangling pointers from the OLD world).
+  - Release links with `/DEBUG` now: `KenshiCoop.pdb` ships next to the DLL
+    so the next dump symbolicates.
+- **Pack visible on join only = divergent local sims of census-present
+  wildlife + un-mintable animal templates.** Existence culling deliberately
+  exempts census-present NPCs, but each side then runs its OWN sim: the
+  join's copy of a pack can stand somewhere the host's copy isn't. And the
+  inverse could never heal - animal templates live in the `ANIMAL_CHARACTER`
+  GameData category, which the proxy mint's `CHARACTER`-only scan MISSed
+  (`proxy template MISS sid='3979-gamedata.base'`), so host wildlife could
+  never mint on the join. Shipped, protocol v38:
+  - **Census position parking**: census rows carry the host position
+    (5xu32 + 3xf32 per NPC). The wide pass parks a census-present local copy
+    that diverged past `KENSHICOOP_CENSUS_PARK` (default 120 u - above the
+    ~50 u town-schedule divergence of a bar NPC seated at a different stool
+    per sim; genuine wanderers measured 500-900 u) onto the host's spot,
+    one park per key per 5 s (run 185524: unthrottled in-bubble parking
+    fought the seat AI every frame and wrecked npc_track/march/snap_rate).
+  - **Mint duplicate guard**: a mint reply defers (far-retry cadence) when a
+    VISIBLE uncorrelated same-template body stands within 20 u of the reply
+    position - bound proxies and suppressed culls excluded, so pack members
+    still mint meters apart while a re-containered twin can't get doubled.
+  - **Animal mint**: template lookup falls back to the `ANIMAL_CHARACTER`
+    category scan.
+  - **Existence-audit probe**: 5 s join-side `[audit] exist` line classifying
+    every enumerated NPC (drv / cen / hid / ghost - ghost = census-absent,
+    unsuppressed, the visible-on-join-only class), per-ghost rows under
+    `KENSHICOOP_DEBUG_CENSUS=1`, and oracle `Test-ExistenceParity` (advisory
+    on `npc_sync`) gating ghost fraction + persistence.
+- **"Host devoid of NPCs" was real emptiness**, not a sync failure: the host
+  census legitimately ran n=12-13 wilderness NPCs at 2000 u during the
+  diagnostic re-run (n=0 swings in the crashed session's logs), and every
+  join-side extra was culled. Diagnostic session on `pack hidden`: 3
+  join-local Wild Bulls culled within 30 s, `hid=3 ghost=0` steady for the
+  whole session - the pack-hidden class is now handled at both ends.
+- **`[fac] AFFECT-EV/AMT` log storm throttled** per faction pair (5 s
+  debounce, skipped count carried into the next line; delta RECORDING for
+  the sync layer untouched) - the crashed session logged 1,840 lines in
+  minutes from one wildlife war re-asserting an already-clamped relation.
+- **Validation:** `spawn_far`, `npc_sync`, `leader_move`, `coop_presence`
+  all PASS post-change (one `npc_sync` smoothness flake at 0.465, clean
+  re-run 0.215 - the known flakiness); existence-parity advisory PASS with
+  zero ghosts; 30-minute zoom soak with markers + wildlife churn, no crash.
+
 ## Accepted edges (documented, deliberately out of scope)
 
 - Ambush/NPC dialog content is not synced (backlog #379/380) - players see

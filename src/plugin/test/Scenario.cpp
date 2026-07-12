@@ -6291,6 +6291,142 @@ private:
 };
 const float NpcCensusScenario::GHOST_DIST = 600.0f;
 
+// spawn_far (2026-07-11 "NPCs spawn on top of the join player" fix): census-
+// range proxy minting. Host runtime spawns used to reach the join only via
+// the ~200 u stream bubble + the 250 u spawn-REQ proximity gate, so a raid
+// walking in from afar materialized at arm's length. With the census-missing
+// scan + reply-side mint gate (KENSHICOOP_SPAWN_MINT_RADIUS, 600 u default)
+// the join must mint the proxies while the squad is still FAR out and let
+// them walk in. (spawn_sync's far leg teleports the PLAYERS to the spawn, so
+// it never exercises approach-from-afar.)
+//
+// Script (host): t=6s spawn 4 runtime NPCs, PARK them ~620 u from the anchor
+//                (just outside the mint radius, so the far-defer/retry path
+//                is exercised too), then order them to WALK back toward the
+//                anchor (re-issued every 5 s until close).
+// Script (join): idle; the replicator's [spawn] census-missing / REQ / INFO
+//                deferred (far) / proxy BOUND lines plus the ~2 Hz SCENARIO
+//                PROXY series are the evidence.
+// Both sides log their leader anchor ("SCENARIO FARBIND anchor=..") and the
+// standard MEMBER/RECV NPC series. Test-SpawnFarBind gates: every far hand
+// binds exactly once (no duplicate mints) and while still >= 400 u from the
+// join anchor (no more on-top materialization).
+class SpawnFarScenario : public Scenario {
+public:
+    SpawnFarScenario()
+        : passed_(false), lastLogMs_(0), lastOrderMs_(0),
+          spawned_(false), nFar_(0),
+          haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
+
+    virtual const char* name() const { return "spawn_far"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        Character* ld = engine::leader(ctx.gw);
+        if (ld && engine::readPos(ld, &ax_, &ay_, &az_)) haveAnchor_ = true;
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO FARBIND anchor=%.1f,%.1f,%.1f have=%d",
+                  ax_, ay_, az_, haveAnchor_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Standard NPC series: the host's MEMBER set picks the squad up when
+        // it re-enters the capture bubble; the join's RECV set shows the
+        // proxies once driven.
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+        }
+
+        if (ctx.isHost) {
+            if (!spawned_ && haveAnchor_ && ctx.elapsedMs >= SPAWN_AT_MS) {
+                spawned_ = true;
+                nFar_ = engine::spawnRuntimeSquad(ctx.gw, SQUAD_N, farHands_);
+                unsigned int parked = 0;
+                for (unsigned int i = 0; i < nFar_; ++i) {
+                    Character* c = engine::resolveCharByHand(
+                        farHands_[i][3], farHands_[i][4], farHands_[i][0],
+                        farHands_[i][1], farHands_[i][2]);
+                    if (!c) continue;
+                    engine::park(c, ax_ + SPAWN_DIST + (float)i * 4.0f, ay_, az_, 0.0f);
+                    ++parked;
+                }
+                for (unsigned int i = 0; i < nFar_; ++i) {
+                    char b[144];
+                    _snprintf(b, sizeof(b) - 1, "SCENARIO SPAWN leg=far hand=%u,%u,%u,%u,%u",
+                              farHands_[i][0], farHands_[i][1], farHands_[i][2],
+                              farHands_[i][3], farHands_[i][4]);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO SPAWNED leg=far n=%u parked=%u dist=%.0f",
+                          nFar_, parked, SPAWN_DIST);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // March the squad toward the anchor; re-issue on a slow cadence
+            // (the walk order holds between issues; per-frame re-issue would
+            // path-restart-stutter, and the squad is detached from town AI).
+            if (spawned_ && haveAnchor_ &&
+                (ctx.elapsedMs - lastOrderMs_) >= ORDER_EVERY_MS) {
+                lastOrderMs_ = ctx.elapsedMs;
+                for (unsigned int i = 0; i < nFar_; ++i) {
+                    Character* c = engine::resolveCharByHand(
+                        farHands_[i][3], farHands_[i][4], farHands_[i][0],
+                        farHands_[i][1], farHands_[i][2]);
+                    if (!c) continue;
+                    float x = 0, y = 0, z = 0;
+                    if (!engine::readPos(c, &x, &y, &z)) continue;
+                    float dx = x - ax_, dy = y - ay_, dz = z - az_;
+                    if (dx * dx + dy * dy + dz * dz < ARRIVE_DIST * ARRIVE_DIST)
+                        continue; // arrived: let it idle beside the players
+                    engine::walkTo(c, ax_ + (float)i * 2.0f, ay_, az_, WALK_SPEED);
+                }
+            }
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // Script-ran verdict only; the bind evidence is judged by the
+            // Test-SpawnFarBind oracle over the paired logs.
+            passed_ = ctx.isHost ? (nFar_ > 0) : true;
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long SPAWN_AT_MS      = 6000;
+    static const unsigned long ORDER_EVERY_MS   = 5000;
+    // Walk-in budget: 620 u at 14 u/s ~ 44 s + 6 s spawn + mint latency.
+    // The harness kill deadline is KillGraceSec (90 s loopback) from the
+    // post-screenshot mark (~arm + 5 s), so the host must self-exit < ~95 s
+    // after arm or it gets force-killed before logging RESULT.
+    static const unsigned long JOIN_DURATION_MS = 75000;
+    static const unsigned long HOST_DURATION_MS = 85000;
+    static const unsigned int  SQUAD_N          = 4;
+    static const unsigned int  MAX_LOG          = 40;
+    static const float         SPAWN_DIST;  // park distance from anchor (units)
+    static const float         WALK_SPEED;  // commanded approach speed (u/s)
+    static const float         ARRIVE_DIST; // stop re-ordering inside this
+
+    bool          passed_;
+    unsigned long lastLogMs_;
+    unsigned long lastOrderMs_;
+    bool          spawned_;
+    unsigned int  nFar_;
+    unsigned int  farHands_[SQUAD_N][5];
+    bool          haveAnchor_;
+    float         ax_, ay_, az_;
+};
+const float SpawnFarScenario::SPAWN_DIST  = 620.0f;
+const float SpawnFarScenario::WALK_SPEED  = 14.0f;
+const float SpawnFarScenario::ARRIVE_DIST = 30.0f;
+
 // shop_probe (protocol 22 phase 0, probe tier): money + vendor-trading evidence.
 //
 // Kenshi facts under test (spikes 28-30): the wallet is per-Platoon (Ownerships::
@@ -9853,6 +9989,7 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "spawn_probe")  return new SpawnSyncScenario(/*probe=*/true);
     if (name == "spawn_sync")   return new SpawnSyncScenario(/*probe=*/false);
     if (name == "npc_census")   return new NpcCensusScenario();
+    if (name == "spawn_far")    return new SpawnFarScenario();
     if (name == "shop_probe")   return new ShopProbeScenario(/*probe=*/true);
     if (name == "money_sync")   return new ShopProbeScenario(/*probe=*/false);
     if (name == "vendor_trade") return new VendorTradeScenario();

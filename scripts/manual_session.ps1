@@ -284,7 +284,9 @@ if ($Inhabit) {
     $seen = $false
     while ((Get-Date) -lt $deadline) {
         if (Test-Path $hostLog) {
-            $hit = Select-String -Path $hostLog -Pattern "inhabit ownership" -ErrorAction SilentlyContinue | Select-Object -First 1
+            # The plugin's load line reads "ownership ranks = {..}" (older builds
+            # said "inhabit ownership = ..." - the grep must match the current one).
+            $hit = Select-String -Path $hostLog -Pattern "ownership ranks = " -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -ne $hit) { $seen = $true; Write-Host "  OK: $($hit.Line.Trim())"; break }
         }
         Start-Sleep -Milliseconds 500

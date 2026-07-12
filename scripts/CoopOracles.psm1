@@ -6305,6 +6305,200 @@ function Test-SuppressChurn {
                 -Metrics @{ hands = $counts.Count; worstPerHand = $worst; restores = $restores } -Detail $detail)
 }
 
+# spawn_far (2026-07-11 "NPCs spawn on top of the join player" fix): census-range
+# proxy minting. The host spawns a runtime squad ~620 u out and walks it toward
+# the co-located leaders; the join must mint the proxies while they are still
+# FAR away (census-missing scan + reply-side mint gate) instead of at the ~200 u
+# stream bubble. Gates:
+#   1. BIND coverage: every far hand drew a "[spawn] proxy BOUND" line.
+#   2. FAR bind: every bind happened >= MinBindDist from the join's leader
+#      anchor (no more materializing on top of the player).
+#   3. NO DUPES: at most one BOUND per hand (the mint gate must not double-mint
+#      a hand that later streams normally).
+#   4. TAKEOVER: at least one proxy's SCENARIO PROXY series reaches within
+#      ApproachDist of the anchor - the walking squad entered the stream bubble
+#      and the SAME proxy body was driven in (no fresh mint at the boundary).
+function Test-SpawnFarBind {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$MinBindDist = 400.0, [double]$ApproachDist = 350.0)
+    if (-not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "spawn_far" -Status SKIP -Detail "no join log")
+    }
+    $hostLegs = Get-SpawnHands -File $HostFile
+    $far = if ($hostLegs.ContainsKey('far')) { @($hostLegs['far']) } else { @() }
+    if ($far.Count -eq 0) {
+        Write-Host "  SPAWN-FAR FAIL - host never spawned the far squad"
+        return (Add-GateResult -Name "spawn_far" -Status FAIL -Detail "no far spawns")
+    }
+    $am = Select-String -Path $JoinFile -Pattern 'SCENARIO FARBIND anchor=([-\d\.]+),([-\d\.]+),([-\d\.]+) have=1' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $am) {
+        Write-Host "  SPAWN-FAR FAIL - join never logged its leader anchor"
+        return (Add-GateResult -Name "spawn_far" -Status FAIL -Detail "no join anchor")
+    }
+    $ax = [double]$am.Matches[0].Groups[1].Value
+    $ay = [double]$am.Matches[0].Groups[2].Value
+    $az = [double]$am.Matches[0].Groups[3].Value
+
+    # BOUND lines with the mint position (the host-authoritative spawn point).
+    $bounds = @{}
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern '\[spawn\] proxy BOUND hand=([\d,]+) .*pos=([-\d\.]+),([-\d\.]+),([-\d\.]+)' -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $h = $g[1].Value
+        if (-not $bounds.ContainsKey($h)) { $bounds[$h] = New-Object System.Collections.ArrayList }
+        $dx = [double]$g[2].Value - $ax
+        $dy = [double]$g[3].Value - $ay
+        $dz = [double]$g[4].Value - $az
+        [void]$bounds[$h].Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+    }
+
+    $boundN = 0; $dupN = 0; $closestBind = [double]::MaxValue; $farOk = $true
+    foreach ($h in $far) {
+        if (-not $bounds.ContainsKey($h)) { continue }
+        $boundN++
+        if ($bounds[$h].Count -gt 1) { $dupN++ }
+        $d = $bounds[$h][0]
+        if ($d -lt $closestBind) { $closestBind = $d }
+        if ($d -lt $MinBindDist) { $farOk = $false }
+    }
+    $bindOk = ($boundN -eq $far.Count)
+    $dupOk  = ($dupN -eq 0)
+    $bindTxt = if ($closestBind -eq [double]::MaxValue) { "n/a" } else { [Math]::Round($closestBind, 0) }
+    Write-Host ("  SPAWN-FAR bind " + $(if ($bindOk) { "PASS" } else { "FAIL" }) +
+                " - $boundN/$($far.Count) far hands minted")
+    Write-Host ("  SPAWN-FAR distance " + $(if ($farOk) { "PASS" } else { "FAIL" }) +
+                " - closest bind $bindTxt u from join anchor (>= $MinBindDist)")
+    Write-Host ("  SPAWN-FAR dupes " + $(if ($dupOk) { "PASS" } else { "FAIL" }) +
+                " - $dupN hand(s) bound more than once")
+
+    # TAKEOVER: the proxy body itself must close on the anchor (stream drive).
+    $P = Get-ScenarioSeries -File $JoinFile -Kind "PROXY"
+    $minApproach = [double]::MaxValue
+    foreach ($h in $far) {
+        $key = Convert-SpawnHandToSeriesKey -Hand $h
+        if ($null -eq $key -or -not $P.ContainsKey($key)) { continue }
+        foreach ($ps in $P[$key]) {
+            $dx = $ps.p[0]-$ax; $dy = $ps.p[1]-$ay; $dz = $ps.p[2]-$az
+            $d = [Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz)
+            if ($d -lt $minApproach) { $minApproach = $d }
+        }
+    }
+    $approachOk = ($minApproach -le $ApproachDist)
+    $appTxt = if ($minApproach -eq [double]::MaxValue) { "n/a" } else { [Math]::Round($minApproach, 0) }
+    Write-Host ("  SPAWN-FAR takeover " + $(if ($approachOk) { "PASS" } else { "FAIL" }) +
+                " - closest proxy approach $appTxt u (<= $ApproachDist)")
+
+    $ok = $bindOk -and $farOk -and $dupOk -and $approachOk
+    $why = @()
+    if (-not $bindOk)     { $why += "far hands never minted" }
+    if (-not $farOk)      { $why += "a proxy minted inside $MinBindDist u (on-top materialization)" }
+    if (-not $dupOk)      { $why += "duplicate mints" }
+    if (-not $approachOk) { $why += "no proxy walked into the stream bubble" }
+    $detail = $why -join "; "
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  SPAWN-FAR $v $detail"
+    return (Add-GateResult -Name "spawn_far" -Status $v `
+                -Metrics @{ far = $far.Count; bound = $boundN; dupes = $dupN
+                            closestBind = $bindTxt; minApproach = $appTxt } -Detail $detail)
+}
+
+# Rest-flap (2026-07-11 choppiness fix): the join's walk/rest classifier used the
+# instantaneous 2-sample velocity, which dips below threshold at every sample
+# pair of a walking NPC - each dip parks/halts the body, each recovery restarts
+# the walk (the observed stutter, several flips per second). The velPeak
+# debounce makes rest entry require ~1-2 s of genuinely still samples, so the
+# cumulative restFlip counter on the [interp] line must now grow at genuine-stop
+# rate only. The session-start clock-slew window is excluded like Test-SnapRate.
+function Test-RestFlap {
+    param([string]$File, [string]$Label = "join", [double]$MaxPerMin = 60.0,
+          [int]$MinWindowSec = 20)
+    if (-not (Test-Path $File)) {
+        return (Add-GateResult -Name "rest_flap" -Status SKIP -Detail "no log")
+    }
+    $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[interp\] .*restFlip=(\d+)"
+    $lines = @(Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)
+    if ($lines.Count -lt 2) {
+        Write-Host "  [$Label] rest-flap SKIP - no [interp] restFlip series"
+        return (Add-GateResult -Name "rest_flap" -Status SKIP -Detail "no restFlip series")
+    }
+    $series = @(foreach ($m in $lines) {
+        $g = $m.Matches[0].Groups
+        [pscustomobject]@{
+            t = Convert-StampToMs -Groups $g -OffsetMs 0
+            n = [long]$g[5].Value
+        }
+    })
+    $startIdx = 0
+    $om = Select-String -Path $File -Pattern "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[time\] OFFSET .*slew=1\.0" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $om) {
+        $slewT = Convert-StampToMs -Groups $om.Matches[0].Groups -OffsetMs 0
+        for ($i = 0; $i -lt $series.Count; $i++) {
+            if ($series[$i].t -le $slewT) { $startIdx = $i }
+        }
+    }
+    $base = $series[$startIdx]
+    $last = $series[$series.Count - 1]
+    $winSec = ($last.t - $base.t) / 1000.0
+    if ($winSec -lt $MinWindowSec) {
+        Write-Host "  [$Label] rest-flap SKIP - scored window ${winSec}s (< ${MinWindowSec}s past the slew)"
+        return (Add-GateResult -Name "rest_flap" -Status SKIP `
+                    -Metrics @{ windowSec = $winSec } -Detail "window too short")
+    }
+    $flips = $last.n - $base.n
+    $rate  = [math]::Round($flips / ($winSec / 60.0), 2)
+    $ok = ($rate -le $MaxPerMin)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  [$Label] rest-flap $v - $flips walk->rest flip(s) over $([math]::Round($winSec,0))s = $rate/min (<= $MaxPerMin/min)"
+    return (Add-GateResult -Name "rest_flap" -Status $v `
+                -Metrics @{ flips = $flips; windowSec = [math]::Round($winSec, 1); ratePerMin = $rate })
+}
+
+# Existence parity (pack-hidden investigation, 2026-07-11). The join emits an
+# "[audit] exist ..." line every 5 s classifying every enumerated NPC:
+#   drv (streamed/driven) / cen (census-present local copy) / hid (suppressed)
+#   / ghost (census-absent, NOT suppressed - the visible-on-join-only class).
+# A ghost is legitimate only transiently (the ~1 s suppress debounce), so with
+# a FRESH census the fraction of samples showing ghosts must stay low, and no
+# ghost population may PERSIST (a wildlife pack the authority never judges
+# would show as sustained ghost>0). Samples with fresh=0 are excluded (wide
+# culling is deliberately disabled on a stale census).
+function Test-ExistenceParity {
+    param([string]$File, [string]$Label = "join",
+          [double]$MaxGhostFrac = 0.35, [int]$MaxGhostRun = 4,
+          [int]$MinSamples = 4)
+    if (-not (Test-Path $File)) {
+        return (Add-GateResult -Name "existence_parity" -Status SKIP -Detail "no log")
+    }
+    $pat = "\[audit\] exist near=(\d+) wide=(\d+) drv=(\d+) cen=(\d+) hid=(\d+) ghost=(\d+) supp=(\d+) census=(\d+) fresh=(\d)"
+    $lines = @(Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)
+    $samples = @(foreach ($m in $lines) {
+        $g = $m.Matches[0].Groups
+        if ($g[9].Value -eq "1") {
+            [pscustomobject]@{ ghost = [int]$g[6].Value; wide = [int]$g[2].Value }
+        }
+    })
+    if ($samples.Count -lt $MinSamples) {
+        Write-Host "  [$Label] existence-parity SKIP - $($samples.Count) fresh-census audit sample(s) (< $MinSamples)"
+        return (Add-GateResult -Name "existence_parity" -Status SKIP `
+                    -Metrics @{ samples = $samples.Count } -Detail "too few fresh audit samples")
+    }
+    $withGhost = @($samples | Where-Object { $_.ghost -gt 0 }).Count
+    $frac = [math]::Round($withGhost / $samples.Count, 3)
+    $maxGhost = ($samples | Measure-Object -Property ghost -Maximum).Maximum
+    # Longest consecutive run of ghost>0 samples = persistence signal
+    # (5 s cadence, so a run of 4 means >= ~15 s of unjudged join-only NPCs).
+    $run = 0; $maxRun = 0
+    foreach ($s in $samples) {
+        if ($s.ghost -gt 0) { $run++; if ($run -gt $maxRun) { $maxRun = $run } }
+        else { $run = 0 }
+    }
+    $ok = ($frac -le $MaxGhostFrac) -and ($maxRun -le $MaxGhostRun)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  [$Label] existence-parity $v - ghosts in $withGhost/$($samples.Count) samples (frac=$frac <= $MaxGhostFrac), longest run $maxRun (<= $MaxGhostRun), peak ghost=$maxGhost"
+    return (Add-GateResult -Name "existence_parity" -Status $v `
+                -Metrics @{ samples = $samples.Count; ghostFrac = $frac
+                            maxRun = $maxRun; peakGhost = $maxGhost })
+}
+
 # ---- Manifest + top-level analysis ---------------------------------------------------
 
 # Load scripts/scenarios.psd1 (or an explicit path).
@@ -6364,6 +6558,7 @@ function Invoke-OneOracle {
         "squad_probe"    { return (Test-SquadProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "squad_sync"     { return (Test-SquadSync      -HostFile $HostLog -JoinFile $JoinLog) }
         "spawn_sync"    { return (Test-SpawnSync       -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
+        "spawn_far"     { return (Test-SpawnFarBind    -HostFile $HostLog -JoinFile $JoinLog) }
         "npc_census"    { return (Test-NpcCensus       -HostFile $HostLog -JoinFile $JoinLog) }
         "sneak_pose"    { return (Test-SneakPose       -HostFile $HostLog -JoinFile $JoinLog) }
         "sneak_detect"  { return (Test-SneakDetect     -HostFile $HostLog -JoinFile $JoinLog) }
@@ -6407,6 +6602,8 @@ function Invoke-OneOracle {
         "snap_rate"     { return (Test-SnapRate        -File $JoinLog) }
         "snap_rate_squad" { return (Test-SnapRate      -File $JoinLog -SquadOnly -GateName "snap_rate_squad") }
         "suppress_churn" { return (Test-SuppressChurn  -File $JoinLog) }
+        "rest_flap"     { return (Test-RestFlap        -File $JoinLog) }
+        "existence_parity" { return (Test-ExistenceParity -File $JoinLog) }
         "clock_sync"    { return (Test-ClockSync       -HostFile $HostLog -JoinFile $JoinLog -ExpectedSkewMs $ExpectedSkewMs) }
         default {
             Write-Host "  WARNING: unknown oracle id '$Id' (manifest error)"
@@ -6572,7 +6769,8 @@ Export-ModuleMember -Function @(
     "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry",
     "Get-FurnSeries", "Test-FurnPut", "Test-CagePeer",
     "Test-SneakProbe",
-    "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync", "Test-NpcCensus",
+    "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync", "Test-SpawnFarBind",
+    "Test-NpcCensus",
     "Get-WalletSeries", "Test-ShopProbe", "Test-MoneySync", "Test-VendorTrade",
     "Test-RecruitProbe", "Test-RecruitSync",
     "Get-FacRelSeries", "Test-FactionProbe", "Test-FactionSync",
@@ -6586,6 +6784,6 @@ Export-ModuleMember -Function @(
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-WpnRelocate", "Test-WeaponDrop",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
-    "Test-SnapRate", "Test-SuppressChurn",
+    "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"
 )

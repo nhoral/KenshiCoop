@@ -1568,3 +1568,87 @@ These extend the numbered doctrine in `POSTMORTEM.md`:
     and research_sync (run 220320: unlock crossed in 1000 ms, sticky,
     finals agree). KENSHICOOP_RESEARCH_SYNC=0 is the escape hatch
     (forced OFF in research_probe).
+
+54. **Mint where EXISTENCE is known, gate on the reply's AUTHORITATIVE
+    position - and classify remote motion by TIME, not by one sample.**
+    (2026-07-11, no wire change - the far-spawn-in + choppy-walk fixes,
+    extending doctrine 33.) Two field reports, one root shape each:
+    - *Proxies minted at the wrong radius.* The doctrine-33 spawn
+      channel gated `PKT_SPAWN_REQ` on a STREAMED position within
+      250 u - but streaming itself starts at the ~200 u capture bubble,
+      so a raid walking in from afar materialized on top of the join
+      player. The census (2000 u) already asserts existence; the fix
+      splits the two radii the way doctrine 48 splits existence from
+      position: a census hand with no local body authors the REQ with
+      no position at all, and the mint decision moves to the REPLY,
+      which carries the host's authoritative transform. Mint only
+      within `KENSHICOOP_SPAWN_MINT_RADIUS` (600 u) of a local squad
+      member - any baked NPC that close sits in a loaded block and
+      would have resolved, so a resolve-fail there is a genuine runtime
+      spawn (the duplicate hazard the old gate guarded is preserved,
+      at the radius where the answer is trustworthy). A too-far reply
+      is a soft ~5 s deferral, never the 30 s denied cooldown (a
+      walking raid covers ~300 u in that). Bind-time corollary: a
+      minted proxy's LOCAL hand is never in the census, so the
+      suppression wide pass culled-and-froze it at the mint point
+      (frozen bodies no-op `applyRaw` = per-frame snap storm);
+      `enforceHostAuthority` now exempts proxy bodies by pointer and
+      instantly restores any suppressed body that becomes a proxy.
+    - *The walk/rest classifier flapped.* The instantaneous 2-sample
+      stream velocity dips below the walk threshold at every
+      sample-pair boundary, so the classifier parked/halted the body
+      several times a second (the observed stutter). Debounce by TIME:
+      the walking verdict holds 1 s past the last genuinely-moving
+      sample. A velPeak debounce failed first (same-day revert): the
+      decaying peak is MAGNITUDE-sensitive, so one teleport-artifact
+      spike (srcVel 90-150 u/s on a seg snap) held a genuinely SEATED
+      divergent NPC in the walk branch ~7 s per spike, hard-snapping
+      every frame - a time hold is spike-immune because duration, not
+      size, is what distinguishes real walking. Companion fixes:
+      `captureNpcs` hysteresis (acquire < 200 u, retain to 260 u) stops
+      bubble-edge NPCs starving the interp buffer, and a seat-break
+      (rest-pose orders are PLAYER-rank; a seated body ignores
+      goal-level moves and no-ops teleports) flushes the order via the
+      player move path once when the host copy starts moving. The
+      smoothness oracle keeps scoring NPCs on the INSTANTANEOUS
+      velocity - the debounce is a DRIVE decision; charging the 1 s
+      trailing walk-hold after a source stop as "active" frames
+      measured the debounce, not the pipeline.
+    Validated by `spawn_far` (host spawns a runtime squad 620 u out and
+    walks it in; every far hand minted, binds >= 400 u from the join
+    anchor, no duplicate mints, same proxy driven to 1-2 u closest
+    approach) and `Test-RestFlap` on npc_sync (walk-to-rest flips/min).
+
+55. **The engine owns every body: never trust a raw `Character*` across
+    frames - prove it live with a hand round-trip first.** (2026-07-11,
+    protocol v38 - the join-crash + pack-hidden fixes.) The join crashed
+    inside the ENGINE's own sensory update (`SensoryData::periodicUpdate ->
+    ZoneManager::findOverlappingActiveZones`, reading `0xFFFF...F`) while we
+    held 93 suppressed wildlife bodies by raw pointer through a zone stream.
+    The engine despawns bodies whenever it likes (zone streaming, wildlife
+    cleanup, combat re-containering); any map that stores `Character*`
+    across frames - `suppressed_`, `proxyByKey_`, `debugMarkers_` - is a
+    use-after-free waiting for churn. The liveness proof that needs no
+    stored state: SEH-read the pointer's CURRENT hand and resolve the hand
+    back; getting the SAME pointer proves the engine's own tables still
+    vouch for the body (and it survives re-containering, which only changes
+    the hand - a stored bind-time hand would false-negative there). Three
+    dispositions, all pointer-untouched: same pointer + same hand = alive,
+    keep; same pointer + CHANGED hand = re-containered, MIGRATE the entry to
+    the new key (a suppressed body must keep being re-asserted under its
+    live key or the hide silently lapses mid-combat - one suspected
+    pack-hidden path); resolve fail/mismatch = despawned, PRUNE entry +
+    marker + counters. Corollaries: `resetSession` must destroy marker
+    labels (GUI objects we own pinned to OLD-world bodies), and existence
+    parity needs its own eyes - the `[audit] exist` line buckets every
+    enumerated NPC (drv/cen/hid/ghost) at 5 s so "a pack only I can see"
+    is a measured `ghost>0` streak (`Test-ExistenceParity`), not a field
+    anecdote. Same protocol bump puts POSITIONS on the census rows: census-
+    present copies are exempt from culling, but two independent sims of the
+    same NPC drift apart - the wide pass PARKS a copy diverged past 120 u
+    (above town-schedule divergence ~50 u, below the measured 500-900 u of
+    true wanderers) onto the host's spot, once per key per 5 s. The
+    threshold/cooldown/scope all matter: unthrottled in-bubble parking
+    fought the engine's seat AI every frame and wrecked npc_track (run
+    185524) - inside the bubble the STREAM owns position truth, parking is
+    a render-range tool only.

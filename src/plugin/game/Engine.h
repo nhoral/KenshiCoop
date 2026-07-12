@@ -322,6 +322,15 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
                          float x, float y, float z, float heading);
 
+// SEH-guarded (join, mint duplicate guard): return a world NPC with the SAME
+// template stringID within 'radius' of (x,y,z), skipping any pointer in
+// 'excl' (bound proxies / suppressed culls the caller already accounts for),
+// or 0. A hit means the census-missing hand is probably that body under a
+// hand we cannot correlate - minting would double it.
+Character* sameTemplateNear(GameWorld* gw, const char* charSid,
+                            float x, float y, float z, float radius,
+                            Character* const* excl, unsigned int exclCount);
+
 // spawn_probe / spawn_sync scenario scaffold (SEH-guarded): reproduce a runtime
 // squad spawn locally - 'count' world characters in a nearby NON-PLAYER faction
 // (findNearbyNonPlayerFaction; leader-faction fallback on a blank save), spread

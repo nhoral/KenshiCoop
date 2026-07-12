@@ -73,6 +73,19 @@ struct Config {
     // 0 disables the census channel entirely (stream-bubble culling only).
     float        censusRadius;      // KENSHICOOP_CENSUS_RADIUS        (2000 u)
 
+    // Census-mint reach (2026-07-11): how far from the join's own squad a
+    // census-missing host NPC may be proxy-minted, so host runtime spawns
+    // (raids) appear at render range and walk in instead of materializing at
+    // the ~200 u stream bubble. 0 disables (legacy stream-bubble minting).
+    float        spawnMintRadius;   // KENSHICOOP_SPAWN_MINT_RADIUS    (600 u)
+
+    // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
+    // census-PRESENT local NPC copy may drift from the host's census position
+    // before the join parks it back onto the host's spot (wide pass only,
+    // per-key cooldown). The census carries positions per row; existence
+    // culling is untouched. 0 disables parking.
+    float        censusParkDist;    // KENSHICOOP_CENSUS_PARK          (120 u)
+
     // Starved-replica guard hold: how long (ms) a driven body whose stream
     // went stale keeps its AI-suspend + damage-guard before releasing to
     // local simulation - a WAN stall must not become an authority transfer.

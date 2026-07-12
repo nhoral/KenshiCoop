@@ -136,8 +136,8 @@
             PrimaryGate = 'npc_track'
             Gating   = @('npc_track', 'pose', 'pose_state', 'body_state',
                          'smoothness', 'anim_truth', 'march', 'suppress_churn',
-                         'snap_rate', 'clock_sync')
-            Advisory = @()
+                         'snap_rate', 'rest_flap', 'clock_sync')
+            Advisory = @('existence_parity')
             Tier = 'smoke'; WanVariant = $true
             # DELIBERATE WAN-regime adjustments (re-validation matrix, 2026-07-05):
             # 120ms +/-40ms 5%-loss puts a walking NPC one-plus update interval
@@ -954,6 +954,23 @@
             PrimaryGate = 'snap_rate_squad'
             Gating   = @('snap_rate_squad', 'suppress_churn', 'clock_sync')
             Advisory = @('snap_rate', 'crosscheck', 'smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # spawn_far (2026-07-11 "NPCs spawn on top of the join player" fix):
+        # census-range proxy minting. The host spawns a runtime squad ~620 u
+        # out and walks it toward the co-located leaders; the join must mint
+        # the proxies at census range (census-missing scan + reply-side mint
+        # gate at KENSHICOOP_SPAWN_MINT_RADIUS) - every far hand bound, all
+        # binds >= 400 u from the join anchor, no duplicate mints, and the
+        # SAME proxy body driven into the stream bubble. snap_rate stays
+        # advisory: the bubble-entry drive takeover legitimately hard-snaps
+        # a proxy whose local AI drifted while it was census-only.
+        spawn_far = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'spawn_far'
+            Gating   = @('spawn_far', 'suppress_churn', 'clock_sync')
+            Advisory = @('snap_rate', 'smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
 

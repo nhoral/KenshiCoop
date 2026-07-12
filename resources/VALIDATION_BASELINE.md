@@ -1760,6 +1760,91 @@ gates (full detail: SYNC_GAPS #13).
 | npc_sync | sync | PASS | smoke run: suppress-churn 10 hands hidden once each; snap-rate 0/min; smoothness 0.377 (gate 0.4, pre-existing margin) |
 | smoke regression suite | - | PASS | post-fix smoke tier all green with the new gates active |
 
+## Far spawn-in + choppy NPC walk (2026-07-11, addendum)
+
+No wire change. The second round of zoom-session field reports (SYNC_GAPS #14,
+doctrine 54): host NPCs materializing on top of the join player, and stuttery
+NPC locomotion outside combat.
+
+- **Census-range minting:** a 2 s census-missing scan records census hands
+  with no local body; their `PKT_SPAWN_REQ` skips the streamed-position gate,
+  and the mint decision moves to the reply's authoritative position -
+  `KENSHICOOP_SPAWN_MINT_RADIUS` (600 u) of a local squad member, too-far
+  replies deferred ~5 s (never the 30 s denied cooldown). Bind-time
+  hardening: `enforceHostAuthority` exempts proxy bodies by pointer from both
+  suppression passes (a proxy's local hand is never census-present, so the
+  wide pass culled-and-froze every far mint, and the frozen bodies no-opped
+  `applyRaw` = a per-frame snap storm) and instantly restores any suppressed
+  body that becomes a proxy or driven.
+- **Walk/rest debounce:** the classifier holds the walking verdict 1 s past
+  the last genuinely-moving sample (`restFlip` counter added to `[interp]`).
+  A velPeak-based debounce was tried and reverted same-day - one
+  teleport-artifact velocity spike (srcVel 90-150 u/s on a seg snap) held a
+  genuinely SEATED divergent NPC in the walk branch ~7 s per spike,
+  hard-snapping every frame (spawn_far run 124346).
+- **Capture hysteresis:** `captureNpcs` queries 260 u, acquires < 200 u
+  unconditionally, retains the 200-260 u band only for hands captured last
+  tick - bubble-edge NPCs stop starving the join's interp buffer.
+- **Seat-break:** a rest-pose apply is a PLAYER-rank order and a seated body
+  no-ops teleports; when the host copy starts moving the join flushes the
+  order once via the player move path (`walkTo`) before the drive resumes.
+- **Smoothness-oracle scoring fix:** NPCs are scored active by INSTANTANEOUS
+  stream velocity, not the debounced verdict - charging the 1 s trailing
+  walk-hold after a source stop as "active" measured the debounce, not the
+  pipeline (leader_move read zeroFrac 0.66-0.77 vs its 0.3 baseline until
+  the fix; 0.19-0.29 after).
+- **New scenario/oracles:** `spawn_far` (host spawns a runtime squad 620 u
+  out, parks it, walks it in at 14 u/s; `Test-SpawnFarBind` gates every far
+  hand minted, binds >= 400 u from the join anchor, no duplicate mints, same
+  proxy driven into the stream bubble) and `Test-RestFlap` (walk-to-rest
+  flips/min, gated on npc_sync).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| spawn_far (new, full tier) | sync | PASS | binds 4/4 far hands at 487-571 u from the join anchor, 0 duplicate mints, closest driven approach 1-2 u; suppress-churn 0 re-hides |
+| leader_move | sync | PASS | post-oracle-fix zeroFrac 0.289 clean / 0.192 wan (was misreported 0.66-0.77) |
+| npc_sync | sync | rest_flap PASS | rest-flap 2-6/min across 4 runs (gate 60/min - the classifier flap is gone); crosscheck/pose green; smoothness+snap-rate remain flaky run-to-run (zeroFrac 0.315-0.83, npc snaps 0-34/min - tracked as open triage) |
+| full matrix 2026-07-11 | - | PASS except triage | 57-run resumed matrix green except npc_carry [clean] (latch flake + join DOWN-state miss, wan passes) and sneak_detect (detection map retains a still-seeing entry after sneak end, 4/4) - both under investigation |
+
+## Join crash + pack-hidden fixes (2026-07-11, addendum)
+
+Protocol v38 (census rows now carry positions). The third round of free-play
+field reports (SYNC_GAPS #15, doctrine 55): a join crash after ~28 minutes,
+and a wildlife pack visible on the join with no host counterpart.
+
+- **Crash root cause (minidump-verified):** `0xC0000005` reading
+  `0xFFFFFFFFFFFFFFFF` in `ZoneManager::findOverlappingActiveZones`, reached
+  from the engine's OWN sensory pass - it walked a body we still held in
+  `suppressed_` by raw `Character*` after the engine despawned it (93
+  suppressed wildlife booked through a zone stream). Fix: hand round-trip
+  liveness proof (SEH-read the pointer's current hand, resolve it back, same
+  pointer = alive) before ANY touch of `suppressed_` / `proxyByKey_` /
+  `debugMarkers_`; dead entries pruned (`pruned=` on `SCENARIO INTERP`),
+  re-containered live bodies MIGRATED to their new key so the hide keeps
+  holding. Release now links `/DEBUG` so future dumps symbolicate.
+- **Census position parking:** census-present copies are exempt from
+  culling but each side sims its own copy; the wide pass now parks a local
+  copy diverged past `KENSHICOOP_CENSUS_PARK` (120 u) onto the host's
+  census position, once per key per 5 s. Threshold and scope were tuned by
+  failure: unthrottled in-bubble parking at 45 u fought the engine's seat
+  AI every frame and broke npc_track/march/snap_rate (run 185524).
+- **Mint duplicate guard + animal mint:** a spawn reply defers when a
+  visible uncorrelated same-template body stands within 20 u of the reply
+  position; proxy template lookup falls back to the `ANIMAL_CHARACTER`
+  category (host wildlife packs previously could never mint on the join).
+- **Existence-audit probe:** 5 s join-side `[audit] exist` line bucketing
+  every enumerated NPC (drv / cen / hid / ghost) plus `Test-ExistenceParity`
+  (advisory on npc_sync) gating ghost fraction and persistence.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| spawn_far | sync | PASS | 4/4 far hands minted and bound, 0 duplicate mints; snap_rate advisory-noisy during the park settling window (45/40 s), gating gates green |
+| npc_sync | sync | PASS | npc_track ratio 1.0 worstMedian 0.35 u, zeroFrac 0.215, snaps 2/min, rest-flap 4/min, existence_parity ghostFrac 0 maxRun 0 (one smoothness flake 0.465 on the prior run - known flakiness) |
+| leader_move | sync | PASS | zeroFrac 0.04 (baseline ~0.3), march 0.083 |
+| coop_presence | squad1 | PASS | snap_rate 0/min, march 0 |
+| existence_parity | - | PASS | ghostFrac 0 across all runs; pack-hidden diagnostic session on the `pack hidden` save read hid=3 ghost=0 steady |
+| 30-min zoom soak | zoom | PASS | markers + census debug on, wildlife churn, both clients alive at timeout, no crash |
+
 ## Known limitations (honest edges)
 
 - Both clients still share one GPU/CPU in local runs; genuinely asymmetric

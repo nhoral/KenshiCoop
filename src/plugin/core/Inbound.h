@@ -66,8 +66,9 @@ struct InboundWorldRemove {
 // join culls local NPCs absent from this list at long range (existence
 // authority); position authority stays with the 20 Hz entity stream.
 struct InboundNpcCensus {
-    u32              ownerId;
-    std::vector<u32> hands; // count*5, readObjectHand layout
+    u32                ownerId;
+    std::vector<u32>   hands; // count*5, readObjectHand layout
+    std::vector<float> pos;   // count*3, host position per row (v38 parking)
 };
 
 // One received conservation DROP intent (Phase W2): the owning character + item identity +
@@ -346,10 +347,12 @@ public:
         EnterCriticalSection(&cs_); wir_.push_back(wr); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received NPC existence census (protocol 36), owner-tagged.
-    void pushNpcCensus(u32 ownerId, const u32* hands, unsigned int count) {
+    void pushNpcCensus(u32 ownerId, const u32* hands, const float* pos,
+                       unsigned int count) {
         InboundNpcCensus nc;
         nc.ownerId = ownerId;
         if (hands && count > 0) nc.hands.assign(hands, hands + count * 5);
+        if (pos && count > 0) nc.pos.assign(pos, pos + count * 3);
         EnterCriticalSection(&cs_); npcCensus_.push_back(nc); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received conservation DROP intent, owner-tagged.

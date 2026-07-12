@@ -1277,17 +1277,20 @@ __declspec(dllexport) void startPlugin() {
         g_repl.setDriveTuning(g_cfg.catchupK, g_cfg.snapDist, g_cfg.snapSeconds);
         g_repl.setSendStamp(g_cfg.sendStamp);
         g_repl.setCensusRadius(g_cfg.censusRadius);
+        g_repl.setSpawnMintRadius(g_cfg.spawnMintRadius);
+        g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
-        char b[240];
+        char b[260];
         _snprintf(b, sizeof(b) - 1,
                   "KenshiCoop: interp delay=%u-%ums extrap=%ums stale=%ums snap=%.0fu "
                   "drive catchupK=%.2f snapDist=%.1fu snapSec=%.2f sendStamp=%d "
-                  "census=%.0fu starveHold=%ums",
+                  "census=%.0fu mint=%.0fu park=%.0fu starveHold=%ums",
                   g_cfg.interpMinDelayMs, g_cfg.interpMaxDelayMs,
                   g_cfg.interpMaxExtrapMs, g_cfg.interpStaleMs, g_cfg.interpSnapDist,
                   g_cfg.catchupK, g_cfg.snapDist, g_cfg.snapSeconds,
                   g_cfg.sendStamp ? 1 : 0,
-                  g_cfg.censusRadius, g_cfg.starveHoldMs);
+                  g_cfg.censusRadius, g_cfg.spawnMintRadius, g_cfg.censusParkDist,
+                  g_cfg.starveHoldMs);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
     }

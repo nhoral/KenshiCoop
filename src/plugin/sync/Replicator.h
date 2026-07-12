@@ -520,6 +520,22 @@ public:
     // <= 0 disables the census channel on both sides.
     void setCensusRadius(float r) { censusRadius_ = r; }
 
+    // KENSHICOOP_SPAWN_MINT_RADIUS (2026-07-11 "NPCs spawn on top of the join
+    // player" fix): how far from our own squad a census-missing host NPC may
+    // be PROXY-MINTED. The census-missing scan asks about every census hand
+    // with no local body; the host's reply carries the authoritative position
+    // and the mint happens only inside this radius (the duplicate guard: a
+    // baked NPC in a loaded block always resolves, so a resolve-fail inside
+    // render range is a genuine host runtime spawn). <= 0 restores the legacy
+    // stream-bubble-only minting.
+    void setSpawnMintRadius(float r) { spawnMintRadius_ = r; }
+
+    // KENSHICOOP_CENSUS_PARK (v38 pack-hidden fix): how far a census-PRESENT
+    // local copy may drift from the host's census position before the join
+    // parks it back onto the host's spot. <= 0 disables parking (existence-
+    // only census, the v37 behavior).
+    void setCensusParkDist(float d) { censusParkDist_ = d; }
+
     unsigned int targetCount() const { return (unsigned int)targets_.size(); }
 
     // Stage 2 smoothness oracle: emit a "SCENARIO SMOOTH ..." summary describing
@@ -597,6 +613,13 @@ private:
         // collapses to ~0 the moment the source halts, deflating the snap
         // gate while the driven body is still converging on the stop point.
         float        velPeak;
+        // Walk/rest debounce (2026-07-11 choppiness fix): last tick a sample
+        // showed genuine translation; the walking verdict holds for a fixed
+        // time after it so mid-walk velocity dips can't flap the classifier.
+        unsigned long moveSeenMs;
+        // The classifier's previous verdict, so genuine walk->rest
+        // transitions can be counted (restFlipNpc_) as a flap-rate signal.
+        bool         wasMoving;
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), lastSeenMs(0),
@@ -610,7 +633,7 @@ private:
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
-                   sneakTick(0), velPeak(0.0f) {}
+                   sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
@@ -663,7 +686,14 @@ private:
     // The engine can undo a one-shot hide on its own (ambush dialog/combat
     // re-tasks the body, zone streaming re-adds it to the update list), so the
     // hide is re-asserted on a ~2 s cadence while the hand stays unstreamed.
+    // Lifetime guard (2026-07-11 join crash, dump: SensoryData::periodicUpdate
+    // walking a freed body during zone streaming with 93 suppressed wildlife
+    // booked): the ENGINE owns every suppressed body and is free to despawn it
+    // at any time. The re-assert pass re-resolves each entry's hand FIRST; a
+    // null/different resolution means the stored Character* is stale, and the
+    // entry (plus its marker/counters) is pruned without touching the pointer.
     unsigned long authReassertMs_;
+    unsigned long authPruned_;      // stale suppressed entries dropped (despawned bodies)
     // Bodies applyTargets actually drove this tick, by POINTER: a combat-driven
     // world NPC is detached into its own squad (container changes), so its local
     // enumeration key no longer matches the host's streamed key - the hand-keyed
@@ -690,6 +720,17 @@ private:
     unsigned long             censusRecvMs_;  // join: last census arrival
     std::set<Key>             censusHands_;   // join: latest existence set
     unsigned long             censusCulls_;   // join: wide-radius suppress count
+    // v38 census position parking (pack-hidden investigation, 2026-07-11):
+    // the host position per census row. A census-PRESENT NPC is exempt from
+    // culling, but its two locally-simulated copies can wander arbitrarily
+    // far apart - the join saw a pack somewhere the host's copy wasn't.
+    // enforceHostAuthority parks a local copy that diverged past
+    // censusParkDist_ back onto the host's spot (0 disables).
+    struct CensusPos { float x, y, z; };
+    std::map<Key, CensusPos>  censusPos_;     // join: host pos per census row
+    float                     censusParkDist_;
+    unsigned long             censusParks_;   // join: divergence-park count
+    std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
     // Third-party furniture placement (protocol 36): ENTER edges detected on
     // peer-owned driven bodies in applyTargets (a guard jailing an arrested
     // player runs purely on the host sim, so the occupant's owner can never
@@ -857,6 +898,7 @@ private:
     unsigned long hardSnapNpc_;     // SNAP_DIST applyRaw on a moving world NPC
     unsigned long walkReissueSquad_;
     unsigned long walkReissueNpc_;
+    unsigned long restFlipNpc_;     // walk->rest classifier transitions (flap telemetry)
     unsigned long interpLogTick_;
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send
@@ -1150,6 +1192,17 @@ private:
     struct DebugMarker { void* label; int color; };
     std::map<Character*, DebugMarker> debugMarkers_;
     void debugMark(Character* c, int colorId, const char* tag);
+    // Lifetime guard (2026-07-11 join crash): the map is keyed by raw
+    // Character* the engine can free (and REUSE for a new body, silently
+    // stealing the old label). enforceHostAuthority prunes entries whose
+    // pointer wasn't vouched live this pass (enumerations / driven / proxy /
+    // validated suppressed); the label object is ours to destroy safely.
+    void pruneDebugMarkers(const std::set<Character*>& live);
+    // v38 census position parking: snap a census-present unstreamed local
+    // copy back onto the host's census position once it diverges past
+    // censusParkDist_. Called from both authority passes with this tick's
+    // live enumeration pointer.
+    void parkDivergedCopy(Character* c, const EntityState& st, const Key& k);
     // Phase B: combat-scoped world-NPC vitals (host side). Keys of streamed
     // NPCs that are fighting / being fought / down, with last-qualified time;
     // publishMedical streams their vitals at ~1 Hz while fresh. The join's
@@ -1204,19 +1257,43 @@ private:
     // by pointer via drivenChars_ (hide on stale stream / restore on return
     // come free from the existing hysteresis).
     std::map<Key, Character*> proxyByKey_;
+    // Lifetime guard (2026-07-11 join crash): the ENGINE owns the proxy body
+    // and can despawn it (zone streaming, cleanup) while proxyByKey_ still
+    // holds the pointer - every later touch would be a use-after-free.
+    // syncSpawns runs a ~1 s liveness sweep: SEH-read each pointer's current
+    // hand and resolve it back; anything but the same pointer unbinds the
+    // entry untouched.
     // JOIN: per-hand request state - debounce, retry cap, negative-reply
     // backoff (deniedMs = when the host said "can't resolve either" or the
     // local proxy spawn failed; retried only after a long cooldown).
     struct SpawnReqState {
         unsigned long lastSendMs; unsigned int sends; unsigned long deniedMs;
-        SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0) {}
+        // Census-mint far-deferral (2026-07-11): the host's reply resolved the
+        // hand but its position was outside the mint radius. NOT a denial -
+        // the NPC may be walking toward us - so re-ask on a short cadence
+        // instead of the long deniedMs cooldown, and reset the send cap so a
+        // slow approach can't exhaust it.
+        unsigned long farMs;
+        SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0), farMs(0) {}
     };
     std::map<Key, SpawnReqState> spawnReq_;
     // JOIN: hands applyTargets failed to resolve this tick, with the streamed
     // position (the request-authoring queue; proximity-gated in syncSpawns so
-    // a far unloaded BAKED zone doesn't breed duplicate proxies).
-    struct UnresolvedHand { float x, y, z; };
+    // a far unloaded BAKED zone doesn't breed duplicate proxies). fromCensus
+    // entries came from the census-missing scan instead of the stream: they
+    // carry NO position (the census is a bare hand list), so the send-side
+    // proximity gate is skipped and the mint decision moves to the reply
+    // (which carries the host's authoritative position).
+    struct UnresolvedHand {
+        float x, y, z; bool fromCensus;
+        UnresolvedHand() : x(0), y(0), z(0), fromCensus(false) {}
+    };
     std::map<Key, UnresolvedHand> unresolvedHands_;
+    // JOIN: census-mint reach (see setSpawnMintRadius) + the census-missing
+    // scan throttle (the resolve sweep over censusHands_ runs at ~0.5 Hz, not
+    // per tick).
+    float         spawnMintRadius_;
+    unsigned long censusScanMs_;
     // Phase 0 telemetry: hands already reported unresolved (log once per hand).
     std::set<Key> spawnLogged_;
     // HOST: per-hand reply throttle (a re-request within the window is a

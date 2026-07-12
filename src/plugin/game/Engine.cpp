@@ -942,6 +942,18 @@ typedef void (__fastcall* AffectRelAmtFn)(FactionRelations* self, Faction* p, fl
 AffectRelEvFn  g_affectEvOrig  = 0;
 AffectRelAmtFn g_affectAmtOrig = 0;
 
+// Per-pair log debounce (2026-07-11 field session: an NPC-vs-NPC wildlife war
+// on the join fired 1,840 AFFECT lines in minutes - two factions re-asserting
+// an already-clamped relation every engine tick). The DELTA RECORDING is
+// untouched (the sync layer drains g_facDeltas); only the log line is gated:
+// each (me, whom) pair logs at most once per 5 s, with the skipped count
+// carried into the next emitted line. POD-only (SEH legal), oldest-slot reuse.
+struct FacLogGate {
+    char meSid[48]; char whomSid[48];
+    unsigned long lastMs; unsigned long skipped;
+};
+static FacLogGate g_facLogGates[16];
+
 void recordFactionDelta(FactionRelations* self, Faction* p, int isEvent,
                         int ev, float amount, float mult) {
     __try {
@@ -953,16 +965,39 @@ void recordFactionDelta(FactionRelations* self, Faction* p, int isEvent,
         r.after = -999.0f;
         if (self && p && g_relGetFn) r.after = g_relGetFn(self, p);
         if (g_facDeltas.size() < 64) g_facDeltas.push_back(r);
+        unsigned long now = GetTickCount();
+        FacLogGate* gate = 0;
+        FacLogGate* oldest = &g_facLogGates[0];
+        for (int gi = 0; gi < 16; ++gi) {
+            FacLogGate* g = &g_facLogGates[gi];
+            if (g->lastMs != 0 && strcmp(g->meSid, r.meSid) == 0 &&
+                strcmp(g->whomSid, r.whomSid) == 0) { gate = g; break; }
+            if (g->lastMs < oldest->lastMs) oldest = g;
+        }
+        if (!gate) {
+            gate = oldest;
+            strncpy(gate->meSid, r.meSid, sizeof(gate->meSid) - 1);
+            gate->meSid[sizeof(gate->meSid) - 1] = '\0';
+            strncpy(gate->whomSid, r.whomSid, sizeof(gate->whomSid) - 1);
+            gate->whomSid[sizeof(gate->whomSid) - 1] = '\0';
+            gate->lastMs = 0; gate->skipped = 0;
+        }
+        if (gate->lastMs != 0 && (now - gate->lastMs) < 5000) {
+            ++gate->skipped;
+            return;
+        }
+        gate->lastMs = now ? now : 1;
         char b[224];
         if (isEvent) {
             _snprintf(b, sizeof(b) - 1,
-                      "[fac] AFFECT-EV me='%s' whom='%s' event=%d mult=%.3f after=%.2f",
-                      r.meSid, r.whomSid, ev, mult, r.after);
+                      "[fac] AFFECT-EV me='%s' whom='%s' event=%d mult=%.3f after=%.2f skipped=%lu",
+                      r.meSid, r.whomSid, ev, mult, r.after, gate->skipped);
         } else {
             _snprintf(b, sizeof(b) - 1,
-                      "[fac] AFFECT-AMT me='%s' whom='%s' amount=%.3f mult=%.3f after=%.2f",
-                      r.meSid, r.whomSid, amount, mult, r.after);
+                      "[fac] AFFECT-AMT me='%s' whom='%s' amount=%.3f mult=%.3f after=%.2f skipped=%lu",
+                      r.meSid, r.whomSid, amount, mult, r.after, gate->skipped);
         }
+        gate->skipped = 0;
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -2175,19 +2210,34 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[2]) {
 unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
     if (!g_getCharsFn || !gw || !out || maxOut == 0) return 0;
     unsigned int n = 0;
+    // Capture-bubble hysteresis (2026-07-11 choppiness fix): a hard 200 u
+    // edge flapped boundary NPCs in/out of the streamed set as the two
+    // clients disagreed slightly on their positions, starving the join's
+    // interp buffer right when the NPC was visibly walking away. ACQUIRE at
+    // 200 u, RETAIN out to 260 u for NPCs captured on the previous call, so
+    // a body must genuinely leave interest (not jitter across the line) to
+    // stop streaming. Previous-set keyed by (hIndex, hSerial); static
+    // arrays, main-thread only (no C++ unwinding inside __try).
+    const float NPC_CAPTURE_ACQUIRE = 200.0f;
+    const float NPC_CAPTURE_KEEP    = 260.0f;
+    static unsigned int prevKeys[512][2];
+    static unsigned int prevN = 0;
+    static unsigned int newKeys[512][2];
+    unsigned int newN = 0;
     __try {
         // Interest: one sphere per squad-tab leader (dual-interest, step 5). The
         // query radii approximate a town-block footprint (~200u far) per sphere.
         Ogre::Vector3 centers[2];
         unsigned int nc = interestCenters(gw, centers);
-        if (nc == 0) return 0;
+        if (nc == 0) { prevN = 0; return 0; }
 
         // Dedupe across the (possibly overlapping) spheres by object pointer.
         static RootObject* appended[512]; // main-thread only
         unsigned int nApp = 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {
             g_npcQuery.clear();
-            g_getCharsFn(gw, &g_npcQuery, &centers[ci], 200.0f, 120.0f, 30.0f, 96, 96, 0);
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], NPC_CAPTURE_KEEP,
+                         120.0f, 30.0f, 96, 96, 0);
             unsigned int total = g_npcQuery.size();
             for (unsigned int i = 0; i < total && n < maxOut; ++i) {
                 RootObject* obj = g_npcQuery[i];
@@ -2199,13 +2249,37 @@ unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
                 if (dup) continue;
                 // getCharactersWithinSphere returns Characters as RootObject* bases.
                 if (captureOne(static_cast<Character*>(obj), &out[n])) {
+                    float dx = out[n].x - centers[ci].x;
+                    float dy = out[n].y - centers[ci].y;
+                    float dz = out[n].z - centers[ci].z;
+                    float distSq = dx * dx + dy * dy + dz * dz;
+                    if (distSq > NPC_CAPTURE_ACQUIRE * NPC_CAPTURE_ACQUIRE) {
+                        // Retention band: only NPCs already streaming stay in.
+                        // Skipping without appending lets an overlapping
+                        // second sphere still acquire it inside ITS 200 u.
+                        bool held = false;
+                        for (unsigned int k = 0; k < prevN && !held; ++k)
+                            held = prevKeys[k][0] == out[n].hIndex &&
+                                   prevKeys[k][1] == out[n].hSerial;
+                        if (!held) continue;
+                    }
                     if (nApp < 512) appended[nApp++] = obj;
+                    if (newN < 512) {
+                        newKeys[newN][0] = out[n].hIndex;
+                        newKeys[newN][1] = out[n].hSerial;
+                        ++newN;
+                    }
                     ++n;
                 }
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return n;
+        // fall through: publish whatever was captured before the fault
+    }
+    prevN = newN;
+    for (unsigned int k = 0; k < newN; ++k) {
+        prevKeys[k][0] = newKeys[k][0];
+        prevKeys[k][1] = newKeys[k][1];
     }
     return n;
 }
@@ -5157,12 +5231,51 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
     }
 }
 
+// SEH-guarded (join, mint duplicate guard 2026-07-11): return a world NPC with
+// the SAME template stringID standing within 'radius' of (x,y,z), or 0. The
+// census-missing hand may be THAT body under a hand we cannot correlate
+// (engine re-container, baked block just loaded) - minting would stand a
+// double on top of it. 'excl'/'exclCount' skips bodies the caller already
+// accounts for (bound proxies, suppressed culls).
+Character* sameTemplateNear(GameWorld* gw, const char* charSid,
+                            float x, float y, float z, float radius,
+                            Character* const* excl, unsigned int exclCount) {
+    if (!gw || !g_getCharsFn || !charSid || !charSid[0]) return 0;
+    __try {
+        Ogre::Vector3 center(x, y, z);
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &center, radius, radius, radius, 96, 96, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* obj = g_npcQuery[i];
+            if (!obj || isPlayerSquad(gw, obj)) continue;
+            Character* ch = static_cast<Character*>(obj);
+            bool skip = false;
+            for (unsigned int e = 0; e < exclCount && !skip; ++e)
+                if (excl[e] == ch) skip = true;
+            if (skip) continue;
+            GameData* gd = ch->getGameData();
+            if (!gd) continue;
+            const char* sid = gd->stringID.c_str();
+            if (sid && strcmp(sid, charSid) == 0) return ch;
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
                          float x, float y, float z, float heading) {
     if (!gw || !gw->theFactory || !g_createCharFn || !charSid || !charSid[0]) return 0;
     // Template by CHARACTER stringID (the same category-scan lookup the
-    // inventory reconstructor uses for items).
+    // inventory reconstructor uses for items). Animal templates live in the
+    // SEPARATE ANIMAL_CHARACTER category (2026-07-11 pack-hidden session:
+    // Bonedog sid '3979-gamedata.base' MISSed the CHARACTER scan forever, so
+    // host wildlife packs could never appear on the join) - scan it second.
     GameData* tmpl = findItemTemplateImpl(gw, charSid, (unsigned int)CHARACTER);
+    if (!tmpl)
+        tmpl = findItemTemplateImpl(gw, charSid, (unsigned int)ANIMAL_CHARACTER);
     if (!tmpl) {
         char b[128];
         _snprintf(b, sizeof(b) - 1, "[spawn] proxy template MISS sid='%s'", charSid);

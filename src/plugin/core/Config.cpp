@@ -273,6 +273,18 @@ void loadConfig(Config& c) {
         std::string cr = envOr("KENSHICOOP_CENSUS_RADIUS", "");
         c.censusRadius = cr.empty() ? 2000.0f : (float)std::atof(cr.c_str());
         if (c.censusRadius < 0.0f) c.censusRadius = 0.0f;
+        // Census-mint radius: "0" (explicit) disables; absent = 600 u default.
+        std::string mr = envOr("KENSHICOOP_SPAWN_MINT_RADIUS", "");
+        c.spawnMintRadius = mr.empty() ? 600.0f : (float)std::atof(mr.c_str());
+        if (c.spawnMintRadius < 0.0f) c.spawnMintRadius = 0.0f;
+        // Census park distance: "0" (explicit) disables; absent = 120 u
+        // default. Deliberately ABOVE town-schedule divergence (~50 u for a
+        // bar NPC seated at a different stool per sim - run 185524 showed
+        // parking those fights the seat AI every frame); a genuinely
+        // divergent wanderer (the pack-hidden class) measures 500-900 u.
+        std::string cp = envOr("KENSHICOOP_CENSUS_PARK", "");
+        c.censusParkDist = cp.empty() ? 120.0f : (float)std::atof(cp.c_str());
+        if (c.censusParkDist < 0.0f) c.censusParkDist = 0.0f;
         // Starve hold: "0" (explicit) restores legacy release-on-stale;
         // absent = 10 s guard-hold default.
         std::string sh = envOr("KENSHICOOP_STARVE_HOLD_MS", "");
