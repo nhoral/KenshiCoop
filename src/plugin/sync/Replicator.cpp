@@ -163,7 +163,7 @@ Replicator::Replicator()
       trustGrants_(0), trustRevokes_(0),
       authSuppresses_(0), authRestores_(0), authReassertMs_(0), authPruned_(0),
       censusRadius_(0.0f), censusSendMs_(0), censusRecvMs_(0), censusCulls_(0),
-      censusParkDist_(0.0f), censusParks_(0),
+      censusParkDist_(0.0f), censusParks_(0), auditRows_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
@@ -5138,6 +5138,30 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         poss[i * 3 + 2]  = states[i].z;
     }
     net.queueNpcCensus(ownerId, hands, poss, n);
+    // travel_parity worldstate rows (host side): dump every census NPC on a
+    // 5 s cadence so Test-TravelParity can cross-compare the two worlds'
+    // populations. cls=host marks the row as the host's authoritative view.
+    if (auditRows_) {
+        static unsigned long rowsMs = 0; // main-thread only
+        if (rowsMs == 0 || (now - rowsMs) >= 5000) {
+            rowsMs = now;
+            char w[64];
+            _snprintf(w, sizeof(w) - 1, "SCENARIO WORLD n=%u cls=host", n);
+            w[sizeof(w) - 1] = '\0'; coop::logLine(w);
+            for (unsigned int i = 0; i < n; ++i) {
+                char nm[40];
+                engine::charName(chars[i], nm, sizeof(nm));
+                char r[224];
+                _snprintf(r, sizeof(r) - 1,
+                          "SCENARIO WNPC hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f "
+                          "cls=host name='%s'",
+                          states[i].hIndex, states[i].hSerial, states[i].hType,
+                          states[i].hContainer, states[i].hContainerSerial,
+                          states[i].x, states[i].y, states[i].z, nm);
+                r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+            }
+        }
+    }
     // ~10 s cadence log so free-play sessions show the census breathing
     // without 1 Hz spam.
     static unsigned long logTick = 0;
@@ -5568,27 +5592,51 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
             EntityState* sts = (pass == 0) ? states : wStates;
             for (unsigned int i = 0; i < cnt; ++i) {
                 if (!counted.insert(cs[i]).second) continue;
-                if (proxyChars.find(cs[i]) != proxyChars.end()) { ++cDrv; continue; }
                 Key k = keyOf(sts[i]);
-                bool streamed = keep.find(k) != keep.end() ||
-                                drivenChars_.find(cs[i]) != drivenChars_.end();
-                if (streamed) { ++cDrv; continue; }
-                if (suppressed_.find(k) != suppressed_.end()) { ++cHid; continue; }
-                if (censusFresh && censusHands_.find(k) != censusHands_.end()) {
-                    ++cCen; continue;
+                const char* cls;
+                if (proxyChars.find(cs[i]) != proxyChars.end() ||
+                    keep.find(k) != keep.end() ||
+                    drivenChars_.find(cs[i]) != drivenChars_.end()) {
+                    cls = "drv"; ++cDrv;
+                } else if (suppressed_.find(k) != suppressed_.end()) {
+                    cls = "hid"; ++cHid;
+                } else if (censusFresh &&
+                           censusHands_.find(k) != censusHands_.end()) {
+                    cls = "cen"; ++cCen;
+                } else {
+                    cls = "ghost"; ++cGhost;
+                    if (dumpGhost == 1 && ghostRows < 10) {
+                        ++ghostRows;
+                        char nm[48]; engine::charName(cs[i], nm, sizeof(nm));
+                        char r[192]; _snprintf(r, sizeof(r) - 1,
+                            "[audit] ghost hand=%u,%u name='%s' pos=%.0f,%.0f,%.0f "
+                            "unstreak=%u",
+                            sts[i].hIndex, sts[i].hSerial, nm,
+                            sts[i].x, sts[i].y, sts[i].z, authCount_[k].unstreamed);
+                        r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+                    }
                 }
-                ++cGhost;
-                if (dumpGhost == 1 && ghostRows < 10) {
-                    ++ghostRows;
-                    char nm[48]; engine::charName(cs[i], nm, sizeof(nm));
-                    char r[192]; _snprintf(r, sizeof(r) - 1,
-                        "[audit] ghost hand=%u,%u name='%s' pos=%.0f,%.0f,%.0f "
-                        "unstreak=%u",
-                        sts[i].hIndex, sts[i].hSerial, nm,
-                        sts[i].x, sts[i].y, sts[i].z, authCount_[k].unstreamed);
+                // travel_parity worldstate rows (join side): one row per
+                // enumerated NPC with its authority class, same schema as the
+                // host's census dump so the oracle can cross-match by hand.
+                if (auditRows_) {
+                    char nm[40]; engine::charName(cs[i], nm, sizeof(nm));
+                    char r[224]; _snprintf(r, sizeof(r) - 1,
+                        "SCENARIO WNPC hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f "
+                        "cls=%s name='%s'",
+                        sts[i].hIndex, sts[i].hSerial, sts[i].hType,
+                        sts[i].hContainer, sts[i].hContainerSerial,
+                        sts[i].x, sts[i].y, sts[i].z, cls, nm);
                     r[sizeof(r) - 1] = '\0'; coop::logLine(r);
                 }
             }
+        }
+        if (auditRows_) {
+            char w[112]; _snprintf(w, sizeof(w) - 1,
+                "SCENARIO WORLD n=%u cls=join drv=%u cen=%u hid=%u ghost=%u fresh=%d",
+                (unsigned)counted.size(), cDrv, cCen, cHid, cGhost,
+                censusFresh ? 1 : 0);
+            w[sizeof(w) - 1] = '\0'; coop::logLine(w);
         }
         char b[192]; _snprintf(b, sizeof(b) - 1,
             "[audit] exist near=%u wide=%u drv=%u cen=%u hid=%u ghost=%u "

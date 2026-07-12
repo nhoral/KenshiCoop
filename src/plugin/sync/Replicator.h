@@ -536,6 +536,14 @@ public:
     // only census, the v37 behavior).
     void setCensusParkDist(float d) { censusParkDist_ = d; }
 
+    // travel_parity worldstate rows: when enabled, both sides dump one
+    // "SCENARIO WNPC hand=.. pos=.. cls=.. name=.." row per enumerated world
+    // NPC every ~5 s - the host from its census walk (cls=host), the join
+    // from the existence audit with each NPC's authority class (drv/cen/hid/
+    // ghost) - so Test-TravelParity can cross-compare the two worlds while
+    // the players travel. Off by default (log volume).
+    void setAuditRows(bool on) { auditRows_ = on; }
+
     unsigned int targetCount() const { return (unsigned int)targets_.size(); }
 
     // Stage 2 smoothness oracle: emit a "SCENARIO SMOOTH ..." summary describing
@@ -731,6 +739,7 @@ private:
     float                     censusParkDist_;
     unsigned long             censusParks_;   // join: divergence-park count
     std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
+    bool                      auditRows_;     // travel_parity worldstate rows
     // Third-party furniture placement (protocol 36): ENTER edges detected on
     // peer-owned driven bodies in applyTargets (a guard jailing an arrested
     // player runs purely on the host sim, so the occupant's owner can never

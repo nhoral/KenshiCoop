@@ -810,6 +810,49 @@ world looked empty.
   re-run 0.215 - the known flakiness); existence-parity advisory PASS with
   zero ghosts; 30-minute zoom soak with markers + wildlife churn, no crash.
 
+### 16. Play-session report 2026-07-11 (fourth round): yellow packs while roaming + join-PC carry put-down divergence
+
+Free-play session on the v38 build: (a) a decent number of enemy packs
+carried YELLOW debug labels (`LOC` = local-only, unjudged/census-absent) on
+the join while roaming; (b) the join PC was KO'd and picked up by a
+cross-visible enemy pack, and at some point the carried join PC was PUT DOWN
+in the host's world but stayed carried on the join - the join PC was then
+being attacked in one world only.
+
+- **(a) Roaming coverage is now a measured, gated scenario** [DONE
+  2026-07-11]: `travel_parity` - the JOIN's PC travels ~600 u out at a 3x
+  speed vote while the HOST's PC follows its local driven copy (the roaming
+  direction no other scenario moved; every prior mover was host-side). Both
+  sides dump a 5 s worldstate (`SCENARIO WORLD`/`WNPC` rows, join rows
+  carrying the drv/cen/hid/ghost authority class - `Replicator::
+  setAuditRows`, armed only for this scenario). Gates: `follow_travel`
+  (travel >= 400 u, follow median gap <= 80 u, p75 <= 120 u) then
+  `travel_parity` (ghost fraction <= 0.35, run <= 4, plus trueGhost /
+  laggard / diverged / hostOnly metrics from the cross-dump comparison).
+  Baseline on the `sync` save: travel 609 u, median gap ~12 u, ghostFrac
+  0-0.06, hostOnly 0-1 - the wilderness baseline is CLEAN, so the field
+  yellow-pack density likely needs town/raid geography; the scenario is the
+  canary and the manual repro tool (`KENSHICOOP_DEBUG_MARKERS` + audit rows).
+  Known texture: the `diverged` metric runs 100-140 at 3x (census rows are
+  <= 1 s stale + the 5 s per-key park cooldown; wanderers legitimately cover
+  100-450 u between parks at 3x wall-speed) - a 1x free-play divergence is
+  a third of that. snap_rate/smoothness stay advisory on this scenario (the
+  walk-drive teleport IS the convergence tool on bubble-crossing wildlife).
+- **(b) Join-PC carried-by-NPC put-down divergence** [OPEN backlog]: carry
+  edges are CARRIER-authored (`EVT_PICKUP_BODY`/`EVT_DROP_BODY` from the
+  host for world-NPC carriers, doctrine 28), and the carried join PC is
+  owner-published - `applyTargets` skips `ownHands_`, so the join PC has NO
+  self-heal path: if the host's `EVT_DROP_BODY` fails to apply on the
+  join's local carrier copy (resolve fail, carrier re-containered, or the
+  join's own sim never picked it up in the first place), the join stays
+  carried indefinitely. `npc_carry` only exercises a HOST-owned squad member
+  as the subject, so this asymmetry is untested. Fix sketch: owner-side
+  carried self-heal - the owner of a carried body reconciles its LOCAL
+  `isBeingCarried` against the carrier's streamed `TASK_CARRY_BODY`
+  (drop-debounced like the carrier-side heal); plus an `npc_carry` variant
+  where the JOIN's tab member is the carried subject. Triage with the
+  existing `[carry] RECV DROP ... ok=` logging next time it reproduces.
+
 ## Accepted edges (documented, deliberately out of scope)
 
 - Ambush/NPC dialog content is not synced (backlog #379/380) - players see

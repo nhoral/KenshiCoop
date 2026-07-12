@@ -1280,6 +1280,9 @@ __declspec(dllexport) void startPlugin() {
         g_repl.setSpawnMintRadius(g_cfg.spawnMintRadius);
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
+        // travel_parity needs the 5 s SCENARIO WORLD/WNPC worldstate rows on
+        // both sides; every other scenario stays quiet (log volume).
+        g_repl.setAuditRows(g_cfg.scenario == "travel_parity");
         char b[260];
         _snprintf(b, sizeof(b) - 1,
                   "KenshiCoop: interp delay=%u-%ums extrap=%ums stale=%ums snap=%.0fu "

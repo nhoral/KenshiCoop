@@ -1845,6 +1845,40 @@ and a wildlife pack visible on the join with no host counterpart.
 | existence_parity | - | PASS | ghostFrac 0 across all runs; pack-hidden diagnostic session on the `pack hidden` save read hid=3 ghost=0 steady |
 | 30-min zoom soak | zoom | PASS | markers + census debug on, wildlife churn, both clients alive at timeout, no crash |
 
+## travel_parity scenario (2026-07-11, addendum)
+
+No wire change. The fourth round of free-play field reports (SYNC_GAPS #16):
+"yellow" (local-only) enemy packs while roaming. Every prior movement
+scenario moved HOST-side bodies; in free play it is the JOIN that wanders
+and drags interest/census coverage with it - `travel_parity` is that
+direction, automated.
+
+- **Script:** the join marches its own rank-1 tab leader ~600 u out under a
+  3x speed vote (re-voted 5 s, 1x in the 10 s settle); the host re-targets
+  its rank-0 leader at the join leader's LOCAL driven copy every second
+  (`SCENARIO FOLLOW self/peer/gap`), stopping 12 u short. Durations 85/75 s
+  (the spawn_far kill-grace precedent: a 100 s host window was killed before
+  RESULT, run 205832).
+- **Worldstate rows:** both sides dump `SCENARIO WORLD` + per-NPC
+  `SCENARIO WNPC hand=.. pos=.. cls=.. name=..` every 5 s
+  (`Replicator::setAuditRows`, armed only for this scenario) - the host from
+  its census walk (cls=host), the join from the existence audit with the
+  drv/cen/hid/ghost class.
+- **Oracles:** `Test-FollowTravel` gates first (travel >= 400 u, median
+  follow gap <= 80 u, p75 <= 120 u after a 20 s grace; p75 not final-sample -
+  the host outlives the join's window and far-point wildlife can yank the
+  stopped PC, run 210715). `Test-TravelParity` time-aligns the two dumps
+  (+-6 s) and gates the ghost fraction (<= 0.35) + longest ghost run (<= 4),
+  with trueGhost/laggard/diverged/hostOnly metrics (hostOnly range-limited
+  to 400 u of the join leader - the host census reaches 2500 u, far past
+  what the join has loaded).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| travel_parity (new, full tier) | sync | PASS x2 | travel 609 u, follow median gap 12.4-12.5 u, p75 12.6 u; ghostFrac 0-0.06, maxRun <= 1, hostOnly 0-1; diverged 127-138 (3x park-lag texture: census <= 1 s stale + 5 s per-key cooldown at 3x wall-speed = legit 100-450 u between parks) |
+| npc_sync (regression) | sync | PASS | npc_track/pose/march/snap_rate/rest_flap green, existence_parity ghostFrac 0 |
+| coop_presence (regression) | squad1 | PASS | all gating green |
+
 ## Known limitations (honest edges)
 
 - Both clients still share one GPU/CPU in local runs; genuinely asymmetric

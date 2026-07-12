@@ -1191,6 +1191,138 @@ private:
 };
 const float CoopPresenceScenario::LEG = 12.0f;
 
+// travel_parity (2026-07-11 field report, "yellow packs while roaming"): the
+// JOIN's player character travels FAR from the start while the HOST's PC
+// follows - the roaming direction no automated test exercised (every mover so
+// far was host-side, but in free play it is the JOIN that wanders and drags
+// the interest/census coverage with it). The join marches its OWN rank-1 tab
+// leader ~600 u out under a 3x speed vote; the host re-targets its rank-0
+// leader at the join leader's LOCAL driven copy every cycle and logs
+// "SCENARIO FOLLOW self=.. peer=.. gap=.." for the follow-quality gate.
+// While the pair travels, BOTH sides dump a 5 s worldstate (SCENARIO WORLD /
+// WNPC rows - the host from its census walk with cls=host, the join from the
+// existence audit with each NPC's authority class; enabled via
+// Replicator::setAuditRows when this scenario is armed) so Test-TravelParity
+// can measure join-only ghosts under zone streaming + census re-centering,
+// exactly the free-play failure mode.
+class TravelParityScenario : public Scenario {
+public:
+    TravelParityScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastVoteMs_(0),
+          haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
+
+    virtual const char* name() const { return "travel_parity"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        engine::writeGameSpeed(ctx.gw, 3.0f, false); // our 3x vote (both sides)
+        // Anchor = the MOVER's start: the join's rank-1 tab leader (both
+        // clients resolve it locally from the shared save).
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int mv = tabLeaderIdx(sq, n, 1);
+        if (mv >= 0) {
+            haveAnchor_ = true;
+            ax_ = sq[mv].x; ay_ = sq[mv].y; az_ = sq[mv].z;
+        }
+        char b[128];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO TRAVEL anchor=%.1f,%.1f,%.1f have=%d vote=3.0 target=%.0f",
+                  ax_, ay_, az_, haveAnchor_ ? 1 : 0, TRAVEL);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!haveAnchor_)
+            coop::logLine("SCENARIO TRAVEL needs a 2-tab save (rank-1 member missing)");
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        bool settling = ctx.elapsedMs >= dur - SETTLE_MS;
+
+        // Re-vote 3x every 5 s (an engine event may reset our request); vote
+        // back to 1x in the settle window so the session ends sane.
+        if (ctx.elapsedMs - lastVoteMs_ >= 5000 || lastVoteMs_ == 0) {
+            lastVoteMs_ = ctx.elapsedMs;
+            engine::writeGameSpeed(ctx.gw, settling ? 1.0f : 3.0f, false);
+        }
+
+        if (haveAnchor_ &&
+            (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            int mv = tabLeaderIdx(sq, n, 1); // the join's mover
+            int fl = tabLeaderIdx(sq, n, 0); // the host's follower
+
+            if (!ctx.isHost) {
+                // JOIN: march our own tab leader toward the far target. The
+                // order is re-issued every second - pathing legs, combat or a
+                // speed change can drop it, and re-ordering the same dest is
+                // a no-op for a character already en route.
+                if (mv >= 0) {
+                    Character* c = engine::resolve(sq[mv]);
+                    if (c) {
+                        if (settling)
+                            engine::orderMoveTo(c, sq[mv].x, sq[mv].y, sq[mv].z);
+                        else
+                            engine::orderMoveTo(c, ax_ + TRAVEL, ay_, az_);
+                    }
+                    logScenarioEntity("MEMBER", sq[mv]);
+                }
+                if (fl >= 0) { logScenarioEntity("RECV", sq[fl]); ++recvCount_; }
+            } else {
+                // HOST: chase the join leader's LOCAL driven copy - the same
+                // body free-play players follow on screen. Stop short of the
+                // peer (don't shove the driven copy around).
+                if (mv >= 0 && fl >= 0) {
+                    float dx = sq[mv].x - sq[fl].x, dz = sq[mv].z - sq[fl].z;
+                    float gap = (float)sqrt((double)(dx * dx + dz * dz));
+                    Character* c = engine::resolve(sq[fl]);
+                    if (c && !settling && gap > FOLLOW_STOP) {
+                        float f = (gap - FOLLOW_STOP) / gap;
+                        engine::orderMoveTo(c, sq[fl].x + dx * f, sq[mv].y,
+                                                sq[fl].z + dz * f);
+                    }
+                    char b[160];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO FOLLOW self=%.1f,%.1f,%.1f peer=%.1f,%.1f,%.1f gap=%.1f",
+                              sq[fl].x, sq[fl].y, sq[fl].z,
+                              sq[mv].x, sq[mv].y, sq[mv].z, gap);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    logScenarioEntity("MEMBER", sq[fl]);
+                    logScenarioEntity("RECV", sq[mv]); ++recvCount_;
+                }
+            }
+        }
+
+        if (ctx.elapsedMs >= dur) {
+            engine::writeGameSpeed(ctx.gw, 1.0f, false); // leave the world at 1x
+            passed_ = haveAnchor_ && recvCount_ >= 1;
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // 85/75 s (the spawn_far precedent): the runner's kill grace is 90 s from
+    // the screenshot anchors, so a host window longer than ~85 s gets killed
+    // before it can log RESULT. The travel itself takes ~40 s at 3x.
+    static const unsigned long JOIN_DURATION_MS = 75000;  // travel + dwell
+    static const unsigned long HOST_DURATION_MS = 85000;  // outlive the join
+    static const unsigned long SETTLE_MS        = 10000;  // final 1x halt window
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const float         TRAVEL;      // total outbound distance (units)
+    static const float         FOLLOW_STOP; // stop short of the peer (units)
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastVoteMs_;
+    bool          haveAnchor_;
+    float         ax_, ay_, az_;
+};
+const float TravelParityScenario::TRAVEL      = 600.0f;
+const float TravelParityScenario::FOLLOW_STOP = 12.0f;
+
 // split_interest (step 5, dual-interest conformance): the players SPLIT UP and the
 // shared world must keep streaming around BOTH of them. The HOST relocates its
 // whole owned tab (rank 0) ~260 u away from the bar and holds it there; the JOIN's
@@ -9946,6 +10078,7 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "leader_move")  return new LeaderMoveScenario();
     if (name == "fast_march")   return new FastMarchScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();
+    if (name == "travel_parity") return new TravelParityScenario();
     if (name == "split_interest") return new SplitInterestScenario();
     if (name == "npc_sync")     return new NpcSyncScenario();
     if (name == "craft_order")  return new CraftOrderScenario();
