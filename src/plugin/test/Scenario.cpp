@@ -3283,7 +3283,7 @@ class SpikeScenario : public Scenario {
 public:
     SpikeScenario()
         : passed_(false), passedSet_(false), started_(false), smokeDone_(false),
-          lastLogMs_(0), durMs_(30000), wmStep_(0),
+          nativeDone_(false), lastLogMs_(0), durMs_(30000), wmStep_(0),
           r4Step_(0), r4Ops_(0), r4NextMs_(0), r4Have_(false), r4Placed_(false),
           r4Started_(false) {
         const char* id = std::getenv("KENSHICOOP_SPIKE");
@@ -3370,6 +3370,13 @@ private:
                 logSpike("smoke leader UNRESOLVED");
             }
             setPass(true);
+        }
+        if (id_ == "402" && ctx.isHost && !nativeDone_ &&
+            ctx.elapsedMs >= 2000) {
+            nativeDone_ = true;
+            int rc = engine::probeNativeSnapshot(ctx.gw);
+            logSpike("native snapshot rc=%d", rc);
+            setPass(rc == 1);
         }
         if (id_ == "451" && ctx.isHost) tick451(ctx);
         if (id_ == "401") tick401(ctx);
@@ -3573,6 +3580,7 @@ private:
     bool          passedSet_;
     bool          started_;
     bool          smokeDone_;
+    bool          nativeDone_;
     unsigned long lastLogMs_;
     unsigned long durMs_;
     int           wmStep_;     // spike 451 script step

@@ -6728,6 +6728,125 @@ function Test-TravelParity {
                             hostOnly = $hostOnly })
 }
 
+# Phase 2 anti-zombie gate: census-band NPCs must MOVE on the join when their
+# host originals move. For every pair of consecutive HOST worldstate dumps
+# (5 s apart), each hand whose host copy advanced >= $HostMoveMin is a judged
+# window; the join copy (nearest join dumps in time, cls != hid) must have
+# advanced at least $MoveRatio of the host's distance. Before the mid-band
+# tier, a bandit outside the ~200 u stream bubble got NO positional stream at
+# all - its local copy stood frozen between 120 u census parks (the "zombie
+# NPC" field report). SKIPs when the corridor produced too few judged windows
+# (empty wilderness runs are common in travel_parity).
+function Test-AntiZombie {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$HostMoveMin = 10.0, [double]$MoveRatio = 0.2,
+          [double]$MaxZombieFrac = 0.30, [int]$MinWindows = 6,
+          [int]$WinMs = 6000)
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "anti_zombie" -Status SKIP -Detail "missing log")
+    }
+    $hostS = @(Group-WnpcSamples -Rows (Get-WnpcRows -File $HostFile))
+    $joinS = @(Group-WnpcSamples -Rows (Get-WnpcRows -File $JoinFile))
+    if ($hostS.Count -lt 2 -or $joinS.Count -lt 2) {
+        Write-Host "  anti-zombie SKIP - $($hostS.Count) host / $($joinS.Count) join dump(s)"
+        return (Add-GateResult -Name "anti_zombie" -Status SKIP `
+                    -Metrics @{ hostDumps = $hostS.Count; joinDumps = $joinS.Count } `
+                    -Detail "too few worldstate dumps")
+    }
+    # hand -> position per dump, keyed for pairwise lookup.
+    function DumpMap($s) {
+        $m = @{}
+        foreach ($r in $s.rows) { if ($r.cls -ne 'hid') { $m[$r.hand] = $r.pos } }
+        return $m
+    }
+    $judged = 0; $zombies = 0; $zombieHands = @{}
+    for ($i = 0; $i + 1 -lt $hostS.Count; $i++) {
+        $h0 = $hostS[$i]; $h1 = $hostS[$i + 1]
+        if (($h1.t - $h0.t) -gt 3 * $WinMs) { continue } # dump gap; not a window
+        $m0 = DumpMap $h0; $m1 = DumpMap $h1
+        # Nearest join dumps to each host dump edge.
+        $j0 = $joinS | Sort-Object { [Math]::Abs($_.t - $h0.t) } | Select-Object -First 1
+        $j1 = $joinS | Sort-Object { [Math]::Abs($_.t - $h1.t) } | Select-Object -First 1
+        if ($null -eq $j0 -or $null -eq $j1) { continue }
+        if ([Math]::Abs($j0.t - $h0.t) -gt $WinMs -or
+            [Math]::Abs($j1.t - $h1.t) -gt $WinMs -or $j0.t -eq $j1.t) { continue }
+        $jm0 = DumpMap $j0; $jm1 = DumpMap $j1
+        foreach ($hand in $m0.Keys) {
+            if (-not $m1.ContainsKey($hand)) { continue }
+            $a = $m0[$hand]; $b = $m1[$hand]
+            $hostMove = [Math]::Sqrt(($b[0]-$a[0])*($b[0]-$a[0]) +
+                                     ($b[1]-$a[1])*($b[1]-$a[1]) +
+                                     ($b[2]-$a[2])*($b[2]-$a[2]))
+            if ($hostMove -lt $HostMoveMin) { continue }
+            if (-not ($jm0.ContainsKey($hand) -and $jm1.ContainsKey($hand))) { continue }
+            $ja = $jm0[$hand]; $jb = $jm1[$hand]
+            $joinMove = [Math]::Sqrt(($jb[0]-$ja[0])*($jb[0]-$ja[0]) +
+                                     ($jb[1]-$ja[1])*($jb[1]-$ja[1]) +
+                                     ($jb[2]-$ja[2])*($jb[2]-$ja[2]))
+            $judged++
+            if ($joinMove -lt $MoveRatio * $hostMove) {
+                $zombies++
+                $zombieHands[$hand] = $true
+            }
+        }
+    }
+    if ($judged -lt $MinWindows) {
+        Write-Host "  anti-zombie SKIP - $judged judged window(s) (< $MinWindows)"
+        return (Add-GateResult -Name "anti_zombie" -Status SKIP `
+                    -Metrics @{ judged = $judged } -Detail "too few moving-NPC windows")
+    }
+    $frac = [math]::Round($zombies / $judged, 3)
+    $ok = ($frac -le $MaxZombieFrac)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  anti-zombie $v - $zombies/$judged moving-NPC windows frozen on the join (frac=$frac <= $MaxZombieFrac; $($zombieHands.Count) distinct hand(s))"
+    return (Add-GateResult -Name "anti_zombie" -Status $v `
+                -Metrics @{ judged = $judged; zombieFrac = $frac
+                            zombieHands = $zombieHands.Count })
+}
+
+# Phase 1 spawn parity: proxy mint-distance distribution. Every join "[spawn]
+# proxy BOUND" line carries mintDist (distance from the join squad at mint) and
+# cen (census-sourced vs stream-sourced). Spawn parity means host runtime
+# spawns appear on the join at the distance the HOST spawned them (usually far
+# - wilderness spawn range is 1000-2000 u), not materializing at the old 600 u
+# radius gate. Gate: at most $MaxNearFrac of census-sourced mints land below
+# $NearDist. Near mints are not individually wrong (the host CAN spawn an
+# ambush on top of the players - dialog ambushes do), so the gate is on the
+# distribution, not each mint.
+function Test-MintDistance {
+    param([string]$JoinFile, [double]$NearDist = 300.0,
+          [double]$MaxNearFrac = 0.34, [int]$MinMints = 3)
+    if (-not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "mint_dist" -Status SKIP -Detail "no join log")
+    }
+    $pat = '\[spawn\] proxy BOUND hand=[\d,]+ .*mintDist=([-\d\.]+) cen=(\d)'
+    $cen = New-Object System.Collections.ArrayList
+    $all = New-Object System.Collections.ArrayList
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern $pat -ErrorAction SilentlyContinue)) {
+        $d = [double]$m.Matches[0].Groups[1].Value
+        if ($d -lt 0) { continue } # no own-squad reference at mint time
+        [void]$all.Add($d)
+        if ($m.Matches[0].Groups[2].Value -eq "1") { [void]$cen.Add($d) }
+    }
+    if ($cen.Count -lt $MinMints) {
+        Write-Host "  mint-dist SKIP - $($cen.Count) census-sourced mint(s) (< $MinMints; total $($all.Count))"
+        return (Add-GateResult -Name "mint_dist" -Status SKIP `
+                    -Metrics @{ mints = $all.Count; censusMints = $cen.Count } `
+                    -Detail "too few census mints")
+    }
+    $near = @($cen | Where-Object { $_ -lt $NearDist }).Count
+    $frac = [math]::Round($near / $cen.Count, 3)
+    $sorted = @($cen | Sort-Object)
+    $median = [math]::Round($sorted[[int]($sorted.Count / 2)], 0)
+    $minD   = [math]::Round($sorted[0], 0)
+    $ok = ($frac -le $MaxNearFrac)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  mint-dist $v - $near/$($cen.Count) census mints below $NearDist u (frac=$frac <= $MaxNearFrac), median $median u, min $minD u"
+    return (Add-GateResult -Name "mint_dist" -Status $v `
+                -Metrics @{ censusMints = $cen.Count; nearFrac = $frac
+                            medianDist = $median; minDist = $minD })
+}
+
 # ---- Manifest + top-level analysis ---------------------------------------------------
 
 # Load scripts/scenarios.psd1 (or an explicit path).
@@ -6835,6 +6954,8 @@ function Invoke-OneOracle {
         "existence_parity" { return (Test-ExistenceParity -File $JoinLog) }
         "follow_travel" { return (Test-FollowTravel    -HostFile $HostLog -JoinFile $JoinLog) }
         "travel_parity" { return (Test-TravelParity    -HostFile $HostLog -JoinFile $JoinLog) }
+        "mint_dist"     { return (Test-MintDistance    -JoinFile $JoinLog) }
+        "anti_zombie"   { return (Test-AntiZombie      -HostFile $HostLog -JoinFile $JoinLog) }
         "clock_sync"    { return (Test-ClockSync       -HostFile $HostLog -JoinFile $JoinLog -ExpectedSkewMs $ExpectedSkewMs) }
         default {
             Write-Host "  WARNING: unknown oracle id '$Id' (manifest error)"
@@ -7018,5 +7139,6 @@ Export-ModuleMember -Function @(
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",
     "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
+    "Test-MintDistance", "Test-AntiZombie",
     "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"
 )

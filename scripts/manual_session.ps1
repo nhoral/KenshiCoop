@@ -88,12 +88,21 @@ param(
     # in the host census. Makes pops and ghosts self-explaining on screen
     # (pair with -Save zoom for long-run wide-camera inspection).
     [switch]$DebugMarkers,
-    # Tile the two game windows side-by-side (host left, join right) the same way the
-    # automated tests do (scripts\arrange_windows.ps1, re-pinned through the load
-    # screen). Requires windowed mode (kenshi.cfg Full Screen=No).
+    # Manual sessions tile the two game windows side-by-side BY DEFAULT (host left,
+    # join right; scripts\arrange_windows.ps1, re-pinned through the load screen) on
+    # the ULTRAWIDE (widest monitor, 3440x1440): each client window is sized to half
+    # the ultrawide via kenshi.cfg Video Mode (set_video_mode.ps1) so visual A/B
+    # validation fills the screen. -NoTile skips both the resize and the tiling.
+    # (-Tile is legacy/accepted; tiling is on unless -NoTile.)
     [switch]$Tile,
+    [switch]$NoTile,
     [ValidateSet("widest", "primary")]
-    [string]$TileMonitor = "primary",
+    [string]$TileMonitor = "widest",
+    # Client (render area) size per window for the manual layout. 1700x1350 is the
+    # proven half-ultrawide fit from the 2026-07-11 free-play session: 2x1700 + window
+    # borders spans the 3440 width, and 1350 + title bar clears the taskbar at 1440.
+    [int]$WindowW = 1700,
+    [int]$WindowH = 1350,
     # How long to keep re-pinning. Must outlast host launch + join delay + both load
     # screens (Kenshi re-centers on gameplay entry), matching run_test.ps1's default.
     [int]$TileRepeatSec = 75
@@ -101,6 +110,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+# Tiling is the manual-session default; -NoTile opts out (-Tile kept for compat).
+$doTile = -not $NoTile
 
 $hostExe = Join-Path $HostDir "kenshi_x64.exe"
 $joinExe = Join-Path $JoinDir "kenshi_x64.exe"
@@ -184,6 +196,16 @@ if (-not $SkipDeploy) {
     Write-Host "=== deploy SKIPPED (-SkipDeploy): installs keep their current DLL ==="
 }
 
+# Size both clients for the manual layout BEFORE launch (Kenshi reads kenshi.cfg
+# Video Mode at startup; the tiler only moves). run_test.ps1 writes the automated
+# layout back on its next run, so the two harnesses never fight over the cfg.
+if ($doTile) {
+    Write-Host ""
+    Write-Host "=== window layout: manual (${WindowW}x${WindowH} x2, $TileMonitor monitor) ==="
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "set_video_mode.ps1") `
+        -Width $WindowW -Height $WindowH -HostDir $HostDir -JoinDir $JoinDir
+}
+
 if ($Sync -and ($Save -eq $JoinSave)) {
     Write-Host ""
     Write-Host "Syncing saves host -> join ..."
@@ -255,7 +277,7 @@ Write-Host "  The host spawns $AutoSpawn squad members a few seconds after gamep
 Write-Host "  Select them on the HOST and move them around; watch the JOIN render and"
 Write-Host "  follow them. Close both windows when you're done (no auto-exit)."
 
-if ($Tile -and $hostPid -ne 0) {
+if ($doTile -and $hostPid -ne 0) {
     # Same mechanism the automated tests use (scripts\arrange_windows.ps1): place the
     # two windows side by side (host left / join right) and RE-PIN through the load
     # screen, because Kenshi re-centers its window on the load->gameplay switch. Runs in
@@ -264,10 +286,15 @@ if ($Tile -and $hostPid -ne 0) {
     $arrangeScript = Join-Path $scriptDir "arrange_windows.ps1"
     Write-Host ""
     Write-Host "Arranging windows side by side ($TileMonitor monitor, host left / join right; re-pinning ${TileRepeatSec}s) ..."
+    # -ClientW/-ClientH: enforce the manual layout size at placement time too.
+    # Kenshi is system-DPI-aware, so when the primary (laptop) monitor runs a
+    # different DPI scale than the ultrawide, Windows RESCALES the window as the
+    # tiler moves it across - a move-only pin lands it the wrong size.
     Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$arrangeScript`"",
         "-HostPid", "$hostPid", "-JoinPid", "$joinPid",
-        "-Monitor", $TileMonitor, "-TimeoutSec", "90", "-RepeatSec", "$TileRepeatSec"
+        "-Monitor", $TileMonitor, "-TimeoutSec", "90", "-RepeatSec", "$TileRepeatSec",
+        "-ClientW", "$WindowW", "-ClientH", "$WindowH"
     ) | Out-Null
 }
 

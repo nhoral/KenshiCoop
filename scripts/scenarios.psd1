@@ -137,7 +137,7 @@
             Gating   = @('npc_track', 'pose', 'pose_state', 'body_state',
                          'smoothness', 'anim_truth', 'march', 'suppress_churn',
                          'snap_rate', 'rest_flap', 'clock_sync')
-            Advisory = @('existence_parity')
+            Advisory = @('existence_parity', 'anti_zombie')
             Tier = 'smoke'; WanVariant = $true
             # DELIBERATE WAN-regime adjustments (re-validation matrix, 2026-07-05):
             # 120ms +/-40ms 5%-loss puts a walking NPC one-plus update interval
@@ -970,7 +970,7 @@
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'spawn_far'
             Gating   = @('spawn_far', 'suppress_churn', 'clock_sync')
-            Advisory = @('snap_rate', 'smoothness', 'anim_truth', 'march')
+            Advisory = @('mint_dist', 'snap_rate', 'smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
 
@@ -997,8 +997,9 @@
             Seconds = 220; KillGraceSec = 190
             PrimaryGate = 'follow_travel'
             Gating   = @('follow_travel', 'travel_parity', 'clock_sync')
-            Advisory = @('existence_parity', 'suppress_churn', 'snap_rate',
-                         'smoothness', 'anim_truth', 'march', 'crosscheck')
+            Advisory = @('existence_parity', 'mint_dist', 'anti_zombie',
+                         'suppress_churn', 'snap_rate', 'smoothness',
+                         'anim_truth', 'march', 'crosscheck')
             Tier = 'full'; WanVariant = $false
         }
 

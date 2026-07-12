@@ -70,7 +70,24 @@ public:
     // Returns false if there is no usable data. vx/vy/vz may be null.
     bool latest(EntityState* out, float* vx, float* vy, float* vz) const;
 
+    // Sender-stamped duration of the newest ring segment (ms; 0 = fewer than
+    // two snapshots). This is the stream's CURRENT per-entity cadence: ~50 ms
+    // on the 20 Hz near tier, ~500+ ms on the round-robin mid tier. The
+    // walk-drive scales its lead point and the walk/rest debounce by it so a
+    // sparsely-sampled NPC keeps a continuous gait instead of reaching the
+    // lead point and idling until the next sample (Phase 2 mid-band tier).
+    unsigned long lastSegMs() const {
+        if (count_ < 2) return 0;
+        unsigned long dt = at(count_ - 1).t - at(count_ - 2).t;
+        return dt;
+    }
+
     bool empty() const { return count_ == 0; }
+
+    // Ring fill (0..CAP). A young ring (< CAP) means this entity was (re-)
+    // acquired within the last ~16 samples - its first reconciliation snap
+    // is a coverage event, not steady-state tracking noise (Phase 2).
+    int samples() const { return count_; }
 
 private:
     struct Snap {

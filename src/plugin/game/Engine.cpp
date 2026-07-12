@@ -25,6 +25,7 @@
 #include <kenshi/RootObjectBase.h>  // getGameData/getFaction (spawn template + owner)
 #include <kenshi/RootObjectFactory.h> // createRandomCharacter / createBuilding / createItem
 #include <kenshi/GameData.h>        // GameData::name / stringID / type (template scan + inv)
+#include <kenshi/GameSaveState.h>   // native object snapshot round-trip probe
 #include <kenshi/Inventory.h>       // Inventory (Phase 4a container contents)
 #include <kenshi/Item.h>            // Item / InventoryItemBase (quantity/quality/equipped)
 #include <kenshi/CharBody.h>        // CharBody::currentAction / _NV_setCurrentAction
@@ -46,6 +47,9 @@
 #include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
 #include <kenshi/gui/ForgottenGUI.h> // ForgottenGUI::mainbar
 #include <kenshi/gui/MainBarGUI.h>  // MainBarGUI::speedButtons (vote-button probe)
+// NOTE: kenshi/ZoneManager.h cannot be included here - it redefines ParticlePool
+// (also defined by CombatClass.h above). The zone-loaded query lives in its own
+// TU (game/ZoneQuery.cpp); see engine::isZoneLoadedAt / engine::resolveZoneQuery.
 #include <mygui/MyGUI_Button.h>     // MyGUI::Button::getStateSelected
 #include <ogre/OgreVector3.h>
 #include <ogre/OgreQuaternion.h>
@@ -1263,6 +1267,9 @@ void resolve() {
     g_createObjFn = (CreateObjFn)KenshiLib::GetRealAddress(&RootObjectFactory::create);
     g_destroyObjFn = (DestroyObjFn)KenshiLib::GetRealAddress(
         static_cast<bool (GameWorld::*)(RootObject*, bool, const char*)>(&GameWorld::destroy));
+    // Phase 1 spawn parity (non-fatal: unresolved -> far minting stays
+    // radius-gated). Lives in game/ZoneQuery.cpp (header-collision quarantine).
+    resolveZoneQuery();
     g_getDataOfTypeFn = (GetDataOfTypeFn)KenshiLib::GetRealAddress(
         &GameDataContainer::getDataOfType);
     // Phase 4a inventory: createItem is overloaded, so disambiguate the 6-arg form.
@@ -1317,6 +1324,81 @@ void resolve() {
     g_underMeleeFn   = (CharBodyBoolFn)KenshiLib::GetRealAddress(
         &Character::isLiterallyUnderMeleeAttackRightNowForSure);
     g_fleeingFn      = (CharBodyBoolFn)KenshiLib::GetRealAddress(&Character::isFleeing);
+
+    // Spike 402: prove which executable is actually mapped and record the
+    // KenshiLib-remapped entry points for the native save/object-serialisation
+    // pipeline.  This is deliberately address-only: no serialiser is invoked.
+    const char* spikeId = std::getenv("KENSHICOOP_SPIKE");
+    if (spikeId && strcmp(spikeId, "402") == 0) {
+        const unsigned __int64 base =
+            (unsigned __int64)GetModuleHandleA(NULL);
+        char modulePath[MAX_PATH];
+        modulePath[0] = '\0';
+        GetModuleFileNameA(NULL, modulePath, MAX_PATH);
+        modulePath[MAX_PATH - 1] = '\0';
+
+        typedef void (RootObjectContainer::*SerialiseThingsAllMemFn)(
+            GameData*, GameDataContainer*, PosRotPair*, const std::string&);
+        typedef void (RootObjectContainer::*SerialiseThingsSomeMemFn)(
+            const lektor<RootObject*>&, GameData*, GameDataContainer*,
+            PosRotPair*, const std::string&);
+
+        struct AddrProbe {
+            const char* name;
+            unsigned __int64 address;
+        };
+        const AddrProbe probes[] = {
+            { "RootObjectContainer::serialiseThings(all)",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  static_cast<SerialiseThingsAllMemFn>(
+                      &RootObjectContainer::serialiseThings)) },
+            { "RootObjectContainer::serialiseThings(list)",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  static_cast<SerialiseThingsSomeMemFn>(
+                      &RootObjectContainer::serialiseThings)) },
+            { "Character::serialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Character::_NV_serialise) },
+            { "Character::loadFromSerialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Character::_NV_loadFromSerialise) },
+            { "Building::serialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Building::_NV_serialise) },
+            { "Building::loadFromSerialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Building::_NV_loadFromSerialise) },
+            { "Item::serialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Item::_NV_serialise) },
+            { "Item::loadFromSerialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Item::_NV_loadFromSerialise) },
+            { "GameDataContainer::save",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &GameDataContainer::save) },
+            { "GameDataContainer::load",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &GameDataContainer::load) }
+        };
+
+        char line[480];
+        _snprintf(line, sizeof(line) - 1,
+                  "[r402] module='%s' base=%016llx", modulePath, base);
+        line[sizeof(line) - 1] = '\0';
+        coop::logLine(line);
+        for (unsigned int i = 0;
+             i < sizeof(probes) / sizeof(probes[0]); ++i) {
+            const unsigned __int64 rva =
+                probes[i].address && probes[i].address >= base
+                    ? probes[i].address - base : 0;
+            _snprintf(line, sizeof(line) - 1,
+                      "[r402] %-48s addr=%016llx rva=%08llx",
+                      probes[i].name, probes[i].address, rva);
+            line[sizeof(line) - 1] = '\0';
+            coop::logLine(line);
+        }
+    }
 }
 
 bool gameplayLive(GameWorld* gw) {
@@ -1325,6 +1407,82 @@ bool gameplayLive(GameWorld* gw) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+int probeNativeSnapshot(GameWorld* gw) {
+    Character* c = leader(gw);
+    if (!c) return 0;
+
+    // Keep every allocation in probe-owned containers. Character::serialise
+    // writes state GameData records into `output`'s source container; nothing
+    // is inserted into GameWorld::savedata or the live platoon container.
+    GameDataContainer output;
+    output.setName("KenshiCoop r402 native snapshot");
+    const std::string sid("kenshicoop-r402-instances");
+    const std::string displayName("KenshiCoop r402 instances");
+    GameData* instances =
+        output.createNewData(INSTANCE_COLLECTION, sid, displayName);
+    if (!instances) {
+        coop::logErrLine("[r402] native snapshot: INSTANCE_COLLECTION create failed");
+        return 0;
+    }
+
+    GameSaveState state = c->serialise(&output, instances, 0);
+    const unsigned int stateCount = (unsigned int)state.states.size();
+    const unsigned int instanceCount =
+        (unsigned int)instances->instances.size();
+    const unsigned int recordCount =
+        (unsigned int)output._getAllData().size();
+
+    char tempDir[MAX_PATH];
+    tempDir[0] = '\0';
+    if (!GetTempPathA(MAX_PATH, tempDir)) {
+        coop::logErrLine("[r402] native snapshot: GetTempPath failed");
+        return -1;
+    }
+    char filename[MAX_PATH];
+    _snprintf(filename, sizeof(filename) - 1,
+              "%sKenshiCoop-r402-%lu.mod", tempDir,
+              (unsigned long)GetCurrentProcessId());
+    filename[sizeof(filename) - 1] = '\0';
+
+    const std::string file(filename);
+    const bool saved = output.save(file, 0);
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    memset(&attr, 0, sizeof(attr));
+    const bool fileExists =
+        GetFileAttributesExA(filename, GetFileExInfoStandard, &attr) != 0;
+    const unsigned __int64 fileBytes = fileExists
+        ? (((unsigned __int64)attr.nFileSizeHigh << 32) |
+           (unsigned __int64)attr.nFileSizeLow)
+        : 0;
+
+    GameDataContainer loaded;
+    const std::string modName("KenshiCoop-r402");
+    const bool loadedOk = saved &&
+        loaded.load(file, modName, 0, 0, true);
+    GameData* loadedInstances =
+        loadedOk ? loaded.getData(sid, INSTANCE_COLLECTION) : 0;
+    const unsigned int loadedInstanceCount = loadedInstances
+        ? (unsigned int)loadedInstances->instances.size() : 0;
+    const unsigned int loadedRecordCount = loadedOk
+        ? (unsigned int)loaded._getAllData().size() : 0;
+
+    char line[480];
+    _snprintf(line, sizeof(line) - 1,
+              "[r402] native snapshot states=%u instances=%u records=%u "
+              "save=%d bytes=%llu load=%d loadedInstances=%u "
+              "loadedRecords=%u file='%s'",
+              stateCount, instanceCount, recordCount, saved ? 1 : 0,
+              fileBytes, loadedOk ? 1 : 0, loadedInstanceCount,
+              loadedRecordCount, filename);
+    line[sizeof(line) - 1] = '\0';
+    coop::logLine(line);
+
+    if (!saved || !loadedOk) return -1;
+    return stateCount > 0 && instanceCount == 1 &&
+           loadedInstanceCount == instanceCount &&
+           loadedRecordCount == recordCount ? 1 : 0;
 }
 
 bool loadSave(const std::string& name) {
@@ -2321,6 +2479,21 @@ void restoreNpc(GameWorld* gw, Character* c) {
         g_addUpdateFn(gw, c);
         static_cast<RootObject*>(c)->setVisible(true);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+bool captureNpcByHand(GameWorld* gw, unsigned int hIndex, unsigned int hSerial,
+                      unsigned int hType, unsigned int hContainer,
+                      unsigned int hContainerSerial, EntityState* out) {
+    if (!gw || !out) return false;
+    Character* c = resolveCharByHand(hIndex, hSerial, hType, hContainer,
+                                     hContainerSerial);
+    if (!c) return false;
+    __try {
+        if (isPlayerSquad(gw, static_cast<RootObject*>(c))) return false;
+        return captureOne(c, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 
@@ -5309,6 +5482,16 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
     detachFromTownAI(c);
     clearGoals(c);
     return c;
+}
+
+bool despawnProxyNpc(GameWorld* gw, Character* proxy) {
+    if (!gw || !proxy || !g_destroyObjFn) return false;
+    __try {
+        return g_destroyObjFn(gw, static_cast<RootObject*>(proxy),
+                              /*justUnloaded*/false, "coop-proxy-dupe-heal");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 unsigned int spawnRuntimeSquad(GameWorld* gw, unsigned int count,

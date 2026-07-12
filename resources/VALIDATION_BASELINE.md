@@ -1890,6 +1890,57 @@ direction, automated.
 | npc_sync (regression) | sync | PASS | npc_track/pose/march/snap_rate/rest_flap green, existence_parity ghostFrac 0 |
 | coop_presence (regression) | squad1 | PASS | all gating green |
 
+## Phase 1 spawn parity: far mint at census discovery (2026-07-12, addendum)
+
+No wire change (the planned `runtimeBorn` flag on PKT_SPAWN_INFO proved
+unnecessary - see below). Fifth round of field reports (manual far-travel):
+host-spawned bandit packs materialize ON TOP of the join player because the
+join was only allowed to proxy-mint census-missing hands within
+`KENSHICOOP_SPAWN_MINT_RADIUS` = 600 u, while the host's own spawner works at
+1000-2000 u.
+
+- **Far mint via the zone-loaded query, not a host flag.** The plan's
+  `runtimeBorn` host tag has no truthful engine signal (baked roaming squads
+  live in the shared save's platoon files too), but the join can answer the
+  real question itself: within a locally LOADED world block every baked
+  shared-save NPC resolves by hand, so an unresolvable census hand positioned
+  there is a genuine host runtime spawn. `engine::isZoneLoadedAt`
+  (game/ZoneQuery.cpp - own TU because kenshi/ZoneManager.h redefines
+  ParticlePool against CombatClass.h) asks `ZoneManager::isZoneLoadedT` and
+  rejects blocks still mid-load. Census-sourced replies
+  (`SpawnReqState.fromCensus`) may mint beyond the 600 u radius when the
+  reply position sits in a loaded zone (capped at 1.25x census radius);
+  stream-sourced hands keep the legacy radius gate.
+- **Sustained-miss dwell (10 s).** The zone-loaded signal precedes baked-body
+  materialization by a few seconds: run 092921 far-minted 12 hands and had to
+  DUPE-HEAL 8 of them within ~3 s. A far mint now requires the hand to have
+  been continuously unresolvable for 10 s (`firstMissMs`, disarmed whenever
+  the hand resolves again). Runtime spawns never resolve locally, so they
+  pass the dwell unharmed; re-run 093521 minted 4/4 with 0 heals.
+- **Baked-duplicate self-heal.** The ~1 Hz proxy liveness sweep additionally
+  resolves each proxy's BOUND key: if it now resolves to a real body (baked
+  block finished loading under the proxy), the original is authoritative and
+  the proxy is destroyed (`GameWorld::destroy`,
+  "[spawn] proxy DUPE-HEAL"). Safety net behind the dwell.
+- **Mint burst budget.** At most 4 proxy mints per tick (a raid answers a REQ
+  burst with an INFO burst; body creation is a visible hitch) - overflow
+  re-judges in ~1 s via the far-retry path.
+- **Telemetry + oracle.** Every "[spawn] proxy BOUND" line now carries
+  `mintDist` (distance from the join squad at mint) and `cen` (census- vs
+  stream-sourced). New `Test-MintDistance` oracle (advisory on spawn_far +
+  travel_parity): at most 34% of census-sourced mints below 300 u - a
+  distribution gate, because the host CAN legitimately spawn an ambush close.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| spawn_far | sync | PASS x2 | 4/4 far hands minted, mint_dist median 574-2123 u min >= 573 u frac-below-300 = 0; 0 dupes after dwell (8/12 DUPE-HEALs before it); snap_rate advisory-noisy (known settling-window flake) |
+| travel_parity (regression) | sync | PASS | travel 60,013 u, follow median gap 13.4 u, max lag run 1; ghostFrac 0.03 maxRun 1, hostOnly 0; mint_dist SKIP (empty corridor - expected) |
+| npc_sync (regression) | sync | PASS (retry; first run 2 NPC snaps = 4/min vs 3/min, the known ~8-bar-NPC flake band) | npc_track/pose/smoothness/march/rest_flap green both runs, existence_parity ghostFrac 0 |
+| coop_presence (regression) | squad1 | PASS | all gating green |
+
+Manual validation gate 1 (horizon fade-in, no spawn-on-top): pending user
+travel session.
+
 ## Known limitations (honest edges)
 
 - Both clients still share one GPU/CPU in local runs; genuinely asymmetric

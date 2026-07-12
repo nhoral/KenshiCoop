@@ -154,6 +154,15 @@ Character* leader(GameWorld* gw);
 // receiver drives them through the identical resolve/walk-drive path.
 unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut);
 
+// SEH-guarded (Phase 2 mid-band tier): resolve a hand (i,s,t,c,cs order like
+// resolveCharByHand) and capture it into an EntityState. Returns false when
+// the hand no longer resolves (despawned since the census walk that listed
+// it) or the body is a player-squad member (never streamed from the NPC
+// tiers). The resolve round-trip is the pointer-liveness proof.
+bool captureNpcByHand(GameWorld* gw, unsigned int hIndex, unsigned int hSerial,
+                      unsigned int hType, unsigned int hContainer,
+                      unsigned int hContainerSerial, EntityState* out);
+
 // SEH-guarded: clear a character's autonomous AI goals so it stops wandering /
 // re-pathing on its own. The body is kept IN the engine update list (removing it
 // freezes the movement controller and makes our walk-drive/teleport no-op), so
@@ -321,6 +330,21 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
 // authoritative + damage-guarded. Returns the proxy Character* or 0.
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
                          float x, float y, float z, float heading);
+
+// SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
+// (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block
+// every baked shared-save NPC resolves by hand, so an unresolvable census hand
+// positioned there is a genuine host RUNTIME spawn - safe to proxy-mint at any
+// distance. resolveZoneQuery() is called from engine::resolve().
+bool isZoneLoadedAt(GameWorld* gw, float x, float y, float z);
+void resolveZoneQuery();
+
+// SEH-guarded (Phase 1 spawn parity): destroy a previously-minted proxy body
+// (GameWorld::destroy, true destruction). Used when the proxy's original hand
+// later resolves to a REAL engine body (baked block finished loading) - the
+// proxy is a duplicate standing next to the authoritative original. The
+// pointer is DEAD after this returns true.
+bool despawnProxyNpc(GameWorld* gw, Character* proxy);
 
 // SEH-guarded (join, mint duplicate guard): return a world NPC with the SAME
 // template stringID within 'radius' of (x,y,z), skipping any pointer in
@@ -748,6 +772,13 @@ unsigned int researchEnumKnown(GameWorld* gw, char* outSids,
 // scalar) and the power bit. Returns 1 ok / 0 not a research bench / -1 fault.
 int probeResearchBenchRead(const unsigned int mHand[5], int* outTech,
                            float* outProg, int* outPower);
+
+// Spike 402: serialize the local leader through Kenshi's native
+// RootObjectContainer -> GameSaveState -> GameDataContainer pipeline into an
+// isolated temporary container, save it as a micro-save, then load it into a
+// second isolated container. Does NOT apply the snapshot to the live object.
+// Returns 1 round-trip ok / 0 unavailable or empty / -1 native save/load failed.
+int probeNativeSnapshot(GameWorld* gw);
 
 // ---- Honest pose oracle (downstream of the actual body, not the task flag) --
 // SEH-guarded: read pose signals that reflect the RENDERED body, so a pose check

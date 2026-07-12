@@ -268,6 +268,14 @@ function Start-PastLauncher {
     return 0
 }
 
+# Automated layout: 1280x1024 pair on the PRIMARY (laptop) monitor - the
+# screenshot-stable baseline. Written every run because manual_session.ps1
+# resizes the same kenshi.cfg files for the ultrawide manual layout; this
+# guarantees automated runs always come back to the known-good geometry.
+Write-Host "Window layout: automated (1280x1024 x2, $ArrangeMonitor monitor)"
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "set_video_mode.ps1") `
+    -Width 1280 -Height 1024 -HostDir $HostDir -JoinDir $JoinDir
+
 Write-Host "Launching HOST (and clicking through the launcher) ..."
 Set-CoopEnv -Mode "host" -Log $hostLog
 $hostPid = Start-PastLauncher -Exe $hostExe -WorkDir $HostDir

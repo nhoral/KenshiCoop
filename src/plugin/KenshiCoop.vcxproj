@@ -75,6 +75,7 @@
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="game\Engine.cpp" />
+    <ClCompile Include="game\ZoneQuery.cpp" />
     <ClCompile Include="sync\Interp.cpp" />
     <ClCompile Include="sync\Replicator.cpp" />
     <ClCompile Include="sync\SaveXfer.cpp" />

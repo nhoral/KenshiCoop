@@ -138,7 +138,19 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     if (!haveLast_ || count_ == 0 || out == 0) return false;
 
     const Snap& newest = at(count_ - 1);
-    if (nowMs - newest.t > cfg.staleMs) return false; // stream dropped; release body
+    // Staleness adapts to the stream's own cadence (Phase 2 mid-band tier):
+    // a round-robin mid-tier entity legitimately sees 500 ms - 1.5 s between
+    // samples (growing with the mid population), so the fixed 2 s window had
+    // entities flapping out of the driven set on every rotation hiccup. Allow
+    // 4 newest-segment durations before declaring the stream dropped, capped
+    // so a genuinely abandoned entity still releases promptly.
+    unsigned long stale = cfg.staleMs;
+    if (count_ >= 2) {
+        unsigned long seg4 = (newest.t - at(count_ - 2).t) * 4;
+        if (seg4 > stale) stale = seg4;
+        if (stale > 6000) stale = 6000;
+    }
+    if (nowMs - newest.t > stale) return false; // stream dropped; release body
 
     *out = last_; // identity + locomotion/pose passthrough
 

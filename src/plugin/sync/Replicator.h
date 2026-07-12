@@ -596,6 +596,10 @@ private:
                                       //   disarm DEBOUNCE: a 1-batch gap must not reset the AI)
         unsigned long combatSnapTick; // last hard snap (cooldown; a failed teleport must not
                                       //   re-fire every frame - walk-converge between snaps)
+        unsigned long npcSnapTick;    // locomotion-path hard snap cooldown (Phase 2): a far
+                                      //   NPC whose teleport can't stick (seat AI, unloaded
+                                      //   terrain) walk-converges between snaps instead of
+                                      //   teleporting every frame
         bool         goalsCleared;    // rest-entry AI-goal clear done (once per rest episode;
                                       // re-cleared only after the body genuinely moves again)
         // Step 4 divergence-gated authority (world NPCs, behind gateAuthority_):
@@ -628,6 +632,17 @@ private:
         // The classifier's previous verdict, so genuine walk->rest
         // transitions can be counted (restFlipNpc_) as a flap-rate signal.
         bool         wasMoving;
+        // Per-hand smoothness attribution (Phase 2 diagnosis): cumulative
+        // active/zero-step frames this body contributed to the oracle, so a
+        // zeroFrac regression can name its worst offenders in the stat line.
+        unsigned long zeroF;
+        unsigned long activeF;
+        // Last tick this body's stream cadence classified MID-tier. A body
+        // that just handed off mid -> near (raid walking into the 20 Hz
+        // bubble) may owe one large reconciliation snap for divergence
+        // accrued under sparse mid coverage - classed to the mid ledger
+        // (like young-ring coverage snaps), not steady-state near tracking.
+        unsigned long midSeenMs;
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), lastSeenMs(0),
@@ -636,12 +651,13 @@ private:
                    koLatched(false), deathLatched(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
-                   combatSeenTick(0), combatSnapTick(0),
+                   combatSeenTick(0), combatSnapTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
-                   sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false) {}
+                   sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
+                   zeroF(0), activeF(0), midSeenMs(0) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
@@ -708,6 +724,14 @@ private:
     // `keep` set can't recognise it and enforceHostAuthority would hide+freeze a
     // body mid-fight. Pointer identity survives the re-containering.
     std::set<Character*>      drivenChars_;
+    // Recently-driven grace (Phase 2 mid-band tier): last tick each body was
+    // driven. drivenChars_ is per-tick, but a mid-tier body's samples arrive
+    // on the round-robin cadence and a rotation hiccup empties its interp for
+    // a beat - the wide authority pass must not judge it as unstreamed during
+    // such a gap (run 20260712_103044: driven bodies culled mid-drive, then
+    // restored by the reassert pass's driven exemption, 6 churn cycles per
+    // hand). Pointers are compared, never dereferenced; timestamp-pruned.
+    std::map<Character*, unsigned long> drivenSeen_;
     // Step-5 hysteresis: consecutive-frame counters per hand so a brief stream
     // hiccup doesn't suppress (needs ~1 s unstreamed) and a boundary NPC doesn't
     // flicker back (needs ~2 s streamed dwell to restore). Spike 18: the hard
@@ -728,6 +752,23 @@ private:
     unsigned long             censusRecvMs_;  // join: last census arrival
     std::set<Key>             censusHands_;   // join: latest existence set
     unsigned long             censusCulls_;   // join: wide-radius suppress count
+    // Phase 2 mid-band streaming tier (HOST): census-walk NPCs OUTSIDE the
+    // ~200/260 u stream bubble, nearest-first, refreshed at the 1 Hz census
+    // cadence. publishOwned round-robins a small slice of them through the
+    // entity batch every frame (quota sized so each NPC hits the 20 Hz wire
+    // at ~MID_HZ aggregate) - between census beats a far NPC keeps receiving
+    // real positions instead of freezing under divergent local AI (the
+    // "zombie NPC" report). Keys only (no Character*): each publish resolves
+    // the hand fresh, so a despawn between census walks degrades to a skip.
+    struct MidBandEntry {
+        Key k; float dist;
+        bool operator<(const MidBandEntry& o) const { return dist < o.dist; }
+    };
+    std::vector<MidBandEntry> midBand_;
+    unsigned int              midCursor_;  // start of the CURRENT slice
+    unsigned long             midSliceMs_; // last slice advance (50 ms cadence:
+                                           // the slice must persist across a
+                                           // whole net tick to be sampled)
     // v38 census position parking (pack-hidden investigation, 2026-07-11):
     // the host position per census row. A census-PRESENT NPC is exempt from
     // culling, but its two locally-simulated copies can wander arbitrarily
@@ -904,10 +945,15 @@ private:
     unsigned long interpExtrap_;
     unsigned long interpSegSnap_;
     unsigned long hardSnapSquad_;   // SNAP_DIST applyRaw on a moving squad body
-    unsigned long hardSnapNpc_;     // SNAP_DIST applyRaw on a moving world NPC
+    unsigned long hardSnapNpc_;     // SNAP_DIST applyRaw on a moving world NPC (near tier)
+    unsigned long hardSnapMid_;     // same, MID-tier bodies (Phase 2): counted apart so
+                                    //   the snap-rate gate keeps guarding the validated
+                                    //   20 Hz pipeline; a newly covered mid NPC's one-time
+                                    //   reconciliation snap is correct, not rubber-banding
     unsigned long walkReissueSquad_;
     unsigned long walkReissueNpc_;
     unsigned long restFlipNpc_;     // walk->rest classifier transitions (flap telemetry)
+    unsigned long restFlipMid_;     // same, mid-tier bodies (kept out of the near gate)
     unsigned long interpLogTick_;
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send
@@ -1283,7 +1329,20 @@ private:
         // instead of the long deniedMs cooldown, and reset the send cap so a
         // slow approach can't exhaust it.
         unsigned long farMs;
-        SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0), farMs(0) {}
+        // Phase 1 spawn parity: the REQ came from the census-missing scan (the
+        // hand is host-census-vouched). Census-sourced replies may FAR-MINT
+        // beyond the radius gate when the reply position sits in a locally
+        // LOADED zone (an unresolvable hand there is a genuine runtime spawn).
+        bool fromCensus;
+        // First time the census-missing scan saw this hand unresolvable. The
+        // far mint requires a sustained miss (FAR_MINT_ARM_MS): a zone can
+        // report loaded a few seconds before its baked bodies resolve, and
+        // minting inside that window stands a short-lived double (run
+        // 20260712_092921: 8/12 far mints DUPE-HEALed within 3 s). Runtime
+        // spawns never resolve locally, so they pass the dwell unharmed.
+        unsigned long firstMissMs;
+        SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0), farMs(0),
+                          fromCensus(false), firstMissMs(0) {}
     };
     std::map<Key, SpawnReqState> spawnReq_;
     // JOIN: hands applyTargets failed to resolve this tick, with the streamed

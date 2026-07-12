@@ -183,7 +183,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v37: research tech-tree sync)", (int)PROTOCOL_VERSION, 37);
+    CHECK_EQ("PROTOCOL_VERSION (v38: census rows carry positions)", (int)PROTOCOL_VERSION, 38);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
