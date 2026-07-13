@@ -2031,6 +2031,61 @@ so a juvenile goat on the host minted as a full-grown one on the join.
 Manual validation (2026-07-12, ultrawide side-by-side free-play): animals
 spawned on the join at the correct size - confirmed by the user.
 
+## Join-initiated town combat: canonical-hand capture translation (2026-07-12)
+
+Manual report (save `no-fight`, host + join PCs in a town): the join PC starts
+a fight with a townsperson and the fight renders ONLY on the join - the host
+never shows combat.
+
+Evidence chain (new `assault_town` scenario, run 20260712_180913): the join's
+capture streamed the combat intent fine (`[combat] CAP hand=<joinPC>
+tgt=1,14,1277954048,...`), the host received it and re-ordered 6 times - every
+one `r=1` (target hand unresolvable). The subject hand's container
+`14,1277954048` existed ONLY in the join's session: the victim was a body the
+join was DRIVING whose local hand had diverged from the wire identity (the
+engine `separateIntoMyOwnSquad`s a town NPC into a fresh local container when
+a fight starts; minted proxies never had the host's hand at all). The capture
+read the LOCAL hand, so the host resolved nothing - suspect 1 of the plan,
+confirmed by logs.
+
+Fix (capture-side, both directions):
+
+- `canonicalOf_` (`Character*` -> streamed Key) stamped every drive tick in
+  `applyTargets` (and the starve-hold park), pruned with `drivenSeen_`'s 30 s
+  horizon, cleared on session reset.
+- `publishOwned` rewrites every OWNED combat intent's SUBJECT to its canonical
+  key before the snapshot reaches the wire, logging a throttled
+  `[combat] CAP xlate ... local=... -> wire=...`.
+- New instrumentation either side of the wire: `[combat] CAP hand=.. task=..
+  tgt=..` (join publish, throttled 2 s/hand) closes the previously-invisible
+  send half; the host's existing `[combat] order ... r=` closes the apply half
+  (r=1 = subject unresolved).
+
+Gates - `assault_town` scenario + oracle (save `sync`, full tier): the JOIN
+picks an upright out-of-combat world NPC near either leader and orders its OWN
+leader to attack (no host-side orders - the exact manual repro). The oracle
+walks the chain link by link and names the broken link on FAIL: (1) join
+issued, (2) join streamed a combat intent (`CAP`), (3) host ordered its
+join-PC copy (`[combat] order ... r=2`), (4) the host's local engine actually
+runs the fight (`hostview fight=1` at 1 Hz, >= 3 samples).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| assault_town | sync | PASS | cap=9 (vic-match 6), host-orders=5 (vic-match 3), hostview-fight=16 |
+| assault_town | no-fight | PASS (was the repro: FAIL "link 3: target resolve" pre-fix) | xlate local=1,9,3867431680,.. -> wire=1,194,1002075200,..; host-orders=3 all r=2, hostview-fight=41 |
+| player_combat (regression) | sync | PASS | both windows: intent crossed + owner-side blood drop (advisory smoothness/march failed in-window - known combat-run noise, primary gates green) |
+| combat_kill (regression) | duel1 | PASS | KO event crossed with actor; advisory smoothness FAIL is the known duel-save slew window |
+| combat_order (regression) | duel1 | PASS | live peaceful->fighting transition crossed |
+| combat_crowd (regression) | sync | PASS | crowd fight replicated |
+| npc_sync (regression) | sync | PASS (first run failed smoothness zeroFrac 0.95 - rerun clean at 0.188/3287 frames) | lifecycle clean, stuck 0, illegal 0 |
+| coop_presence (regression) | squad1 | PASS | - |
+
+Notes: the oracle's vic-match metrics can read 0 on a healthy run - a bar
+brawl legitimately retargets the join PC's fight mid-window, and on `no-fight`
+the ISSUED line records the victim's join-local hand while the wire carries
+the translated canonical hand (that difference is the fix working, not a
+mismatch).
+
 ## Known limitations (honest edges)
 
 - Both clients still share one GPU/CPU in local runs; genuinely asymmetric

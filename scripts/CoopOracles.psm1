@@ -1767,6 +1767,57 @@ function Test-PlayerCombat {
     return (Add-GateResult -Name "player_combat" -Status PASS -Metrics $m)
 }
 
+# assault_town (join-initiated town combat): the JOIN's player character starts an
+# unprovoked fight with a world NPC; the fight must appear on the HOST. The gate
+# walks the wire chain link by link so a FAIL names the broken link:
+#   1. issued  - join ordered its own leader onto a victim (scenario marker)
+#   2. cap     - the join's replicator CAPTURED + streamed the combat intent
+#                ("[combat] CAP hand=<atk>" on the join)
+#   3. applied - the host's drive path ORDERED its join-PC copy into the fight
+#                ("[combat] order hand=<atk> ... r=2" on the host)
+#   4. fight   - the host's local engine actually runs it ("hostview fight=1"
+#                lines; MinFight samples at 1 Hz)
+function Test-AssaultTown {
+    param([string]$HostFile, [string]$JoinFile, [int]$MinFight = 3)
+    $mi = Select-String -Path $JoinFile -Pattern 'SCENARIO ASSAULT issued atk=(\d+),(\d+) vic=(\d+),(\d+) ok=(\d)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mi) {
+        Write-Host "  ASSAULT-TOWN FAIL - join never issued the assault (no victim pick?)"
+        return (Add-GateResult -Name "assault_town" -Status FAIL -Detail "no assault order (link 1)")
+    }
+    $atk = $mi.Matches[0].Groups[1].Value + ',' + $mi.Matches[0].Groups[2].Value
+    $vic = $mi.Matches[0].Groups[3].Value + ',' + $mi.Matches[0].Groups[4].Value
+
+    # 2. Capture: the join streamed a combat task for its leader (any target -
+    # a bar brawl legitimately retargets); strict victim match kept as metric.
+    $capAll = @(Select-String -Path $JoinFile -Pattern ('\[combat\] CAP hand=' + $atk + ' ') -ErrorAction SilentlyContinue).Count
+    $capVic = @(Select-String -Path $JoinFile -Pattern ('\[combat\] CAP hand=' + $atk + ' task=\d+ tgt=\d+,\d+,\d+,' + $vic + '$') -ErrorAction SilentlyContinue).Count
+
+    # 3. Applied: the host's combat branch ordered its driven join-PC copy
+    # (r=2 = ordered; r=1 = target hand didn't resolve on the host).
+    $ordOk   = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=2') -ErrorAction SilentlyContinue).Count
+    $ordMiss = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=1') -ErrorAction SilentlyContinue).Count
+    $ordVic  = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=' + $vic + ' .*r=2') -ErrorAction SilentlyContinue).Count
+
+    # 4. Fight: the host's local combat read of the join-PC copy.
+    $fight = @(Select-String -Path $HostFile -Pattern 'SCENARIO ASSAULT hostview fight=1' -ErrorAction SilentlyContinue).Count
+
+    $m = @{ cap = $capAll; capVic = $capVic; ordered = $ordOk; orderedVic = $ordVic
+            orderMiss = $ordMiss; hostFight = $fight }
+    $bad = @()
+    if ($capAll -lt 1) { $bad += "join never streamed a combat intent for $atk (link 2: capture)" }
+    elseif ($ordOk -lt 1) {
+        if ($ordMiss -ge 1) { $bad += "host saw the intent but the target hand never resolved ($ordMiss r=1 orders; link 3: target resolve)" }
+        else                { $bad += "host never ordered the join-PC copy (0 [combat] order lines; link 3: apply)" }
+    }
+    if ($fight -lt $MinFight) { $bad += "host-side fight never ran (hostview fight=1 x$fight, need >= $MinFight; link 4)" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  ASSAULT-TOWN FAIL - " + ($bad -join "; ") + " [cap=$capAll capVic=$capVic ord=$ordOk ordVic=$ordVic miss=$ordMiss fight=$fight]")
+        return (Add-GateResult -Name "assault_town" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  ASSAULT-TOWN PASS - atk=$atk vic=$vic cap=$capAll (vic-match $capVic) host-orders=$ordOk (vic-match $ordVic) hostview-fight=$fight")
+    return (Add-GateResult -Name "assault_town" -Status PASS -Metrics $m)
+}
+
 # player_ko BIDIRECTIONAL: each side KOs then revives its OWN squad member; the
 # KO and revive must cross as reliable events (EVT_KNOCKOUT=1 / EVT_REVIVE=3,
 # SEND on the owner, RECV on the peer) and the peer's driven copy must lie down
@@ -6979,6 +7030,7 @@ function Invoke-OneOracle {
         "combat_kill"   { return (Test-CombatKill      -HostFile $HostLog -JoinFile $JoinLog) }
         "damage_guard"  { return (Test-DamageGuard     -HostFile $HostLog -JoinFile $JoinLog) }
         "player_combat" { return (Test-PlayerCombat    -HostFile $HostLog -JoinFile $JoinLog) }
+        "assault_town"  { return (Test-AssaultTown     -HostFile $HostLog -JoinFile $JoinLog) }
         "player_ko"     { return (Test-PlayerKo        -HostFile $HostLog -JoinFile $JoinLog) }
         "medic_order"   { return (Test-MedicOrder      -HostFile $HostLog -JoinFile $JoinLog) }
         "limb_loss"     { return (Test-LimbLoss        -HostFile $HostLog -JoinFile $JoinLog) }
@@ -7176,7 +7228,7 @@ Export-ModuleMember -Function @(
     "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose",
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",
     "Test-CombatProbe", "Test-CombatOrder", "Test-CombatKill", "Test-DamageGuard",
-    "Get-VitalsSeries", "Test-PlayerCombat", "Test-PlayerKo", "Test-MedicOrder",
+    "Get-VitalsSeries", "Test-PlayerCombat", "Test-AssaultTown", "Test-PlayerKo", "Test-MedicOrder",
     "Test-LimbLoss", "Test-NpcVitals",
     "Get-StatsSeries", "Test-StatsSync",
     "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry",

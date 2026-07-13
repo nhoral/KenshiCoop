@@ -222,6 +222,19 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
         }
+        # assault_town: the JOIN's player character starts an UNPROVOKED fight
+        # with a world NPC (the no-fight report: a join-picked town fight only
+        # rendered on the join). No host-side orders - the fight must cross as
+        # the join's streamed combat intent and run for real on the host. The
+        # oracle walks the chain link by link (issue -> capture -> host order ->
+        # host fight) so a FAIL names the broken link.
+        assault_town = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'assault_town'
+            Gating   = @('assault_town', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'lifecycle')
+            Tier = 'full'; WanVariant = $false
+        }
         # player_ko: players as VICTIMS both directions - scaffold KO + revive on
         # each side's OWN member; edges must cross as reliable EVT_KNOCKOUT/EVT_REVIVE
         # and the peer's driven copy must lie down / stand up.

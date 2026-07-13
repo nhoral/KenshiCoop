@@ -277,6 +277,7 @@ void Replicator::resetSession() {
     targets_.clear();          // interp buffers + per-body drive state
     drivenChars_.clear();
     drivenSeen_.clear();       // recently-driven grace (pointers dangle after swap)
+    canonicalOf_.clear();      // capture-translation reverse map (same pointers)
     proxyByKey_.clear();
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
@@ -292,6 +293,7 @@ void Replicator::resetSession() {
     debugMarkers_.clear();
     hostBody_.clear();
     attackerOf_.clear();
+    combatCapMs_.clear();
     authCount_.clear();
     ownHands_.clear();
     // Protocol 36: the existence census describes the OLD world's hands; the
@@ -528,6 +530,64 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (!owned) continue;
         buf[n++] = raw[i];
         ownHands_.insert(hk);
+    }
+    // Combat-subject CANONICAL translation (join-initiated town combat, run
+    // 20260712_180913): the capture reads the target's LOCAL hand, but a body
+    // this client is DRIVING can live in a local runtime container that the
+    // peer has never heard of (the engine separateIntoMyOwnSquad's a town NPC
+    // when a fight starts; a minted proxy never had the peer's hand at all).
+    // Publish the SUBJECT under the key the peer streams it by (canonicalOf_,
+    // stamped every drive tick) or the peer's applyCombat resolves nothing
+    // (r=1 forever) and the fight renders on one client only.
+    for (unsigned int i = 0; i < n; ++i) {
+        EntityState& e = buf[i];
+        if (!coop::taskIsCombat(e.task)) continue;
+        Character* tc = engine::resolveCharByHand(e.sIndex, e.sSerial, e.sType,
+                                                  e.sContainer, e.sContainerSerial);
+        if (!tc) continue;
+        std::map<Character*, Key>::const_iterator cit = canonicalOf_.find(tc);
+        if (cit == canonicalOf_.end()) continue;
+        const Key& ck = cit->second;
+        if (ck.i == e.sIndex && ck.s == e.sSerial && ck.t == e.sType &&
+            ck.c == e.sContainer && ck.cs == e.sContainerSerial)
+            continue;
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[combat] CAP xlate hand=%u,%u tgt local=%u,%u,%u,%u,%u -> wire=%u,%u,%u,%u,%u",
+            e.hIndex, e.hSerial,
+            e.sType, e.sContainer, e.sContainerSerial, e.sIndex, e.sSerial,
+            ck.t, ck.c, ck.cs, ck.i, ck.s);
+        b[sizeof(b) - 1] = '\0';
+        e.sType = ck.t; e.sContainer = ck.c; e.sContainerSerial = ck.cs;
+        e.sIndex = ck.i; e.sSerial = ck.s;
+        // Throttle the log per canonical victim (the rewrite itself runs every
+        // publish frame).
+        unsigned long xNow = nowMs();
+        std::map<Key, unsigned long>::iterator xt = combatCapMs_.find(ck);
+        if (xt == combatCapMs_.end() || (xNow - xt->second) >= 2000) {
+            combatCapMs_[ck] = xNow;
+            coop::logLine(b);
+        }
+    }
+    // Capture-side combat visibility (join-initiated town combat investigation):
+    // the receive side logs [combat] order when an intent ARRIVES, but nothing
+    // ever recorded what this client SENDS - a fight that never crosses is
+    // indistinguishable from one never captured. One throttled line per owned
+    // combatant while its streamed task is a combat stance.
+    {
+        unsigned long capNow = nowMs();
+        for (unsigned int i = 0; i < n; ++i) {
+            const EntityState& e = buf[i];
+            if (!coop::taskIsCombat(e.task)) continue;
+            Key k = keyOf(e);
+            std::map<Key, unsigned long>::iterator ct = combatCapMs_.find(k);
+            if (ct != combatCapMs_.end() && (capNow - ct->second) < 2000) continue;
+            combatCapMs_[k] = capNow;
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[combat] CAP hand=%u,%u task=%u tgt=%u,%u,%u,%u,%u",
+                e.hIndex, e.hSerial, (unsigned)e.task,
+                e.sType, e.sContainer, e.sContainerSerial, e.sIndex, e.sSerial);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
     }
     // Host also streams nearby world NPCs (host-authoritative world). The join leaves
     // streamNpcs_ off, so on the join this publishes ONLY its owned squad subset.
@@ -4447,6 +4507,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                         // Squad-class: full park. drivenChars_ membership also
                         // keeps host-authority suppression off the body.
                         drivenChars_.insert(c);
+                        canonicalOf_[c] = it->first;
                         if (aiSuspend_) engine::addAiSuspend(c);
                     }
                     // World NPCs: damage guard only - AI, suppression and
@@ -4499,6 +4560,7 @@ void Replicator::applyTargets(GameWorld* gw) {
         }
         drivenChars_.insert(c);
         drivenSeen_[c] = now; // recently-driven grace for the authority passes
+        canonicalOf_[c] = it->first; // capture translation (combat subjects)
         debugMark(c, 0, "DRV");
 
         // Every driven body is damage-guarded (locally-simulated hits must not
@@ -5372,7 +5434,10 @@ void Replicator::applyTargets(GameWorld* gw) {
     // never dereferenced, only compared, but the map should stay small).
     for (std::map<Character*, unsigned long>::iterator ds = drivenSeen_.begin();
          ds != drivenSeen_.end(); ) {
-        if ((now - ds->second) > 30000) drivenSeen_.erase(ds++);
+        if ((now - ds->second) > 30000) {
+            canonicalOf_.erase(ds->first); // same lifetime bound (dangling ptr)
+            drivenSeen_.erase(ds++);
+        }
         else ++ds;
     }
     if (aiSuspend_ && (now - aiLogTick_) > 3000) {

@@ -3852,6 +3852,160 @@ private:
     unsigned int  npcB_[5];
 };
 
+// assault_town (join-initiated town combat): the JOIN's player character starts
+// an UNPROVOKED fight with a world NPC (the user's no-fight report: a fight the
+// join picks with a townsperson renders only on the join). Save 'sync' (bar
+// full of armed NPCs). The JOIN latches its own tab-1 leader, picks the nearest
+// upright out-of-combat world NPC, and orders the attack - the exact chain a
+// player right-click produces. Nothing is ordered host-side: the fight must
+// cross as the join's streamed combat intent (captureOne's task override ->
+// host applyTargets combat branch -> host-local fight). Audit trail:
+//   join:  "SCENARIO ASSAULT issued atk=A vic=V", [combat] CAP hand=A tgt=V
+//   host:  [combat] order hand=A tgt=V r=2 (the driven join-PC copy engaged),
+//          "SCENARIO ASSAULT hostview fight=1 tgt=V" (host's local combat read
+//          of the join-PC copy), SCENARIO VITALS for V on both sides.
+class AssaultTownScenario : public Scenario {
+public:
+    AssaultTownScenario()
+        : passed_(false), lastLogMs_(0), lastOrderMs_(0), haveOwn_(false),
+          havePeer_(false), haveVic_(false), issued_(false), pickFailLogged_(false),
+          hostFightSeen_(0) {}
+
+    virtual const char* name() const { return "assault_town"; }
+
+    virtual void onGameplay(const ScenarioContext& ctx) {
+        latchLeaders(ctx);
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        latchLeaders(ctx);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveOwn_ || !havePeer_) latchLeaders(ctx);
+
+        // JOIN: pick the victim and issue/refresh the attack. orderAttackByHand
+        // no-ops while the attacker is already fighting, so the 2.5 s cadence is
+        // a keep-alive, not an AI reset.
+        if (!ctx.isHost && haveOwn_ && ctx.elapsedMs >= ASSAULT_AT_MS) {
+            // Victim pick retries on the order cadence: the first run showed a
+            // one-shot pick near the join's tab-1 leader finding nothing within
+            // pickCombatVictim's 30 u (the sync save bakes the bar crowd around
+            // the HOST leader). Fall back to picking near the PEER leader - the
+            // attack order's own pathing walks our PC to the victim, which is
+            // exactly the user's manual repro (walk up to a townsperson, fight).
+            if (!haveVic_ && (ctx.elapsedMs - lastOrderMs_) >= 2500) {
+                lastOrderMs_ = ctx.elapsedMs;
+                haveVic_ = engine::pickCombatVictim(ctx.gw, ownHand_, 0, vic_, 0);
+                if (!haveVic_ && havePeer_)
+                    haveVic_ = engine::pickCombatVictim(ctx.gw, peerHand_, 0, vic_, 0);
+                if (!haveVic_ && !pickFailLogged_) {
+                    coop::logLine("SCENARIO ASSAULT pick FAILED (no upright NPC; retrying)");
+                    pickFailLogged_ = true;
+                }
+            }
+            if (haveVic_ &&
+                (!issued_ || (ctx.elapsedMs - lastOrderMs_) >= 2500)) {
+                lastOrderMs_ = ctx.elapsedMs;
+                bool ok = engine::orderAttackByHand(ctx.gw, ownHand_, vic_);
+                if (!issued_) {
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "SCENARIO ASSAULT issued atk=%u,%u vic=%u,%u ok=%d",
+                        ownHand_[3], ownHand_[4], vic_[3], vic_[4], ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    issued_ = true;
+                }
+            }
+        }
+
+        // 1 Hz series, both sides: local combat read of the ATTACKER (join = its
+        // owned leader, host = its driven copy of the peer leader) + victim
+        // vitals. The host learns the victim hand from its OWN combat read of
+        // the copy (cr.target), so the two logs cross-reference by hand.
+        if (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            const unsigned int* atk = ctx.isHost ? peerHand_ : ownHand_;
+            bool haveAtk = ctx.isHost ? havePeer_ : haveOwn_;
+            if (haveAtk) {
+                engine::CombatRead cr;
+                bool fight = engine::readCombatByHand(atk, &cr) &&
+                             (cr.inCombat || cr.modeActive);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO ASSAULT %s fight=%d tgt=%u,%u wait=%d",
+                    ctx.isHost ? "hostview" : "joinview",
+                    fight ? 1 : 0,
+                    cr.hasTarget ? cr.target[3] : 0,
+                    cr.hasTarget ? cr.target[4] : 0,
+                    cr.waiting ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                if (ctx.isHost && fight) ++hostFightSeen_;
+                if (ctx.isHost && cr.hasTarget) logVitalsLine(cr.target, ctx.elapsedMs);
+                logVitalsLine(atk, ctx.elapsedMs);
+            }
+            if (!ctx.isHost && haveVic_) logVitalsLine(vic_, ctx.elapsedMs);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // Join: the assault must have been issued. Host: lenient (leaders
+            // latched) - the wire-level judgement is the oracle's, from the
+            // CAP/order/hostview lines above.
+            passed_ = ctx.isHost ? havePeer_ : (issued_ && haveVic_);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ASSAULT_AT_MS    = 10000;
+    static const unsigned long HOST_DURATION_MS = 52000;
+    static const unsigned long JOIN_DURATION_MS = 45000;
+    static const unsigned int  MAX_LOG          = 40;
+
+    void latchLeaders(const ScenarioContext& ctx) {
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        EntityState sq[MAX_LOG];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_LOG);
+        if (!haveOwn_) {
+            int idx = tabLeaderIdx(sq, n, ownRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], ownHand_);
+                haveOwn_ = true;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO ASSAULT own rank=%u hand=%u,%u",
+                    ownRank, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!havePeer_) {
+            int idx = tabLeaderIdx(sq, n, ownRank == 0u ? 1u : 0u);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], peerHand_);
+                havePeer_ = true;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO ASSAULT peer rank=%u hand=%u,%u",
+                    ownRank == 0u ? 1u : 0u, peerHand_[3], peerHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    bool          passed_;
+    unsigned long lastLogMs_;
+    unsigned long lastOrderMs_;
+    bool          haveOwn_;
+    bool          havePeer_;
+    bool          haveVic_;
+    bool          issued_;
+    bool          pickFailLogged_;
+    unsigned int  hostFightSeen_;
+    unsigned int  ownHand_[5];
+    unsigned int  peerHand_[5];
+    unsigned int  vic_[5];
+};
+
 // player_ko (player-combat validation, phase 1): players as VICTIMS, both
 // directions. Save 'squad1'. Window A: the HOST knocks out its OWN tab-0 leader
 // (scaffold KO, the down_order pattern - deterministic; real combat damage is
@@ -10118,6 +10272,7 @@ Scenario* makeScenario(const std::string& name) {
     if (name == "combat_order") return new CombatOrderScenario();
     if (name == "combat_kill")  return new CombatKillScenario();
     if (name == "player_combat") return new PlayerCombatScenario();
+    if (name == "assault_town") return new AssaultTownScenario();
     if (name == "player_ko")    return new PlayerKoScenario();
     if (name == "medic_order")  return new MedicOrderScenario();
     if (name == "limb_loss")    return new LimbLossScenario();

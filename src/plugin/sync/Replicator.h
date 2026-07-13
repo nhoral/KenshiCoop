@@ -701,6 +701,10 @@ private:
     // we keep the last attacker for ATTR_WINDOW_MS and stamp it as the event's ACTOR
     // (causality: "downed BY"), so combat KO/death events carry who-did-it.
     std::map<Key, std::pair<Key, unsigned long> > attackerOf_;
+    // Capture-side combat telemetry: last "[combat] CAP" emit per OWNED hand
+    // (throttle). Records what this client SENDS on the wire - the missing
+    // half of the audit trail for join-initiated fights.
+    std::map<Key, unsigned long> combatCapMs_;
     u32                   nextEventId_;
     // Stage 6: world NPCs we've hidden+frozen on the join because the host isn't
     // streaming them. Keyed by hand so we restore the exact body when it re-enters
@@ -732,6 +736,16 @@ private:
     // restored by the reassert pass's driven exemption, 6 churn cycles per
     // hand). Pointers are compared, never dereferenced; timestamp-pruned.
     std::map<Character*, unsigned long> drivenSeen_;
+    // Reverse identity map for CAPTURE translation (join-initiated town combat,
+    // run 20260712_180913): body pointer -> the canonical key the PEER streams
+    // it under. A driven body's LOCAL hand can diverge from its wire identity
+    // (the engine separateIntoMyOwnSquad's a town NPC into a fresh local
+    // container when a fight starts; minted proxies never had the peer's hand
+    // at all), so a captured combat intent's SUBJECT must be published under
+    // the canonical key or the peer's applyCombat can't resolve the target
+    // (r=1 forever - the fight only renders on the attacker's client).
+    // Refilled every drive tick; pruned alongside drivenSeen_.
+    std::map<Character*, Key> canonicalOf_;
     // Step-5 hysteresis: consecutive-frame counters per hand so a brief stream
     // hiccup doesn't suppress (needs ~1 s unstreamed) and a boundary NPC doesn't
     // flicker back (needs ~2 s streamed dwell to restore). Spike 18: the hard
