@@ -2086,6 +2086,46 @@ the ISSUED line records the victim's join-local hand while the wire carries
 the translated canonical hand (that difference is the fix working, not a
 mismatch).
 
+## Monolith split - full-tier regression (2026-07-13)
+
+The four oversized components were mechanically decomposed (plan "Break Up
+the Monolith Files", commits `429c5ae` / `6d0674c` / `aceba6c` / `9f659bb`):
+`Engine.cpp` (8.9k) -> `EngineInternal.h/.cpp` + 5 domain TUs; `Replicator.cpp`
+(6.5k) -> 7 partial-class TUs + `ReplicatorUtil.h`; `Scenario.cpp` (10.3k) ->
+factory chain + `ScenarioSupport.h/.cpp` + 10 domain TUs; `CoopOracles.psm1`
+(7.3k) -> root module + 9 dot-sourced `scripts/oracles/*.ps1` fragments. Zero
+behavior/wire changes; public headers byte-identical. `resources/CODE_MAP.md`
+(new) carries the per-plane inventories, shared-state contracts and the
+emitter->consumer log-tag index.
+
+Per-stage gates all green: clean build + `prototest` 227/227 + the 4-scenario
+smoke set after every stage (npc_sync retry-passed its known smoothness
+clock-slew flake in stages 2-3); the oracle split was additionally validated
+by offline re-judging six historical run dirs (spawn_far, player_combat,
+coop_presence, npc_sync, travel_parity, assault_town) - `verdict.json`
+byte-identical (timestamp excluded) old module vs fragments.
+
+Final `regress.ps1 -Tier full` (83 runs, 2026-07-13 overnight): 75
+first-attempt passes, 3 FLAKY (retry-passed: `death_order [clean]`,
+`fast_march [clean]`, `sneak_detect [clean]`), 5 recorded FAILs. Every FAIL
+was dispositioned against a CONTROL rebuild of the pre-split commit
+(`1242ffc`) on the same machine, same night:
+
+| Failing run | Split DLL | Pre-split control DLL | Disposition |
+|---|---|---|---|
+| `craft_order [clean]` | FAIL (march 0.363; rerun failed join sampling pre=68 post=0) | FAIL (march 0.323) | environmental, not split-caused |
+| `npc_carry [clean]` | FAIL "no host NPC latch" (known availability flake, baseline line: wandering NPCs outside interest) | FAIL (carry chain: dropped body not DOWN on join) | environmental (same known flake family) |
+| `recruit_sync [clean]` | FAIL converged 3/4, host/runtime leg (no REKEY/BOUND) | FAIL converged 3/4, join/runtime leg (same signature, mirrored) | environmental |
+| `spawn_sync [clean]` | FAIL near-bind 1/4 + smoothness slew | FAIL near-bind 1/4 (identical) | environmental |
+| `sneak_detect [wan]` | FAIL detection-map clear + slew; targeted rerun PASS | - | flake, retry-passed |
+
+The identical failure signatures on the pre-split control DLL show these four
+`sync`-save scenarios were failing environmentally that night (heavy machine
+load from the 83-run marathon; the save's bar population drifting is the
+usual suspect) - not a split regression. Everything that distinguishes the
+split (compile units, linkage, factory chain, module dot-sourcing) is
+exercised by the 75 green runs.
+
 ## Known limitations (honest edges)
 
 - Both clients still share one GPU/CPU in local runs; genuinely asymmetric

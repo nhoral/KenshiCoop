@@ -47,8 +47,9 @@ pointers or install hooks; a helper needed by a second domain TU moves to
 
 ### Log-tag index (engine plane emitters)
 
-Consumer column = oracle function in `scripts/CoopOracles.psm1` (completed in
-the Stage 4 oracle split; "diag" = human/log-diff diagnostic only).
+Consumer column = oracle function, exported by `scripts/CoopOracles.psm1`
+and defined in its `scripts/oracles/*.ps1` fragment (Stage 4 split; "diag" =
+human/log-diff diagnostic only).
 
 | Tag | Emitter | Meaning | Consumer |
 |---|---|---|---|
@@ -59,7 +60,7 @@ the Stage 4 oracle split; "diag" = human/log-diff diagnostic only).
 | `[fac] AFFECT-EV` / `AFFECT-AMT` | EngineInternal.cpp `recordFactionDelta` | engine relation mutation (5 s per-pair debounce; deltas still queue) | Test-FactionSync |
 | `[shop] BUY-LOCAL` | EngineInternal.cpp `buyItem_hook` | real purchase through Inventory::buyItem | diag (protocol 22 groundwork) |
 | `[shop] BUY-BEFORE/AFTER`, `ensure-stock`, `probe-buy` | EngineWorld.cpp `probeVendorBuy` | programmatic vendor-buy probe | diag |
-| `[spawn] proxy` / `runtime` | EngineSpawnCombat.cpp spawn levers | proxy mint / runtime squad spawn results | Test-SpawnParity family |
+| `[spawn] proxy` / `runtime` | EngineSpawnCombat.cpp spawn levers | proxy mint / runtime squad spawn results | Test-SpawnProbe / Test-SpawnSync / Test-SpawnFarBind |
 | `[seatres]` (side=HOST/JOIN) | EngineEntity.cpp `logSeatResolveOnce` (also emitted from spawn/combat TU) | once-per-pair subject-hand resolve position check | diag (Stage 3a craft/seat) |
 | `[med] LIMB-FIT` | EngineSpawnCombat.cpp | robot-limb fit path evidence | Test-LimbLoss |
 | `[mk] *` / `[mkspy] *` / `[wpndiag] *` / `[tmpl] MISS` / `[recon] grp` / `[wd] scan` | EngineInventory.cpp | item mint/reconcile/weapon-fab diagnostics (spike 451) | diag; `[recon]`/inventory hashes feed Test-InventorySync |
@@ -103,16 +104,18 @@ Never add file-scope mutable state there: cross-TU state is a class member.
 
 ### Log-tag index (replication plane emitters)
 
-| Tag family | Emitter TU | Consumer oracle (scripts/CoopOracles.psm1) |
+Consumer column = oracle function + its `scripts/oracles/*.ps1` fragment.
+
+| Tag family | Emitter TU | Consumer oracle |
 |---|---|---|
-| `[life]` | Core (`lifeSet`) | Test-EntityLifecycle |
-| `[combat]` (order/CAP/CAP xlate), `[victim]` | Publish (capture) + Drive (order/apply) | Test-PlayerCombat / Test-AssaultTown / Test-CombatOrder |
-| `[snap]`, `[interp]`, `[pose]`, `[ai]`, `[gate]`, `[trust]`, `[oi]` | Drive | Test-Smoothness / Test-AntiZombie / gate diagnostics |
-| `[census]`, `[audit]`, `[authority]`, `[ck]` | Authority (+Publish send half) | Test-NpcParity / authority gates |
-| `[spawn]`, `[limb]`, `[event]`, `[med]` (apply half) | Spawn | Test-SpawnParity / Test-LimbLoss / event oracles |
-| `[inv]`, `[wi]`, `[wd]`, `[dk]`/`[pk]`/`[sk]`, `[xfer]`, `[key]` | Items | Test-InventorySync / Test-WorldItems / Test-WeaponConservation / Test-Transfers |
-| `[stats]`, `[money]`, `[fac]`, `[door]`, `[bdoor]`, `[build]`, `[prod]`, `[research]`, `[recruit]`, `[squad]`, `[sneak]`, `[speed]`, `[time]`, `[latejoin]`, `[rank]` | Channels | matching per-channel oracles (Test-StatsSync, Test-MoneySync, ...) |
-| `[carry]`, `[furn]` | Publish (SEND) + Drive (drive/sweep) + Spawn (RECV edges) | Test-CarrySync / Test-FurnitureSync |
+| `[life]` | Core (`lifeSet`) | Test-Lifecycle (Motion.ps1) |
+| `[combat]` (order/CAP/CAP xlate), `[victim]` | Publish (capture) + Drive (order/apply) | Test-PlayerCombat / Test-AssaultTown / Test-CombatOrder / Test-CombatCrowd (Combat.ps1) |
+| `[snap]`, `[interp]`, `[pose]`, `[ai]`, `[gate]`, `[trust]`, `[oi]` | Drive | Test-Smoothness / Test-SnapRate / Test-AntiZombie (Motion.ps1); gate diagnostics |
+| `[census]`, `[audit]`, `[authority]`, `[ck]` | Authority (+Publish send half) | Test-NpcCensus / Test-ExistenceParity / Test-SuppressChurn (Npc.ps1, Motion.ps1) |
+| `[spawn]`, `[limb]`, `[event]`, `[med]` (apply half) | Spawn | Test-SpawnProbe/SpawnSync (Npc.ps1) / Test-LimbLoss (Medical.ps1) / Test-DeathOrder (Npc.ps1) |
+| `[inv]`, `[wi]`, `[wd]`, `[dk]`/`[pk]`/`[sk]`, `[xfer]`, `[key]` | Items | Test-InventorySync / Test-WorldItemSync / Test-WeaponDrop / Test-WeaponLoot / Test-TradePeer (Inventory.ps1) |
+| `[stats]`, `[money]`, `[fac]`, `[door]`, `[bdoor]`, `[build]`, `[prod]`, `[research]`, `[recruit]`, `[squad]`, `[sneak]`, `[speed]`, `[time]`, `[latejoin]`, `[rank]` | Channels | matching per-channel oracles: Test-StatsSync (Medical.ps1); Test-Sneak*/Test-Speed* (Npc.ps1); Test-Money*/Faction*/Door*/Bdoor*/Build*/Prod*/Research*/Recruit*/Squad*/Time* (World.ps1); Test-Latejoin* (Session.ps1) |
+| `[carry]`, `[furn]` | Publish (SEND) + Drive (drive/sweep) + Spawn (RECV edges) | Test-CarryOrder / Test-NpcCarry / Test-FurnPut / Test-CagePeer (Npc.ps1) |
 
 ## Scenario plane (`src/plugin/test/`)
 
