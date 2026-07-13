@@ -1,6 +1,6 @@
 // ZoneQuery.cpp - the zone-loaded query (Phase 1 spawn parity), quarantined in
 // its own TU because kenshi/ZoneManager.h redefines ParticlePool (also defined
-// by kenshi/CombatClass.h, which Engine.cpp needs) - the two vendored headers
+// by kenshi/CombatClass.h, which EngineInternal.cpp needs) - the two vendored headers
 // cannot share a translation unit.
 //
 // Why the query exists: within a locally LOADED world block, every baked

@@ -74,7 +74,12 @@
     <ClCompile Include="core\Config.cpp" />
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
-    <ClCompile Include="game\Engine.cpp" />
+    <ClCompile Include="game\EngineInternal.cpp" />
+    <ClCompile Include="game\EngineEntity.cpp" />
+    <ClCompile Include="game\EngineInventory.cpp" />
+    <ClCompile Include="game\EngineSpawnCombat.cpp" />
+    <ClCompile Include="game\EngineCharState.cpp" />
+    <ClCompile Include="game\EngineWorld.cpp" />
     <ClCompile Include="game\ZoneQuery.cpp" />
     <ClCompile Include="sync\Interp.cpp" />
     <ClCompile Include="sync\Replicator.cpp" />

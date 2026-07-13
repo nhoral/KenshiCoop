@@ -1,0 +1,1036 @@
+// EngineEntity.cpp - entity capture / resolve / apply (monolith split from
+// EngineInternal.cpp, 2026-07-12): EntityState capture (captureOne/captureSquad/
+// captureNpcs + interest centers), hand resolve (resolve/resolveCharByHand),
+// motion apply (applyRaw/orderMoveTo/walkTo/park), NPC suppression, the debug
+// marker HUD labels, and the seat/bed/cage/machine template + work-fixture
+// finders shared by scenario scenes.
+//
+// Owner state: section-private statics/anon-namespace helpers only (pose
+// classifiers, marker SEH shims, capture hysteresis buffers).
+// Must NOT: define g_* engine pointers (EngineInternal.cpp owns them - EngineInternal.h
+// declares them), install hooks, or change any log string - log phrasing is
+// the API consumed by the PowerShell oracles (see resources/CODE_MAP.md).
+
+#include "EngineInternal.h"
+
+namespace coop {
+namespace engine {
+
+// ---- Entity capture / resolve / apply --------------------------------------
+
+namespace {
+// Anchored rest poses worth reproducing: the body stays put AT a fixture (a stool,
+// throne, bed, machine), so committing the same task on the join seats/poses it in
+// place. We deliberately EXCLUDE movement tasks (WANDER_TOWN, GO_TO_THE_BAR...) and
+// plain standing (STAND_STILL/IDLE): reproducing a wander task walks the body away
+// (tens of metres of drift), and a standing pose is visually identical to a park.
+bool isReproduciblePose(int t) {
+    switch (t) {
+        case SIT_AROUND:
+        case SIT_ON_THRONE:
+        case REST:
+        case RELAX_IN_TOWN_PACKAGE:
+        case USE_BED:
+        case USE_BED_ORDER:
+        case SLEEP_ON_FLOOR:
+        // Crafting / gathering / work poses (Stage 3a). All of these pin the body
+        // AT a work fixture whose subject hand resolves cross-client, exactly like
+        // sitting, so the player-order path (applyTaskOrder) reproduces them in
+        // place. Mining drills, farm plots, research benches and smithies all run
+        // through OPERATE_MACHINERY; the others cover automatic machines, training
+        // dummies and the ambient "pretend to work" town pose.
+        case OPERATE_MACHINERY:
+        case OPERATE_AUTOMATIC_MACHINERY:
+        case USE_TRAINING_DUMMY:
+        case PRETEND_TO_OPERATE_MACHINERY:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Node-anchored rest poses: the body sits/idles AT an AI node. The node subject is
+// not a resolvable RootObject, so applyTask cannot reproduce it - only the body's
+// own local AI can, by executing the node. Used to decide NOT to suspend/park these.
+bool isNodeAnchoredPoseImpl(int t) {
+    switch (t) {
+        case STAND_AT_NODE:
+        case STAND_AT_SHOPKEEPER_NODE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// DEBUG (host-side): log each distinct task key seen among captured bodies once,
+// with whether we treat it as a reproducible rest pose. Reveals exactly which
+// tasks the bar's seated NPCs use so the allowlist can be widened. Lives outside
+// any __try so the std::set's allocations don't violate MSVC's SEH/unwind rule.
+void logTaskKeyOnce(int k, bool hasSubject, const char* desc) {
+    static std::set<int> seen;
+    if (seen.insert(k).second) {
+        char b[160];
+        _snprintf(b, sizeof(b) - 1, "[taskkey] key=%d desc='%s' repro=%d subject=%d",
+                  k, (desc && desc[0]) ? desc : "?",
+                  isReproduciblePose(k) ? 1 : 0, hasSubject ? 1 : 0);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+}
+
+// DIAGNOSTIC: resolve a subject (seat) hand to its world position. POD-only locals
+// in its own SEH frame (no C++ unwinding objects) so a bad handle degrades to false.
+bool resolveSubjectPos(u32 idx, u32 ser, u32 type, u32 cont, u32 contSer,
+                       float* x, float* y, float* z) {
+    if (!g_handGetRootFn || !g_handCtorFn) return false;
+    __try {
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, idx, ser, (itemType)type, cont, contSer);
+        RootObject* r = g_handGetRootFn(h);
+        if (!r) return false;
+        Ogre::Vector3 p = r->getPosition();
+        *x = p.x; *y = p.y; *z = p.z;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+} // namespace
+
+// DIAGNOSTIC (host-side): once per (npc,fixture) pair, log where THIS client
+// resolves the subject handle (seat, machine, dummy, bed...) vs where the NPC
+// actually is. Comparing the host's and join's "[seatres]" lines for the same
+// handle answers whether the fixture identity correlates across clients (same
+// pos) or not. The task= field distinguishes seated poses from crafting/gathering
+// work stations (OPERATE_MACHINERY etc.), so the same line doubles as the
+// craft-subject ([craftres]) diagnostic for Stage 3a.
+// External linkage (EngineInternal.h): also emitted from the spawn/combat TU.
+void logSeatResolveOnce(const char* side, int task, u32 npcIdx, u32 npcSer,
+                        u32 sIdx, u32 sSer, u32 sType, u32 sCont, u32 sContSer,
+                        float npx, float npy, float npz) {
+    static std::set<std::pair<u32, u32> > seen;
+    if (!seen.insert(std::make_pair(npcIdx, sIdx)).second) return;
+    float sx = 0, sy = 0, sz = 0;
+    bool ok = resolveSubjectPos(sIdx, sSer, sType, sCont, sContSer, &sx, &sy, &sz);
+    float dx = sx - npx, dz = sz - npz;
+    float d = ok ? (float)sqrt((double)(dx * dx + dz * dz)) : -1.0f;
+    char b[240];
+    _snprintf(b, sizeof(b) - 1,
+              "[seatres] %s task=%d npc=%u,%u subj=%u,%u ok=%d npcpos=%.1f,%.1f subjpos=%.1f,%.1f d=%.1f",
+              side, task, npcIdx, npcSer, sIdx, sSer, ok ? 1 : 0, npx, npz, sx, sz, d);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+}
+
+namespace {
+// SEH-guarded capture of a single Character into an EntityState. Kept in its own
+// __try frame (no C++ unwinding objects) so a bad pointer degrades to a skip.
+bool captureOne(Character* c, EntityState* e) {
+    __try {
+        const hand& h = c->handle;
+        e->hType            = (u32)h.type;
+        e->hContainer       = h.container;
+        e->hContainerSerial = h.containerSerial;
+        e->hIndex           = h.index;
+        e->hSerial          = h.serial;
+
+        Ogre::Vector3 p = c->getPosition();
+        e->x = p.x; e->y = p.y; e->z = p.z;
+        e->heading = c->getOrientation().getYaw().valueRadians();
+
+        CharMovement* mv = c->movement;
+        if (mv) {
+            e->cSpeed   = mv->currentSpeed;
+            e->cMotionX = mv->currentMotion.x;
+            e->cMotionY = mv->currentMotion.y;
+            e->cMotionZ = mv->currentMotion.z;
+            e->cMoving  = mv->currentlyMoving ? 1 : 0;
+        } else {
+            e->cSpeed = 0; e->cMotionX = e->cMotionY = e->cMotionZ = 0; e->cMoving = 0;
+        }
+        // Stage 5 pose: capture the current task + the object it targets, so the
+        // receiver can adopt the same pose at the same fixture (sit/operate). No
+        // current action -> TASK_NONE (the receiver idle-parks).
+        e->task = TASK_NONE;
+        e->rawTask = TASK_NONE;
+        e->sType = e->sContainer = e->sContainerSerial = e->sIndex = e->sSerial = 0;
+        if (g_taskerKeyFn) {
+            CharBody* b = c->body;
+            Tasker* t = b ? b->currentAction : 0;
+            if (t) {
+                int k = g_taskerKeyFn(t);
+                e->rawTask = (u16)k; // diagnostic: stream the raw key for divergence checks
+                const char* desc = 0;
+                if (g_taskerDescFn) {
+                    const std::string* ds = g_taskerDescFn(t);
+                    if (ds) desc = ds->c_str();
+                }
+                logTaskKeyOnce(k, t->subject.index != 0 || t->subject.serial != 0, desc);
+                // Only stream anchored rest poses; everything else stays TASK_NONE
+                // so the receiver parks instead of reproducing a moving task.
+                if (isReproduciblePose(k)) {
+                    e->task = (u16)k;
+                    const hand& s = t->subject;
+                    e->sType            = (u32)s.type;
+                    e->sContainer       = s.container;
+                    e->sContainerSerial = s.containerSerial;
+                    e->sIndex           = s.index;
+                    e->sSerial          = s.serial;
+                    // DIAGNOSTIC: where does THIS (host) client resolve the fixture?
+                    logSeatResolveOnce("HOST", k, e->hIndex, e->hSerial,
+                                       e->sIndex, e->sSerial, e->sType,
+                                       e->sContainer, e->sContainerSerial,
+                                       e->x, e->y, e->z);
+                }
+            }
+        }
+        // Stage 2: body-state flags (down/KO/ragdoll/dead/crawl). 0 = upright. Read
+        // last so a fault here can't lose the transform we already captured.
+        e->bodyState = readBodyState(c);
+        // Carried-body sync (protocol 18): a body carrying someone streams the
+        // synthetic TASK_CARRY_BODY with the carried hand as the subject - the
+        // receiver's SELF-HEAL for a lost pickup event. Sits above rest poses
+        // (clobbers a sit/work task) and below combat (the combat override just
+        // after clobbers it - you drop the body to fight).
+        if (c->isCarryingSomething) {
+            const hand& ch = c->carryingObject;
+            if (ch.index != 0 || ch.serial != 0) {
+                e->task             = TASK_CARRY_BODY;
+                e->sType            = (u32)ch.type;
+                e->sContainer       = ch.container;
+                e->sContainerSerial = ch.containerSerial;
+                e->sIndex           = ch.index;
+                e->sSerial          = ch.serial;
+            }
+        }
+        // Stage 3c combat: if the body is fighting a resolvable target, OVERRIDE the
+        // pose task with the synthetic combat intent and stash the target's hand in the
+        // subject fields. Combat outranks any rest pose (you can't sit and fight), so
+        // this clobbers a sit/work task set above. The join reproduces the cause by
+        // ordering its local copy to melee the same target. (Read inside this __try so
+        // a combat-read fault can't lose the transform/body-state already captured.)
+        {
+            CombatRead cr;
+            // combatModeActive, not isInCombatMode(): the latter flickers OFF
+            // between combo sections / slot rotations, and a flickering stream
+            // disarm-reset the peer's copies every gap (measured in combat_crowd:
+            // a fighting hand's streamed task alternated combat/none all fight).
+            if (readCombat(c, &cr) && (cr.inCombat || cr.modeActive) &&
+                cr.hasTarget && (cr.target[3] != 0 || cr.target[4] != 0)) {
+                // Stance split (protocol 15): an attack-slot-QUEUED combatant
+                // streams TASK_COMBAT_WAIT so the join holds its copy in the
+                // menace ring instead of timer-re-issuing the focused attack.
+                e->task = cr.waiting ? TASK_COMBAT_WAIT : TASK_COMBAT_MELEE;
+                e->sType            = cr.target[0];
+                e->sContainer       = cr.target[1];
+                e->sContainerSerial = cr.target[2];
+                e->sIndex           = cr.target[3];
+                e->sSerial          = cr.target[4];
+            }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+} // namespace
+
+unsigned int captureSquad(GameWorld* gw, bool leaderOnly,
+                          EntityState* out, unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0) return 0;
+    unsigned int n = 0;
+    __try {
+        if (!gw->player) return 0;
+        unsigned int size = (unsigned int)gw->player->playerCharacters.size();
+        for (unsigned int i = 0; i < size && n < maxOut; ++i) {
+            Character* c = gw->player->playerCharacters[i];
+            if (!c) continue;
+            // captureOne has its own __try; calling it here is fine.
+            if (captureOne(c, &out[n])) ++n;
+            if (leaderOnly) break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
+Character* resolve(const EntityState& e) {
+    if (!g_handGetCharFn || !g_handCtorFn) return 0;
+    __try {
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, e.hIndex, e.hSerial, (itemType)e.hType,
+                     e.hContainer, e.hContainerSerial);
+        return g_handGetCharFn(h);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Resolve a Character* from raw hand fields (same path as resolve(EntityState)).
+Character* resolveCharByHand(unsigned int idx, unsigned int ser, unsigned int type,
+                             unsigned int cont, unsigned int contSer) {
+    if (!g_handGetCharFn || !g_handCtorFn) return 0;
+    __try {
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, idx, ser, (itemType)type, cont, contSer);
+        return g_handGetCharFn(h);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+bool applyRaw(Character* c, const EntityState& e) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        Ogre::Vector3 pos(e.x, e.y, e.z);
+        Ogre::Quaternion rot(Ogre::Radian(e.heading), Ogre::Vector3::UNIT_Y);
+        mv->_setPositionDirectionAndTeleport(pos, rot);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool readPos(Character* c, float* x, float* y, float* z) {
+    if (!c) return false;
+    __try {
+        Ogre::Vector3 p = c->getPosition();
+        if (x) *x = p.x; if (y) *y = p.y; if (z) *z = p.z;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool readHand(Character* c, unsigned int out[5]) {
+    if (!c) return false;
+    __try {
+        const hand& h = c->handle;
+        out[0] = h.index;
+        out[1] = h.serial;
+        out[2] = (unsigned int)h.type;
+        out[3] = h.container;
+        out[4] = h.containerSerial;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool orderMoveTo(Character* c, float x, float y, float z) {
+    if (!c) return false;
+    __try {
+        Ogre::Vector3 dest(x, y, z);
+        // Prefer the player move-order path (moves a player-controlled leader).
+        if (g_charSetDestFn) {
+            g_charSetDestFn(c, &dest, false);
+            return true;
+        }
+        // Fallback: drive the movement controller directly (AI/proxy bodies).
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        mv->setDesiredSpeed(RUN);
+        mv->setDestination(dest, HIGH_PRIORITY, false);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool walkTo(Character* c, float x, float y, float z, float speed) {
+    if (!c) return false;
+    __try {
+        Ogre::Vector3 dest(x, y, z);
+        // Dual-path so ONE call drives both kinds of body:
+        //   * player-controlled (squad): the player move-order path; a player char
+        //     ignores a bare CharMovement::setDestination (proved in Stage 1).
+        //   * AI-controlled (NPC): a CharMovement HIGH_PRIORITY destination, which
+        //     overrides the NPC's autonomous movement goals (proved in the monolith).
+        // Issuing both is safe: each body obeys the one that applies to it.
+        if (g_charSetDestFn) g_charSetDestFn(c, &dest, false);
+
+        CharMovement* mv = c->movement;
+        if (mv) {
+            mv->setDestination(dest, HIGH_PRIORITY, false);
+            float s = speed;
+            if (s < 1.0f) s = (float)RUN; // unknown/tiny: default to a run pace
+            mv->setDesiredSpeed(s);        // override the order's default speed (catch-up)
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool park(Character* c, float x, float y, float z, float heading) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        Ogre::Vector3 pos(x, y, z);
+        Ogre::Quaternion rot(Ogre::Radian(heading), Ogre::Vector3::UNIT_Y);
+        mv->halt(); // clean stop (resets path AND clip phase - only at settle)
+        mv->_setPositionDirectionAndTeleport(pos, rot);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool applyMotion(Character* c, bool moving, float speed, float mx, float my, float mz) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        mv->currentlyMoving = moving;
+        mv->currentSpeed    = speed;
+        mv->desiredSpeed    = speed; // keep accel logic from re-deciding to idle
+        mv->currentMotion   = Ogre::Vector3(mx, my, mz);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool readMotion(Character* c, bool* moving, float* speed) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        if (moving) *moving = mv->currentlyMoving;
+        if (speed)  *speed  = mv->currentSpeed;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+int readTaskKey(Character* c) {
+    if (!c || !g_taskerKeyFn) return -1;
+    __try {
+        CharBody* b = c->body;
+        Tasker* t = b ? b->currentAction : 0;
+        if (!t) return (int)TASK_NONE;
+        return g_taskerKeyFn(t);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+bool isNodeAnchoredPose(int taskKey) { return isNodeAnchoredPoseImpl(taskKey); }
+
+bool recruitNpc(GameWorld* gw, Character* c) {
+    if (!gw || !c || !g_recruitFn) return false;
+    __try {
+        if (!gw->player) return false;
+        return g_recruitFn(gw->player, c, false);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+Character* leader(GameWorld* gw) {
+    if (!gw) return 0;
+    __try {
+        if (!gw->player || gw->player->playerCharacters.size() == 0) return 0;
+        return gw->player->playerCharacters[0];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// True if 'obj' is one of the local player's squad members (we never stream our
+// own controllable squad as a host NPC). Caller holds the SEH frame.
+// External linkage (EngineInternal.h): also used by the spawn/combat TU.
+bool isPlayerSquad(GameWorld* gw, RootObject* obj) {
+    PlayerInterface* pl = gw->player;
+    if (!pl) return false;
+    unsigned int pc = (unsigned int)pl->playerCharacters.size();
+    for (unsigned int j = 0; j < pc; ++j) {
+        if (static_cast<RootObject*>(pl->playerCharacters[j]) == obj) return true;
+    }
+    return false;
+}
+
+// Read a live NON-player Faction* off a nearby world NPC (the first non-squad
+// character within the interest radius whose faction differs from the player's).
+// This avoids FactionManager (no header): spawning into this faction yields a true
+// world NPC that is NOT in the player squad, and owning the work fixture with the
+// same faction gives that NPC a legitimate reason to operate it. Caller holds SEH.
+// Returns 0 if no non-player NPC is nearby (e.g. an empty/blank save).
+Faction* findNearbyNonPlayerFaction(GameWorld* gw) {
+    if (!gw || !g_getCharsFn || !gw->player) return 0;
+    if (gw->player->playerCharacters.size() == 0) return 0;
+    Faction* playerFac = gw->player->getFaction();
+    Ogre::Vector3 center = gw->player->playerCharacters[0]->getPosition();
+    // Wide radius: we only need ANY loaded world NPC to read a faction pointer off,
+    // not a close one. A blank-start save can sit just outside a town, so the bar
+    // crowd is well beyond the 200u capture radius - reach the whole loaded block.
+    g_npcQuery.clear();
+    g_getCharsFn(gw, &g_npcQuery, &center, 6000.0f, 6000.0f, 6000.0f, 512, 512, 0);
+    unsigned int total = g_npcQuery.size();
+    {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SETUP: faction scan found %u loaded NPC(s) within 6000u", total);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    for (unsigned int i = 0; i < total; ++i) {
+        RootObject* obj = g_npcQuery[i];
+        if (!obj || isPlayerSquad(gw, obj)) continue;
+        Faction* f = static_cast<Character*>(obj)->getFaction();
+        if (f && f != playerFac) return f;
+    }
+    return 0;
+}
+
+// DUAL-INTEREST centers (step 5): one interest sphere per squad TAB leader, up
+// to two. Both clients load the same save, so the shared playerCharacters list
+// (and its tab/container partition) is identical on each machine - the first
+// member of each distinct hand-container IS the other player's leader as seen
+// locally. A single host-leader-centered sphere meant the shared world degraded
+// the moment the players split up (spike 16); with one sphere per tab leader,
+// NPCs around EACH player stay streamed (spike 19's validated design). Writes up
+// to two centers; returns the count. Caller holds the SEH frame.
+unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[2]) {
+    PlayerInterface* pl = gw->player;
+    if (!pl || pl->playerCharacters.size() == 0) return 0;
+    unsigned int pairs[2][2];
+    unsigned int nc = 0;
+    unsigned int total = pl->playerCharacters.size();
+    for (unsigned int i = 0; i < total && nc < 2; ++i) {
+        Character* m = pl->playerCharacters[i];
+        if (!m) continue;
+        unsigned int h[5];
+        if (!readObjectHand(static_cast<RootObject*>(m), h)) continue;
+        bool seen = false;
+        for (unsigned int k = 0; k < nc; ++k)
+            if (pairs[k][0] == h[1] && pairs[k][1] == h[2]) { seen = true; break; }
+        if (seen) continue;
+        pairs[nc][0] = h[1]; pairs[nc][1] = h[2];
+        outC[nc] = m->getPosition();
+        ++nc;
+    }
+    return nc;
+}
+
+unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
+    if (!g_getCharsFn || !gw || !out || maxOut == 0) return 0;
+    unsigned int n = 0;
+    // Capture-bubble hysteresis (2026-07-11 choppiness fix): a hard 200 u
+    // edge flapped boundary NPCs in/out of the streamed set as the two
+    // clients disagreed slightly on their positions, starving the join's
+    // interp buffer right when the NPC was visibly walking away. ACQUIRE at
+    // 200 u, RETAIN out to 260 u for NPCs captured on the previous call, so
+    // a body must genuinely leave interest (not jitter across the line) to
+    // stop streaming. Previous-set keyed by (hIndex, hSerial); static
+    // arrays, main-thread only (no C++ unwinding inside __try).
+    const float NPC_CAPTURE_ACQUIRE = 200.0f;
+    const float NPC_CAPTURE_KEEP    = 260.0f;
+    static unsigned int prevKeys[512][2];
+    static unsigned int prevN = 0;
+    static unsigned int newKeys[512][2];
+    unsigned int newN = 0;
+    __try {
+        // Interest: one sphere per squad-tab leader (dual-interest, step 5). The
+        // query radii approximate a town-block footprint (~200u far) per sphere.
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) { prevN = 0; return 0; }
+
+        // Dedupe across the (possibly overlapping) spheres by object pointer.
+        static RootObject* appended[512]; // main-thread only
+        unsigned int nApp = 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], NPC_CAPTURE_KEEP,
+                         120.0f, 30.0f, 96, 96, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* obj = g_npcQuery[i];
+                if (!obj) continue;
+                if (isPlayerSquad(gw, obj)) continue; // never stream our own squad here
+                bool dup = false;
+                for (unsigned int k = 0; k < nApp; ++k)
+                    if (appended[k] == obj) { dup = true; break; }
+                if (dup) continue;
+                // getCharactersWithinSphere returns Characters as RootObject* bases.
+                if (captureOne(static_cast<Character*>(obj), &out[n])) {
+                    float dx = out[n].x - centers[ci].x;
+                    float dy = out[n].y - centers[ci].y;
+                    float dz = out[n].z - centers[ci].z;
+                    float distSq = dx * dx + dy * dy + dz * dz;
+                    if (distSq > NPC_CAPTURE_ACQUIRE * NPC_CAPTURE_ACQUIRE) {
+                        // Retention band: only NPCs already streaming stay in.
+                        // Skipping without appending lets an overlapping
+                        // second sphere still acquire it inside ITS 200 u.
+                        bool held = false;
+                        for (unsigned int k = 0; k < prevN && !held; ++k)
+                            held = prevKeys[k][0] == out[n].hIndex &&
+                                   prevKeys[k][1] == out[n].hSerial;
+                        if (!held) continue;
+                    }
+                    if (nApp < 512) appended[nApp++] = obj;
+                    if (newN < 512) {
+                        newKeys[newN][0] = out[n].hIndex;
+                        newKeys[newN][1] = out[n].hSerial;
+                        ++newN;
+                    }
+                    ++n;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // fall through: publish whatever was captured before the fault
+    }
+    prevN = newN;
+    for (unsigned int k = 0; k < newN; ++k) {
+        prevKeys[k][0] = newKeys[k][0];
+        prevKeys[k][1] = newKeys[k][1];
+    }
+    return n;
+}
+
+void clearGoals(Character* c) {
+    if (!c || !g_clearGoalsFn) return;
+    __try {
+        g_clearGoalsFn(c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+bool isLocalPlayerChar(GameWorld* gw, Character* c) {
+    if (!gw || !c) return false;
+    __try {
+        return isPlayerSquad(gw, static_cast<RootObject*>(c));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool suppressNpc(GameWorld* gw, Character* c) {
+    if (!gw || !c || !g_removeUpdateFn) return false;
+    __try {
+        g_removeUpdateFn(gw, c);
+        if (g_clearGoalsFn) g_clearGoalsFn(c);
+        // Freezing alone leaves the body standing/visible at its seat; hide it too
+        // so a host-unstreamed NPC fully disappears (no standing-on-the-seat double).
+        static_cast<RootObject*>(c)->setVisible(false);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void restoreNpc(GameWorld* gw, Character* c) {
+    if (!gw || !c || !g_addUpdateFn) return;
+    __try {
+        g_addUpdateFn(gw, c);
+        static_cast<RootObject*>(c)->setVisible(true);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+bool captureNpcByHand(GameWorld* gw, unsigned int hIndex, unsigned int hSerial,
+                      unsigned int hType, unsigned int hContainer,
+                      unsigned int hContainerSerial, EntityState* out) {
+    if (!gw || !out) return false;
+    Character* c = resolveCharByHand(hIndex, hSerial, hType, hContainer,
+                                     hContainerSerial);
+    if (!c) return false;
+    __try {
+        if (isPlayerSquad(gw, static_cast<RootObject*>(c))) return false;
+        return captureOne(c, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Stage 6 host authority: enumerate nearby WORLD NPCs (excluding our own squad),
+// yielding both the live Character* and its hand-bearing EntityState so the join
+// can decide which are NOT in the host's streamed set and suppress them. Mirrors
+// captureNpcs' interest query so the join's local set matches the host's.
+unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outStates,
+                      unsigned int maxOut) {
+    if (!g_getCharsFn || !gw || !outChars || !outStates || maxOut == 0) return 0;
+    unsigned int n = 0;
+    __try {
+        // Same dual-interest spheres as captureNpcs, so the join's suppression
+        // view matches what the host is willing to stream.
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], 200.0f, 120.0f, 30.0f, 96, 96, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* obj = g_npcQuery[i];
+                if (!obj) continue;
+                if (isPlayerSquad(gw, obj)) continue; // never suppress our own squad
+                Character* ch = static_cast<Character*>(obj);
+                bool dup = false;
+                for (unsigned int k = 0; k < n; ++k)
+                    if (outChars[k] == ch) { dup = true; break; }
+                if (dup) continue;
+                if (captureOne(ch, &outStates[n])) { outChars[n] = ch; ++n; }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
+unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
+                          EntityState* outStates, unsigned int maxOut) {
+    if (!g_getCharsFn || !gw || !outChars || !outStates || maxOut == 0) return 0;
+    if (radius <= 0.0f) return 0;
+    unsigned int n = 0;
+    __try {
+        // Same dual-interest centers as the stream bubble, but the query
+        // reaches the census radius (uniform in all axes, like the proven
+        // findNearbyNonPlayerFaction whole-block scan) with wide limits.
+        Ogre::Vector3 centers[2];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], radius, radius, radius,
+                         512, 512, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* obj = g_npcQuery[i];
+                if (!obj) continue;
+                if (isPlayerSquad(gw, obj)) continue; // never census our own squad
+                Character* ch = static_cast<Character*>(obj);
+                bool dup = false;
+                for (unsigned int k = 0; k < n; ++k)
+                    if (outChars[k] == ch) { dup = true; break; }
+                if (dup) continue;
+                if (captureOne(ch, &outStates[n])) { outChars[n] = ch; ++n; }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
+namespace {
+// getName() returns std::string by value (needs C++ unwinding), so the copy
+// lives in a callee; the SEH guard in charName only has POD locals (C2712).
+void charNameCopy(Character* c, char* out, unsigned int cap) {
+    std::string nm = static_cast<RootObjectBase*>(c)->getName();
+    strncpy(out, nm.c_str(), cap - 1);
+    out[cap - 1] = '\0';
+}
+} // namespace
+
+void charName(Character* c, char* out, unsigned int cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!c) return;
+    __try {
+        charNameCopy(c, out, cap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = '\0';
+    }
+}
+
+// ---- Debug marker HUD labels (KENSHICOOP_DEBUG_MARKERS, spike-47 substrate) --
+// ForgottenGUI::createScreenLabel + ScreenLabel::setTracking pin a colored text
+// label to a character; the engine's own per-frame projection keeps it on the
+// body (spike 47 render proof). The Replicator uses these to make join-side
+// authority states self-explaining on screen: who is host-driven, who is
+// hidden, who is a local-only ghost. C2712 split: the outer fns build the
+// std::string/Colour/Vector3 (unwindable), POD-only inner fns hold the SEH.
+
+namespace {
+
+void markerColour(int colorId, MyGUI::Colour* col) {
+    switch (colorId) {
+    case 0:  *col = MyGUI::Colour(0.30f, 1.00f, 0.30f, 1.0f); break; // driven
+    case 1:  *col = MyGUI::Colour(1.00f, 0.25f, 0.25f, 1.0f); break; // hidden
+    case 2:  *col = MyGUI::Colour(1.00f, 0.90f, 0.25f, 1.0f); break; // local-only
+    default: *col = MyGUI::Colour(0.80f, 0.80f, 0.80f, 1.0f); break;
+    }
+}
+
+ScreenLabel* markerCreateSeh(ForgottenGUI* g, Character* c,
+                             const std::string* text, const MyGUI::Colour* col,
+                             const Ogre::Vector3* off) {
+    __try {
+        ScreenLabel* l = g->createScreenLabel(*text, *col, ScreenLabel::LS_SMALL,
+                                              ScreenLabel::RS_STOPPED);
+        if (l) {
+            l->_NV_setRisingSpeed(ScreenLabel::RS_STOPPED);
+            l->_NV_setTracking(c->handle, *off);
+        }
+        return l;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+bool markerUpdateSeh(ScreenLabel* l, const std::string* text,
+                     const MyGUI::Colour* col) {
+    __try {
+        l->_NV_setCaption(*text);
+        l->_NV_setColor(*col);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool markerDestroySeh(ForgottenGUI* g, ScreenLabel* l) {
+    __try {
+        g->destroy(l);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+} // namespace
+
+void* markerCreate(Character* c, const char* text, int colorId) {
+    if (!c || !text) return 0;
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return 0;
+    std::string t(text);
+    MyGUI::Colour col;
+    markerColour(colorId, &col);
+    Ogre::Vector3 off(0.0f, 2.2f, 0.0f); // head height (spike 47)
+    return markerCreateSeh(g, c, &t, &col, &off);
+}
+
+bool markerUpdate(void* label, const char* text, int colorId) {
+    if (!label || !text) return false;
+    std::string t(text);
+    MyGUI::Colour col;
+    markerColour(colorId, &col);
+    return markerUpdateSeh((ScreenLabel*)label, &t, &col);
+}
+
+void markerDestroy(void* label) {
+    if (!label) return;
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return;
+    markerDestroySeh(g, (ScreenLabel*)label);
+}
+
+// The helpers from here to readObjectHand have EXTERNAL linkage (declared in
+// EngineInternal.h): the inventory, spawn/combat and world TUs share them.
+
+// Case-insensitive substring test on raw C strings (no C++ temporaries -> SEH
+// legal). Returns true if 'needle' appears anywhere in 'hay'.
+bool ciContains(const char* hay, const char* needle) {
+    if (!hay || !needle || !needle[0]) return false;
+    for (const char* h = hay; *h; ++h) {
+        const char* a = h; const char* b = needle;
+        while (*a && *b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+            if (ca != cb) break;
+            ++a; ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
+// Find a furniture BUILDING template that is actually a SEAT. Caller holds SEH.
+// Priority avoids matching crafting stations ("Engineering Bench" etc.): we want
+// stools/chairs/thrones, NOT generic "bench"/"seat" substrings.
+GameData* findSeatTemplate(GameWorld* gw) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    // Ordered keyword preference; first present keyword that any template matches.
+    const char* prefs[] = { "bar stool", "stool", "chair", "throne" };
+    for (unsigned int k = 0; k < 4; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
+// Find a BUILDING template that is a BED (bed/cage occupancy sync). Caller holds
+// SEH. "camp bed" is the buildable outdoor bed (no walls/power needed); plain
+// "bed" is the fallback (may match indoor variants - still a UseableStuff bed).
+GameData* findBedTemplate(GameWorld* gw) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    const char* prefs[] = { "camp bed", "bedroll", "bed" };
+    for (unsigned int k = 0; k < 3; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
+// Find a BUILDING template that is a PRISON CAGE. Caller holds SEH.
+GameData* findCageTemplate(GameWorld* gw) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    const char* prefs[] = { "prisoner cage", "cage" };
+    for (unsigned int k = 0; k < 2; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
+// Find a furniture BUILDING template that is an OPERABLE work fixture an NPC can
+// stand at and work (crafting/gathering class). Caller holds SEH. Ordered keyword
+// preference: a training dummy is the most deterministic (no inputs/power/recipe -
+// the user can just order "train" and the work pose plays), then common crafting
+// machines. Mining/farming need terrain resources, so they're not spawned here.
+GameData* findMachineTemplate(GameWorld* gw) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    const char* prefs[] = {
+        "training dummy", "combat dummy", "punching bag", "research bench",
+        "engineering bench", "weapon smithy", "spinning wheel", "loom"
+    };
+    const unsigned int nprefs = sizeof(prefs) / sizeof(prefs[0]);
+    for (unsigned int k = 0; k < nprefs; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
+// Compute a world point 'fwd' metres ahead of the leader's facing and 'side' to
+// its right, plus the leader's yaw. Caller holds SEH.
+bool leaderAnchor(GameWorld* gw, float fwd, float side,
+                  Ogre::Vector3* outPos, float* outYaw) {
+    if (!gw || !gw->player || gw->player->playerCharacters.size() == 0) return false;
+    Character* ld = gw->player->playerCharacters[0];
+    if (!ld) return false;
+    Ogre::Vector3 p = ld->getPosition();
+    float yaw = ld->getOrientation().getYaw().valueRadians();
+    // Kenshi faces -Z at yaw 0; forward = (sin yaw, 0, cos yaw) is a good-enough
+    // "ahead of the character" for placing a prop the user then fine-tunes.
+    float fx = (float)sin((double)yaw), fz = (float)cos((double)yaw);
+    float rx = fz, rz = -fx; // right = forward rotated -90deg about Y
+    outPos->x = p.x + fx * fwd + rx * side;
+    outPos->y = p.y; // character ground Y; building placement re-grounds via terrain
+    outPos->z = p.z + fz * fwd + rz * side;
+    if (outYaw) *outYaw = yaw;
+    return true;
+}
+
+// Read a character's CURRENT task key (TASK_NONE if idle / unreadable). Mirrors the
+// capture path; used by re-arm to avoid re-issuing a goal a worker is already doing
+// (clearAllAIGoals + addGoal every tick would thrash pathing and never animate).
+int readCharTaskKey(Character* c) {
+    if (!c || !g_taskerKeyFn) return TASK_NONE;
+    __try {
+        CharBody* b = c->body;
+        Tasker* t = b ? b->currentAction : 0;
+        if (!t) return TASK_NONE;
+        return g_taskerKeyFn(t);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return TASK_NONE;
+    }
+}
+
+// Find a BAKED work fixture (training dummy / crafting machine) near the leader by
+// scanning loaded BUILDING objects (NOT templates). Returns the live fixture and the
+// task to issue at it. This is how craft re-arm relocates the dummy after a reload
+// without any sidecar - the save-stable building is simply searched for by name.
+RootObject* findWorkFixtureNear(GameWorld* gw, int* outTask) {
+    if (!gw || !g_getObjsFn || !gw->player) return 0;
+    if (gw->player->playerCharacters.size() == 0) return 0;
+    __try {
+        Ogre::Vector3 center = gw->player->playerCharacters[0]->getPosition();
+        g_npcQuery.clear();
+        g_getObjsFn(gw, &g_npcQuery, &center, 60.0f, BUILDING, 256, 0);
+        unsigned int total = g_npcQuery.size();
+        const char* prefs[] = {
+            "training dummy", "combat dummy", "punching bag", "research bench",
+            "engineering bench", "weapon smithy", "spinning wheel", "loom"
+        };
+        const unsigned int nprefs = sizeof(prefs) / sizeof(prefs[0]);
+        for (unsigned int k = 0; k < nprefs; ++k) {
+            for (unsigned int i = 0; i < total; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                GameData* gd = o->getGameData();
+                if (gd && ciContains(gd->name.c_str(), prefs[k])) {
+                    if (outTask)
+                        *outTask = (ciContains(gd->name.c_str(), "dummy") ||
+                                    ciContains(gd->name.c_str(), "bag"))
+                                       ? USE_TRAINING_DUMMY : OPERATE_MACHINERY;
+                    return o;
+                }
+            }
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Nearest NON-squad character to a fixture (the worker that should operate it).
+Character* findWorkerNear(GameWorld* gw, RootObject* fixture) {
+    if (!gw || !g_getCharsFn || !fixture || !gw->player) return 0;
+    __try {
+        Ogre::Vector3 at = fixture->getPosition();
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &at, 40.0f, 30.0f, 10.0f, 64, 64, 0);
+        unsigned int total = g_npcQuery.size();
+        Character* best = 0; float bestD2 = 1e18f;
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* o = g_npcQuery[i];
+            if (!o || isPlayerSquad(gw, o)) continue;
+            Ogre::Vector3 p = o->getPosition();
+            float dx = p.x - at.x, dz = p.z - at.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < bestD2) { bestD2 = d2; best = static_cast<Character*>(o); }
+        }
+        return best;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+bool readObjectHand(RootObject* obj, unsigned int out[5]) {
+    if (!obj) return false;
+    __try {
+        const hand& h = obj->handle;
+        out[0] = (unsigned int)h.type;
+        out[1] = h.container;
+        out[2] = h.containerSerial;
+        out[3] = h.index;
+        out[4] = h.serial;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+
+} // namespace engine
+} // namespace coop
