@@ -460,11 +460,116 @@ private:
     char          sid_[48];
 };
 
+// world_item_drop (query-free NON-gear drop-and-APPEAR): the town-hardening path.
+// The AUTHOR (host by default) seeds a common NON-gear item, then DROPS it via
+// engine::dropItemFromInventory -> Inventory::dropItem -> the hooked _NV_dropItem,
+// so the drop is captured QUERY-FREE ([wi] DROP-CAP) rather than re-found by the
+// spatial scan. The peer must SPAWN a proxy at the captured spot, and - because
+// culling is now handle-based (real Item* gone), not spatial-scan-miss - the item
+// must STAY put without flicker for the rest of the run. Both clients sample the
+// interest sphere every 500 ms; BOTH assert the item APPEARED (n>=1 after the drop
+// settles) and PERSISTED (never dropped back to 0 once seen) - a flicker or a
+// premature cull fails the persistence leg. No despawn here (world_item_sync
+// already covers the cull leg); this isolates appear + stay.
+class WorldItemDropScenario : public Scenario {
+public:
+    WorldItemDropScenario()
+        : passed_(false), have_(false), lastLogMs_(0), step_(0),
+          seeded_(0), dropped_(0), dropType_(0),
+          sawItem_(false), persistOk_(true) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        sid_[0] = '\0';
+    }
+
+    virtual const char* name() const { return "world_item_drop"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        have_ = engine::pickInventoryContainer(ctx.gw, hand_);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO WID anchor host=%d have=%d hand=%u,%u,%u,%u,%u",
+            ctx.isHost ? 1 : 0, have_ ? 1 : 0,
+            hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            engine::WorldItemRaw raw[16];
+            unsigned int n = engine::captureWorldItems(ctx.gw, raw, 16, 60.0f);
+            // Appear + persist tracking (both clients). Only judge AFTER the drop
+            // has had time to fire and replicate.
+            if (ctx.elapsedMs >= APPEAR_MS) {
+                if (n >= 1) sawItem_ = true;
+                else if (sawItem_) persistOk_ = false; // vanished after being seen = flicker/premature cull
+            }
+            float x = (n > 0) ? raw[0].x : 0.0f, y = (n > 0) ? raw[0].y : 0.0f, z = (n > 0) ? raw[0].z : 0.0f;
+            unsigned int hash = (n > 0) ? raw[0].hash : 0u;
+            char b[200];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO WID %s t=%lu n=%u seen=%d persist=%d pos=%.2f,%.2f,%.2f hash=%u",
+                ctx.isHost ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, n,
+                sawItem_ ? 1 : 0, persistOk_ ? 1 : 0, x, y, z, hash);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // HOST authors the drop through the hooked inventory drop path.
+        if (ctx.isHost && have_ && step_ == 0 && ctx.elapsedMs >= 5000) {
+            step_ = 1;
+            seeded_ = engine::addTestItemsToContainer(ctx.gw, hand_, 1, sid_, sizeof(sid_));
+            InvItemEntry items[INV_ITEMS_MAX];
+            unsigned int n = engine::captureContainerContents(ctx.gw, hand_, items, INV_ITEMS_MAX, 0);
+            for (unsigned int i = 0; i < n; ++i)
+                if (!items[i].equipped && strcmp(items[i].stringID, sid_) == 0) { dropType_ = items[i].itemType; break; }
+            dropped_ = engine::dropItemFromInventory(ctx.gw, hand_, sid_, dropType_, 1);
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WID DROP seeded=%d dropped=%d sid='%s' type=%u",
+                      seeded_, dropped_, sid_[0] ? sid_ : "(none)", dropType_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // Both sides must have SEEN the ground item and kept it (no flicker).
+            // The host additionally proves it actually authored the drop.
+            bool appeared = sawItem_ && persistOk_;
+            passed_ = ctx.isHost ? (have_ && dropped_ > 0 && appeared) : appeared;
+            char m[160];
+            _snprintf(m, sizeof(m) - 1,
+                "SCENARIO WID verdict host=%d dropped=%d seen=%d persist=%d pass=%d",
+                ctx.isHost ? 1 : 0, dropped_, sawItem_ ? 1 : 0, persistOk_ ? 1 : 0, passed_ ? 1 : 0);
+            m[sizeof(m) - 1] = '\0'; coop::logLine(m);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long HOST_DURATION_MS = 24000; // outlive the join's window
+    static const unsigned long JOIN_DURATION_MS = 20000;
+    static const unsigned long APPEAR_MS        = 9000;  // drop@5s + replication slack
+    bool          passed_;
+    bool          have_;
+    unsigned long lastLogMs_;
+    int           step_;
+    int           seeded_;
+    int           dropped_;
+    unsigned int  dropType_;
+    bool          sawItem_;
+    bool          persistOk_;
+    unsigned int  hand_[5];
+    char          sid_[48];
+};
+
 } // namespace
 
 Scenario* makeWorldItemScenario(const std::string& name) {
     if (name == "drop_probe")   return new DropProbeScenario();
     if (name == "world_item_sync") return new WorldItemSyncScenario();
+    if (name == "world_item_drop") return new WorldItemDropScenario();
     if (name == "world_item_join") return new WorldItemSyncScenario(/*joinAuthor*/ true);
     if (name == "world_weapon_drop") return new WorldGearDropScenario("world_weapon_drop", 2);
     if (name == "world_armor_drop")  return new WorldGearDropScenario("world_armor_drop", 3);

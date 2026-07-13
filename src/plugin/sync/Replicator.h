@@ -71,6 +71,19 @@ public:
     // prior one-directional behaviour is preserved.
     void setOwnRanks(const std::set<unsigned int>& r) { ownRanks_ = r; }
 
+    // Cross-owner trade veto classifier (engine InvOwnerClassFn). Given a
+    // save-stable owner hand (readObjectHand layout [type,container,
+    // containerSerial,index,serial]) returns 0 = not a player-squad member,
+    // 1 = a squad member owned by THIS client, 2 = a squad member owned by the
+    // PEER. Consults the sets publishOwned refreshes each tick (allSquad_ +
+    // ownHands_). Const + set-lookup only, so it is safe to call from the engine
+    // tick (the UI-drag detour runs on the same main thread).
+    int ownerClassForHand(const unsigned int h[5]) const {
+        Key k; k.t = h[0]; k.c = h[1]; k.cs = h[2]; k.i = h[3]; k.s = h[4];
+        if (allSquad_.find(k) == allSquad_.end()) return 0;
+        return (ownHands_.find(k) != ownHands_.end()) ? 1 : 2;
+    }
+
     // AI-gating probe (join side): recruit diverged NPCs into the player squad to
     // validate the "inhabit" lever (stops self-tasking + becomes drivable).
     void setProbeRecruit(bool v) { probeRecruit_ = v; }
@@ -826,6 +839,10 @@ private:
     // (never drive a body we own + simulate locally), defense-in-depth on the partition.
     std::set<unsigned int> ownRanks_;
     std::set<Key>          ownHands_;
+    // Every player-squad member key (own + peer), refreshed each publishOwned from
+    // the pre-ownership-filter roster. Lets the trade veto tell a squad character
+    // apart from a world NPC / container (which are never blocked).
+    std::set<Key>          allSquad_;
 
     // Phase 4a inventory state. ownedContainers_ = containers we author (publish, never
     // reconcile back onto us). invPub_ = last published content fingerprint + send time
@@ -867,7 +884,14 @@ private:
     //   fresh ids. Items in the map but not seen this scan have left the world -> culled.
     // JOIN: worldProxies_ maps a host netId to the LOCAL proxy object we spawned for it,
     //   plus the last applied pos/hash so we only re-place it on real change.
-    struct WorldTrack { u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen; };
+    // stringID/itemType/quantity/quality are captured at DISCOVERY (a spatial-scan
+    // row or a query-free drop-hook edge) so the item can be streamed and refreshed
+    // by HANDLE resolution alone - no rescan needed. `seen` is retained only for the
+    // legacy scan path; culling is now handle-based (engine::groundItemLiveness).
+    struct WorldTrack {
+        u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen;
+        char stringID[48]; u32 itemType; u16 quantity; u16 quality;
+    };
     struct WorldProxy { RootObject* obj; float x, y, z; u32 hash; };
     std::map<Key, WorldTrack> worldTrack_;
     // Spawned proxies for PEER-authored ground items, keyed by (ownerId, netId):
@@ -897,8 +921,13 @@ private:
     // groundedWeapons_: the REAL ground Item* handles THIS client is tracking per sid (from
     //   its own UI drop OR from relocating a peer's drop). A received PICKUP re-homes one of
     //   these into the picking character's bag; a local pickup (census increase) consumes one.
+    // Each entry also carries the drop's GLOBALLY-SHARED identity (dropOwnerId, dropId) - both
+    //   clients agree on it from the DROP packet, so a PICKUP can name the EXACT instance to
+    //   re-home. This disambiguates two same-sid weapons on the ground (one dropped by each
+    //   client): FIFO-by-sid would otherwise re-home the wrong copy on the peer.
     // nextPickupId_ hands out per-sender monotonic ids; appliedPickups_ dedupes received ones.
-    std::map<std::string, std::deque<void*> > groundedWeapons_;
+    struct GroundWeapon { u32 dropOwnerId; u32 dropId; void* item; };
+    std::map<std::string, std::deque<GroundWeapon> > groundedWeapons_;
     u32                               nextPickupId_;
     std::set<std::pair<u32, u32> >    appliedPickups_;
 

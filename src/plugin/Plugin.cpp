@@ -44,6 +44,13 @@ coop::Inbound    g_inbound;
 coop::Replicator g_repl;
 coop::u32        g_tick = 0;
 
+// Cross-owner trade veto owner classifier (engine InvOwnerClassFn): forwards a
+// save-stable owner hand to the Replicator's squad-ownership sets. Free function
+// so the engine layer (which must not know about the Replicator) can call it.
+static int coopInvOwnerClass(const unsigned int h[5]) {
+    return g_repl.ownerClassForHand(h);
+}
+
 bool  g_gameStarted   = false;
 DWORD g_gameStartTick = 0;
 
@@ -803,6 +810,11 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         // against its baseline to catch a completed cross-owner UI drag - the one
         // inventory write the single-writer snapshots cannot represent - and author
         // a reliable PKT_INV_XFER so the peer relocates its own copy (conservation).
+        // RETIRED by the trade veto (blockXfer): a refused drag can never complete,
+        // so there is nothing to detect/replicate - Config forces xferSync off when
+        // blockXfer is on, making this (and applyTransfers below) a no-op. The
+        // xferLatch_/xferDefer_ reconcile-race machinery then stays dormant (never
+        // populated). KENSHICOOP_BLOCK_XFER=0 restores this replicate-the-trade path.
         if (g_cfg.xferSync)
             g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
         // Phase W1 (bidirectional): BOTH clients stream the free ground items they
@@ -1379,6 +1391,35 @@ __declspec(dllexport) void startPlugin() {
             coopLog("[shop] buyItem detour installed; purchase logging ON");
         else
             coopLog("[shop] FAILED to install buyItem detour; purchase logging off");
+    }
+
+    // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER, default ON in real sessions):
+    // refuse a UI inventory drag whose source + destination squad characters are
+    // owned by different clients (item stays in the source bag) so ground drops
+    // are the only cross-client transfer path. Retires Protocol 37 (Config forces
+    // xferSync off when this is on). The classifier is always registered (cheap);
+    // the detours install only when the veto is on or the xfer_block test runs.
+    coop::engine::setInvOwnerClassifier(&coopInvOwnerClass);
+    coop::engine::setBlockXfer(g_cfg.blockXfer);
+    if (g_cfg.blockXfer || g_cfg.scenario == "xfer_block") {
+        if (coop::engine::installXferBlockHook())
+            coopLog(g_cfg.blockXfer
+                ? "[xfer] drag detours installed; cross-owner trade veto ON (drop to transfer)"
+                : "[xfer] drag detours installed; drag logging ON");
+        else
+            coopLog("[xfer] FAILED to install drag detours; cross-owner trade veto degraded");
+    }
+
+    // Phase W1b: query-free ground-drop capture (town reliability). Detour
+    // Inventory::dropItem so every drop is discovered without the spatial sphere
+    // query that fails in towns; publishWorldItems seeds its tracker from these
+    // edges and culls by handle liveness. Rides the world-sync gate (the channel
+    // it feeds), so real sessions and the world_item_* / drop scenarios get it.
+    if (g_cfg.worldSync) {
+        if (coop::engine::installItemDropHook())
+            coopLog("[wi] dropItem detour installed; query-free drop capture ON");
+        else
+            coopLog("[wi] FAILED to install dropItem detour; drop capture falls back to the spatial scan");
     }
 
     // Recruitment sync (protocol 23, default ON): detour PlayerInterface::

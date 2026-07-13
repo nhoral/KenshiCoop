@@ -268,92 +268,152 @@ void Replicator::applyInventories(GameWorld* gw) {
     }
 }
 
+// Local content fingerprint for a tracked world item (change-detection ONLY, so it
+// need only be stable on this client - cross-client matching uses netId + position
+// tolerance). Mirrors the engine-side worldItemHash inputs (sid + type + qty + qual).
+static u32 worldTrackHash(const char* sid, u32 type, u16 qty, u16 qual) {
+    u32 h = 2166136261u;
+    if (sid) for (const char* p = sid; *p; ++p) { h ^= (unsigned char)*p; h *= 16777619u; }
+    h ^= type * 2654435761u;
+    h ^= (u32)qty  * 40503u;
+    h ^= (u32)qual * 2246822519u;
+    return h ? h : 1u;
+}
+
 void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     // Owner-authoritative world stream, BOTH directions since the W1 bidir fix (each
-    // client streams the free ground items IT authors - the join's dropped materials
-    // were invisible on the host before). Scan the interest sphere for free ground
-    // items, assign/reuse a netId per item (keyed by its local engine hand), and
-    // stream new/changed items + cull vanished ones. A settled world produces stable
-    // content+pos - so zero traffic - with a slow periodic safety resend.
+    // client streams the free ground items IT authors). DISCOVERY has two sources now:
+    //   (1) the query-free drop hook (engine::drainItemDrops) - a drop captured at
+    //       Inventory::dropItem, so a TOWN drop is found even when the spatial query
+    //       misses it (the core town-reliability fix); and
+    //   (2) the spatial scan (captureWorldItems) - best-effort, for pre-existing save
+    //       items / host runtime drops the drop hook didn't author.
+    // Both key a track by the item's LOCAL engine hand, so a drop found by BOTH sources
+    // converges on ONE track (one netId) - no duplicate proxy. CULLING is now HANDLE-
+    // based (engine::groundItemLiveness): a track is removed only when its real item is
+    // gone or picked up, NOT when a single scan misses it - killing the town flicker.
     const float         RADIUS       = 60.0f; // interest scope for ground items (v1)
     const float         POS_EPS      = 0.5f;  // re-stream a moved item past this gap
     const unsigned long WI_RESEND_MS = 5000;  // periodic safety resend (loss / late join)
     static int dumpWi = -1;
     if (dumpWi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWi = (e && e[0] == '1') ? 1 : 0; }
-
-    engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
-    unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
     unsigned long now = nowMs();
 
     // ECHO GUARD: a proxy we spawned for a PEER's streamed item is a real local
     // RootObject and enumerates like any other ground item - re-publishing it would
-    // bounce the item back to its author as a duplicate. Filter every capture row
+    // bounce the item back to its author as a duplicate. Filter every discovery row
     // that resolves to an object in our proxy set.
     std::set<RootObject*> proxyObjs;
     for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
          pi != worldProxies_.end(); ++pi)
         proxyObjs.insert(pi->second.obj);
 
-    for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ++it)
-        it->second.seen = false;
+    // Gear (itemType WEAPON/ARMOUR) rides the W2 conservation drop/pickup channel
+    // (the real shared-save object is relocated bag<->ground on each client), so the
+    // W1 template-proxy stream skips it in BOTH discovery sources below.
 
-    // Gear (itemType 2 WEAPON / 3 ARMOUR) is handled by the conservation drop/pickup channel
-    // (the real object is relocated bag<->ground on each client and re-homed on pickup), so the
-    // W1 template-proxy stream skips it - both to avoid a duplicate proxy AND because a W1 cull
-    // only removes the join's proxy, leaving a host-dropped real item orphaned on the ground.
-    WorldItemEntry send[WORLD_ITEMS_MAX]; unsigned int ns = 0;
-    for (unsigned int i = 0; i < n; ++i) {
-        if (isGearType(raw[i].itemType)) continue;
-        if (!proxyObjs.empty() &&
-            proxyObjs.count(engine::resolveObjectByHand(raw[i].hand)) != 0)
-            continue; // peer-authored proxy - not ours to publish
-        Key k; k.t = raw[i].hand[0]; k.c = raw[i].hand[1]; k.cs = raw[i].hand[2];
-        k.i = raw[i].hand[3]; k.s = raw[i].hand[4];
-        std::map<Key, WorldTrack>::iterator tit = worldTrack_.find(k);
-        bool isNew = (tit == worldTrack_.end());
-        if (isNew) {
-            WorldTrack t; t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
-            t.x = t.y = t.z = 0.0f; t.seen = true;
+    // ---- Discovery 1: query-free drop-hook edges (town reliable) -----------
+    {
+        engine::ItemDropEdge de[64];
+        unsigned int nde = engine::drainItemDrops(de, 64);
+        for (unsigned int i = 0; i < nde; ++i) {
+            if (isGearType(de[i].itemType)) continue;
+            if (de[i].itemHand[3] == 0 && de[i].itemHand[4] == 0) continue; // unresolved hand
+            // A drop from a PEER-owned squad copy is the peer's to author (it streams
+            // its own drop); authoring it here too would duplicate the proxy. World
+            // NPC (class 0) and our own squad (class 1) drops still stream.
+            if (ownerClassForHand(de[i].ownerHand) == 2) continue;
+            Key k; k.t = de[i].itemHand[0]; k.c = de[i].itemHand[1]; k.cs = de[i].itemHand[2];
+            k.i = de[i].itemHand[3]; k.s = de[i].itemHand[4];
+            if (worldTrack_.find(k) != worldTrack_.end()) continue; // already tracked
+            WorldTrack t; memset(&t, 0, sizeof(t));
+            t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
+            t.x = de[i].x; t.y = de[i].y; t.z = de[i].z; t.seen = true;
+            strncpy(t.stringID, de[i].stringID, sizeof(t.stringID) - 1);
+            t.stringID[sizeof(t.stringID) - 1] = '\0';
+            t.itemType = de[i].itemType; t.quantity = de[i].quantity; t.quality = de[i].quality;
             worldTrack_[k] = t;
-            tit = worldTrack_.find(k);
-        }
-        WorldTrack& tr = tit->second;
-        tr.seen = true;
-        bool sent = (tr.lastSendMs != 0);
-        float dx = raw[i].x - tr.x, dy = raw[i].y - tr.y, dz = raw[i].z - tr.z;
-        bool moved = (dx*dx + dy*dy + dz*dz) > (POS_EPS * POS_EPS);
-        bool changed = !sent || (tr.hash != raw[i].hash) || moved;
-        bool periodic = sent && !changed && (now - tr.lastSendMs >= WI_RESEND_MS);
-        if (!changed && !periodic) continue;
-        if (ns < WORLD_ITEMS_MAX) {
-            WorldItemEntry& e = send[ns++];
-            e.netId = tr.netId;
-            strncpy(e.stringID, raw[i].stringID, sizeof(e.stringID) - 1);
-            e.stringID[sizeof(e.stringID) - 1] = '\0';
-            e.itemType = raw[i].itemType;
-            e.quantity = raw[i].quantity;
-            e.quality  = raw[i].quality;
-            e.x = raw[i].x; e.y = raw[i].y; e.z = raw[i].z;
-            e.state = 0;
-        }
-        tr.hash = raw[i].hash; tr.lastSendMs = now;
-        tr.x = raw[i].x; tr.y = raw[i].y; tr.z = raw[i].z;
-        if (changed && dumpWi) {
-            char b[200]; _snprintf(b, sizeof(b) - 1,
-                "[wi] SEND netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f hash=%u",
-                tr.netId, raw[i].stringID, raw[i].quantity, raw[i].x, raw[i].y, raw[i].z, raw[i].hash);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            if (dumpWi) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                "[wi] DROP-CAP netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f (query-free)",
+                t.netId, t.stringID, t.quantity, t.x, t.y, t.z);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
         }
     }
 
+    // ---- Discovery 2: the spatial scan (best-effort) -----------------------
+    {
+        engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
+        unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
+        for (unsigned int i = 0; i < n; ++i) {
+            if (isGearType(raw[i].itemType)) continue;
+            if (!proxyObjs.empty() &&
+                proxyObjs.count(engine::resolveObjectByHand(raw[i].hand)) != 0)
+                continue; // peer-authored proxy - not ours to publish
+            Key k; k.t = raw[i].hand[0]; k.c = raw[i].hand[1]; k.cs = raw[i].hand[2];
+            k.i = raw[i].hand[3]; k.s = raw[i].hand[4];
+            std::map<Key, WorldTrack>::iterator tit = worldTrack_.find(k);
+            if (tit == worldTrack_.end()) {
+                WorldTrack t; memset(&t, 0, sizeof(t));
+                t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
+                t.x = raw[i].x; t.y = raw[i].y; t.z = raw[i].z; t.seen = true;
+                strncpy(t.stringID, raw[i].stringID, sizeof(t.stringID) - 1);
+                t.stringID[sizeof(t.stringID) - 1] = '\0';
+                t.itemType = raw[i].itemType; t.quantity = raw[i].quantity; t.quality = raw[i].quality;
+                worldTrack_[k] = t;
+            } else {
+                // Refresh the description (a re-stack can change qty/quality).
+                WorldTrack& tr = tit->second;
+                strncpy(tr.stringID, raw[i].stringID, sizeof(tr.stringID) - 1);
+                tr.stringID[sizeof(tr.stringID) - 1] = '\0';
+                tr.itemType = raw[i].itemType; tr.quantity = raw[i].quantity; tr.quality = raw[i].quality;
+            }
+        }
+    }
+
+    // ---- Stream new/changed + HANDLE-based cull over every track -----------
+    WorldItemEntry send[WORLD_ITEMS_MAX]; unsigned int ns = 0;
     u32 removed[256]; unsigned int nr = 0;
     for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ) {
-        if (!it->second.seen) {
-            if (nr < 256) removed[nr++] = it->second.netId;
-            if (dumpWi) { char b[96]; _snprintf(b, sizeof(b) - 1, "[wi] CULL netId=%u", it->second.netId);
-                          b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+        WorldTrack& tr = it->second;
+        unsigned int ihand[5] = { it->first.t, it->first.c, it->first.cs, it->first.i, it->first.s };
+        float pos[3] = { tr.x, tr.y, tr.z };
+        // Query-free liveness: is the real item still on the ground (not gone/picked-up)?
+        if (!engine::groundItemLiveness(ihand, pos)) {
+            if (nr < 256) removed[nr++] = tr.netId;
+            if (dumpWi) { char b[112]; _snprintf(b, sizeof(b) - 1,
+                "[wi] CULL netId=%u (gone/picked-up)", tr.netId);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             worldTrack_.erase(it++);
-        } else ++it;
+            continue;
+        }
+        bool sent = (tr.lastSendMs != 0);
+        float dx = pos[0] - tr.x, dy = pos[1] - tr.y, dz = pos[2] - tr.z;
+        bool moved = (dx*dx + dy*dy + dz*dz) > (POS_EPS * POS_EPS);
+        u32 h = worldTrackHash(tr.stringID, tr.itemType, tr.quantity, tr.quality);
+        bool changed = !sent || (tr.hash != h) || moved;
+        bool periodic = sent && !changed && (now - tr.lastSendMs >= WI_RESEND_MS);
+        if (changed || periodic) {
+            if (ns < WORLD_ITEMS_MAX) {
+                WorldItemEntry& e = send[ns++];
+                e.netId = tr.netId;
+                strncpy(e.stringID, tr.stringID, sizeof(e.stringID) - 1);
+                e.stringID[sizeof(e.stringID) - 1] = '\0';
+                e.itemType = tr.itemType;
+                e.quantity = tr.quantity;
+                e.quality  = tr.quality;
+                e.x = pos[0]; e.y = pos[1]; e.z = pos[2];
+                e.state = 0;
+            }
+            tr.hash = h; tr.lastSendMs = now;
+            if (changed && dumpWi) {
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wi] SEND netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f hash=%u",
+                    tr.netId, tr.stringID, tr.quantity, pos[0], pos[1], pos[2], h);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        tr.x = pos[0]; tr.y = pos[1]; tr.z = pos[2];
+        ++it;
     }
 
     if (ns > 0) net.queueWorldItems(ownerId, send, ns);
@@ -481,6 +541,26 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
                 continue;
             }
+            // Which REAL Item*(s) just ENTERED this bag? The picked-up ground object is the
+            // same handle (conservation), so the pointers present now but not last tick are
+            // exactly the ones picked up. Correlating each to the ground copy WE tracked
+            // recovers its shared (dropOwnerId, dropId) - the identity both clients agree on -
+            // so the peer re-homes the EXACT instance rather than guessing FIFO-by-sid.
+            std::set<void*> prevSet;
+            {
+                std::map<std::string, std::deque<void*> >::iterator pit = prevC.ptrs.find(ce->first);
+                if (pit != prevC.ptrs.end())
+                    for (std::deque<void*>::iterator q = pit->second.begin(); q != pit->second.end(); ++q)
+                        prevSet.insert(*q);
+            }
+            std::deque<void*> added;
+            {
+                std::map<std::string, std::deque<void*> >::iterator cit = curPtrs.find(ce->first);
+                if (cit != curPtrs.end())
+                    for (std::deque<void*>::iterator q = cit->second.begin(); q != cit->second.end(); ++q)
+                        if (prevSet.count(*q) == 0) added.push_back(*q);
+            }
+            std::deque<GroundWeapon>& q = groundedWeapons_[ce->first];
             for (int k = 0; k < inc; ++k) {
                 WorldPickupPacket pkt; memset(&pkt, 0, sizeof(pkt));
                 pkt.type = (u8)PKT_WORLD_PICKUP; pkt.ownerId = ownerId;
@@ -489,13 +569,26 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 pkt.oIndex = it->i; pkt.oSerial = it->s;
                 strncpy(pkt.stringID, ce->first.c_str(), sizeof(pkt.stringID) - 1);
                 pkt.itemType = ce->second.itemType; pkt.quality = ce->second.quality;
+                // Match a newly-arrived pointer to a tracked ground instance for its identity.
+                bool matched = false;
+                if (!added.empty()) {
+                    void* got = added.front(); added.pop_front();
+                    for (std::deque<GroundWeapon>::iterator g = q.begin(); g != q.end(); ++g) {
+                        if (g->item == got) {
+                            pkt.refDropOwnerId = g->dropOwnerId; pkt.refDropId = g->dropId;
+                            q.erase(g); matched = true; break;
+                        }
+                    }
+                }
+                if (!matched && !q.empty()) { // couldn't pin the instance -> oldest same-sid copy
+                    pkt.refDropOwnerId = q.front().dropOwnerId; pkt.refDropId = q.front().dropId;
+                    q.pop_front();
+                }
                 net.queueWorldPickup(pkt);
-                std::deque<void*>& q = groundedWeapons_[ce->first];
-                if (!q.empty()) q.pop_front(); // our ground copy is now in the bag
-                if (dumpWd) { char b[200]; _snprintf(b, sizeof(b) - 1,
-                    "[wd] PICKUP id=%u sid='%s' owner=%u,%u,%u,%u,%u prev=%d now=%d trackedLeft=%u",
+                if (dumpWd) { char b[220]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] PICKUP id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u prev=%d now=%d trackedLeft=%u",
                     pkt.pickupId, pkt.stringID, it->t, it->c, it->cs, it->i, it->s,
-                    prevCount, ce->second.count, (unsigned)q.size());
+                    pkt.refDropOwnerId, pkt.refDropId, prevCount, ce->second.count, (unsigned)q.size());
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             }
         }
@@ -572,9 +665,13 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
             for (int d = 0; d < delta; ++d) {
                 void* di = departed.empty() ? 0 : departed.front();
                 // Prefer the REAL dropped object's position (the exact cursor-drop spot) over
-                // the owner-feet fallback - and it's query-free, so both clients agree.
+                // the owner-feet fallback - and it's query-free, so both clients agree. But a
+                // town-dropped item frequently reports its transform as (0,0,0) the frame it
+                // grounds; that sentinel must NOT clobber the good owner-feet fallback (else the
+                // peer relocates its copy to world origin and it's invisible near the player).
                 float dpos[3] = { pos[0], pos[1], pos[2] };
-                if (di) { float ip[3]; if (engine::itemWorldPos(di, ip)) {
+                if (di) { float ip[3]; if (engine::itemWorldPos(di, ip) &&
+                          !(ip[0] == 0.0f && ip[1] == 0.0f && ip[2] == 0.0f)) {
                     dpos[0] = ip[0]; dpos[1] = ip[1]; dpos[2] = ip[2]; } }
                 WorldDropPacket pkt; memset(&pkt, 0, sizeof(pkt));
                 pkt.type = (u8)PKT_WORLD_DROP; pkt.ownerId = ownerId; pkt.dropId = nextDropId_++;
@@ -587,7 +684,8 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 pkt.x = dpos[0]; pkt.y = dpos[1]; pkt.z = dpos[2];
                 net.queueWorldDrop(pkt);
                 if (di) {
-                    groundedWeapons_[pe->first].push_back(di);
+                    GroundWeapon gw2; gw2.dropOwnerId = ownerId; gw2.dropId = pkt.dropId; gw2.item = di;
+                    groundedWeapons_[pe->first].push_back(gw2);
                     departed.pop_front();
                 }
                 char b[220]; _snprintf(b, sizeof(b) - 1,
@@ -622,9 +720,13 @@ void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
         void* dropped = 0;
         int moved = engine::relocateWeaponToGround(gw, ownerHand, p.stringID, p.itemType,
                                                    p.x, p.y, p.z, &dropped);
-        // Track the relocated REAL object so a later PICKUP intent re-homes this exact handle
-        // back into the owner's bag (no spatial re-query, which fails in towns).
-        if (moved > 0 && dropped) groundedWeapons_[std::string(p.stringID)].push_back(dropped);
+        // Track the relocated REAL object under the drop's SHARED identity so a later PICKUP
+        // intent naming (ownerId, dropId) re-homes this exact handle back into the owner's bag
+        // (no spatial re-query, which fails in towns; no FIFO-by-sid guess between duplicates).
+        if (moved > 0 && dropped) {
+            GroundWeapon gw2; gw2.dropOwnerId = p.ownerId; gw2.dropId = p.dropId; gw2.item = dropped;
+            groundedWeapons_[std::string(p.stringID)].push_back(gw2);
+        }
         // Keep the transfer detector blind to the relocation we just made.
         if (moved > 0) xferRebase(gw, ok);
         char b[240]; _snprintf(b, sizeof(b) - 1,
@@ -651,17 +753,27 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
         if (ownHands_.count(ok) != 0) continue;        // we own this char -> we picked it up locally
         unsigned int targetHand[5] = { p.oType, p.oContainer, p.oContainerSerial,
                                        p.oIndex, p.oSerial };
-        std::deque<void*>& q = groundedWeapons_[std::string(p.stringID)];
+        std::deque<GroundWeapon>& q = groundedWeapons_[std::string(p.stringID)];
         int moved = 0;
-        if (!q.empty()) {
-            void* item = q.front();
+        std::deque<GroundWeapon>::iterator pick = q.end();
+        if (p.refDropId != 0) {
+            // Re-home the EXACT instance the picker named (both clients tracked it under this
+            // (owner,id)). If we don't have it tracked, do NOT guess a same-sid copy - that is
+            // the very mistake this identity fixes; a genuine peer copy will match.
+            for (std::deque<GroundWeapon>::iterator g = q.begin(); g != q.end(); ++g)
+                if (g->dropOwnerId == p.refDropOwnerId && g->dropId == p.refDropId) { pick = g; break; }
+        } else if (!q.empty()) {
+            pick = q.begin(); // legacy/no-identity: fall back to oldest same-sid copy
+        }
+        if (pick != q.end()) {
+            void* item = pick->item;
             moved = engine::addItemPtrToInventory(gw, targetHand, item);
-            if (moved) q.pop_front(); // re-homed; stop tracking it on the ground
+            if (moved) q.erase(pick); // re-homed; stop tracking it on the ground
         }
         char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u moved=%d trackedLeft=%u",
+            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u moved=%d trackedLeft=%u",
             p.pickupId, p.stringID, p.oType, p.oContainer, p.oContainerSerial, p.oIndex,
-            p.oSerial, moved, (unsigned)q.size());
+            p.oSerial, p.refDropOwnerId, p.refDropId, moved, (unsigned)q.size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // Keep the transfer detector blind to the relocation we just made.
         Key tk; tk.t = p.oType; tk.c = p.oContainer; tk.cs = p.oContainerSerial;

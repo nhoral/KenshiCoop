@@ -156,7 +156,22 @@ struct Config {
     // author reliable PKT_INV_XFER intents for moves that cross the single-writer
     // ownership boundary; receivers relocate the real item between their own copies
     // (conservation: no fabrication or destruction, so traded gear survives).
+    // SUPERSEDED by blockXfer: when blockXfer is on, cross-owner drags are refused
+    // at the engine (nothing to replicate), so xferSync is forced OFF.
     bool          xferSync;
+
+    // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER: "1" force on, "0" force off,
+    // unset = ON for real sessions [scenario == ""] and the xfer_block scenario).
+    // When on, a UI inventory drag whose SOURCE and DESTINATION squad characters
+    // are owned by DIFFERENT clients is refused at the engine (Inventory::tryAddItem
+    // detour) - the item stays in the source bag and nothing crosses the ownership
+    // boundary. This makes ground-drop the only cross-client transfer path (the
+    // dupe/wipe/weapon-vanish class of drag bug can't happen if the drag can't
+    // complete). Same-owner drags (a player managing their own squads) are always
+    // allowed; world containers and the vendor buyItem path are untouched. Retires
+    // Protocol 37 (forces xferSync off). "0" is the escape hatch (restores the
+    // Protocol 37 replicate-the-trade behaviour).
+    bool          blockXfer;
 
     // Phase W1/W2 world-item sync (KENSHICOOP_WORLD_SYNC: "1" force on, "0" force
     // off, unset = ON for real sessions [scenario == ""] and the world_item_* /

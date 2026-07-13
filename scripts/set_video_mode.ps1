@@ -5,11 +5,11 @@
 .DESCRIPTION
   Kenshi reads its window size from kenshi.cfg ("Video Mode=W x H @ 32-bit
   colour [0]"); the window tiler (arrange_windows.ps1) only MOVES windows, so
-  the size each session wants must be written here before launch. The two
+  the size each session wants must be written here before launch.   The two
   harnesses call this with their own layout:
     * manual_session.ps1 -> ultrawide layout (3440x1440 split into two
-      side-by-side windows; 1700x1350 client leaves room for borders, title
-      bar and taskbar - the proven fit from the 2026-07-11 free-play session)
+      side-by-side windows; 1720x1440 client fills the ultrawide edge-to-edge,
+      2x1720 = 3440 wide at full 1440 height)
     * run_test.ps1       -> automated layout (1280x1024 pair on the laptop
       primary monitor, the long-standing screenshot-stable baseline)
   Idempotent: only rewrites a cfg whose current mode differs. Also enforces

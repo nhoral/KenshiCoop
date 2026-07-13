@@ -62,6 +62,7 @@ void loadConfig(Config& c) {
                      (c.scenario == "world_armor_drop") ||
                      (c.scenario == "trade_probe") ||  // cross-owner drag baseline needs the live channel
                      (c.scenario == "trade_peer") ||   // protocol 37 fix rides + suppresses this channel
+                     (c.scenario == "xfer_block") ||   // veto test drags between owned tabs
                      (c.scenario == "weapon_loot");    // acquisition crosses on the snapshot channel
         c.invSync = (env == "1") || (env != "0" && auto_);
     }
@@ -75,6 +76,22 @@ void loadConfig(Config& c) {
         std::string env = envOr("KENSHICOOP_XFER_SYNC", "");
         c.xferSync = (env == "1") || (env != "0" && c.invSync);
         if (c.scenario == "trade_probe") c.xferSync = false;
+    }
+
+    // Cross-owner trade veto (OPT-IN). Blocks direct squad-to-squad drags and
+    // forces ground drops. Superseded as the DEFAULT by allowing direct trade via
+    // Protocol 37 (xferSync): the tryAddItem veto could not reliably classify every
+    // engine drag path (the portrait-drag routes the item through the cursor, whose
+    // owner is not a squad character - see the 2026-07-13 session), so a blocked
+    // drag leaked as a phantom ground drop. Protocol 37 is post-hoc (diffs container
+    // totals) and therefore path-agnostic, so REAL sessions now ALLOW + replicate.
+    // Env semantics: "1" = force the veto on; unset/"0" = off. Only the dedicated
+    // xfer_block scenario auto-enables it (to keep the veto code exercised).
+    {
+        std::string env = envOr("KENSHICOOP_BLOCK_XFER", "");
+        bool auto_ = (c.scenario == "xfer_block");
+        c.blockXfer = (env == "1") || (env != "0" && auto_);
+        if (c.blockXfer) c.xferSync = false; // veto supersedes replicate
     }
 
     // World-item sync (Phase W1/W2). Env semantics: "1" = force on, "0" = force off

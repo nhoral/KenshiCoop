@@ -327,7 +327,15 @@ typedef double         f64;
 // body's AGE. Animals scale body size by age; minting proxies with a fixed
 // adult age made every join-side creature full-grown regardless of the
 // host's actual (often juvenile) animal.
-const u16 PROTOCOL_VERSION = 39;
+//
+// v40 (ground-weapon identity, 2026-07-13): WorldPickupPacket carries the
+// originating DROP's shared identity (refDropOwnerId, refDropId). Ground
+// weapons were tracked FIFO-by-stringID, so picking up one of two same-sid
+// weapons on the ground (one dropped by each client) re-homed the peer's
+// front-of-queue copy - the WRONG instance. The picker now correlates the
+// exact Item* that re-entered its bag to the drop it tracked and names that
+// instance; the peer re-homes precisely that (owner,id)-keyed copy.
+const u16 PROTOCOL_VERSION = 40;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -764,6 +772,12 @@ struct WorldPickupPacket {
     char stringID[48];
     u32  itemType;   // GameData::type (WEAPON for now)
     u16  quality;    // quality*100 (0 if n/a)
+    // EXACT ground instance being re-homed: the identity of the originating DROP that both
+    // clients tracked it under. When refDropId != 0 the peer re-homes precisely that (owner,
+    // id)-keyed copy (disambiguating two same-sid ground weapons); refDropId == 0 means the
+    // picker couldn't correlate an instance and the peer falls back to its oldest same-sid copy.
+    u32 refDropOwnerId;
+    u32 refDropId;
 };
 
 // ---- Protocol 37: cross-owner TRANSFER intent --------------------------------

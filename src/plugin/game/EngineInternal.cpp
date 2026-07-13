@@ -568,6 +568,216 @@ Item* __fastcall buyItem_hook(Inventory* self, Item* itemToBuy, RootObject* send
     return got;
 }
 
+// ---- Cross-owner trade veto (block direct squad-to-squad transfers) --------
+// A UI inventory drag has no single engine entry point; it is remove-then-add:
+// Inventory::removeItemDontDestroy_returnsItem on the SOURCE (the item lands on
+// the mouse cursor) then Inventory::tryAddItem on the DESTINATION. We detour the
+// _NV_ twins of BOTH (hooking the real body catches virtual + direct calls) and
+// REFUSE the add when the source and destination squad characters are owned by
+// DIFFERENT clients - the item stays on the cursor / in the source bag, so a
+// player can only hand items to the peer's squad by dropping them on the ground.
+// Purely LOCAL: only the dragging client runs this, so no packet is involved.
+//
+// The source is identified two ways (belt + suspenders): the exact remove/add
+// pairing captured here (g_pendRem*), and the item's own _whosInventoryWeAreIn
+// hand (still the source until the destination add rewrites it) as the fallback
+// for a cross-tick mouse-item drag. g_invVetoSuspend is the reentrancy guard the
+// Replicator's own sanctioned relocations raise so they are never refused.
+typedef Item* (__fastcall* RemoveDontDestroyFn)(Inventory* self, Item* it,
+                                                int howmany, bool returnCopyIfSomeLeft);
+typedef bool  (__fastcall* TryAddItemFn)(Inventory* self, Item* item, int quantity);
+RemoveDontDestroyFn g_removeDontDestroyOrig = 0;
+TryAddItemFn        g_tryAddItemOrig        = 0;
+
+bool g_invVetoSuspend = false;            // Replicator's own move in progress (extern)
+static bool           g_blockXfer   = false;
+static InvOwnerClassFn g_invOwnerClass = 0;
+static Inventory*     g_pendRemInv   = 0; // last remove's source inventory (main thread)
+static Item*          g_pendRemItem  = 0; // last item removed onto the cursor
+static unsigned int   g_pendRemOwnerHand[5] = { 0, 0, 0, 0, 0 }; // its owner-char hand
+static bool           g_havePendRemOwner = false;                 // hand above is valid
+
+// KENSHICOOP_INV_DUMP diagnostic gate (read once). When on, EVERY squad<->squad
+// drag logs a "[xfer] DRAG" line (src/dst owner class + block decision) - the A1
+// evidence for the drag call sequence, thread-affinity and refused-add behaviour.
+static int xferDumpFlag() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); v = (e && e[0] == '1') ? 1 : 0; }
+    return v;
+}
+
+// Read the owner (character/container) hand behind an Inventory into out[5]
+// (readObjectHand layout). Caller holds SEH.
+static bool ownerHandOfInventory(Inventory* inv, unsigned int out[5]) {
+    if (!inv) return false;
+    RootObject* o = inv->owner; // Inventory::owner (member 0x88)
+    if (!o) return false;
+    return readObjectHand(o, out);
+}
+
+// Read the hand of the inventory an item last belonged to (its drag source, which
+// survives removeItemDontDestroy until the next add rewrites it). Caller holds SEH.
+static bool sourceHandOfItem(Item* item, unsigned int out[5]) {
+    if (!item) return false;
+    const hand& h = item->_whosInventoryWeAreIn;
+    out[0] = (unsigned int)h.type; out[1] = h.container; out[2] = h.containerSerial;
+    out[3] = h.index; out[4] = h.serial;
+    return (out[0] || out[1] || out[2] || out[3] || out[4]);
+}
+
+Item* __fastcall removeDontDestroy_hook(Inventory* self, Item* it, int howmany,
+                                        bool returnCopyIfSomeLeft) {
+    Item* r = g_removeDontDestroyOrig(self, it, howmany, returnCopyIfSomeLeft);
+    if ((g_blockXfer || xferDumpFlag()) && !g_invVetoSuspend) {
+        __try {
+            g_pendRemItem = r ? r : it; g_pendRemInv = self;
+            // Resolve + cache the SOURCE owner-character hand NOW, at remove time.
+            // A UI drag is a strict remove->add on this frame; the add may receive a
+            // COPY of the removed Item* (pointer != g_pendRemItem), so pairing on the
+            // pointer alone let cross-squad drags slip through unclassified. The cached
+            // hand makes the source reliable regardless of the pointer.
+            g_havePendRemOwner = ownerHandOfInventory(self, g_pendRemOwnerHand);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_havePendRemOwner = false; }
+    }
+    return r;
+}
+
+bool __fastcall tryAddItem_hook(Inventory* self, Item* item, int quantity) {
+    if ((g_blockXfer || xferDumpFlag()) && !g_invVetoSuspend && g_invOwnerClass &&
+        self && item) {
+        int decision = 0; // 1 = block
+        int srcClass = 0, dstClass = 0;
+        bool haveSrc = false, haveDst = false;
+        unsigned int dstHand[5] = { 0, 0, 0, 0, 0 };
+        unsigned int srcHand[5] = { 0, 0, 0, 0, 0 };
+        __try {
+            haveDst = ownerHandOfInventory(self, dstHand);
+            // Source (in priority): the owner hand cached at the paired remove this
+            // frame; else the exact remove/add pointer pairing; else the item's
+            // last-inventory hand. The cached hand is the robust path - it survives
+            // the engine handing us a COPY of the removed Item*.
+            if (g_havePendRemOwner && g_pendRemInv && g_pendRemInv != self) {
+                memcpy(srcHand, g_pendRemOwnerHand, sizeof(srcHand)); haveSrc = true;
+            }
+            if (!haveSrc && item == g_pendRemItem && g_pendRemInv && g_pendRemInv != self)
+                haveSrc = ownerHandOfInventory(g_pendRemInv, srcHand);
+            if (!haveSrc) haveSrc = sourceHandOfItem(item, srcHand);
+            if (haveDst && haveSrc) {
+                dstClass = g_invOwnerClass(dstHand);
+                srcClass = g_invOwnerClass(srcHand);
+                if ((srcClass == 1 && dstClass == 2) || (srcClass == 2 && dstClass == 1))
+                    decision = 1;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { decision = 0; }
+        // Diagnostic (A1): under dump, log every add that touches a squad member on
+        // EITHER end (srcClass||dstClass) - including the misses (class 0 / unresolved
+        // hand), so a cross-squad drag that fails to block is no longer silent.
+        if (xferDumpFlag() && (srcClass || dstClass || haveSrc || haveDst)) {
+            __try {
+                char sid[48]; sid[0] = '\0';
+                GameData* gd = item->getGameData();
+                if (gd) { strncpy(sid, gd->stringID.c_str(), sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0'; }
+                char b[240];
+                _snprintf(b, sizeof(b) - 1,
+                          "[xfer] DRAG sid='%s' src=%d dst=%d block=%d haveSrc=%d haveDst=%d "
+                          "srcH=%u,%u,%u,%u,%u dstH=%u,%u,%u,%u,%u", sid,
+                          srcClass, dstClass, decision, haveSrc ? 1 : 0, haveDst ? 1 : 0,
+                          srcHand[0], srcHand[1], srcHand[2], srcHand[3], srcHand[4],
+                          dstHand[0], dstHand[1], dstHand[2], dstHand[3], dstHand[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        if (g_blockXfer && decision == 1) {
+            __try {
+                char sid[48]; sid[0] = '\0';
+                GameData* gd = item->getGameData();
+                if (gd) { strncpy(sid, gd->stringID.c_str(), sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0'; }
+                char b[176];
+                _snprintf(b, sizeof(b) - 1,
+                          "[xfer] BLOCK cross-owner drag sid='%s' src=%d dst=%d (drop on the ground to transfer)",
+                          sid, srcClass, dstClass);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            // Cancel the drag CLEANLY: put the item back into its SOURCE inventory
+            // (veto suspended so our own re-add is not itself vetoed). Merely
+            // returning false strands the item on the cursor with the source count
+            // still decreased - which the gear-drop detector then mistakes for a
+            // DROP and leaks the item to the peer as a ground item (observed bug).
+            // Restoring the count in the same frame also keeps the detector quiet.
+            bool restored = false;
+            Inventory* src = g_pendRemInv;
+            if (src && item) {
+                bool sav = g_invVetoSuspend; g_invVetoSuspend = true;
+                __try { restored = g_tryAddItemOrig(src, item, quantity); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { restored = false; }
+                g_invVetoSuspend = sav;
+            }
+            g_pendRemItem = 0; g_pendRemInv = 0; g_havePendRemOwner = false;
+            // If we returned it to the source, report the destination add as handled
+            // so the engine clears the cursor (item safe in source, nothing crossed).
+            // If the source was unresolved, refuse (item stays on cursor) rather than
+            // risk a duplicate.
+            return restored ? true : false;
+        }
+    }
+    bool ok = g_tryAddItemOrig(self, item, quantity);
+    g_pendRemItem = 0; g_pendRemInv = 0; g_havePendRemOwner = false;
+    return ok;
+}
+
+// ---- Phase W1b: query-free ground-drop capture -----------------------------
+// Detour Inventory::dropItem (the _NV_ twin: hooking the real body catches the
+// virtual dispatch AND our own dropItemFromInventory / relocateWeaponToGround
+// calls). Every drop records the grounded Item* + owner + description + position
+// so the Replicator discovers town drops without the spatial sphere query. We
+// call the original FIRST so the engine has already grounded + positioned the
+// item when we read itemWorldPos. Same main-thread edge-queue pattern as the
+// recruit/save detours (engine tick + plugin tick share the thread; no lock).
+typedef void (__fastcall* DropItemFn)(Inventory* self, Item* it);
+DropItemFn g_dropItemOrig = 0;
+std::vector<ItemDropEdge> g_dropEdges;
+
+void __fastcall dropItem_hook(Inventory* self, Item* it) {
+    g_dropItemOrig(self, it);
+    // A drop may internally remove the item (setting the veto's pending-remove
+    // state) but is NOT a bag->bag transfer, so invalidate any pending remove here
+    // - otherwise a later unrelated add could be mis-paired to this drop's source.
+    g_pendRemItem = 0; g_pendRemInv = 0; g_havePendRemOwner = false;
+    __try {
+        if (it) {
+            ItemDropEdge e;
+            memset(&e, 0, sizeof(e));
+            if (self && self->owner) readObjectHand(self->owner, e.ownerHand);
+            readObjectHand(static_cast<RootObject*>(it), e.itemHand);
+            GameData* gd = it->getGameData();
+            if (gd) {
+                strncpy(e.stringID, gd->stringID.c_str(), sizeof(e.stringID) - 1);
+                e.stringID[sizeof(e.stringID) - 1] = '\0';
+                e.itemType = (unsigned int)gd->type;
+            }
+            int qty = it->quantity; if (qty < 1) qty = 1;
+            e.quantity = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);
+            float ql = it->quality;
+            e.quality = (unsigned short)(ql > 0.0f ? (int)(ql * 100.0f) : 0);
+            float p[3] = { 0, 0, 0 };
+            bool haveP = itemWorldPos(it, p) &&
+                         !(p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f);
+            if (!haveP && self && self->owner) {
+                // A town item often reports its transform as origin the frame it
+                // grounds (the exact town-scan failure). Fall back to the dropping
+                // character's feet so the peer proxy lands where the player is, not
+                // at world (0,0,0) - which is off in the void and looks "missing".
+                Ogre::Vector3 op = self->owner->getPosition();
+                p[0] = op.x; p[1] = op.y; p[2] = op.z;
+                haveP = !(p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f);
+            }
+            if (haveP) { e.x = p[0]; e.y = p[1]; e.z = p[2]; }
+            if (g_dropEdges.size() < 128) g_dropEdges.push_back(e);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 // AI-gating probe lever: PlayerInterface::recruit(Character*, bool) adds an NPC
 // to the local player's squad (the "inhabit" path). A recruited body stops
 // self-assigning town tasks (player chars idle until ordered) and obeys our
@@ -1572,6 +1782,40 @@ bool installShopHook() {
     if (!addr) return false;
     return KenshiLib::AddHook(addr, (void*)&buyItem_hook,
                               (void**)&g_buyItemOrig) == KenshiLib::SUCCESS;
+}
+
+// Cross-owner trade veto: detour the _NV_ twins of the drag primitives (hooking
+// the real body catches virtual dispatch AND direct calls). Both must install or
+// the pairing is incomplete, so a partial success is reported as failure.
+bool installXferBlockHook() {
+    intptr_t addRem = KenshiLib::GetRealAddress(
+        &Inventory::_NV_removeItemDontDestroy_returnsItem);
+    intptr_t addAdd = KenshiLib::GetRealAddress(&Inventory::_NV_tryAddItem);
+    if (!addRem || !addAdd) return false;
+    if (KenshiLib::AddHook(addRem, (void*)&removeDontDestroy_hook,
+                           (void**)&g_removeDontDestroyOrig) != KenshiLib::SUCCESS)
+        return false;
+    return KenshiLib::AddHook(addAdd, (void*)&tryAddItem_hook,
+                              (void**)&g_tryAddItemOrig) == KenshiLib::SUCCESS;
+}
+
+void setBlockXfer(bool on)                    { g_blockXfer = on; }
+void setInvOwnerClassifier(InvOwnerClassFn fn) { g_invOwnerClass = fn; }
+
+// Query-free ground-drop capture: detour the dropItem _NV_ twin.
+bool installItemDropHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(&Inventory::_NV_dropItem);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&dropItem_hook,
+                              (void**)&g_dropItemOrig) == KenshiLib::SUCCESS;
+}
+
+unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut) {
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < g_dropEdges.size() && n < maxOut; ++i, ++n)
+        out[n] = g_dropEdges[i];
+    g_dropEdges.clear();
+    return n;
 }
 
 bool installRecruitHook() {

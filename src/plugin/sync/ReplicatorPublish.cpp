@@ -43,6 +43,10 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // reshuffle existing ranks and silently flip whole-tab ownership.
     latchTabs(ctnrs);
     ownHands_.clear();
+    // Full squad roster (own + peer) for the trade veto's owner classifier: every
+    // captured member, before the ownership partition below decides which we own.
+    allSquad_.clear();
+    for (unsigned int i = 0; i < nSquad; ++i) allSquad_.insert(keyOf(raw[i]));
     unsigned int n = 0;
     for (unsigned int i = 0; i < nSquad && n < MAX_PUBLISH; ++i) {
         std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);

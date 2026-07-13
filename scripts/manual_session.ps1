@@ -92,17 +92,18 @@ param(
     # join right; scripts\arrange_windows.ps1, re-pinned through the load screen) on
     # the ULTRAWIDE (widest monitor, 3440x1440): each client window is sized to half
     # the ultrawide via kenshi.cfg Video Mode (set_video_mode.ps1) so visual A/B
-    # validation fills the screen. -NoTile skips both the resize and the tiling.
+    # validation FILLS the screen. -NoTile skips both the resize and the tiling.
     # (-Tile is legacy/accepted; tiling is on unless -NoTile.)
     [switch]$Tile,
     [switch]$NoTile,
     [ValidateSet("widest", "primary")]
     [string]$TileMonitor = "widest",
-    # Client (render area) size per window for the manual layout. 1700x1350 is the
-    # proven half-ultrawide fit from the 2026-07-11 free-play session: 2x1700 + window
-    # borders spans the 3440 width, and 1350 + title bar clears the taskbar at 1440.
-    [int]$WindowW = 1700,
-    [int]$WindowH = 1350,
+    # Client (render area) size per window for the manual layout: 1720x1440 fills the
+    # 3440x1440 ultrawide edge-to-edge (2x1720 = 3440 wide, full 1440 height). This is
+    # the MANUAL-only resolution; automated runs (run_test.ps1) keep the smaller
+    # 1280x1024 primary-monitor layout, so the two harnesses never fight over the cfg.
+    [int]$WindowW = 1720,
+    [int]$WindowH = 1440,
     # How long to keep re-pinning. Must outlast host launch + join delay + both load
     # screens (Kenshi re-centers on gameplay entry), matching run_test.ps1's default.
     [int]$TileRepeatSec = 75

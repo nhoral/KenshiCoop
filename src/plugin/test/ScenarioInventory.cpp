@@ -749,6 +749,212 @@ private:
     unsigned int  rankHand_[2][5];
 };
 
+// xfer_block (cross-owner trade VETO validation): with KENSHICOOP_BLOCK_XFER on, a
+// direct squad-to-squad drag between DIFFERENT-owner tabs must be REFUSED at the
+// engine (the item is conserved in the source bag), while a SAME-owner drag still
+// succeeds. The HOST drives both via engine::moveItemBetweenContainers(...,
+// suspendVeto=false) - the exact remove+add a UI drag performs, subject to the veto:
+//   GIVE @16s: 1 common  rank0(host) -> rank1(join)          -> BLOCKED (moved=0)
+//   SELF @26s: 1 common  rank0.memberA -> rank0.memberB      -> ALLOWED (moved>=1)
+// Both clients seed the host tab @6s and sample both tabs every 500 ms. The in-plugin
+// verdict gates on: the cross-owner move returned 0 AND the source/dest probe counts
+// are UNCHANGED after it (nothing crossed), and - when a second host-tab member exists
+// - the same-owner move succeeded. Protocol 37 is retired under the veto, so no
+// PKT_INV_XFER is emitted (the runner cross-checks the logs for the absence).
+class XferBlockScenario : public Scenario {
+public:
+    XferBlockScenario()
+        : passed_(false), lastLogMs_(0), samples_(0), seedDone_(false),
+          giveDone_(false), selfDone_(false), probeType_(0), haveSelfDst_(false),
+          giveMoved_(-2), selfMoved_(-2),
+          r0BeforeGive_(-1), r1BeforeGive_(-1), r0AfterGive_(-1), r1AfterGive_(-1) {
+        probeSid_[0] = '\0';
+        for (int r = 0; r < 2; ++r) { rankHave_[r] = false; for (int k = 0; k < 5; ++k) rankHand_[r][k] = 0; }
+        for (int k = 0; k < 5; ++k) selfDst_[k] = 0;
+    }
+
+    virtual const char* name() const { return "xfer_block"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        for (unsigned int r = 0; r < 2; ++r)
+            rankHave_[r] = resolveRankMember(ctx.gw, r, 0, rankHand_[r]);
+        haveSelfDst_ = resolveRankMember(ctx.gw, 0, 1, selfDst_); // 2nd host-tab member (if any)
+        engine::commonTestItemSid(ctx.gw, probeSid_, sizeof(probeSid_), &probeType_);
+        char b[220];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO XFB anchor host=%d r0=%d r1=%d selfDst=%d probeSid='%s' probeType=%u",
+            ctx.isHost ? 1 : 0, rankHave_[0] ? 1 : 0, rankHave_[1] ? 1 : 0,
+            haveSelfDst_ ? 1 : 0, probeSid_[0] ? probeSid_ : "(none)", probeType_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            int probe[2] = { -1, -1 };
+            for (unsigned int rank = 0; rank < 2; ++rank) {
+                if (!rankHave_[rank]) continue;
+                InvItemEntry items[INV_ITEMS_MAX]; unsigned int hash = 0;
+                unsigned int n = engine::captureContainerContents(
+                    ctx.gw, rankHand_[rank], items, INV_ITEMS_MAX, &hash);
+                int pq = 0;
+                for (unsigned int i = 0; i < n; ++i)
+                    if (probeSid_[0] && items[i].itemType == probeType_ &&
+                        strcmp(items[i].stringID, probeSid_) == 0)
+                        pq += (int)items[i].quantity;
+                probe[rank] = pq;
+                char b[200];
+                _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO XFB r=%u %s t=%lu count=%u hash=%u probe=%d",
+                    rank, (ctx.isHost == (rank == 0)) ? "OWN" : "PEER",
+                    (unsigned long)ctx.elapsedMs, n, hash, pq);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                ++samples_;
+            }
+
+            // Seed material into the container each side OWNS (baseline sync liveness).
+            if (!seedDone_ && ctx.elapsedMs >= SEED_MS) {
+                seedDone_ = true;
+                unsigned int ownRank = ctx.isHost ? 0u : 1u;
+                if (rankHave_[ownRank]) {
+                    char sid[48]; sid[0] = '\0';
+                    int got = engine::addTestItemsToContainer(ctx.gw, rankHand_[ownRank], 3, sid, sizeof(sid));
+                    char m[200]; _snprintf(m, sizeof(m) - 1, "SCENARIO XFB SEED r=%u n=%d sid='%s'",
+                                           ownRank, got, sid[0] ? sid : "(none)");
+                    m[sizeof(m) - 1] = '\0'; coop::logLine(m);
+                }
+            }
+
+            // HOST drives the drags AS a UI drag would (subject to the veto).
+            if (ctx.isHost && probeSid_[0] && rankHave_[0] && rankHave_[1]) {
+                if (!giveDone_ && ctx.elapsedMs >= GIVE_MS) {
+                    giveDone_ = true;
+                    r0BeforeGive_ = probe[0]; r1BeforeGive_ = probe[1];
+                    giveMoved_ = engine::moveItemBetweenContainers(
+                        ctx.gw, rankHand_[0], rankHand_[1], probeSid_, probeType_, 1, /*suspendVeto*/false);
+                    char m[160]; _snprintf(m, sizeof(m) - 1,
+                        "SCENARIO XFB GIVE moved=%d (expect 0=blocked)", giveMoved_);
+                    m[sizeof(m) - 1] = '\0'; coop::logLine(m);
+                }
+                // Capture post-GIVE counts a sample later (nothing should have crossed).
+                if (giveDone_ && r0AfterGive_ < 0 && ctx.elapsedMs >= GIVE_MS + 1000) {
+                    r0AfterGive_ = probe[0]; r1AfterGive_ = probe[1];
+                }
+                if (!selfDone_ && ctx.elapsedMs >= SELF_MS) {
+                    selfDone_ = true;
+                    selfMoved_ = haveSelfDst_
+                        ? engine::moveItemBetweenContainers(
+                              ctx.gw, rankHand_[0], selfDst_, probeSid_, probeType_, 1, /*suspendVeto*/false)
+                        : -1; // no second host-tab member on this save; sub-check skipped
+                    char m[160]; _snprintf(m, sizeof(m) - 1,
+                        "SCENARIO XFB SELF moved=%d (expect >=1=allowed; -1=skipped)", selfMoved_);
+                    m[sizeof(m) - 1] = '\0'; coop::logLine(m);
+                }
+            }
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            bool executed = rankHave_[0] && rankHave_[1] && samples_ > 0 && seedDone_ &&
+                            (!ctx.isHost || (giveDone_ && selfDone_));
+            bool blockOk = true, selfOk = true, conserveOk = true;
+            if (ctx.isHost) {
+                blockOk = (giveMoved_ == 0);                     // cross-owner drag refused
+                if (r0AfterGive_ >= 0 && r1AfterGive_ >= 0 && r0BeforeGive_ >= 0)
+                    conserveOk = (r0AfterGive_ == r0BeforeGive_) && (r1AfterGive_ == r1BeforeGive_);
+                selfOk = !haveSelfDst_ || (selfMoved_ >= 1);     // same-owner drag still works
+            }
+            char m[220];
+            _snprintf(m, sizeof(m) - 1,
+                "SCENARIO XFB verdict executed=%d blockOk=%d conserveOk=%d selfOk=%d give=%d self=%d",
+                executed ? 1 : 0, blockOk ? 1 : 0, conserveOk ? 1 : 0, selfOk ? 1 : 0,
+                giveMoved_, selfMoved_);
+            m[sizeof(m) - 1] = '\0'; coop::logLine(m);
+            passed_ = executed && blockOk && conserveOk && selfOk;
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Resolve the ordinal-th lowest-hand member of the squad TAB with the given rank
+    // (the same tab->rank partition the Replicator and the sibling scenarios use).
+    static bool resolveRankMember(GameWorld* gw, unsigned int rank, unsigned int ordinal,
+                                  unsigned int out[5]) {
+        for (int i = 0; i < 5; ++i) out[i] = 0;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ false, sq, MAX_SQUAD);
+        if (n == 0) return false;
+        unsigned int idx[MAX_SQUAD]; unsigned int m = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            int cr = containerRankOf(sq, n, i);
+            if (cr >= 0 && (unsigned int)cr == rank && m < MAX_SQUAD) idx[m++] = i;
+        }
+        for (unsigned int a = 1; a < m; ++a)
+            for (unsigned int b = a; b > 0 && handLess(sq[idx[b]], sq[idx[b-1]]); --b) {
+                unsigned int t = idx[b]; idx[b] = idx[b-1]; idx[b-1] = t;
+            }
+        if (ordinal >= m) return false;
+        unsigned int i = idx[ordinal];
+        out[0] = sq[i].hType; out[1] = sq[i].hContainer;
+        out[2] = sq[i].hContainerSerial; out[3] = sq[i].hIndex; out[4] = sq[i].hSerial;
+        return true;
+    }
+    static bool handLess(const EntityState& a, const EntityState& b) {
+        if (a.hType != b.hType) return a.hType < b.hType;
+        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+        if (a.hContainerSerial != b.hContainerSerial) return a.hContainerSerial < b.hContainerSerial;
+        if (a.hIndex != b.hIndex) return a.hIndex < b.hIndex;
+        return a.hSerial < b.hSerial;
+    }
+    static bool ctnrLess(const EntityState& a, const EntityState& b) {
+        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+        return a.hContainerSerial < b.hContainerSerial;
+    }
+    static bool ctnrEq(const EntityState& a, const EntityState& b) {
+        return a.hContainer == b.hContainer && a.hContainerSerial == b.hContainerSerial;
+    }
+    static int containerRankOf(const EntityState* sq, unsigned int n, unsigned int i) {
+        EntityState distinct[MAX_SQUAD]; unsigned int dn = 0;
+        for (unsigned int a = 0; a < n; ++a) {
+            bool seen = false;
+            for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[a])) { seen = true; break; }
+            if (!seen && dn < MAX_SQUAD) distinct[dn++] = sq[a];
+        }
+        for (unsigned int a = 1; a < dn; ++a)
+            for (unsigned int b = a; b > 0 && ctnrLess(distinct[b], distinct[b-1]); --b) {
+                EntityState t = distinct[b]; distinct[b] = distinct[b-1]; distinct[b-1] = t;
+            }
+        for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[i])) return (int)b;
+        return -1;
+    }
+
+    static const unsigned long HOST_DURATION_MS = 44000; // outlive the join's window
+    static const unsigned long JOIN_DURATION_MS = 34000;
+    static const unsigned long SEED_MS          = 6000;
+    static const unsigned long GIVE_MS          = 16000; // cross-owner drag (blocked)
+    static const unsigned long SELF_MS          = 26000; // same-owner drag (allowed)
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    bool          passed_;
+    unsigned long lastLogMs_;
+    unsigned int  samples_;
+    bool          seedDone_;
+    bool          giveDone_;
+    bool          selfDone_;
+    char          probeSid_[48];
+    unsigned int  probeType_;
+    bool          haveSelfDst_;
+    int           giveMoved_;
+    int           selfMoved_;
+    int           r0BeforeGive_, r1BeforeGive_, r0AfterGive_, r1AfterGive_;
+    bool          rankHave_[2];
+    unsigned int  rankHand_[2][5];
+    unsigned int  selfDst_[5];
+};
+
 // inv_equip: EQUIPPED-gear (armour/weapon slot) sync. Each client owns one squad tab
 // (host rank 0, join rank 1). On the geared member of its OWN tab it UNEQUIPS one REAL
 // (save-loaded) worn item and leaves it off - the "drop/unequip armour" action. Because
@@ -1365,6 +1571,7 @@ Scenario* makeInventoryScenario(const std::string& name) {
     if (name == "inv_bidir")    return new InventoryBidirScenario();
     if (name == "trade_probe")  return new TradeProbeScenario();
     if (name == "trade_peer")   return new TradePeerScenario();
+    if (name == "xfer_block")   return new XferBlockScenario();
     if (name == "inv_equip")    return new InventoryEquipScenario(/*reequip=*/false);
     if (name == "inv_reequip")  return new InventoryEquipScenario(/*reequip=*/true);
     if (name == "inv_wpnseq")   return new WeaponSeqScenario();

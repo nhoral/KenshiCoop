@@ -389,6 +389,13 @@ extern PlatoonRefreshInvFn g_platoonRefreshInvFn;
 extern ShopGetTraderFn     g_shopGetTraderFn;
 extern BuyItemFn g_buyItemOrig;
 
+// Cross-owner trade veto (see Engine.h installXferBlockHook). g_invVetoSuspend
+// is the reentrancy guard: the Replicator's OWN item relocations that re-home a
+// REAL tracked item across the ownership boundary (W3 pickup addItemPtrToInventory,
+// the retired Protocol 37 moveItemBetweenContainers) set it around their tryAddItem
+// call so the veto never refuses a sanctioned sync move (only genuine UI drags).
+extern bool g_invVetoSuspend;
+
 // recruitment + squad moves
 extern RecruitFn g_recruitFn;
 extern std::vector<RecruitEdgeRec> g_recruitEdges;

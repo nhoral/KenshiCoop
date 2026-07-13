@@ -779,7 +779,8 @@ int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
 
 int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                               const unsigned int dstHand[5],
-                              const char* sid, unsigned int typeCat, int qty) {
+                              const char* sid, unsigned int typeCat, int qty,
+                              bool suspendVeto) {
     if (!gw || !sid || !sid[0] || qty <= 0) return 0;
     RootObject* srcRo = resolveObjectByHand(srcHand);
     RootObject* dstRo = resolveObjectByHand(dstHand);
@@ -796,6 +797,12 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
     Item* curItems[64];
     unsigned int ncur = readInvItems(src, cur, curItems, MAXC);
     int moved = 0;
+    // This is normally a SANCTIONED cross-owner relocation (Protocol 37
+    // conservation), so suspend the trade veto for its duration - the veto only
+    // exists to refuse genuine UI drags, never our own reconciled moves. The
+    // xfer_block test passes suspendVeto=false to drive it AS a UI drag would
+    // (veto active), so it can assert the refusal + item conservation.
+    bool vetoSav = g_invVetoSuspend; if (suspendVeto) g_invVetoSuspend = true;
     __try {
         // Loose stacks first (the ordinary bag-to-bag drag), then worn copies (the
         // "drag straight out of an equip slot" trade the field report describes).
@@ -811,6 +818,7 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                 if (!taken) continue;
                 if (!dst->tryAddItem(taken, take)) {          // virtual: real-object relocation
                     src->tryAddItem(taken, take);             // destination refused - put it back
+                    g_invVetoSuspend = vetoSav;
                     return moved;
                 }
                 curItems[i] = 0; // detached; never touch this stack again
@@ -818,8 +826,10 @@ int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_invVetoSuspend = vetoSav;
         return moved;
     }
+    g_invVetoSuspend = vetoSav;
     return moved;
 }
 
@@ -1327,6 +1337,26 @@ int objectWorldPos(const unsigned int hand[5], float out[3]) {
     return ok;
 }
 
+// SEH-guarded (Phase W1b): handle-based liveness of a tracked ground item. Resolve the
+// item's local engine hand and decide whether it is still a FREE ground item, WITHOUT
+// the getObjectsWithinSphere query that fails in towns. Returns 1 (and fills out[3] with
+// the current world position) if the item still exists and is NOT inside an inventory;
+// returns 0 if it was destroyed (hand no longer resolves) or picked up (isInInventory).
+// This replaces the "vanished from the spatial scan" cull, which false-culled town drops.
+int groundItemLiveness(const unsigned int itemHand[5], float out[3]) {
+    RootObject* ro = resolveObjectByHand(itemHand);
+    if (!ro) return 0; // destroyed / no longer resolvable
+    int live = 0;
+    __try {
+        Item* it = reinterpret_cast<Item*>(ro);
+        if (it->isInInventory) return 0; // picked up into some inventory
+        Ogre::Vector3 p = ro->getPosition();
+        if (out) { out[0] = p.x; out[1] = p.y; out[2] = p.z; }
+        live = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { live = 0; }
+    return live;
+}
+
 // SEH-guarded (Phase W3): world position of a tracked Item* (as void*). The drop detector
 // reads this off the REAL just-dropped object to author the exact cursor-drop location -
 // far more accurate than the owner's feet, and it never relies on the (town-unreliable)
@@ -1420,9 +1450,14 @@ int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void*
     __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
     if (!inv) return 0;
     int ok = 0;
+    // Sanctioned conservation pickup (W3): re-homing a REAL tracked ground item
+    // whose stale _whosInventoryWeAreIn could otherwise look cross-owner to the
+    // trade veto. Suspend it so the sanctioned relocation is never refused.
+    bool vetoSav = g_invVetoSuspend; g_invVetoSuspend = true;
     __try {
         ok = inv->tryAddItem(reinterpret_cast<Item*>(item), 1) ? 1 : 0; // virtual: ground -> bag
     } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    g_invVetoSuspend = vetoSav;
     return ok;
 }
 

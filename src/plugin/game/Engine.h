@@ -533,9 +533,41 @@ int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
 // the factory cannot rebuild (weapons). Loose stacks move first, then worn copies (the
 // "drag out of an equip slot" case). If the destination refuses the item it is put BACK
 // into src (never leaked). Returns the number moved.
+// suspendVeto (default true): sanctioned sync relocations keep the trade veto
+// suspended so it never refuses them. The xfer_block test passes false to drive
+// the engine primitives EXACTLY like a UI drag (subject to the veto), so it can
+// assert a cross-owner move is refused (returns 0, item conserved in src).
 int moveItemBetweenContainers(GameWorld* gw, const unsigned int srcHand[5],
                               const unsigned int dstHand[5],
-                              const char* sid, unsigned int typeCat, int qty);
+                              const char* sid, unsigned int typeCat, int qty,
+                              bool suspendVeto = true);
+
+// ---- Cross-owner trade veto (block direct squad-to-squad transfers) --------
+// The engine has no single "drag" entry point (the squad-move problem), so a
+// UI item drag is remove-then-add: Inventory::removeItemDontDestroy_returnsItem
+// on the source, Inventory::tryAddItem on the destination. We detour both to
+// REFUSE a move whose source and destination squad characters are owned by
+// DIFFERENT clients - forcing players to transfer via ground drops. The veto is
+// purely LOCAL (only the dragging client sees the drag), so no packet is needed.
+
+// Owner-classification callback the Replicator supplies (ownHands_ + the full
+// player-squad set). Given a save-stable owner hand (readObjectHand layout
+// [type,container,containerSerial,index,serial]), returns:
+//   0 = not a player-squad member (world NPC / container / vendor - never blocked)
+//   1 = a squad member owned by THIS client
+//   2 = a squad member owned by the PEER
+// A move is cross-owner iff one end is 1 and the other is 2.
+typedef int (*InvOwnerClassFn)(const unsigned int ownerHand[5]);
+void setInvOwnerClassifier(InvOwnerClassFn fn);
+
+// Enable/disable the cross-owner drag veto (KENSHICOOP_BLOCK_XFER). Off by
+// default until set; the veto only fires when a classifier is also registered.
+void setBlockXfer(bool on);
+
+// Detour Inventory::tryAddItem + removeItemDontDestroy_returnsItem for the veto
+// (and for diagnostic drag-sequence logging under KENSHICOOP_INV_DUMP=1).
+// Returns true if both detours installed.
+bool installXferBlockHook();
 
 // SEH-guarded (store_probe): like addTestItemsToContainer, but walks the common
 // stackable templates until the container ACCEPTS one - storage buildings are
@@ -586,6 +618,37 @@ struct WorldItemRaw {
 // every result is a real world item. Returns the number written.
 unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int maxOut,
                                float radius);
+
+// ---- Phase W1b: query-free ground-drop capture (town reliability) ----------
+// The W1 stream above discovers ground items with getObjectsWithinSphere, which
+// fails in towns (a dropped item then never appears / flickers on the peer). To
+// discover a drop WITHOUT the spatial query we detour the engine drop primitive
+// (Inventory::dropItem): every drop records the exact grounded Item* + its owner
+// + description + world position at the drop frame. The Replicator seeds its
+// world-item tracker from these edges (query-free) and culls by HANDLE liveness
+// (below), so a town drop is streamed reliably.
+struct ItemDropEdge {
+    unsigned int   ownerHand[5]; // inventory owner that dropped it (readObjectHand layout)
+    unsigned int   itemHand[5];  // the now-grounded item's local engine hand
+    char           stringID[48];
+    unsigned int   itemType;     // GameData::type category
+    unsigned short quantity;
+    unsigned short quality;      // quality*100 (0 if n/a)
+    float          x, y, z;      // world position at the drop frame
+};
+// Detour Inventory::dropItem so every drop is recorded (drained once per tick).
+// Returns true if installed.
+bool installItemDropHook();
+// Drain captured drop edges into out[] (up to maxOut); clears the queue. Returns
+// the number written.
+unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut);
+
+// Handle-based liveness of a tracked ground item (query-free cull): resolve the
+// item's local engine hand and return 1 if it is still a FREE ground item (it
+// exists AND is not inside an inventory), filling outPos[3] with its current
+// world position; return 0 if it is gone (destroyed) or has been picked up (now
+// in an inventory). Replaces the "vanished from the spatial scan" cull test.
+int groundItemLiveness(const unsigned int itemHand[5], float outPos[3]);
 
 // SEH-guarded (join): spawn a LOCAL proxy ground item from the template (sid, typeCat) at
 // world position (x,y,z), so the join renders a host-dropped item where the host sees it.
