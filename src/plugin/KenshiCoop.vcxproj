@@ -52,11 +52,15 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- PDB for post-mortem minidump triage (2026-07-11 join crash). No codegen impact. -->
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ProgramDatabaseFile>$(OutDir)KenshiCoop.pdb</ProgramDatabaseFile>
       <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -71,6 +75,7 @@
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="game\Engine.cpp" />
+    <ClCompile Include="game\ZoneQuery.cpp" />
     <ClCompile Include="sync\Interp.cpp" />
     <ClCompile Include="sync\Replicator.cpp" />
     <ClCompile Include="sync\SaveXfer.cpp" />

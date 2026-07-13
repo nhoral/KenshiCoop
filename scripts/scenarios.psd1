@@ -99,10 +99,13 @@
             # 0.42-0.44 vs the 0.4 gate; crosscheck still green at base tolerance).
             WanDemote = @('smoothness')
         }
+        # suppress_churn gates here (town save): the 2026-07-11 pop-in/out fix -
+        # census-present town NPCs must never cycle hidden->restored->hidden at
+        # the stream-bubble boundary ('Saint'/'Kumo' churned before the veto).
         coop_presence = @{
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'coop_presence'
-            Gating   = @('coop_presence', 'march', 'clock_sync')
+            Gating   = @('coop_presence', 'suppress_churn', 'snap_rate', 'march', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth')
             Tier = 'smoke'; WanVariant = $true
         }
@@ -132,8 +135,11 @@
             Save = 'sync'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'npc_track'
             Gating   = @('npc_track', 'pose', 'pose_state', 'body_state',
-                         'smoothness', 'anim_truth', 'march', 'clock_sync')
-            Advisory = @()
+                         'smoothness', 'anim_truth', 'march', 'suppress_churn',
+                         'snap_rate', 'rest_flap', 'clock_sync')
+            # lifecycle (Phase 3): the [life] transition audit - advisory for
+            # its first regression cycle, promoted once its baseline is known.
+            Advisory = @('existence_parity', 'anti_zombie', 'lifecycle')
             Tier = 'smoke'; WanVariant = $true
             # DELIBERATE WAN-regime adjustments (re-validation matrix, 2026-07-05):
             # 120ms +/-40ms 5%-loss puts a walking NPC one-plus update interval
@@ -842,6 +848,40 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # research_probe: tech-tree phase-0 diagnostic (protocol 38 -
+        # researchSync forced OFF). Both sides pick the deterministic
+        # not-known-researchable RESEARCH subject at t=8s and poll
+        # isKnown/canResearch 1 Hz; the HOST fires Research::startResearch at
+        # t=10s (its isKnown flips - the spike-401 write lever); the JOIN
+        # fires its OWN startResearch at t=25s. Gates: matching subject sids
+        # (wire-key stability), host lever landed, join known=0 across the
+        # t=10-25s divergence window (the unlock must NOT cross with the
+        # hatch off), join self-lever landed AND stuck to run end.
+        research_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'research_probe'
+            Gating   = @('research_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # research_sync: protocol-38 host-authoritative tech-tree sync
+        # (researchSync ON - the same script as research_probe minus the
+        # join's self-start, so the WIRE must flip the join's isKnown).
+        # publishResearch streams one reliable PKT_RESEARCH row per known
+        # sid (~1 Hz sample, first sight = baseline, 15 s safety resend);
+        # applyResearch lands each via Research::startResearch. Gates: the
+        # probe's local legs PLUS [research] rows sent AND applied, the
+        # join's subject known=1 within 6 s of the host's start, sticky to
+        # run end, and both finals known=1.
+        research_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'research_sync'
+            Gating   = @('research_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # store_probe: storage/machine container phase-0 diagnostic (protocol
         # 34 - storeSync forced OFF, the protocol-27 mint channel ON). The
         # HOST places a crafting bench + a general-storage chest leader-
@@ -895,8 +935,73 @@
         npc_census = @{
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'npc_census'
-            Gating   = @('npc_census', 'clock_sync')
+            Gating   = @('npc_census', 'suppress_churn', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # fast_march (2026-07-11 rubber-banding validation): leader_move at 5x
+        # game speed (both sides vote 5x; consensus takes it). Gates on the
+        # join's PLAYER-SQUAD hard-snap RATE - before the velocity-aware snap
+        # gate, 5x wall-clock velocities teleported the driven leader every
+        # sample (~35 snaps/s measured in the 2026-07-11 manual session), and a
+        # sprinting leader false-snapped even at 1x (gap=8.6 vs the fixed 8 u
+        # gate). Background-NPC snaps stay un-gated at 5x: a bar NPC resting
+        # between stream updates legitimately falls 100+ u behind and the
+        # teleport is the correct convergence tool (measured gaps 128-1826 u).
+        # Crosscheck stays advisory: at 5x the driven copy legitimately trails
+        # by ~1 wall-clock update interval * 5x velocity.
+        fast_march = @{
+            Save = 'sync'; Setup = ''; Tolerance = 18.0
+            PrimaryGate = 'snap_rate_squad'
+            Gating   = @('snap_rate_squad', 'suppress_churn', 'clock_sync')
+            Advisory = @('snap_rate', 'crosscheck', 'smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # spawn_far (2026-07-11 "NPCs spawn on top of the join player" fix):
+        # census-range proxy minting. The host spawns a runtime squad ~620 u
+        # out and walks it toward the co-located leaders; the join must mint
+        # the proxies at census range (census-missing scan + reply-side mint
+        # gate at KENSHICOOP_SPAWN_MINT_RADIUS) - every far hand bound, all
+        # binds >= 400 u from the join anchor, no duplicate mints, and the
+        # SAME proxy body driven into the stream bubble. snap_rate stays
+        # advisory: the bubble-entry drive takeover legitimately hard-snaps
+        # a proxy whose local AI drifted while it was census-only.
+        spawn_far = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'spawn_far'
+            Gating   = @('spawn_far', 'suppress_churn', 'clock_sync')
+            Advisory = @('mint_dist', 'snap_rate', 'smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # travel_parity (2026-07-11 free-play "yellow packs while roaming"
+        # report): the JOIN's PC teleport-hops ~60,000 u across the map (15
+        # hops x 4000 u, ~9 s dwell each - every hop lands entirely outside
+        # the previous 2000 u census bubble, so existence coverage rebuilds
+        # from nothing at each stop: zone streams, census re-centering,
+        # mint/cull churn) while the HOST's PC follows its local driven copy
+        # (teleport catch-up past 150 u, walk inside) - the roaming direction
+        # (join drags the interest/census coverage) no other scenario moves.
+        # Both sides dump a 5 s worldstate (SCENARIO WORLD/WNPC rows; the
+        # join rows carry the drv/cen/hid/ghost authority class).
+        # follow_travel gates first: if the follow never held, the parity
+        # numbers describe two separated worlds and mean nothing.
+        # travel_parity gates the visible-on-join-only (ghost) fraction +
+        # persistence while moving; crosscheck stays advisory (hop legs open
+        # multi-thousand-unit transients). snap_rate advisory: the hard snap
+        # IS the convergence tool on every hop. Seconds/KillGraceSec: the
+        # 160 s host window outlives the default 150 s self-exit + 90 s kill
+        # grace.
+        travel_parity = @{
+            Save = 'sync'; Setup = ''; Tolerance = 18.0
+            Seconds = 220; KillGraceSec = 190
+            PrimaryGate = 'follow_travel'
+            Gating   = @('follow_travel', 'travel_parity', 'clock_sync')
+            Advisory = @('existence_parity', 'mint_dist', 'anti_zombie',
+                         'lifecycle', 'suppress_churn', 'snap_rate',
+                         'smoothness', 'anim_truth', 'march', 'crosscheck')
             Tier = 'full'; WanVariant = $false
         }
 
@@ -1017,6 +1122,21 @@
             Gating   = @('trade_peer', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
+        }
+
+        # weapon_loot: weapon-fabrication sync validation (the last trading loss
+        # vector). The HOST's owned leader ACQUIRES a weapon that exists in NO
+        # shared-save inventory (novel sid, engine-fabricated - the loot/vendor-buy
+        # shape); the join's driven copy must gain EXACTLY one copy of the same
+        # template via the inventory snapshot channel + the spike-451 weapon CREATE,
+        # with zero dupes on either side (fabrication must not race the W2
+        # conservation channel or the snapshot echo).
+        weapon_loot = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'weapon_loot'
+            Gating   = @('weapon_loot', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
         }
 
         # ---- world items ------------------------------------------------------------

@@ -61,12 +61,30 @@ struct Config {
     float        interpSnapDist;    // KENSHICOOP_INTERP_SNAP_DIST     (50 u)
     float        catchupK;          // KENSHICOOP_CATCHUP_K            (2.0)
     float        snapDist;          // KENSHICOOP_SNAP_DIST            (8 u)
+    float        snapSeconds;       // KENSHICOOP_SNAP_SECONDS         (0.75 s)
+                                    // velocity-aware hard-snap gate: teleport a
+                                    // driven body only when it trails the newest
+                                    // sample by more than this much travel time
+                                    // (snapDist stays the slow-mover floor)
 
     // Protocol 36 NPC existence census: wide-radius ghost-culling reach in
     // world units. The host broadcasts the hand list of every world NPC within
     // this radius at 1 Hz; the join suppresses local NPCs absent from it.
     // 0 disables the census channel entirely (stream-bubble culling only).
     float        censusRadius;      // KENSHICOOP_CENSUS_RADIUS        (2000 u)
+
+    // Census-mint reach (2026-07-11): how far from the join's own squad a
+    // census-missing host NPC may be proxy-minted, so host runtime spawns
+    // (raids) appear at render range and walk in instead of materializing at
+    // the ~200 u stream bubble. 0 disables (legacy stream-bubble minting).
+    float        spawnMintRadius;   // KENSHICOOP_SPAWN_MINT_RADIUS    (600 u)
+
+    // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
+    // census-PRESENT local NPC copy may drift from the host's census position
+    // before the join parks it back onto the host's spot (wide pass only,
+    // per-key cooldown). The census carries positions per row; existence
+    // culling is untouched. 0 disables parking.
+    float        censusParkDist;    // KENSHICOOP_CENSUS_PARK          (120 u)
 
     // Starved-replica guard hold: how long (ms) a driven body whose stream
     // went stale keeps its AI-suspend + damage-guard before releasing to
@@ -319,6 +337,18 @@ struct Config {
     // OFF for prod_probe (it measures the unsynced baseline). "0" is the A/B
     // escape hatch.
     bool          prodSync;
+
+    // KENSHICOOP_RESEARCH_SYNC (default ON): research tech-tree sync
+    // (protocol 38) - the HOST samples its Research store's known set ~1 Hz
+    // (Research::isKnown over the shared RESEARCH GameData enumeration) and
+    // streams one reliable PKT_RESEARCH row per known stringID (first sight
+    // is the session baseline, then a safety resend); the join applies each
+    // row via Research::startResearch - idempotent against already-known
+    // sids. Without it the tech tree is per-client: a tech the host
+    // researches never unlocks on the join (spike 401). Forced OFF for
+    // research_probe (it measures the unsynced baseline). "0" is the A/B
+    // escape hatch.
+    bool          researchSync;
 
     // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
     // (protocol 34) - the HOST censuses container-bearing buildings (storage

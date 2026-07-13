@@ -43,6 +43,12 @@ namespace {
 const float MOVE_EPS    = 0.20f;  // source speed above which we treat it as moving
 const float SNAP_DIST   = 8.0f;   // gap beyond which we hard-snap (teleport)
                                   // (default for snapDist_ - env-tunable, proto 36)
+const float SNAP_SECONDS = 0.75f; // velocity-aware snap gate default: hard-snap
+                                  // only when the body trails the source by more
+                                  // than this much travel time (measured steady-
+                                  // state trail while tracking a sprinter: ~0.17s;
+                                  // WAN adds ~0.3s - 0.75s only fires on genuine
+                                  // fell-behind/warp) (KENSHICOOP_SNAP_SECONDS)
 const float REPARK_DIST = 1.0f;   // at rest, re-place if it drifts past this
 const float CATCHUP_K   = 2.0f;   // gap-proportional speed boost (chase a moving tgt)
                                   // (default for catchupK_ - env-tunable, proto 36)
@@ -88,6 +94,10 @@ const unsigned long COMBAT_DISARM_MS      = 4000; // host-stream combat gap befo
 const unsigned long COMBAT_SNAP_COOL_MS   = 3000; // min gap between hard snaps per body (a
                                                   // snap that can't stick - stagger, stale
                                                   // interp - must not re-fire every frame)
+const unsigned long NPC_SNAP_COOL_MS      = 3000; // same idea for the locomotion drive
+                                                  // (Phase 2): between snaps the walk band
+                                                  // converges; a seat-anchored/unloaded body
+                                                  // can't be teleport-spammed into place
 const unsigned long ATTR_WINDOW_MS = 3000; // remember a combatant's victim this long, so a
                                            // KO/death edge can still name the attacker
 // Carried-body sync (protocol 18): the reliable pickup/drop edges do the work;
@@ -124,8 +134,9 @@ float dist3(float ax, float ay, float az, float bx, float by, float bz) {
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-// Conservation channel item types. itemType 2 = WEAPON (createItem can't rebuild a proxy)
-// and 3 = ARMOUR/clothing. Both are non-stackable EQUIPPABLE gear, so each unit is a distinct
+
+// Conservation channel item types. itemType 2 = WEAPON and 3 = ARMOUR/clothing.
+// Both are non-stackable EQUIPPABLE gear, so each unit is a distinct
 // object the peer already mirrors (weapons via shared save; armour also reconstructed by inv
 // sync) - the real object can be relocated bag<->ground on every client and re-homed on pickup
 // WITHOUT fabrication. The W1 host-authored proxy stream handles everything else (stacks, loot)
@@ -135,14 +146,16 @@ inline bool isGearType(unsigned int t) { return t == 2u || t == 3u; }
 } // namespace
 
 Replicator::Replicator()
-    : catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), sendStamp_(true),
+    : catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), snapSeconds_(SNAP_SECONDS),
+      sendStamp_(true),
       starveHoldMs_(10000), starveHeldNow_(0),
       leaderOnly_(true), streamNpcs_(false),
       activeFrames_(0), zeroWhileActive_(0), maxStep_(0.0f), slewSkipFrames_(0),
       interpLerp_(0), interpSingle_(0), interpClampOld_(0),
       interpExtrap_(0), interpSegSnap_(0),
-      hardSnapSquad_(0), hardSnapNpc_(0),
-      walkReissueSquad_(0), walkReissueNpc_(0), interpLogTick_(0),
+      hardSnapSquad_(0), hardSnapNpc_(0), hardSnapMid_(0),
+      walkReissueSquad_(0), walkReissueNpc_(0), restFlipNpc_(0), restFlipMid_(0),
+      interpLogTick_(0),
       translateFrames_(0), walkTruthFrames_(0),
       restSampleFrames_(0), marchFrames_(0),
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
@@ -154,13 +167,17 @@ Replicator::Replicator()
       dmgGuard_(false), carrySync_(true), furnSync_(true), stealthSync_(true),
       gateAuthority_(false), trustLogTick_(0),
       trustGrants_(0), trustRevokes_(0),
-      authSuppresses_(0), authRestores_(0), authReassertMs_(0),
+      authSuppresses_(0), authRestores_(0), authReassertMs_(0), authPruned_(0),
       censusRadius_(0.0f), censusSendMs_(0), censusRecvMs_(0), censusCulls_(0),
+      midCursor_(0), midSliceMs_(0),
+      censusParkDist_(0.0f), censusParks_(0), auditRows_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0),
-      spawnSync_(false), spawnPosLogMs_(0), moneySync_(true), recruitSync_(true),
+      spawnSync_(false), spawnPosLogMs_(0),
+      spawnMintRadius_(0.0f), censusScanMs_(0),
+      moneySync_(true), recruitSync_(true),
       squadSync_(true),
       facSeqOut_(1), facSampleMs_(0), factionSync_(true),
       doorSeqOut_(1), doorSampleMs_(0), doorSync_(true),
@@ -168,16 +185,111 @@ Replicator::Replicator()
       bdoorSeqOut_(1), bdoorSampleMs_(0), bdoorSync_(true),
       hungerSync_(true),
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
+      researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
-      timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f) {}
+      timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
+      lifeSweepMs_(0) {}
+
+// ---- Phase 3: unified entity lifecycle ---------------------------------------
+// The AUDIT layer over the authority/mint/drive machinery: every decision
+// point reports the state it just put a hand into, lifeSet logs the edge, and
+// the lifecycle oracle judges the journeys. Mechanics live where they were
+// validated; this is the one place their OUTCOMES meet.
+
+const char* Replicator::lifeName(int s) {
+    switch (s) {
+    case LIFE_DISCOVERED: return "DISCOVERED";
+    case LIFE_RESOLVED:   return "RESOLVED";
+    case LIFE_HI:         return "HI";
+    case LIFE_MID:        return "MID";
+    case LIFE_PARKED:     return "PARKED";
+    case LIFE_CULLED:     return "CULLED";
+    default:              return "UNKNOWN";
+    }
+}
+
+int Replicator::lifeSet(const Key& k, int to, const char* reason) {
+    unsigned long now = nowMs();
+    Lifecycle& lc = life_[k];
+    int from = lc.state;
+    lc.touchMs = now;
+    if (from == to) return from;
+    lc.state = (u8)to;
+    lc.sinceMs = now;
+    lc.stuckLogMs = 0;
+    // Silent seed: every census-band wilderness NPC is born PARKED, and
+    // logging hundreds of those at session start buries the real journeys.
+    if (from == LIFE_UNKNOWN && to == LIFE_PARKED) return from;
+    char b[176];
+    _snprintf(b, sizeof(b) - 1,
+              "[life] hand=%u,%u,%u,%u,%u from=%s to=%s reason=%s",
+              k.t, k.c, k.cs, k.i, k.s,
+              lifeName(from), lifeName(to), reason ? reason : "-");
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return from;
+}
+
+void Replicator::lifeSweep(GameWorld* gw, unsigned long now) {
+    if ((now - lifeSweepMs_) < 5000) return;
+    lifeSweepMs_ = now;
+    // A hand not confirmed for a while left interest (or its body despawned):
+    // drop the record so the map tracks the live world, and a re-appearance
+    // starts a fresh journey from UNKNOWN.
+    const unsigned long PRUNE_MS = 30000;
+    // Self-audit: DISCOVERED means "the host swears this exists and we have
+    // no body" - the mint pipeline should resolve that within its dwell +
+    // round-trip budget WHEN the hand's census position sits in a locally
+    // loaded zone (an unloaded far zone defers legitimately, forever if need
+    // be). Older than STUCK_MS is the invisible-raid failure (the join
+    // fights nothing); one line per hand per STUCK_LOG_MS so the lifecycle
+    // oracle sees it without the log flooding.
+    const unsigned long STUCK_MS     = 30000;
+    const unsigned long STUCK_LOG_MS = 15000;
+    for (std::map<Key, Lifecycle>::iterator it = life_.begin();
+         it != life_.end(); ) {
+        Lifecycle& lc = it->second;
+        if ((now - lc.touchMs) > PRUNE_MS) { life_.erase(it++); continue; }
+        if (lc.state == LIFE_DISCOVERED && (now - lc.sinceMs) > STUCK_MS &&
+            (lc.stuckLogMs == 0 || (now - lc.stuckLogMs) > STUCK_LOG_MS)) {
+            std::map<Key, CensusPos>::iterator cp = censusPos_.find(it->first);
+            bool mintable = cp != censusPos_.end() &&
+                            engine::isZoneLoadedAt(gw, cp->second.x,
+                                                   cp->second.y, cp->second.z);
+            if (mintable) {
+                lc.stuckLogMs = now;
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "[life] STUCK hand=%u,%u,%u,%u,%u state=DISCOVERED age=%lus (mintable)",
+                          it->first.t, it->first.c, it->first.cs, it->first.i,
+                          it->first.s, (now - lc.sinceMs) / 1000);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                lc.stuckLogMs = now; // re-check the zone on the next cadence
+            }
+        }
+        ++it;
+    }
+}
 
 void Replicator::resetSession() {
     // Pointer caches (dangling after the swap) + everything keyed off them.
     targets_.clear();          // interp buffers + per-body drive state
     drivenChars_.clear();
+    drivenSeen_.clear();       // recently-driven grace (pointers dangle after swap)
     proxyByKey_.clear();
     suppressed_.clear();
+    midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
+    midCursor_ = 0; midSliceMs_ = 0;
+    life_.clear();             // Phase 3 lifecycle: the OLD world's journeys
+    lifeSweepMs_ = 0;
+    // Debug markers hold raw Character* from the OLD world plus GUI label
+    // objects we own - destroy the labels and drop the map before either
+    // dangles into the new session.
+    for (std::map<Character*, DebugMarker>::iterator mi = debugMarkers_.begin();
+         mi != debugMarkers_.end(); ++mi)
+        engine::markerDestroy(mi->second.label);
+    debugMarkers_.clear();
     hostBody_.clear();
     attackerOf_.clear();
     authCount_.clear();
@@ -185,6 +297,8 @@ void Replicator::resetSession() {
     // Protocol 36: the existence census describes the OLD world's hands; the
     // host re-publishes within a second of the new world going live.
     censusHands_.clear();
+    censusPos_.clear();
+    parkMs_.clear();
     censusRecvMs_ = 0;
     censusSendMs_ = 0;
     furnPeerPend_.clear();
@@ -197,6 +311,7 @@ void Replicator::resetSession() {
     bdoorRows_.clear();
     doorRows_.clear();
     prodRows_.clear();
+    researchRows_.clear(); // protocol 38: re-baselined from the new world's store
     facRows_.clear();
     invPub_.clear();
     invRecv_.clear();
@@ -236,6 +351,7 @@ void Replicator::resetSession() {
     unresolvedHands_.clear();
     spawnLogged_.clear();
     spawnReplyMs_.clear();
+    censusScanMs_ = 0;
     // Speed/time consensus: re-seed from the fresh world's live state (the
     // save's speed becomes the new baseline; the join's slew re-measures).
     speedLastApplied_ = -1.0f;
@@ -254,6 +370,7 @@ void Replicator::resetSession() {
     // Sample-cadence clocks restart.
     facSampleMs_ = doorSampleMs_ = buildSampleMs_ = bdoorSampleMs_ = 0;
     prodSampleMs_ = 0;
+    researchSampleMs_ = 0;
     contCensusMs_ = 0;
     authReassertMs_ = 0;
     // Config gates, ownRanks_ and every OUTBOUND seq counter are deliberately
@@ -416,6 +533,58 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // streamNpcs_ off, so on the join this publishes ONLY its owned squad subset.
     if (streamNpcs_ && n < MAX_PUBLISH)
         n += engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
+    // Phase 2 mid-band tier (host): append a rotating slice of the census-walk
+    // NPCs beyond the stream bubble (midBand_, nearest-first, rebuilt at 1 Hz
+    // by publishNpcCensus). Quota = |midBand|/10 puts each mid NPC in ~1 of
+    // every 10 snapshots; the net thread samples snapshots at 20 Hz, so each
+    // NPC hits the wire at ~2 Hz aggregate - real movement between census
+    // beats instead of a frozen local sim (the "zombie NPC" report). The
+    // wrap-around phase bump (midRot_) keeps a fixed frame-rate/net-tick
+    // ratio from aliasing the same slice positions into every sampled
+    // snapshot. Hands are resolved fresh each frame: a despawn since the
+    // census walk degrades to a skip, and the near tier is deduped by hand
+    // (an NPC walking into the bubble is already in buf at 20 Hz).
+    if (streamNpcs_ && !midBand_.empty() && n < MAX_PUBLISH) {
+        const unsigned int nearEnd = n;
+        unsigned int sz = (unsigned int)midBand_.size();
+        unsigned int quota = (sz + 9) / 10;
+        if (quota > 16) quota = 16;
+        // Advance the slice on the NET-TICK cadence (50 ms), not per frame:
+        // publishOwned runs every render frame but the net thread samples
+        // the latest snapshot only at 20 Hz, so per-frame rotation dropped
+        // 2/3 of the slices on the floor at 75 fps and starved entries for
+        // whole rotations (run 103044: starve=5..10, driven bodies flapping
+        // out of the driven set). A slice that persists >= one net tick is
+        // guaranteed on the wire: quota/10th of the list every 50 ms = each
+        // mid NPC at ~2 Hz, deterministically.
+        unsigned long nowPub = nowMs();
+        if (midSliceMs_ == 0 || (nowPub - midSliceMs_) >= 50) {
+            midSliceMs_ = nowPub;
+            midCursor_ += quota; // linear cursor, index mod size below
+        }
+        unsigned int tried = 0, added = 0;
+        while (tried < sz && added < quota && n < MAX_PUBLISH) {
+            const Key mk = midBand_[(midCursor_ + tried) % sz].k;
+            ++tried;
+            bool dup = false;
+            for (unsigned int i = 0; i < nearEnd && !dup; ++i)
+                dup = buf[i].hIndex == mk.i && buf[i].hSerial == mk.s;
+            if (dup) continue;
+            if (engine::captureNpcByHand(gw, mk.i, mk.s, mk.t, mk.c, mk.cs,
+                                         &buf[n])) {
+                // Movers only (Phase 2 refinement, run 112835): a stationary
+                // far NPC is covered by the 1 Hz census position (park
+                // fallback) - streaming it just fed the join a body to drive
+                // and starved Kenshi's character-update budget town-wide.
+                // Skipping WITHOUT consuming quota lets the scan reach past
+                // parked bodies, so a lone approaching raid effectively
+                // streams at near-full rate while a busy field shares ~2 Hz.
+                if (buf[n].cMoving == 0 && buf[n].cSpeed <= 0.25f) continue;
+                ++n;
+                ++added;
+            }
+        }
+    }
     net.setOwnedEntities(ownerId, buf, n);
 
     // Refresh the (sticky) attacker map from this tick's combat intents: a captured
@@ -1641,6 +1810,75 @@ void Replicator::applyProd(GameWorld* gw, Inbound& in) {
     }
 }
 
+void Replicator::publishResearch(GameWorld* gw, NetLink& net, u32 ownerId) {
+    if (!researchSync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // unlocks are rare; 1 Hz is plenty
+    const unsigned long RESEND_MS = 15000; // lost-row / late-prereq corrector
+    unsigned long now = nowMs();
+    if (researchSampleMs_ != 0 && (now - researchSampleMs_) < SAMPLE_MS) return;
+    researchSampleMs_ = now;
+
+    // The known set is bounded by the RESEARCH record count (384 on the sync
+    // save); 512 rows x 48 B of main-thread-only scratch covers modded trees.
+    const unsigned int MAX_KNOWN = 512;
+    const unsigned int SID_CAP   = 48;
+    static char sids[MAX_KNOWN * SID_CAP]; // main-thread only
+    unsigned int n = engine::researchEnumKnown(gw, sids, SID_CAP, MAX_KNOWN);
+    for (unsigned int i = 0; i < n; ++i) {
+        const char* sid = sids + (size_t)i * SID_CAP;
+        ResearchRow& rr = researchRows_[std::string(sid)];
+        bool first  = !rr.sent;
+        bool resend = rr.sent && (now - rr.lastSendMs) >= RESEND_MS;
+        if (!first && !resend) continue;
+        rr.sent = true; rr.lastSendMs = now;
+        ResearchPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_RESEARCH;
+        pkt.ownerId = ownerId;
+        pkt.seq     = researchSeqOut_++;
+        strncpy(pkt.sid, sid, sizeof(pkt.sid) - 1);
+        net.queueResearch(pkt);
+        if (first) { // resends stay silent; the new unlock is the signal
+            char b[128];
+            _snprintf(b, sizeof(b) - 1, "[research] SEND sid='%s' seq=%u",
+                      pkt.sid, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::applyResearch(GameWorld* gw, Inbound& in) {
+    std::deque<InboundResearch> got;
+    in.drainResearch(got);
+    if (got.empty()) return;
+    if (!researchSync_) return;
+    for (std::deque<InboundResearch>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const ResearchPacket& p = it->pkt;
+        char sid[sizeof(p.sid)];
+        strncpy(sid, p.sid, sizeof(sid) - 1);
+        sid[sizeof(sid) - 1] = '\0';
+        if (!sid[0]) continue;
+        ResearchRow& rr = researchRows_[std::string(sid)];
+        if (rr.seqSeen != 0 && p.seq <= rr.seqSeen) continue; // stale row
+        rr.seqSeen = p.seq;
+        if (rr.applied) continue; // landed earlier; resends are no-ops
+        int known = -1, can = -1;
+        int rc = engine::researchQueryBySid(gw, sid, &known, &can);
+        if (rc != 1) continue; // store/levers not up yet; the resend retries
+        if (known == 1) { rr.applied = true; continue; } // already converged
+        int started = engine::researchStartBySid(gw, sid);
+        int knownAfter = -1;
+        engine::researchQueryBySid(gw, sid, &knownAfter, &can);
+        if (knownAfter == 1) rr.applied = true;
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[research] RECV sid='%s' known %d->%d start=%d seq=%u",
+                  sid, known, knownAfter, started, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId) {
     (void)gw;
     if (!buildSync_) return;
@@ -2535,6 +2773,59 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                   // of a runtime-born NPC mints a hand the HOST cannot resolve,
                   // so BOTH sides answer requests AND author them.
 
+    // Proxy liveness sweep (2026-07-11 join crash): the engine owns the proxy
+    // bodies and can despawn one at any time; every path below (and
+    // applyTargets) would then touch a freed pointer. ~1 s cadence round-trip
+    // proof per proxy: SEH-read the pointer's CURRENT hand and resolve it back
+    // - getting the same pointer proves the body is alive (and survives engine
+    // re-containering, which merely changes the hand). Anything else means the
+    // pointer is stale: unbind WITHOUT further touches and let the normal
+    // census-missing / REQ machinery re-mint if the host still streams it.
+    static unsigned long sweepMs = 0; // main-thread only
+    if (!proxyByKey_.empty() && (now - sweepMs) >= 1000) {
+        sweepMs = now;
+        for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
+             it != proxyByKey_.end(); ) {
+            unsigned int h[5];
+            Character* live = 0;
+            if (engine::readHand(it->second, h))
+                live = engine::resolveCharByHand(h[0], h[1], h[2], h[3], h[4]);
+            if (live != it->second) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] proxy DESPAWNED hand=%u,%u,%u,%u,%u (unbound; proxies=%u)",
+                    it->first.t, it->first.c, it->first.cs, it->first.i,
+                    it->first.s, (unsigned)proxyByKey_.size() - 1);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                spawnReq_.erase(it->first); // allow a fresh REQ/mint cycle
+                lifeSet(it->first, LIFE_UNKNOWN, "proxy-despawned");
+                proxyByKey_.erase(it++);
+                continue;
+            }
+            // Baked-duplicate self-heal (Phase 1 spawn parity): the proxy's
+            // BOUND key was unresolvable when we minted - if it resolves NOW
+            // (to a body that isn't the proxy; proxies carry their own minted
+            // hands), the shared-save original materialized under it (its
+            // block finished loading, or an engine re-container restored the
+            // hand). The original is authoritative and resolve-driven by the
+            // stream directly; the proxy is a standing double - destroy it.
+            const Key& bk = it->first;
+            Character* orig = engine::resolveCharByHand(bk.i, bk.s, bk.t, bk.c, bk.cs);
+            if (orig && orig != it->second) {
+                engine::despawnProxyNpc(gw, it->second);
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] proxy DUPE-HEAL hand=%u,%u,%u,%u,%u (original resolved; "
+                    "proxy destroyed, proxies=%u)",
+                    bk.t, bk.c, bk.cs, bk.i, bk.s, (unsigned)proxyByKey_.size() - 1);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                spawnReq_.erase(bk); // hand resolves now - no REQ needed again
+                lifeSet(bk, LIFE_RESOLVED, "dupe-heal");
+                proxyByKey_.erase(it++);
+                continue;
+            }
+            ++it;
+        }
+    }
+
     // ---- Answering side (both clients) ---------------------------------------
     {
         std::deque<InboundSpawnReq> got;
@@ -2558,15 +2849,17 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.hIndex = rq.hIndex; pkt.hSerial = rq.hSerial;
             Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
             bool dead = false;
+            float age = 0.0f;
             bool found = c && engine::describeCharacter(
                 c, pkt.charSid, sizeof(pkt.charSid), pkt.facSid, sizeof(pkt.facSid),
-                &pkt.x, &pkt.y, &pkt.z, &pkt.heading, &dead);
+                &pkt.x, &pkt.y, &pkt.z, &pkt.heading, &dead, &age);
             pkt.found = found ? 1 : 0;
             pkt.dead  = dead ? 1 : 0;
+            pkt.age   = age; // animals scale body size by age (protocol 39)
             net.queueSpawnInfo(pkt);
             char b[224]; _snprintf(b, sizeof(b) - 1,
-                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d sid='%s' fac='%s'",
-                k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead,
+                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
+                k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
                 pkt.charSid, pkt.facSid);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
@@ -2576,6 +2869,95 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     // Land replies first (a proxy bound this tick is driven this same frame).
     std::deque<InboundSpawnInfo> got;
     in.drainSpawnInfos(got);
+
+    // Census-missing scan (2026-07-11 "NPCs spawn on top of the join player"
+    // fix): the census is the join's EXISTENCE authority out to ~2000 u, but
+    // proxies used to mint only off STREAMED states (host's ~200 u capture
+    // bubble) - a raid walking in materialized on top of the player. Ask
+    // about every fresh-census hand with no local body; the mint decision
+    // happens on the reply (which carries the host's position) against
+    // spawnMintRadius_. A resolvable hand is skipped (the shared save's baked
+    // NPC), as is anything already proxied, denied, or recently answered
+    // "too far". ~0.5 Hz: the resolve sweep is cheap but not free.
+    const unsigned long FAR_RETRY_MS   = 5000;
+    // Mint duplicate guard: a visible uncorrelated same-template body within
+    // this range of the reply position defers the mint (far-retry cadence).
+    const float MINT_DUPE_RADIUS = 20.0f;
+    const unsigned long CENSUS_SCAN_MS = 2000;
+    if (spawnMintRadius_ > 0.0f && !censusHands_.empty() &&
+        censusRecvMs_ != 0 && (now - censusRecvMs_) <= 5000 &&
+        (now - censusScanMs_) >= CENSUS_SCAN_MS) {
+        censusScanMs_ = now;
+        for (std::set<Key>::iterator it = censusHands_.begin();
+             it != censusHands_.end(); ++it) {
+            const Key& k = *it;
+            if (proxyByKey_.find(k) != proxyByKey_.end()) continue;
+            if (ownHands_.find(k) != ownHands_.end()) continue;
+            {
+                // Already recorded unresolved by applyTargets. Phase 2 mid-band
+                // regression (run 113712): the mid tier now STREAMS a distant
+                // runtime spawn before this scan ever sees it, and skipping
+                // here left the hand stream-classed (cen=0) - proximity-gated
+                // REQs, no far-mint - so raids again materialized on top of
+                // the join player (mints at 237-249 u vs Phase 1's ~574 u).
+                // The hand is census-vouched regardless of which path noticed
+                // it first: grant the census mark + arm the far-mint dwell.
+                std::map<Key, UnresolvedHand>::iterator uh = unresolvedHands_.find(k);
+                if (uh != unresolvedHands_.end()) {
+                    uh->second.fromCensus = true;
+                    SpawnReqState& ar = spawnReq_[k];
+                    if (ar.firstMissMs == 0) ar.firstMissMs = now;
+                    lifeSet(k, LIFE_DISCOVERED, "census-miss");
+                    continue;
+                }
+            }
+            std::map<Key, unsigned long>::iterator rko = rekeyedOld_.find(k);
+            if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS)
+                continue;
+            std::map<Key, SpawnReqState>::iterator sq = spawnReq_.find(k);
+            if (sq != spawnReq_.end()) {
+                if (sq->second.deniedMs != 0 &&
+                    (now - sq->second.deniedMs) < DENIED_RETRY_MS) continue;
+                if (sq->second.farMs != 0 &&
+                    (now - sq->second.farMs) < FAR_RETRY_MS) continue;
+            }
+            if (engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs)) {
+                // Resolvable again: disarm the far-mint dwell so a LATER real
+                // despawn restarts the sustained-miss clock from zero.
+                std::map<Key, SpawnReqState>::iterator ar = spawnReq_.find(k);
+                if (ar != spawnReq_.end()) ar->second.firstMissMs = 0;
+                continue;
+            }
+            // Arm/continue the sustained-miss clock (Phase 1 far mint): a zone
+            // reports loaded a few seconds before its baked bodies resolve, so
+            // the far mint waits FAR_MINT_ARM_MS of continuous missing-ness.
+            {
+                SpawnReqState& ar = spawnReq_[k];
+                if (ar.firstMissMs == 0) ar.firstMissMs = now;
+            }
+            UnresolvedHand& u = unresolvedHands_[k];
+            u.fromCensus = true;
+            lifeSet(k, LIFE_DISCOVERED, "census-miss");
+            if (spawnLogged_.insert(k).second) {
+                char b[144]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] census-missing hand=%u,%u,%u,%u,%u (no local body)",
+                    k.t, k.c, k.cs, k.i, k.s);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    // Own-squad positions: the reply-side mint gate and the request-side
+    // proximity gate both measure against them. One capture per tick, only
+    // when there is work.
+    const unsigned int MAX_SQUAD = 32;
+    static EntityState squad[MAX_SQUAD]; // main-thread only
+    unsigned int nSquad = 0;
+    if (!got.empty() || !unresolvedHands_.empty())
+        nSquad = engine::captureSquad(gw, false, squad, MAX_SQUAD);
+
+    const unsigned int MINT_BUDGET_PER_TICK = 4;
+    unsigned int mintedThisTick = 0;
     for (std::deque<InboundSpawnInfo>::iterator it = got.begin();
          it != got.end(); ++it) {
         const SpawnInfoPacket& p = it->pkt;
@@ -2597,8 +2979,90 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         std::map<Key, unsigned long>::iterator rko = rekeyedOld_.find(k);
         if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS)
             continue;
+        // Mint gate (census-mint fix + Phase 1 spawn parity): the reply
+        // position is the host's authority. Inside spawnMintRadius_ of our
+        // own squad, always mint (a baked NPC this close sits in a loaded
+        // block and would have resolved locally, so an unresolvable hand
+        // here is a genuine host runtime spawn). BEYOND the radius, a
+        // census-sourced hand may FAR-MINT when its position sits in a
+        // locally LOADED zone - the same "baked would have resolved" logic,
+        // generalized from a fixed radius to the true zone-loaded query -
+        // so host spawns appear on the join at the same distance they
+        // appeared on the host (the "NPCs spawn on top of the join player"
+        // report). Anything else: soft-defer (the NPC may be walking toward
+        // us - retry on the FAR_RETRY_MS cadence, and reset the send cap so
+        // a long approach can't exhaust it).
+        float mintDist = -1.0f;
+        for (unsigned int i = 0; i < nSquad; ++i) {
+            float d = dist3(p.x, p.y, p.z, squad[i].x, squad[i].y, squad[i].z);
+            if (mintDist < 0.0f || d < mintDist) mintDist = d;
+        }
+        if (spawnMintRadius_ > 0.0f &&
+            (mintDist < 0.0f || mintDist > spawnMintRadius_)) {
+            // Sustained-miss dwell: the zone-loaded signal precedes baked-body
+            // materialization by a few seconds (run 20260712_092921 healed
+            // 8/12 far mints), so a far mint additionally requires the hand
+            // to have been continuously unresolvable for FAR_MINT_ARM_MS.
+            const unsigned long FAR_MINT_ARM_MS = 10000;
+            bool farOk = rq.fromCensus && mintDist >= 0.0f &&
+                         rq.firstMissMs != 0 &&
+                         (now - rq.firstMissMs) >= FAR_MINT_ARM_MS &&
+                         (censusRadius_ <= 0.0f || mintDist <= censusRadius_ * 1.25f) &&
+                         engine::isZoneLoadedAt(gw, p.x, p.y, p.z);
+            if (!farOk) {
+                rq.farMs = now;
+                rq.sends = 0;
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] INFO deferred (far) hand=%u,%u,%u,%u,%u dist=%.0f mint=%.0f cen=%d",
+                    k.t, k.c, k.cs, k.i, k.s, mintDist, spawnMintRadius_,
+                    rq.fromCensus ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                continue;
+            }
+        }
+        // Per-tick mint budget: a raid arriving all at once answers a burst
+        // of REQs with a burst of INFOs - creating many bodies in one engine
+        // tick is a visible hitch. Overflow re-judges in ~1 s via farMs.
+        if (mintedThisTick >= MINT_BUDGET_PER_TICK) {
+            rq.farMs = (now > FAR_RETRY_MS) ? (now - FAR_RETRY_MS + 1000) : now;
+            rq.sends = 0;
+            continue;
+        }
+        // Mint duplicate guard (2026-07-11): a VISIBLE body of the same
+        // template already near the reply position means the census-missing
+        // hand is probably THAT body under a hand we cannot correlate (engine
+        // re-container, baked block just loaded) - minting would stand a
+        // double on top of it. Bound proxies (they answer to their own stream
+        // keys - pack members mint meters apart) and suppressed culls (hidden;
+        // often the very copy whose old hand got culled) are excluded, so a
+        // legit mint only defers while a visible uncorrelated twin stands
+        // there; the far-retry cadence re-judges in 5 s.
+        {
+            static Character* excl[NPC_CENSUS_MAX]; // main-thread only
+            unsigned int ne = 0;
+            for (std::map<Key, Character*>::iterator pi = proxyByKey_.begin();
+                 pi != proxyByKey_.end() && ne < NPC_CENSUS_MAX; ++pi)
+                excl[ne++] = pi->second;
+            for (std::map<Key, Character*>::iterator si = suppressed_.begin();
+                 si != suppressed_.end() && ne < NPC_CENSUS_MAX; ++si)
+                excl[ne++] = si->second;
+            Character* twin = engine::sameTemplateNear(gw, p.charSid,
+                                                       p.x, p.y, p.z,
+                                                       MINT_DUPE_RADIUS,
+                                                       excl, ne);
+            if (twin) {
+                rq.farMs = now;
+                rq.sends = 0;
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] INFO deferred (dupe) hand=%u,%u,%u,%u,%u sid='%s' "
+                    "twin within %.0fu",
+                    k.t, k.c, k.cs, k.i, k.s, p.charSid, MINT_DUPE_RADIUS);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                continue;
+            }
+        }
         Character* proxy = engine::spawnProxyNpc(gw, p.charSid, p.facSid,
-                                                 p.x, p.y, p.z, p.heading);
+                                                 p.x, p.y, p.z, p.heading, p.age);
         if (!proxy) {
             // Local mint failed (template/faction absent here - modded host?).
             // Back off hard; retrying in seconds cannot succeed.
@@ -2610,24 +3074,27 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             continue;
         }
         proxyByKey_[k] = proxy;
+        ++mintedThisTick;
+        lifeSet(k, LIFE_RESOLVED, "mint");
         // Dead on arrival: latch the down state now (the same reliable-latch
         // path an EVT_DEATH would take) so the proxy spawns INTO ragdoll
         // instead of standing up for a frame. Latched entries never age out.
         if (p.dead) targets_[k].deathLatched = true;
-        char b[192]; _snprintf(b, sizeof(b) - 1,
+        // mintDist (Phase 1 telemetry): how far from our squad the proxy
+        // appeared - the spawn-parity oracle gates its distribution.
+        char b[224]; _snprintf(b, sizeof(b) - 1,
             "[spawn] proxy BOUND hand=%u,%u,%u,%u,%u sid='%s' fac='%s' dead=%d "
-            "pos=%.1f,%.1f,%.1f (proxies=%u)",
+            "age=%.2f pos=%.1f,%.1f,%.1f mintDist=%.0f cen=%d (proxies=%u)",
             k.t, k.c, k.cs, k.i, k.s, p.charSid, p.facSid, p.dead ? 1 : 0,
-            p.x, p.y, p.z, (unsigned)proxyByKey_.size());
+            p.age, p.x, p.y, p.z, mintDist, rq.fromCensus ? 1 : 0,
+            (unsigned)proxyByKey_.size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
     // Author requests for the hands applyTargets recorded unresolved last
-    // tick, proximity-gated to our own squad members.
+    // tick (proximity-gated to our own squad members) plus this tick's
+    // census-missing hands (no position - the reply-side mint gate judges).
     if (!unresolvedHands_.empty()) {
-        const unsigned int MAX_SQUAD = 32;
-        static EntityState squad[MAX_SQUAD]; // main-thread only
-        unsigned int nSquad = engine::captureSquad(gw, false, squad, MAX_SQUAD);
         for (std::map<Key, UnresolvedHand>::iterator it = unresolvedHands_.begin();
              it != unresolvedHands_.end(); ++it) {
             const Key& k = it->first;
@@ -2639,18 +3106,31 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS)
                 continue;
             SpawnReqState& rq = spawnReq_[k];
+            // Census-sourced hands stay census-marked across retries (the
+            // far-mint privilege follows the EXISTENCE authority, not the
+            // path a later stream sample happened to arrive by).
+            if (it->second.fromCensus) rq.fromCensus = true;
             if (rq.deniedMs != 0) {
                 if ((now - rq.deniedMs) < DENIED_RETRY_MS) continue;
                 rq.deniedMs = 0; rq.sends = 0; // cooldown over: ask again
             }
+            // Recent "too far" reply: the hand exists host-side but outside
+            // the mint radius - re-ask on the FAR_RETRY_MS cadence only.
+            if (rq.farMs != 0 && (now - rq.farMs) < FAR_RETRY_MS) continue;
             if (rq.sends >= REQ_MAX_SENDS) continue;
             if (rq.lastSendMs != 0 && (now - rq.lastSendMs) < REQ_DEBOUNCE_MS) continue;
-            bool nearSquad = false;
-            for (unsigned int i = 0; i < nSquad && !nearSquad; ++i) {
-                nearSquad = dist3(it->second.x, it->second.y, it->second.z,
-                                  squad[i].x, squad[i].y, squad[i].z) <= SPAWN_REQ_RADIUS;
+            // Streamed unresolved hands keep the legacy send-side proximity
+            // gate. Census-missing hands have NO position (the census is a
+            // bare hand list) - for them the reply-side mint gate is the
+            // duplicate guard.
+            if (!it->second.fromCensus) {
+                bool nearSquad = false;
+                for (unsigned int i = 0; i < nSquad && !nearSquad; ++i) {
+                    nearSquad = dist3(it->second.x, it->second.y, it->second.z,
+                                      squad[i].x, squad[i].y, squad[i].z) <= SPAWN_REQ_RADIUS;
+                }
+                if (!nearSquad) continue;
             }
-            if (!nearSquad) continue;
             SpawnReqPacket pkt;
             memset(&pkt, 0, sizeof(pkt));
             pkt.type    = (u8)PKT_SPAWN_REQ;
@@ -2728,10 +3208,10 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
     // REARRANGES or ADDS (entry count >= last sent) settles fast. A change that REMOVES an
     // entry settles much longer: mid-drag the UI holds the dragged item on the CURSOR, out
     // of the inventory entirely, for up to ~1 s - a transient "item gone" the peer would act
-    // on by DESTROYING a worn item it cannot refabricate (createItemAndAdd is unreliable for
-    // weapons; equipped fabrication is non-persistent, d25), losing it for good. Equip and
-    // unequip-to-bag keep the entry count (a MOVE), so they still replicate promptly; only
-    // genuine removals (and the in-cursor flicker) wait out the longer window.
+    // on by DESTROYING a worn item. Weapons DO refabricate now (spike 451 recipe), but a
+    // destroy+refabricate round-trip still loses identity/quality and churns, so the long
+    // window stays. Equip and unequip-to-bag keep the entry count (a MOVE), so they still
+    // replicate promptly; only genuine removals (and the in-cursor flicker) wait it out.
     const unsigned long INV_SETTLE_MS        = 350;
     const unsigned long INV_REMOVE_SETTLE_MS = 1800;
     InvItemEntry items[INV_ITEMS_MAX];
@@ -3566,13 +4046,20 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, u32 localId) {
         int moved = engine::moveItemBetweenContainers(gw, sHand, dHand, p.stringID,
                                                       p.itemType, (int)p.quantity);
         int fab = 0;
-        if (moved < (int)p.quantity && !isGearType(p.itemType)) {
-            // Our src copy is short (desync) - non-gear can be fabricated into dst so
-            // the trade still lands. Gear never fabricates (the sender's latch + the
-            // authoritative snapshots repair the miss instead).
-            fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
-                                                   (int)p.quantity - moved, (int)p.quality,
-                                                   p.manufacturer, p.material);
+        if (moved < (int)p.quantity) {
+            // Our src copy is short (desync) - fabricate the shortfall into dst so the
+            // trade still lands. Non-gear always did this; gear joined once spike 451
+            // made weapon fabrication work (armour always could). Dupe safety: the
+            // latch below keeps stale snapshots from reconciling the fab away, and
+            // wdSuppress_ keeps the W2 weapon census from reading the count edge as a
+            // ground pickup. KENSHICOOP_WEAPON_FAB=0 restores gear-never-fabricates
+            // (weapons also die inside createItemAndAdd on the same env).
+            static int gearFab = -1;
+            if (gearFab < 0) { const char* e = getenv("KENSHICOOP_WEAPON_FAB"); gearFab = (e && e[0] == '0') ? 0 : 1; }
+            if (!isGearType(p.itemType) || gearFab)
+                fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
+                                                       (int)p.quantity - moved, (int)p.quality,
+                                                       p.manufacturer, p.material);
         }
         XKey key(std::string(p.stringID), p.itemType);
         // Latch OUR peer end(s) too: an in-flight stale snapshot (captured by its
@@ -3858,12 +4345,35 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
             suppressed_.erase(sit);
         }
         proxyByKey_[newK] = c;
+        lifeSet(newK, LIFE_RESOLVED, "rekey");
     }
+    life_.erase(oldK); // the old hand's journey ends with the re-key
     char rb[224]; _snprintf(rb, sizeof(rb) - 1,
         "[%s] REKEY old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u ok=%d repaired=%d culled=%d",
         tag, oldK.t, oldK.c, oldK.cs, oldK.i, oldK.s,
         newK.t, newK.c, newK.cs, newK.i, newK.s, c ? 1 : 0, repaired, culled);
     rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+}
+
+void Replicator::logHardSnap(Character* c, const EntityState& out, const char* kind,
+                             float gap, float srcVel, float gate, bool hadDest) {
+    // Throttle to ~4 lines/s so a snap storm (the thing under investigation)
+    // stays legible; skipped lines are accounted for in the next one.
+    static unsigned long tick = 0;      // main-thread only
+    static unsigned long skipped = 0;
+    unsigned long now = nowMs();
+    if (tick != 0 && (now - tick) < 250) { ++skipped; return; }
+    tick = now;
+    char nm[48];
+    engine::charName(c, nm, sizeof(nm));
+    char b[240];
+    _snprintf(b, sizeof(b) - 1,
+              "[snap] %s hand=%u,%u name='%s' gap=%.1f gate=%.1f srcVel=%.1f "
+              "cSpeed=%.1f mult=%.2f slew=%.2f dest=%d skipped=%lu",
+              kind, out.hIndex, out.hSerial, nm, gap, gate, srcVel, out.cSpeed,
+              speedLastSet_, timeSlew_, hadDest ? 1 : 0, skipped);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    skipped = 0;
 }
 
 void Replicator::applyTargets(GameWorld* gw) {
@@ -3884,6 +4394,14 @@ void Replicator::applyTargets(GameWorld* gw) {
     // re-containers world NPCs) so it never hides a body we are driving.
     drivenChars_.clear();
     starveHeldNow_ = 0; // per-tick starved-hold census (stat line)
+    // Own-squad positions, for scoping the smoothness/march oracles to the
+    // historical near-bubble population (Phase 2). The mid tier drives bodies
+    // far outside it, where Kenshi throttles offscreen character updates -
+    // their stepwise rendering is an engine LOD fact, not an interp fault,
+    // and it buried the gates' real signal (run 111445: one boundary walker
+    // charged 341 zero-frames of 365 active).
+    static EntityState oracleSquad[16]; // main-thread only
+    unsigned int oracleSquadN = engine::captureSquad(gw, false, oracleSquad, 16);
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
         // Never drive a body WE own: we control + stream it locally, the peer drives
         // its copy from our stream. The disjoint partition + no local loopback means
@@ -3980,6 +4498,8 @@ void Replicator::applyTargets(GameWorld* gw) {
             continue;
         }
         drivenChars_.insert(c);
+        drivenSeen_[c] = now; // recently-driven grace for the authority passes
+        debugMark(c, 0, "DRV");
 
         // Every driven body is damage-guarded (locally-simulated hits must not
         // mutate the local-only medical model; outcomes arrive as host events).
@@ -4494,8 +5014,131 @@ void Replicator::applyTargets(GameWorld* gw) {
         // this - not the cMoving flag (which a fidget/turn sets in place) - decides
         // walk-vs-rest, and the smoothness oracle uses the same notion of "active"
         // so a correctly-held (parked) body is not counted as missed movement.
+        //
+        // Walk/rest DEBOUNCE (2026-07-11 choppiness fix): the instantaneous
+        // 2-sample velocity dips below NPC_MOVE_VEL at every sample-pair
+        // boundary of a walking source, so the raw classifier FLAPPED
+        // walk->rest->walk several times a second - each rest entry parks/
+        // halts the body, each walk re-entry restarts the path = the observed
+        // stutter. Hold the walking verdict for a fixed TIME after the last
+        // genuinely-moving sample instead: a walking source's dips are always
+        // shorter than the hold, a genuine stop enters rest ~1 s later.
+        // (A velPeak-based debounce was tried first and reverted same-day:
+        // the peak is magnitude-sensitive, so one teleport-artifact velocity
+        // spike in the stream - srcVel 90-150 u/s on a seg snap - held a
+        // genuinely SEATED divergent NPC in the walk branch for ~7 s per
+        // spike, hard-snapping every frame; spawn_far run 124346.)
+        const unsigned long NPC_MOVE_HOLD_MS = 1000;
+        // Phase 2 mid-band tier: the per-entity stream cadence. Near-tier
+        // bodies see ~50 ms segments; a round-robin mid-tier body sees the
+        // rotation period (~500 ms +, growing with the mid population). The
+        // walk-hold and the lead point both scale with it, so a sparsely
+        // sampled walker neither flips to rest between samples nor reaches
+        // its lead point and idles waiting for the next one. Cadence = the
+        // LARGER of the newest segment and the smoothed inter-arrival EMA:
+        // the newest segment alone reads ~50 ms whenever the 1 Hz census
+        // rebuild reshuffles the rotation and a hand lands two slices in a
+        // row (run 105155: mid bodies misclassified as near-tier, dragging
+        // their sparse-stream rendering into the near gates).
+        unsigned long segMs = d.interp.lastSegMs();
+        {
+            unsigned long avgMs = (unsigned long)d.interp.avgInterval();
+            if (avgMs > segMs) segMs = avgMs;
+        }
+        unsigned long moveHold = NPC_MOVE_HOLD_MS;
+        if (segMs * 5 > moveHold) moveHold = segMs * 5; // survive sample droughts
+        if (moveHold > 5000) moveHold = 5000;
         float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
-        bool npcMoving = haveNewest && (vlen > NPC_MOVE_VEL);
+        if (vlen > d.velPeak) d.velPeak = vlen;
+        else                  d.velPeak *= 0.99f; // ~1 s half-life at 75 fps
+        if (haveNewest && vlen > NPC_MOVE_VEL) d.moveSeenMs = now;
+        bool npcMoving = haveNewest && d.moveSeenMs != 0 &&
+                         (now - d.moveSeenMs) <= moveHold;
+        // Mid-tier body = sparse stream cadence (the round-robin period).
+        // Its drive shares the near-tier code below, but its counters/oracles
+        // are tracked apart: the near-tier gates guard the validated 20 Hz
+        // pipeline, the mid tier is judged by the anti-zombie oracle.
+        bool midTier = !isSquad && segMs > 250;
+        if (midTier) d.midSeenMs = now;
+        if (!isSquad) {
+            if (d.wasMoving && !npcMoving) {
+                if (midTier) ++restFlipMid_;
+                else         ++restFlipNpc_;
+            }
+            d.wasMoving = npcMoving;
+        }
+
+        // Velocity-aware hard-snap gate (2026-07-11 rubber-banding fix). The
+        // walk-drive's natural trailing distance behind 'newest' scales with the
+        // source's WALL-CLOCK speed (render delay + batch cadence are time, not
+        // distance): a sprinter at ~50 u/s trails ~8-9 u in steady state, which
+        // sat exactly on the old fixed 8 u gate ([snap] measured gap=8.6 with
+        // srcVel~50 repeatedly), and any game-speed multiplier scales measured
+        // velocity the same way (5x turned the gate into a per-sample teleport).
+        // Gate on TIME behind the source instead - snap only when the body
+        // trails by more than snapSeconds_ of travel. Two hardenings from the
+        // fast_march validation run:
+        //   * the velocity estimate is a slow-decaying PEAK (~1 s half-life),
+        //     not the instantaneous sample - a source stopping at a leg end
+        //     deflated the gate to the floor while the body was still tens of
+        //     units out, turning every stop into a teleport;
+        //   * the distance floor scales with the consensus game speed - at 5x
+        //     every trailing distance is 5x in world units for the same time
+        //     lag, and burst onsets outrun the engine's real max locomotion
+        //     speed for a moment regardless of the commanded catch-up.
+        // (velPeak itself is updated above, where the walk/rest debounce
+        // shares it.)
+        float multEff = (speedLastSet_ > 1.0f) ? speedLastSet_ : 1.0f;
+        float snapGate = snapDist_ * multEff;
+        // The trailing allowance grows with the stream cadence (Phase 2
+        // mid-band tier): against ~500 ms+ samples the body legitimately
+        // trails newest by a full segment of source travel (the lead point
+        // it walks toward was computed a segment ago), so the near-tier
+        // allowance hard-snapped mid walkers chronically (run 103044: 4,259
+        // teleports in 30 s, 'Dust Boss' at gap 20-40 u vs gate 18-25 all
+        // run).
+        float gateSec = snapSeconds_ + (float)segMs / 1000.0f;
+        if (gateSec > 2.5f) gateSec = 2.5f;
+        if (d.velPeak * gateSec > snapGate) snapGate = d.velPeak * gateSec;
+
+        // Mid-tier bodies are only DRIVEN while the host copy genuinely moves
+        // (Phase 2): a stationary far NPC goes back to its own local AI and
+        // the census-park divergence fallback - the pre-mid-tier regime.
+        // Driving all ~36 census-band bodies at once starved Kenshi's own
+        // character-update budget and the whole town rendered stepwise
+        // (run 112835: near-tier walkers at zeroFrac 0.63 vs the 0.33
+        // baseline; snap storms at every host stop because the drive
+        // trailed farther). Movers stay driven - the anti-zombie fix - and
+        // the release also skips the AI suspend below, so the local AI can
+        // idle the body naturally between host movements.
+            if (!isSquad && midTier && !npcMoving) {
+                drivenChars_.erase(c);
+                drivenSeen_.erase(c); // wide pass may census-park it again
+                d.parked = false; d.haveDest = false;
+                d.taskApplied = false; d.issuedTask = TASK_NONE;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                lifeSet(it->first, LIFE_PARKED, "mid-rest");
+                debugMark(c, 2, lifeName(LIFE_PARKED));
+                continue;
+            }
+
+        // Lifecycle: a body that stays driven past the release checks lives
+        // in the HI (20 Hz) or MID (round-robin) tier by its stream cadence,
+        // with a 10 s hold toward MID so cadence jitter at the tier boundary
+        // doesn't flap the record (run 145113 baselined a 3 s hold: boundary
+        // bodies flapped HI<->MID ~100x/run - classification noise, not tier
+        // changes; and the pre-release placement double-logged every
+        // stationary mid body PARKED<->MID each tick). PCs classify HI
+        // permanently - their 20 Hz stream never opens a mid-sized segment
+        // (Phase 3: PCs and NPCs share this record, the drive below, and
+        // the classifier).
+        {
+            bool midish = midTier ||
+                          (d.midSeenMs != 0 && (now - d.midSeenMs) < 10000);
+            int st = (!isSquad && midish) ? LIFE_MID : LIFE_HI;
+            lifeSet(it->first, st, "drive");
+            debugMark(c, st == LIFE_MID ? 3 : 0, lifeName(st));
+        }
 
         // AI-suspend probe: for a host-driven world NPC, suspend its AI decision
         // layer (faction-safe) so it stops self-tasking but keeps animating. The
@@ -4510,105 +5153,144 @@ void Replicator::applyTargets(GameWorld* gw) {
         // the next time it stops we re-evaluate the host's (possibly new) task.
         bool genuinelyMoving = isSquad ? hostMoving : npcMoving;
         if (genuinelyMoving) {
+            // Seat-break (2026-07-11): a rest pose applyRest committed is a
+            // PLAYER-RANK order, and a seated body both ignores goal-level
+            // movement and re-places itself at the fixture - applyRaw
+            // teleports NO-OP on it (spawn_far run 124346: 'Bar Thug' hard-
+            // snapped every frame at constant gap=343 while locally still
+            // task=87). When the host copy starts moving, flush the order by
+            // issuing the walk through the player move-order path once.
+            if (!isSquad && haveNewest &&
+                (d.taskApplied || d.issuedTask != TASK_NONE)) {
+                float spd = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
+                engine::walkTo(c, newest.x, newest.y, newest.z, spd);
+                d.haveDest = true; d.dx = newest.x; d.dy = newest.y; d.dz = newest.z;
+                char b[112]; _snprintf(b, sizeof(b) - 1,
+                    "[interp] seat-break hand=%u,%u task=%u",
+                    out.hIndex, out.hSerial, (unsigned)d.issuedTask);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
             d.taskApplied = false; d.taskBad = false; d.issuedTask = TASK_NONE;
             d.goalsCleared = false; // next rest episode gets one fresh goal-clear
         }
 
-        if (!isSquad) {
-            // ---- NPC: velocity-gated drive (smooth walk OR quieted rest) -------
-            // An NPC is fully AI-simulated locally, so we classify by the host's
-            // actual VELOCITY (not the cMoving flag, which a fidget/turn sets while
-            // the body stays put):
-            //   * GENUINELY translating -> throttled lead-point walk-drive with NO
-            //     clearGoals. The HIGH_PRIORITY move-order already overrides the
-            //     AI's movement, and clearGoals would CANCEL our destination (the
-            //     engine drops the path), forcing per-frame re-issue => path-restart
-            //     stutter. So we leave the AI's goals alone and let the body walk.
-            //   * NEAR-STATIONARY -> the AI wants to wander off, so clearGoals to
-            //     quiet it, then park at the host transform (held position). This is
-            //     where the fidget-in-place drift came from.
-            // removeFromUpdateList is NOT used: it freezes the movement controller
-            // (walk + teleport both no-op). Real sit/idle poses come in Stage 5.
-            if (npcMoving && haveActual && gapNewest > snapDist_) {
-                engine::applyRaw(c, newest);
-                ++hardSnapNpc_;
-                d.parked = false; d.haveDest = false;
-            } else if (npcMoving) {
-                float tx = newest.x, ty = newest.y, tz = newest.z;
-                float lead = vlen * LEAD_SECONDS;
-                tx += vx / vlen * lead; ty += vy / vlen * lead; tz += vz / vlen * lead;
-                float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
-                                         : (REISSUE_DIST + 1.0f);
-                if (moved > REISSUE_DIST) {
-                    float spd = out.cSpeed + gapNewest * catchupK_;
-                    float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
-                    float cap = base * 2.5f;
-                    if (spd > cap) spd = cap;
-                    engine::walkTo(c, tx, ty, tz, spd);
-                    ++walkReissueNpc_;
-                    d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
-                }
-                d.parked = false;
-            } else {
-                // At rest, task-authoritative: reproduce the host's sit/idle pose at
-                // the same fixture, else quiet + park.
-                //
-                // The earlier AI-suspend-only path just snapped position and trusted
-                // a "currently-held" pose - but bar patrons sit DYNAMICALLY (they
-                // walk in and SIT_AROUND a stool), so at the moment we suspend them
-                // they are still standing and freeze there. The host streams task 87
-                // (SIT_AROUND, reproducible, subject resolves), so we must actively
-                // INJECT the seat via applyRest->applyTask. AI-suspend (set above for
-                // this NPC) is what stops the local AI from standing it back up - the
-                // thrash that broke this on the non-suspend path.
-                applyRest(c, d, out, haveActual, ax, ay, az, now, /*isSquad*/false);
-                d.haveDest = false;
-            }
-        } else if (hostMoving && haveActual && haveNewest && gapNewest > snapDist_) {
-            // Fell behind / source warped: hard-snap to the true position (no-halt
-            // teleport keeps the clip phase advancing rather than freezing).
+        // ---- Unified drive (Phase 3): one walk/rest/snap path for PCs and
+        // NPCs. The kinds differ by POLICY, not code:
+        //   * moving CLASSIFIER - a PC body is inert when uncontrolled, so
+        //     the host's cMoving flag is trustworthy; an NPC's flag flaps on
+        //     fidgets/turns, so NPCs classify by debounced stream VELOCITY
+        //     (npcMoving, the walk-hold above). Both feed the same tree.
+        //   * SNAP permission - PCs keep the validated instant absolute gate
+        //     (the other player's characters are the user-facing rubber
+        //     banding; falling behind must reconcile immediately). NPCs are
+        //     divergence-gated at 3x the velocity-scaled gate (run 115656:
+        //     a max-speed chase holds a STABLE trailing gap catch-up can
+        //     never close - re-snapping it every few hundred ms was the
+        //     storm; a stable trail is faithful-if-late rendering, and every
+        //     genuine warp measured >= 3x anyway), with the mid-tier
+        //     cooldown on top (far teleports routinely fail to stick - seat
+        //     anchors, unloaded terrain - and must not re-fire per frame).
+        //   * at REST - both kinds reproduce the host's pose via applyRest
+        //     (per-kind inside: squad members are never town-AI-detached).
+        // Walk mechanics are IDENTICAL: lead-point walk along the source
+        // velocity (cadence-adaptive - at 20 Hz the fixed 0.6 s lead PCs
+        // were validated with; stretched to 1.5 stream segments against
+        // sparse mid-tier samples so the body never idles between them),
+        // gap-proportional catch-up speed capped at 2.5x, re-issued only
+        // when the lead point moves (per-frame re-issue = path-restart
+        // stutter). No clearGoals while walking: the HIGH_PRIORITY move
+        // order already overrides AI movement, and clearGoals would CANCEL
+        // our destination. removeFromUpdateList is never used: it freezes
+        // the movement controller (walk + teleport both no-op).
+        bool snapOk;
+        if (isSquad) {
+            snapOk = haveNewest;
+        } else {
+            // (A grow-vs-own-EMA ratio trigger was tried for the divergence
+            // gate first and kept firing on melee-lunge jitter - srcVel 0,
+            // gap hopping 30% within a couple frames, 10-14 snaps/min in
+            // npc_sync run 123101. Marginal trailing under the 3x bound
+            // converges through the catch-up walk; a stopped source heals
+            // through the rest-path park.)
+            snapOk = gapNewest > snapGate * 3.0f &&
+                     (!midTier || (now - d.npcSnapTick) >= NPC_SNAP_COOL_MS);
+        }
+        if (genuinelyMoving && haveActual && gapNewest > snapGate && snapOk) {
+            // Fell behind / source warped: hard-snap to the true position
+            // (no-halt teleport keeps the clip phase advancing).
             engine::applyRaw(c, newest);
-            ++hardSnapSquad_;
-            d.parked = false;
-            d.haveDest = false;
-        } else if (hostMoving) {
-            // Engine-WALK toward a LEAD point ahead of the body - the fix for the
-            // teleport-slide "float". Aiming at the (render-delayed) interp target
-            // makes the char reach it instantly and stop, then wait for the target
-            // to creep forward => stop-start stutter. Instead aim at the newest
-            // received position projected along the source's velocity, so the char
-            // always has somewhere to walk and keeps a continuous gait; catch-up
-            // speed converges it, and when the source halts the lead collapses so it
-            // settles exactly. Re-issued only when the lead point moves enough (the
-            // player move-order recomputes the path, so per-frame re-issue stutters).
+            if (isSquad) {
+                ++hardSnapSquad_;
+                logHardSnap(c, out, "squad", gapNewest, vlen, snapGate, d.haveDest);
+            } else {
+                // Accounting: a snap on a YOUNG ring (< 16 samples, ~0.8 s of
+                // 20 Hz coverage) is the one-time divergence reconciliation
+                // of a newly / re-acquired body (Phase 2 replaces the census
+                // park with it) - classed with the mid counter so the
+                // snap-rate gate keeps measuring steady-state tracking only.
+                // A recent mid->near handoff (raid entering the 20 Hz
+                // bubble) is the same reconciliation debt: divergence
+                // accrued under sparse mid coverage, paid with one snap
+                // right after the cadence flips near (run 123101: 'Fuu' gap
+                // 407 on a 20 Hz-classed ring whose history was mid-band).
+                // The clock-slew catch-up window is the same class again:
+                // while timeSlew_ != 1 the join sim runs at a different
+                // wall-clock rate than the host stream, so every divergent
+                // copy legitimately needs reconciliation teleports - the
+                // smoothness oracle already excludes those frames for the
+                // same reason (run 150302: coop_presence spent its whole 25 s
+                // at slew=2.00 and 4 session-start catch-up snaps tripped
+                // the steady-state npc gate).
+                bool slewing = timeSlew_ < 0.99f || timeSlew_ > 1.01f;
+                bool coverage = d.interp.samples() < 16 ||
+                                (d.midSeenMs != 0 && (now - d.midSeenMs) < 5000) ||
+                                slewing;
+                if (midTier || coverage) ++hardSnapMid_;
+                else                     ++hardSnapNpc_;
+                d.npcSnapTick = now;
+                logHardSnap(c, out,
+                            midTier ? "mid" : (coverage ? "cover" : "npc"),
+                            gapNewest, vlen, snapGate, d.haveDest);
+            }
+            d.parked = false; d.haveDest = false;
+        } else if (genuinelyMoving) {
             float tx = newest.x, ty = newest.y, tz = newest.z;
-            float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
+            // Lead only while the instantaneous velocity is meaningful: the
+            // debounced classifier keeps the walk verdict through mid-walk
+            // velocity dips (vlen ~ 0), where a lead projection would
+            // divide by zero - aim at the newest position instead.
             if (vlen > 0.01f) {
-                float lead = vlen * LEAD_SECONDS;
-                tx += vx / vlen * lead;
-                ty += vy / vlen * lead;
-                tz += vz / vlen * lead;
+                float leadSec = LEAD_SECONDS;
+                float segSec  = (float)segMs / 1000.0f * 1.5f;
+                if (segSec > leadSec) leadSec = segSec;
+                if (leadSec > 3.0f)   leadSec = 3.0f;
+                float lead = vlen * leadSec;
+                tx += vx / vlen * lead; ty += vy / vlen * lead; tz += vz / vlen * lead;
             }
             float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
                                      : (REISSUE_DIST + 1.0f);
             if (moved > REISSUE_DIST) {
-                float spd = out.cSpeed;
-                spd += gapNewest * catchupK_;
+                float spd = out.cSpeed + gapNewest * catchupK_;
                 float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
                 float cap = base * 2.5f;
                 if (spd > cap) spd = cap;
                 engine::walkTo(c, tx, ty, tz, spd);
-                ++walkReissueSquad_;
+                if (isSquad) ++walkReissueSquad_;
+                else         ++walkReissueNpc_;
                 d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
             }
             d.parked = false;
             // No motion mirror while genuinely moving: the engine selects the
             // grounded walk clip itself from the locomotion it is performing.
         } else {
-            // Squad member at rest: reproduce the host's pose (e.g. seated on the
-            // same chair) at the same fixture, else quiet + park (Stage 5). This is
-            // what makes a join squad-mate sit instead of standing on the chair.
-            applyRest(c, d, out, haveActual, ax, ay, az, now, /*isSquad*/true);
+            // At rest, task-authoritative: reproduce the host's sit/idle pose
+            // at the same fixture, else quiet + park. Bar patrons sit
+            // DYNAMICALLY (walk in and SIT_AROUND a stool), so the seat must
+            // be actively INJECTED via applyRest->applyTask; AI-suspend is
+            // what stops the local AI from standing an NPC back up. For a
+            // squad member this is what makes a join squad-mate sit on the
+            // same chair instead of standing on it.
+            applyRest(c, d, out, haveActual, ax, ay, az, now, isSquad);
             d.haveDest = false;
         }
 
@@ -4617,7 +5299,34 @@ void Replicator::applyTargets(GameWorld* gw) {
         // walk-vs-rest decision (velocity-gated for NPCs, flag-based for the squad
         // leader as validated in Stage 3), so a correctly-parked body at a host
         // fidget is not scored as a smoothness miss.
-        bool oracleActive = isSquad ? hostMoving : npcMoving;
+        // NPCs are judged by the INSTANTANEOUS stream velocity, not the
+        // debounced npcMoving: the 1 s walk-hold keeps the drive in the walk
+        // branch through source stops, and scoring that trailing second as
+        // "active" charges ~75 legitimate at-rest frames per stop to
+        // zeroFrac (leader_move zeroFrac 0.66-0.77 vs the 0.3 baseline).
+        // Mid-tier / far bodies are excluded from the smoothness/anim/march
+        // scoring entirely (Phase 2): their sparse cadence renders differently
+        // by design (long-lead walks, occasional reconciliation snaps), Kenshi
+        // itself throttles far/offscreen character updates into stepwise
+        // motion (an engine LOD fact, not an interp fault), and the gates
+        // were tuned for - and must keep guarding - the CLOSE 20 Hz pipeline.
+        // Scope by DISTANCE to the own squad (the historical judged
+        // population), not just cadence: a boundary walker flaps between
+        // cadences faster than the estimate settles (run 111445). The
+        // anti-zombie oracle owns mid-tier quality.
+        bool oracleNear = !midTier;
+        if (oracleNear && !isSquad && haveActual && oracleSquadN > 0) {
+            float best = -1.0f;
+            for (unsigned int oi = 0; oi < oracleSquadN; ++oi) {
+                float dd = dist3(ax, ay, az, oracleSquad[oi].x,
+                                 oracleSquad[oi].y, oracleSquad[oi].z);
+                if (best < 0.0f || dd < best) best = dd;
+            }
+            if (best > 200.0f) oracleNear = false;
+        }
+        bool oracleActive = oracleNear &&
+                            (isSquad ? hostMoving
+                                     : (haveNewest && vlen > NPC_MOVE_VEL));
         if (oracleActive && haveActual && d.haveActual) {
             float step = dist3(ax, ay, az, d.lx, d.ly, d.lz);
             // Smoothness is only scored at steady sim speed. During the
@@ -4631,7 +5340,8 @@ void Replicator::applyTargets(GameWorld* gw) {
             // so the summary shows how much of the run was excluded.
             if (timeSlew_ > 0.99f && timeSlew_ < 1.01f) {
                 ++activeFrames_;
-                if (step < 0.01f) ++zeroWhileActive_;
+                ++d.activeF;
+                if (step < 0.01f) { ++zeroWhileActive_; ++d.zeroF; }
                 if (step > maxStep_) maxStep_ = step;
             } else {
                 ++slewSkipFrames_;
@@ -4645,7 +5355,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (engine::readMotion(c, &m, &sp) && m && sp > 0.1f)
                     ++walkTruthFrames_;
             }
-        } else if (!oracleActive && haveActual && d.haveActual) {
+        } else if (oracleNear && !oracleActive && haveActual && d.haveActual) {
             // Host is AT REST. Is the driven body marching in place? (walk clip
             // playing while the body does not translate). This is the bug the
             // float oracle is blind to.
@@ -4656,6 +5366,14 @@ void Replicator::applyTargets(GameWorld* gw) {
                 ++marchFrames_;
         }
         if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+    }
+    // Prune the recently-driven grace map on a horizon well past the grace
+    // window (pointers to despawned bodies must not accumulate; they are
+    // never dereferenced, only compared, but the map should stay small).
+    for (std::map<Character*, unsigned long>::iterator ds = drivenSeen_.begin();
+         ds != drivenSeen_.end(); ) {
+        if ((now - ds->second) > 30000) drivenSeen_.erase(ds++);
+        else ++ds;
     }
     if (aiSuspend_ && (now - aiLogTick_) > 3000) {
         aiLogTick_ = now;
@@ -4680,16 +5398,34 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (it->second.interp.jitter() > maxJit)
                 maxJit = it->second.interp.jitter();
         }
-        char b[240];
+        char b[288];
         _snprintf(b, sizeof(b) - 1,
             "[interp] lerp=%lu extrap=%lu clamp=%lu seg=%lu single=%lu "
-            "snapSq=%lu snapNpc=%lu reissueSq=%lu reissueNpc=%lu "
-            "delay=%lu jit=%.1f starve=%u",
+            "snapSq=%lu snapNpc=%lu reissueSq=%lu reissueNpc=%lu restFlip=%lu "
+            "delay=%lu jit=%.1f starve=%u snapMid=%lu restFlipMid=%lu",
             interpLerp_, interpExtrap_, interpClampOld_, interpSegSnap_,
             interpSingle_, hardSnapSquad_, hardSnapNpc_,
-            walkReissueSquad_, walkReissueNpc_, maxDelay, maxJit,
-            starveHeldNow_);
+            walkReissueSquad_, walkReissueNpc_, restFlipNpc_, maxDelay, maxJit,
+            starveHeldNow_, hardSnapMid_, restFlipMid_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // Worst zero-step contributor (Phase 2 smoothness diagnosis): name the
+        // hand charging the most frozen-while-active frames to the oracle.
+        {
+            const Driven* worst = 0; const Key* wk = 0;
+            for (std::map<Key, Driven>::iterator it = targets_.begin();
+                 it != targets_.end(); ++it) {
+                if (!worst || it->second.zeroF > worst->zeroF) {
+                    worst = &it->second; wk = &it->first;
+                }
+            }
+            if (worst && worst->zeroF > 0) {
+                char z[144]; _snprintf(z, sizeof(z) - 1,
+                    "[interp] worstZero hand=%u,%u zero=%lu active=%lu seg=%lu",
+                    wk->i, wk->s, worst->zeroF, worst->activeF,
+                    worst->interp.lastSegMs());
+                z[sizeof(z) - 1] = '\0'; coop::logLine(z);
+            }
+        }
     }
     if (gateAuthority_ && (now - trustLogTick_) > 3000) {
         trustLogTick_ = now;
@@ -4777,23 +5513,139 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // (inside the join's scan, outside the host's) would be false-culled.
     unsigned int n = engine::listNpcsWide(gw, censusRadius_ * 1.25f, chars, states,
                                           NPC_CENSUS_MAX);
-    static u32 hands[NPC_CENSUS_MAX * 5];
+    static u32   hands[NPC_CENSUS_MAX * 5];
+    static float poss[NPC_CENSUS_MAX * 3];
     for (unsigned int i = 0; i < n; ++i) {
         hands[i * 5 + 0] = states[i].hType;
         hands[i * 5 + 1] = states[i].hContainer;
         hands[i * 5 + 2] = states[i].hContainerSerial;
         hands[i * 5 + 3] = states[i].hIndex;
         hands[i * 5 + 4] = states[i].hSerial;
+        poss[i * 3 + 0]  = states[i].x;
+        poss[i * 3 + 1]  = states[i].y;
+        poss[i * 3 + 2]  = states[i].z;
     }
-    net.queueNpcCensus(ownerId, hands, n);
+    net.queueNpcCensus(ownerId, hands, poss, n);
+
+    // Phase 2 mid-band tier: rebuild the round-robin list from this census
+    // walk. Everything beyond the stream bubble's KEEP band belongs to the
+    // mid tier; nearest-first so a MAX_PUBLISH squeeze drops the farthest.
+    // Distance is to the closest own-squad member (the interest centers are
+    // squad-tab leaders; members trail them by meters - close enough for a
+    // priority ordering).
+    {
+        const float MID_NEAR_EDGE = 260.0f; // captureNpcs' NPC_CAPTURE_KEEP
+        const unsigned int MAX_SQUAD = 32;
+        static EntityState squad[MAX_SQUAD]; // main-thread only
+        unsigned int nSquad = engine::captureSquad(gw, false, squad, MAX_SQUAD);
+        midBand_.clear();
+        for (unsigned int i = 0; i < n; ++i) {
+            float best = -1.0f;
+            for (unsigned int s = 0; s < nSquad; ++s) {
+                float d = dist3(states[i].x, states[i].y, states[i].z,
+                                squad[s].x, squad[s].y, squad[s].z);
+                if (best < 0.0f || d < best) best = d;
+            }
+            if (best < 0.0f || best <= MID_NEAR_EDGE) continue; // near tier
+            MidBandEntry e;
+            e.k.t  = states[i].hType;
+            e.k.c  = states[i].hContainer;
+            e.k.cs = states[i].hContainerSerial;
+            e.k.i  = states[i].hIndex;
+            e.k.s  = states[i].hSerial;
+            e.dist = best;
+            midBand_.push_back(e);
+        }
+        std::sort(midBand_.begin(), midBand_.end());
+        // Nearest-first BUDGET: driving every census NPC measurably slowed
+        // the join's sim (run 111445: slewSkip 7949 vs baseline ~1-2.6k, and
+        // the sim-tick/render-frame ratio degraded enough to fail the
+        // smoothness gate on bodies that WERE tracking). The nearest ~48
+        // cover everything the join player can meaningfully watch; the far
+        // remainder keeps the census-park fallback it always had.
+        const unsigned int MID_BAND_MAX = 48;
+        if (midBand_.size() > MID_BAND_MAX) midBand_.resize(MID_BAND_MAX);
+        if (midCursor_ >= midBand_.size()) midCursor_ = 0;
+    }
+
+    // travel_parity worldstate rows (host side): dump every census NPC on a
+    // 5 s cadence so Test-TravelParity can cross-compare the two worlds'
+    // populations. cls=host marks the row as the host's authoritative view.
+    if (auditRows_) {
+        static unsigned long rowsMs = 0; // main-thread only
+        if (rowsMs == 0 || (now - rowsMs) >= 5000) {
+            rowsMs = now;
+            char w[64];
+            _snprintf(w, sizeof(w) - 1, "SCENARIO WORLD n=%u cls=host", n);
+            w[sizeof(w) - 1] = '\0'; coop::logLine(w);
+            for (unsigned int i = 0; i < n; ++i) {
+                char nm[40];
+                engine::charName(chars[i], nm, sizeof(nm));
+                char r[224];
+                _snprintf(r, sizeof(r) - 1,
+                          "SCENARIO WNPC hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f "
+                          "cls=host name='%s'",
+                          states[i].hIndex, states[i].hSerial, states[i].hType,
+                          states[i].hContainer, states[i].hContainerSerial,
+                          states[i].x, states[i].y, states[i].z, nm);
+                r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+            }
+        }
+    }
     // ~10 s cadence log so free-play sessions show the census breathing
     // without 1 Hz spam.
     static unsigned long logTick = 0;
     if ((now - logTick) > 10000) {
         logTick = now;
         char b[96];
-        _snprintf(b, sizeof(b) - 1, "[census] sent n=%u radius=%.0f", n, censusRadius_);
+        _snprintf(b, sizeof(b) - 1, "[census] sent n=%u radius=%.0f mid=%u",
+                  n, censusRadius_, (unsigned)midBand_.size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the
+        // same 10 s cadence, so a join-side cull can be classified against the
+        // host's actual membership (true ghost vs host enumeration miss).
+        static int dump = -1;
+        if (dump < 0) {
+            const char* e = getenv("KENSHICOOP_DEBUG_CENSUS");
+            dump = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (dump == 1) {
+            for (unsigned int i = 0; i < n; ++i) {
+                char nm[48];
+                engine::charName(chars[i], nm, sizeof(nm));
+                char r[160];
+                _snprintf(r, sizeof(r) - 1,
+                          "[census] row %u hand=%u,%u pos=%.0f,%.0f,%.0f name='%s'",
+                          i, states[i].hIndex, states[i].hSerial,
+                          states[i].x, states[i].y, states[i].z, nm);
+                r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+            }
+        }
+    }
+}
+
+void Replicator::debugMark(Character* c, int colorId, const char* tag) {
+    static int en = -1;
+    if (en < 0) {
+        const char* e = getenv("KENSHICOOP_DEBUG_MARKERS");
+        en = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (en != 1 || !c) return;
+    std::map<Character*, DebugMarker>::iterator it = debugMarkers_.find(c);
+    if (it != debugMarkers_.end() && it->second.color == colorId) return;
+    char nm[40];
+    engine::charName(c, nm, sizeof(nm));
+    char cap[64];
+    _snprintf(cap, sizeof(cap) - 1, "%s %s", tag, nm);
+    cap[sizeof(cap) - 1] = '\0';
+    if (it == debugMarkers_.end()) {
+        void* l = engine::markerCreate(c, cap, colorId);
+        if (l) {
+            DebugMarker m; m.label = l; m.color = colorId;
+            debugMarkers_[c] = m;
+        }
+    } else if (engine::markerUpdate(it->second.label, cap, colorId)) {
+        it->second.color = colorId;
     }
 }
 
@@ -4804,7 +5656,9 @@ void Replicator::applyNpcCensus(Inbound& in) {
     // Latest wins (reliable-ordered channel, 1 Hz - normally one pending).
     const InboundNpcCensus& nc = got.back();
     censusHands_.clear();
+    censusPos_.clear();
     unsigned int n = (unsigned int)(nc.hands.size() / 5);
+    bool havePos = nc.pos.size() >= (size_t)n * 3;
     for (unsigned int i = 0; i < n; ++i) {
         Key k;
         k.t  = nc.hands[i * 5 + 0];
@@ -4813,6 +5667,13 @@ void Replicator::applyNpcCensus(Inbound& in) {
         k.i  = nc.hands[i * 5 + 3];
         k.s  = nc.hands[i * 5 + 4];
         censusHands_.insert(k);
+        if (havePos) {
+            CensusPos cp;
+            cp.x = nc.pos[i * 3 + 0];
+            cp.y = nc.pos[i * 3 + 1];
+            cp.z = nc.pos[i * 3 + 2];
+            censusPos_[k] = cp;
+        }
     }
     censusRecvMs_ = nowMs();
     static unsigned long logTick = 0;
@@ -4837,6 +5698,33 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     std::set<Key> keep;
     for (std::map<Key, Driven>::iterator it = targets_.begin(); it != targets_.end(); ++it) {
         if (it->second.fresh) keep.insert(it->first);
+    }
+
+    // Proxy bodies are EXEMPT from authority judgment (2026-07-11 census-mint
+    // fix): a proxy's LOCAL hand never matches its streamed key, so the wide
+    // pass saw every far-minted proxy as a census-absent ghost and froze it
+    // ~1 s after binding (spawn_far run 124346: all four proxies culled at
+    // their mint position, then the drive's teleports no-opped on the frozen
+    // bodies forever). Their existence authority is the census entry for the
+    // STREAM key that minted them; drive/starve policy is applyTargets'.
+    std::set<Character*> proxyChars;
+    for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
+         it != proxyByKey_.end(); ++it) proxyChars.insert(it->second);
+    // Un-hide anything suppressed before it became a proxy / driven body (the
+    // mint can land on a body a previous pass already judged).
+    for (std::map<Key, Character*>::iterator it = suppressed_.begin();
+         it != suppressed_.end(); ) {
+        if (proxyChars.find(it->second) != proxyChars.end() ||
+            drivenChars_.find(it->second) != drivenChars_.end()) {
+            engine::restoreNpc(gw, it->second);
+            ++authRestores_;
+            { char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[authority] restore NPC hand=%u,%u (proxy/driven exemption; supp=%u)",
+                (unsigned)it->first.i, (unsigned)it->first.s,
+                (unsigned)suppressed_.size() - 1);
+              b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            suppressed_.erase(it++);
+        } else ++it;
     }
 
     // Enumerate the join's local world NPCs (same interest query as the host).
@@ -4871,6 +5759,9 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     }
 
     for (unsigned int i = 0; i < n; ++i) {
+        // Proxy bodies answer to their streamed key's census entry, not their
+        // local hand (which exists on no other client) - never judge them.
+        if (proxyChars.find(chars[i]) != proxyChars.end()) continue;
         Key k = keyOf(states[i]);
         // Streamed = the hand is in this tick's fresh set, OR the body pointer is
         // one applyTargets drove this tick. The pointer check covers combat-
@@ -4879,27 +5770,55 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
         // suppress an actively-driven combatant (crowd copies froze mid-brawl).
         bool streamed = (keep.find(k) != keep.end()) ||
                         (drivenChars_.find(chars[i]) != drivenChars_.end());
+        // Pop-out fix (2026-07-11 field report): existence authority is the
+        // CENSUS, drive authority is the STREAM. An NPC at the ~200 u stream-
+        // bubble boundary flickers in/out of the host's fresh set (the two
+        // clients disagree slightly on its position), and the old streamed-only
+        // signal hid REAL host-present NPCs ('Saint'/'Kumo' measured churning
+        // suppress->restore->suppress every few seconds). While the census is
+        // fresh, a census-present NPC is never suppressed - its local AI copy
+        // may drift, but it EXISTS; only census-absent ghosts get hidden. With
+        // no fresh census (hatch off / host lagging) the legacy streamed-only
+        // behavior stands.
+        bool exists = streamed ||
+                      (censusFresh && censusHands_.find(k) != censusHands_.end());
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
         AuthCount& ac = authCount_[k];
-        if (streamed) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
-        else          { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
-        if (streamed) {
+        if (exists) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
+        else        { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
+        if (exists) {
             // Host owns it again: hand it back once the stream has DWELLED (a
             // boundary NPC that flickers into the set for a frame stays hidden).
             if (s != suppressed_.end() && ac.streamed >= RESTORE_AFTER_FRAMES) {
                 engine::restoreNpc(gw, chars[i]);
                 suppressed_.erase(s);
+                s = suppressed_.end();
                 ++authRestores_;
-                { char b[112]; _snprintf(b, sizeof(b) - 1,
-                    "[authority] restore NPC hand=%u,%u (supp=%u churn=%lu/%lu)",
-                    states[i].hIndex, states[i].hSerial,
+                lifeSet(k, LIFE_RESOLVED, "restore");
+                { char nm[48]; engine::charName(chars[i], nm, sizeof(nm));
+                  char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[authority] restore NPC hand=%u,%u name='%s' (supp=%u churn=%lu/%lu)",
+                    states[i].hIndex, states[i].hSerial, nm,
                     (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
                   b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             }
+            if (s == suppressed_.end() && !streamed) {
+                // Driven bodies report their tier (and own their marker) from
+                // applyTargets; a census-present LOCAL copy is the park-
+                // fallback regime.
+                lifeSet(k, LIFE_PARKED, "census-local");
+                debugMark(chars[i], 2, lifeName(LIFE_PARKED));
+            }
+            // NOTE: census position parking deliberately does NOT run inside
+            // the stream bubble (npc_sync regression, run 185524): a bar NPC
+            // whose two schedules seat it ~50 u apart is re-placed by its own
+            // seat AI the same frame, so the park never sticks and the fight
+            // wrecked tracking/march. Inside the bubble the stream owns
+            // position truth; parking is a WIDE-pass render-range tool.
         } else {
-            // Host isn't streaming it: after the debounce, hide + freeze so the
-            // local AI can't run a divergent (standing) copy on top of the
-            // host-driven world.
+            // Host neither streams nor lists it (census-absent ghost): after
+            // the debounce, hide + freeze so the local AI can't run a divergent
+            // copy on top of the host-driven world.
             if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
                 // Phase 2 hardening: only RECORD the suppression when the engine
                 // call actually landed. A faulted hide used to be booked as done,
@@ -4910,9 +5829,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                 if (engine::suppressNpc(gw, chars[i])) {
                     suppressed_[k] = chars[i];
                     ++authSuppresses_;
-                    { char b[128]; _snprintf(b, sizeof(b) - 1,
-                        "[authority] suppress NPC hand=%u,%u (streamed=%u local=%u supp=%u churn=%lu/%lu)",
-                        states[i].hIndex, states[i].hSerial, (unsigned)keep.size(), n,
+                    lifeSet(k, LIFE_CULLED, "suppress");
+                    debugMark(chars[i], 1, lifeName(LIFE_CULLED));
+                    { char nm[48]; engine::charName(chars[i], nm, sizeof(nm));
+                      char b[192]; _snprintf(b, sizeof(b) - 1,
+                        "[authority] suppress NPC hand=%u,%u name='%s' (streamed=%u local=%u supp=%u churn=%lu/%lu)",
+                        states[i].hIndex, states[i].hSerial, nm, (unsigned)keep.size(), n,
                         (unsigned)suppressed_.size(), authSuppresses_, authRestores_);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
                 } else if (ac.unstreamed == SUPPRESS_AFTER_FRAMES) {
@@ -4932,14 +5854,35 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     // inside the bubble), as is anything applyTargets drove this tick. Same
     // hysteresis counters so a census-boundary NPC doesn't churn.
     if (censusFresh && wn > 0) {
+        unsigned long nowR = nowMs(); // recently-driven grace reference
         std::set<Character*> nearSet;
         for (unsigned int i = 0; i < n; ++i) nearSet.insert(chars[i]);
         for (unsigned int i = 0; i < wn; ++i) {
             if (nearSet.find(wChars[i]) != nearSet.end()) continue;
-            if (drivenChars_.find(wChars[i]) != drivenChars_.end()) continue;
+            if (proxyChars.find(wChars[i]) != proxyChars.end()) continue;
+            // Phase 2 mid-band tier: a DRIVEN body used to skip this pass
+            // entirely - correct for parking/suppression (the stream owns its
+            // position, and hiding a driven body is self-defeating), but it
+            // also skipped RESTORE: a suppressed NPC whose hand starts
+            // arriving on the mid tier is driven every tick (drivenChars_)
+            // yet stays hidden+frozen forever - walk orders no-op on a body
+            // removed from the update list, the permanent-zombie shape of
+            // the old boundary flicker. Let a driven body reach the restore
+            // branch (same dwell), and skip only park/suppress for it.
+            // "Driven" includes a grace window (drivenSeen_): a mid-tier
+            // body's samples ride the round-robin, and a rotation hiccup
+            // must not let the cull streak run while the body is between
+            // samples (run 103044: 6 cull/restore cycles per hand).
+            bool driven = drivenChars_.find(wChars[i]) != drivenChars_.end();
+            if (!driven) {
+                std::map<Character*, unsigned long>::iterator ds =
+                    drivenSeen_.find(wChars[i]);
+                driven = ds != drivenSeen_.end() && (nowR - ds->second) < 8000;
+            }
             Key k = keyOf(wStates[i]);
+            if (driven && suppressed_.find(k) == suppressed_.end()) continue;
             bool exists = censusHands_.find(k) != censusHands_.end() ||
-                          keep.find(k) != keep.end();
+                          keep.find(k) != keep.end() || driven;
             std::map<Key, Character*>::iterator s = suppressed_.find(k);
             AuthCount& ac = authCount_[k];
             if (exists) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
@@ -4948,21 +5891,38 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                 if (s != suppressed_.end() && ac.streamed >= RESTORE_AFTER_FRAMES) {
                     engine::restoreNpc(gw, wChars[i]);
                     suppressed_.erase(s);
+                    s = suppressed_.end();
                     ++authRestores_;
-                    { char b[112]; _snprintf(b, sizeof(b) - 1,
-                        "[census] restore NPC hand=%u,%u (supp=%u culls=%lu)",
-                        wStates[i].hIndex, wStates[i].hSerial,
+                    lifeSet(k, LIFE_RESOLVED, "restore-wide");
+                    debugMark(wChars[i], 2, lifeName(LIFE_PARKED));
+                    { char nm[48]; engine::charName(wChars[i], nm, sizeof(nm));
+                      char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[census] restore NPC hand=%u,%u name='%s' (supp=%u culls=%lu)",
+                        wStates[i].hIndex, wStates[i].hSerial, nm,
                         (unsigned)suppressed_.size(), censusCulls_);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                }
+                // v38 parking, wide-radius flavor (this is where the pack-
+                // hidden class lives: census-present wilderness NPCs far
+                // outside the stream bubble, each side simulating its own).
+                // Driven bodies excluded: the mid/near stream owns them.
+                if (s == suppressed_.end() && !driven) {
+                    lifeSet(k, LIFE_PARKED, "census-wide");
+                    parkDivergedCopy(wChars[i], wStates[i], k);
                 }
             } else if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
                 if (engine::suppressNpc(gw, wChars[i])) {
                     suppressed_[k] = wChars[i];
                     ++authSuppresses_;
                     ++censusCulls_;
-                    { char b[128]; _snprintf(b, sizeof(b) - 1,
-                        "[census] cull NPC hand=%u,%u (census=%u wide=%u supp=%u culls=%lu)",
-                        wStates[i].hIndex, wStates[i].hSerial,
+                    lifeSet(k, LIFE_CULLED, "cull-wide");
+                    debugMark(wChars[i], 1, lifeName(LIFE_CULLED));
+                    { char nm[48]; engine::charName(wChars[i], nm, sizeof(nm));
+                      char b[192]; _snprintf(b, sizeof(b) - 1,
+                        "[census] cull NPC hand=%u,%u name='%s' pos=%.0f,%.0f,%.0f "
+                        "(census=%u wide=%u supp=%u culls=%lu)",
+                        wStates[i].hIndex, wStates[i].hSerial, nm,
+                        wStates[i].x, wStates[i].y, wStates[i].z,
                         (unsigned)censusHands_.size(), wn,
                         (unsigned)suppressed_.size(), censusCulls_);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
@@ -4984,18 +5944,225 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     // and stayed visible"). The call is idempotent, so re-applying to a body the
     // engine never touched is a no-op; keys the host started streaming again are
     // skipped (the restore dwell owns those).
+    //
+    // Lifetime guard (2026-07-11 join crash): the engine owns every suppressed
+    // body and can despawn it at any time - the 17:53 session held 93 hidden
+    // wildlife bodies through a zone stream, and the dump shows the engine's
+    // own sensory update walking a freed body. Before ANY touch, prove each
+    // entry live with a hand round-trip: SEH-read the pointer's CURRENT hand
+    // and resolve it back - the same pointer proves the body is alive (this
+    // survives engine re-containering, which only changes the hand); anything
+    // else means despawned, and the entry + marker + counters are dropped
+    // without touching the pointer. A live body whose hand CHANGED (combat
+    // detach re-containered it while hidden) migrates its entry to the new key
+    // so the hide keeps re-asserting - the old key would never resolve again.
     unsigned long now = nowMs();
-    if (!suppressed_.empty() && (now - authReassertMs_) >= 2000) {
+    if ((now - authReassertMs_) >= 2000) {
         authReassertMs_ = now;
+        unsigned int pruned = 0;
+        std::map<Key, Character*> migrated;
         for (std::map<Key, Character*>::iterator it = suppressed_.begin();
-             it != suppressed_.end(); ++it) {
-            if (keep.find(it->first) != keep.end()) continue;
+             it != suppressed_.end(); ) {
+            unsigned int h[5];
+            Character* live = 0;
+            if (engine::readHand(it->second, h))
+                live = engine::resolveCharByHand(h[0], h[1], h[2], h[3], h[4]);
+            if (live != it->second) {
+                std::map<Character*, DebugMarker>::iterator mi =
+                    debugMarkers_.find(it->second);
+                if (mi != debugMarkers_.end()) {
+                    engine::markerDestroy(mi->second.label);
+                    debugMarkers_.erase(mi);
+                }
+                authCount_.erase(it->first);
+                ++pruned; ++authPruned_;
+                suppressed_.erase(it++);
+                continue;
+            }
+            Key ck; ck.i = h[0]; ck.s = h[1]; ck.t = h[2];
+            ck.c = h[3]; ck.cs = h[4];
+            if (ck < it->first || it->first < ck) {
+                migrated[ck] = it->second;
+                authCount_.erase(it->first);
+                suppressed_.erase(it++);
+                continue;
+            }
+            if (keep.find(it->first) != keep.end()) { ++it; continue; }
             // A combat-detached body is driven under a DIFFERENT streamed key
             // (pointer identity survives the re-containering); never re-hide a
             // body applyTargets drove this tick.
-            if (drivenChars_.find(it->second) != drivenChars_.end()) continue;
+            if (drivenChars_.find(it->second) != drivenChars_.end()) { ++it; continue; }
             engine::suppressNpc(gw, it->second);
+            ++it;
         }
+        for (std::map<Key, Character*>::iterator it = migrated.begin();
+             it != migrated.end(); ++it) {
+            if (suppressed_.find(it->first) != suppressed_.end()) continue;
+            suppressed_[it->first] = it->second;
+            if (keep.find(it->first) == keep.end() &&
+                drivenChars_.find(it->second) == drivenChars_.end())
+                engine::suppressNpc(gw, it->second);
+        }
+        if (pruned > 0) {
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[authority] pruned %u stale suppressed entries (despawned; supp=%u total=%lu)",
+                pruned, (unsigned)suppressed_.size(), authPruned_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Marker map hygiene on the same cadence: drop labels whose Character*
+        // wasn't vouched live this pass (this tick's enumerations, driven and
+        // proxy sets, plus the just-validated suppressed bodies). A pruned
+        // body that comes back into judgment simply gets a fresh label.
+        if (!debugMarkers_.empty()) {
+            std::set<Character*> vouched;
+            for (unsigned int i = 0; i < n; ++i)  vouched.insert(chars[i]);
+            for (unsigned int i = 0; i < wn; ++i) vouched.insert(wChars[i]);
+            vouched.insert(drivenChars_.begin(), drivenChars_.end());
+            vouched.insert(proxyChars.begin(), proxyChars.end());
+            for (std::map<Key, Character*>::iterator it = suppressed_.begin();
+                 it != suppressed_.end(); ++it) vouched.insert(it->second);
+            pruneDebugMarkers(vouched);
+        }
+    }
+
+    // Existence-audit probe (pack-hidden investigation, 2026-07-11): a 5 s
+    // census of what THIS client's world holds vs what the host vouches for,
+    // classifying every enumerated NPC into exactly one bucket:
+    //   drv   - streamed/driven this tick (host actively drives it)
+    //   cen   - census-present, unstreamed (legit local-sim copy, host has it)
+    //   hid   - booked suppressed (we hid it)
+    //   ghost - census-absent, NOT suppressed (the visible-on-join-only class:
+    //           either inside the suppress debounce, judged only while the
+    //           census was stale, or escaping judgment entirely)
+    // ghost is the bucket the field reports live in - it should only ever be
+    // transient (one debounce, ~1 s). Test-ExistenceParity gates on it.
+    // KENSHICOOP_DEBUG_CENSUS=1 additionally dumps a row per ghost.
+    static unsigned long auditMs = 0; // main-thread only
+    if ((now - auditMs) >= 5000) {
+        auditMs = now;
+        unsigned int cDrv = 0, cCen = 0, cHid = 0, cGhost = 0;
+        static int dumpGhost = -1;
+        if (dumpGhost < 0) {
+            const char* e = getenv("KENSHICOOP_DEBUG_CENSUS");
+            dumpGhost = (e && e[0] == '1') ? 1 : 0;
+        }
+        std::set<Character*> counted;
+        unsigned int ghostRows = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            unsigned int cnt = (pass == 0) ? n : wn;
+            Character**  cs  = (pass == 0) ? chars : wChars;
+            EntityState* sts = (pass == 0) ? states : wStates;
+            for (unsigned int i = 0; i < cnt; ++i) {
+                if (!counted.insert(cs[i]).second) continue;
+                Key k = keyOf(sts[i]);
+                const char* cls;
+                if (proxyChars.find(cs[i]) != proxyChars.end() ||
+                    keep.find(k) != keep.end() ||
+                    drivenChars_.find(cs[i]) != drivenChars_.end()) {
+                    cls = "drv"; ++cDrv;
+                } else if (suppressed_.find(k) != suppressed_.end()) {
+                    cls = "hid"; ++cHid;
+                } else if (censusFresh &&
+                           censusHands_.find(k) != censusHands_.end()) {
+                    cls = "cen"; ++cCen;
+                } else {
+                    cls = "ghost"; ++cGhost;
+                    if (dumpGhost == 1 && ghostRows < 10) {
+                        ++ghostRows;
+                        char nm[48]; engine::charName(cs[i], nm, sizeof(nm));
+                        char r[192]; _snprintf(r, sizeof(r) - 1,
+                            "[audit] ghost hand=%u,%u name='%s' pos=%.0f,%.0f,%.0f "
+                            "unstreak=%u",
+                            sts[i].hIndex, sts[i].hSerial, nm,
+                            sts[i].x, sts[i].y, sts[i].z, authCount_[k].unstreamed);
+                        r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+                    }
+                }
+                // travel_parity worldstate rows (join side): one row per
+                // enumerated NPC with its authority class, same schema as the
+                // host's census dump so the oracle can cross-match by hand.
+                if (auditRows_) {
+                    char nm[40]; engine::charName(cs[i], nm, sizeof(nm));
+                    char r[224]; _snprintf(r, sizeof(r) - 1,
+                        "SCENARIO WNPC hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f "
+                        "cls=%s name='%s'",
+                        sts[i].hIndex, sts[i].hSerial, sts[i].hType,
+                        sts[i].hContainer, sts[i].hContainerSerial,
+                        sts[i].x, sts[i].y, sts[i].z, cls, nm);
+                    r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+                }
+            }
+        }
+        if (auditRows_) {
+            char w[112]; _snprintf(w, sizeof(w) - 1,
+                "SCENARIO WORLD n=%u cls=join drv=%u cen=%u hid=%u ghost=%u fresh=%d",
+                (unsigned)counted.size(), cDrv, cCen, cHid, cGhost,
+                censusFresh ? 1 : 0);
+            w[sizeof(w) - 1] = '\0'; coop::logLine(w);
+        }
+        char b[192]; _snprintf(b, sizeof(b) - 1,
+            "[audit] exist near=%u wide=%u drv=%u cen=%u hid=%u ghost=%u "
+            "supp=%u census=%u fresh=%d parks=%lu",
+            n, wn, cDrv, cCen, cHid, cGhost,
+            (unsigned)suppressed_.size(), (unsigned)censusHands_.size(),
+            censusFresh ? 1 : 0, censusParks_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Phase 3 lifecycle upkeep: prune left-interest records + self-audit
+    // mintable hands stuck in DISCOVERED (the invisible-raid failure).
+    lifeSweep(gw, now);
+}
+
+void Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Key& k) {
+    // v38 pack-hidden fix: existence culling exempts census-present NPCs, but
+    // both clients then run INDEPENDENT sims of the same body - the join's
+    // copy can stand somewhere the host's copy isn't (the "pack hidden" save:
+    // a pack visible on the join with no host counterpart at that spot).
+    // The census now carries the host position per row; reconcile a local
+    // copy that drifted past the park distance with a halt+teleport onto the
+    // host's spot. 120 u default: ABOVE town-schedule divergence (two sims
+    // seating the same bar NPC ~50 u apart - run 185524), so only genuinely
+    // divergent wanderers (measured 500-900 u) trip it.
+    if (censusParkDist_ <= 0.0f) return;
+    std::map<Key, CensusPos>::iterator it = censusPos_.find(k);
+    if (it == censusPos_.end()) return;
+    float d = dist3(st.x, st.y, st.z, it->second.x, it->second.y, it->second.z);
+    if (d <= censusParkDist_) return;
+    // Per-key cooldown (npc_sync regression, run 185524): the engine's own
+    // schedule AI can re-place the body the same frame (a seated copy), so an
+    // unthrottled park re-teleported every frame and wrecked tracking. One
+    // park per key per cooldown bounds the fight; a free wanderer sticks on
+    // the first try.
+    unsigned long nowP = nowMs();
+    std::map<Key, unsigned long>::iterator pm = parkMs_.find(k);
+    if (pm != parkMs_.end() && (nowP - pm->second) < 5000) return;
+    parkMs_[k] = nowP;
+    if (engine::park(c, it->second.x, it->second.y, it->second.z, st.heading)) {
+        ++censusParks_;
+        static unsigned long logTick = 0; // main-thread only, ~4 lines/s
+        unsigned long now = nowMs();
+        if ((now - logTick) >= 250) {
+            logTick = now;
+            char nm[48]; engine::charName(c, nm, sizeof(nm));
+            char b[192]; _snprintf(b, sizeof(b) - 1,
+                "[census] park hand=%u,%u name='%s' d=%.0f local=%.0f,%.0f,%.0f "
+                "host=%.0f,%.0f,%.0f (parks=%lu)",
+                k.i, k.s, nm, d, st.x, st.y, st.z,
+                it->second.x, it->second.y, it->second.z, censusParks_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+}
+
+void Replicator::pruneDebugMarkers(const std::set<Character*>& live) {
+    for (std::map<Character*, DebugMarker>::iterator it = debugMarkers_.begin();
+         it != debugMarkers_.end(); ) {
+        if (live.find(it->first) == live.end()) {
+            engine::markerDestroy(it->second.label);
+            debugMarkers_.erase(it++);
+        } else ++it;
     }
 }
 
@@ -5204,13 +6371,14 @@ void Replicator::logSmoothSummary() {
         float extrapFrac = (total > 0)
                                ? (float)(interpExtrap_ + interpClampOld_) / (float)total
                                : 0.0f;
-        char ip[224];
+        char ip[240];
         _snprintf(ip, sizeof(ip) - 1,
                   "SCENARIO INTERP samples=%lu lerp=%lu extrap=%lu clamp=%lu seg=%lu "
-                  "extrapFrac=%.3f snapSq=%lu snapNpc=%lu reissueSq=%lu reissueNpc=%lu",
+                  "extrapFrac=%.3f snapSq=%lu snapNpc=%lu reissueSq=%lu reissueNpc=%lu "
+                  "restFlip=%lu pruned=%lu",
                   total, interpLerp_, interpExtrap_, interpClampOld_, interpSegSnap_,
                   extrapFrac, hardSnapSquad_, hardSnapNpc_,
-                  walkReissueSquad_, walkReissueNpc_);
+                  walkReissueSquad_, walkReissueNpc_, restFlipNpc_, authPruned_);
         ip[sizeof(ip) - 1] = '\0';
         coop::logLine(ip);
     }

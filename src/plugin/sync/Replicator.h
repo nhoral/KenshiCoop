@@ -48,9 +48,10 @@ public:
     // the walk-drive's hard-snap / catch-up gains for WAN A/B runs without a
     // rebuild. Defaults match the historical constants.
     void setInterpConfig(const InterpConfig& c) { cfg_ = c; }
-    void setDriveTuning(float catchupK, float snapDist) {
+    void setDriveTuning(float catchupK, float snapDist, float snapSeconds) {
         if (catchupK > 0.0f) catchupK_ = catchupK;
         if (snapDist > 0.0f) snapDist_ = snapDist;
+        if (snapSeconds > 0.0f) snapSeconds_ = snapSeconds;
     }
     // KENSHICOOP_SEND_STAMP=0: ignore the batch sendMs and index interp rings
     // on arrival time (the legacy scheme) - a receiver-local A/B lever.
@@ -400,6 +401,24 @@ public:
     // Production machine sync master enable (KENSHICOOP_PROD_SYNC).
     void setProdSync(bool v) { prodSync_ = v; }
 
+    // BEFORE engine (protocol 38, HOST only - the tech-tree authority):
+    // sample the Research store's known set ~1 Hz (Research::isKnown over
+    // the shared RESEARCH GameData enumeration) and stream one PKT_RESEARCH
+    // row per known sid - first sight sends (the host's known set IS the
+    // session baseline), then a safety resend covers a lost row / a join
+    // whose apply lever needed prerequisites that arrived later.
+    void publishResearch(GameWorld* gw, NetLink& net, u32 ownerId);
+
+    // BEFORE engine (protocol 38, join side): drain received known-research
+    // rows; sids already known locally are skipped (idempotent), the rest
+    // apply through Research::startResearch - the exact lever a research-UI
+    // click commits (flips isKnown in the same tick, spike 401). Per-sid
+    // seq guard drops stale rows.
+    void applyResearch(GameWorld* gw, Inbound& in);
+
+    // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
+    void setResearchSync(bool v) { researchSync_ = v; }
+
     // Storage/machine container sync (protocol 34, KENSHICOOP_STORE_SYNC):
     // when set (HOST only - host-authoritative world containers), a ~1 Hz
     // census of container-bearing buildings (STORAGE + the machine classes)
@@ -501,6 +520,30 @@ public:
     // <= 0 disables the census channel on both sides.
     void setCensusRadius(float r) { censusRadius_ = r; }
 
+    // KENSHICOOP_SPAWN_MINT_RADIUS (2026-07-11 "NPCs spawn on top of the join
+    // player" fix): how far from our own squad a census-missing host NPC may
+    // be PROXY-MINTED. The census-missing scan asks about every census hand
+    // with no local body; the host's reply carries the authoritative position
+    // and the mint happens only inside this radius (the duplicate guard: a
+    // baked NPC in a loaded block always resolves, so a resolve-fail inside
+    // render range is a genuine host runtime spawn). <= 0 restores the legacy
+    // stream-bubble-only minting.
+    void setSpawnMintRadius(float r) { spawnMintRadius_ = r; }
+
+    // KENSHICOOP_CENSUS_PARK (v38 pack-hidden fix): how far a census-PRESENT
+    // local copy may drift from the host's census position before the join
+    // parks it back onto the host's spot. <= 0 disables parking (existence-
+    // only census, the v37 behavior).
+    void setCensusParkDist(float d) { censusParkDist_ = d; }
+
+    // travel_parity worldstate rows: when enabled, both sides dump one
+    // "SCENARIO WNPC hand=.. pos=.. cls=.. name=.." row per enumerated world
+    // NPC every ~5 s - the host from its census walk (cls=host), the join
+    // from the existence audit with each NPC's authority class (drv/cen/hid/
+    // ghost) - so Test-TravelParity can cross-compare the two worlds while
+    // the players travel. Off by default (log volume).
+    void setAuditRows(bool on) { auditRows_ = on; }
+
     unsigned int targetCount() const { return (unsigned int)targets_.size(); }
 
     // Stage 2 smoothness oracle: emit a "SCENARIO SMOOTH ..." summary describing
@@ -553,6 +596,10 @@ private:
                                       //   disarm DEBOUNCE: a 1-batch gap must not reset the AI)
         unsigned long combatSnapTick; // last hard snap (cooldown; a failed teleport must not
                                       //   re-fire every frame - walk-converge between snaps)
+        unsigned long npcSnapTick;    // locomotion-path hard snap cooldown (Phase 2): a far
+                                      //   NPC whose teleport can't stick (seat AI, unloaded
+                                      //   terrain) walk-converges between snaps instead of
+                                      //   teleporting every frame
         bool         goalsCleared;    // rest-entry AI-goal clear done (once per rest episode;
                                       // re-cleared only after the body genuinely moves again)
         // Step 4 divergence-gated authority (world NPCs, behind gateAuthority_):
@@ -573,6 +620,29 @@ private:
         unsigned long furnPeerTick;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
+        // Velocity-aware snap gate (2026-07-11): slow-decaying peak of the
+        // source's wall-clock speed. The instantaneous 2-sample estimate
+        // collapses to ~0 the moment the source halts, deflating the snap
+        // gate while the driven body is still converging on the stop point.
+        float        velPeak;
+        // Walk/rest debounce (2026-07-11 choppiness fix): last tick a sample
+        // showed genuine translation; the walking verdict holds for a fixed
+        // time after it so mid-walk velocity dips can't flap the classifier.
+        unsigned long moveSeenMs;
+        // The classifier's previous verdict, so genuine walk->rest
+        // transitions can be counted (restFlipNpc_) as a flap-rate signal.
+        bool         wasMoving;
+        // Per-hand smoothness attribution (Phase 2 diagnosis): cumulative
+        // active/zero-step frames this body contributed to the oracle, so a
+        // zeroFrac regression can name its worst offenders in the stat line.
+        unsigned long zeroF;
+        unsigned long activeF;
+        // Last tick this body's stream cadence classified MID-tier. A body
+        // that just handed off mid -> near (raid walking into the 20 Hz
+        // bubble) may owe one large reconciliation snap for divergence
+        // accrued under sparse mid coverage - classed to the mid ledger
+        // (like young-ring coverage snaps), not steady-state near tracking.
+        unsigned long midSeenMs;
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), lastSeenMs(0),
@@ -581,12 +651,13 @@ private:
                    koLatched(false), deathLatched(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
-                   combatSeenTick(0), combatSnapTick(0),
+                   combatSeenTick(0), combatSnapTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
-                   sneakTick(0) {}
+                   sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
+                   zeroF(0), activeF(0), midSeenMs(0) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
@@ -639,13 +710,28 @@ private:
     // The engine can undo a one-shot hide on its own (ambush dialog/combat
     // re-tasks the body, zone streaming re-adds it to the update list), so the
     // hide is re-asserted on a ~2 s cadence while the hand stays unstreamed.
+    // Lifetime guard (2026-07-11 join crash, dump: SensoryData::periodicUpdate
+    // walking a freed body during zone streaming with 93 suppressed wildlife
+    // booked): the ENGINE owns every suppressed body and is free to despawn it
+    // at any time. The re-assert pass re-resolves each entry's hand FIRST; a
+    // null/different resolution means the stored Character* is stale, and the
+    // entry (plus its marker/counters) is pruned without touching the pointer.
     unsigned long authReassertMs_;
+    unsigned long authPruned_;      // stale suppressed entries dropped (despawned bodies)
     // Bodies applyTargets actually drove this tick, by POINTER: a combat-driven
     // world NPC is detached into its own squad (container changes), so its local
     // enumeration key no longer matches the host's streamed key - the hand-keyed
     // `keep` set can't recognise it and enforceHostAuthority would hide+freeze a
     // body mid-fight. Pointer identity survives the re-containering.
     std::set<Character*>      drivenChars_;
+    // Recently-driven grace (Phase 2 mid-band tier): last tick each body was
+    // driven. drivenChars_ is per-tick, but a mid-tier body's samples arrive
+    // on the round-robin cadence and a rotation hiccup empties its interp for
+    // a beat - the wide authority pass must not judge it as unstreamed during
+    // such a gap (run 20260712_103044: driven bodies culled mid-drive, then
+    // restored by the reassert pass's driven exemption, 6 churn cycles per
+    // hand). Pointers are compared, never dereferenced; timestamp-pruned.
+    std::map<Character*, unsigned long> drivenSeen_;
     // Step-5 hysteresis: consecutive-frame counters per hand so a brief stream
     // hiccup doesn't suppress (needs ~1 s unstreamed) and a boundary NPC doesn't
     // flicker back (needs ~2 s streamed dwell to restore). Spike 18: the hard
@@ -666,6 +752,35 @@ private:
     unsigned long             censusRecvMs_;  // join: last census arrival
     std::set<Key>             censusHands_;   // join: latest existence set
     unsigned long             censusCulls_;   // join: wide-radius suppress count
+    // Phase 2 mid-band streaming tier (HOST): census-walk NPCs OUTSIDE the
+    // ~200/260 u stream bubble, nearest-first, refreshed at the 1 Hz census
+    // cadence. publishOwned round-robins a small slice of them through the
+    // entity batch every frame (quota sized so each NPC hits the 20 Hz wire
+    // at ~MID_HZ aggregate) - between census beats a far NPC keeps receiving
+    // real positions instead of freezing under divergent local AI (the
+    // "zombie NPC" report). Keys only (no Character*): each publish resolves
+    // the hand fresh, so a despawn between census walks degrades to a skip.
+    struct MidBandEntry {
+        Key k; float dist;
+        bool operator<(const MidBandEntry& o) const { return dist < o.dist; }
+    };
+    std::vector<MidBandEntry> midBand_;
+    unsigned int              midCursor_;  // start of the CURRENT slice
+    unsigned long             midSliceMs_; // last slice advance (50 ms cadence:
+                                           // the slice must persist across a
+                                           // whole net tick to be sampled)
+    // v38 census position parking (pack-hidden investigation, 2026-07-11):
+    // the host position per census row. A census-PRESENT NPC is exempt from
+    // culling, but its two locally-simulated copies can wander arbitrarily
+    // far apart - the join saw a pack somewhere the host's copy wasn't.
+    // enforceHostAuthority parks a local copy that diverged past
+    // censusParkDist_ back onto the host's spot (0 disables).
+    struct CensusPos { float x, y, z; };
+    std::map<Key, CensusPos>  censusPos_;     // join: host pos per census row
+    float                     censusParkDist_;
+    unsigned long             censusParks_;   // join: divergence-park count
+    std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
+    bool                      auditRows_;     // travel_parity worldstate rows
     // Third-party furniture placement (protocol 36): ENTER edges detected on
     // peer-owned driven bodies in applyTargets (a guard jailing an arrested
     // player runs purely on the host sim, so the occupant's owner can never
@@ -679,7 +794,12 @@ private:
     std::map<Key, unsigned long> ownFurnExit_;
     InterpConfig          cfg_;
     float                 catchupK_;  // walk-drive gap-proportional speed gain
-    float                 snapDist_;  // moving-body hard-snap distance (u)
+    float                 snapDist_;  // moving-body hard-snap distance floor (u)
+    float                 snapSeconds_; // velocity-aware snap gate: teleport only
+                                        // when the body trails the newest sample
+                                        // by more than this much TRAVEL TIME (the
+                                        // fixed distance gate false-fired on
+                                        // sprinters and any game speed > 2x)
     bool                  sendStamp_; // index interp rings on sender stamps (v35)
     unsigned long         starveHoldMs_;  // guard-hold window past staleness
     unsigned int          starveHeldNow_; // bodies in the hold this tick (stat line)
@@ -825,9 +945,15 @@ private:
     unsigned long interpExtrap_;
     unsigned long interpSegSnap_;
     unsigned long hardSnapSquad_;   // SNAP_DIST applyRaw on a moving squad body
-    unsigned long hardSnapNpc_;     // SNAP_DIST applyRaw on a moving world NPC
+    unsigned long hardSnapNpc_;     // SNAP_DIST applyRaw on a moving world NPC (near tier)
+    unsigned long hardSnapMid_;     // same, MID-tier bodies (Phase 2): counted apart so
+                                    //   the snap-rate gate keeps guarding the validated
+                                    //   20 Hz pipeline; a newly covered mid NPC's one-time
+                                    //   reconciliation snap is correct, not rubber-banding
     unsigned long walkReissueSquad_;
     unsigned long walkReissueNpc_;
+    unsigned long restFlipNpc_;     // walk->rest classifier transitions (flap telemetry)
+    unsigned long restFlipMid_;     // same, mid-tier bodies (kept out of the near gate)
     unsigned long interpLogTick_;
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send
@@ -1050,6 +1176,22 @@ private:
     u32           prodSeqOut_;
     unsigned long prodSampleMs_;
     bool          prodSync_;
+    // Protocol 38 known-research rows, keyed by the RESEARCH stringID (the
+    // cross-client-stable wire identity, spike 401). HOST: sent/lastSendMs =
+    // first-sight send + safety resend. JOIN: seqSeen = stale-row guard,
+    // applied = the local startResearch landed (isKnown flipped) so resends
+    // stop re-applying.
+    struct ResearchRow {
+        unsigned long lastSendMs;
+        u32  seqSeen;
+        bool sent;
+        bool applied;
+        ResearchRow() : lastSendMs(0), seqSeen(0), sent(false), applied(false) {}
+    };
+    std::map<std::string, ResearchRow> researchRows_;
+    u32           researchSeqOut_;
+    unsigned long researchSampleMs_;
+    bool          researchSync_;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the
@@ -1088,6 +1230,78 @@ private:
     // tag selects the log prefix ("recruit" / "squad").
     void rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
                        const char* tag);
+    // Hard-snap attribution diagnostics (rubber-banding investigation): one
+    // throttled [snap] line per applyRaw teleport with everything needed to
+    // classify the cause (gap, source speed+velocity, game speed, slew,
+    // whether a walk destination was live). ~4 lines/s max; skipped snaps are
+    // counted into the next line.
+    void logHardSnap(Character* c, const EntityState& out, const char* kind,
+                     float gap, float srcVel, float gate, bool hadDest);
+
+    // ---- Phase 3: unified entity lifecycle (join side) ---------------------
+    // One explicit, logged state per hand replacing the implicit union of
+    // suppressed_/proxyByKey_/drivenChars_/censusHands_ membership tests as
+    // the AUDIT view of an entity's journey. The mechanics stay where they
+    // were validated (authority passes, mint pipeline, drive tiers); every
+    // decision point REPORTS its outcome here, so the log tells one coherent
+    // story per hand ("LIFE hand=.. from=.. to=.. reason=..") and the
+    // lifecycle oracle can gate on illegal journeys (e.g. a hand stuck in
+    // DISCOVERED while mintable, or a body driven while culled).
+    enum LifeState {
+        LIFE_UNKNOWN = 0,   // never judged (or pruned after leaving interest)
+        LIFE_DISCOVERED,    // known to exist (census) but NO local body yet
+        LIFE_RESOLVED,      // local body bound (baked resolve / minted proxy),
+                            //   not driven this tick
+        LIFE_HI,            // driven at near-tier (20 Hz) cadence; PCs live
+                            //   here permanently (Phase 3 unification)
+        LIFE_MID,           // driven at mid-tier (round-robin) cadence
+        LIFE_PARKED,        // local-AI copy under census existence (park
+                            //   fallback owns divergence repair)
+        LIFE_CULLED         // suppressed (hidden + frozen; census-absent ghost)
+    };
+    struct Lifecycle {
+        u8            state;
+        unsigned long sinceMs;   // when the current state was entered
+        unsigned long touchMs;   // last confirmation (stale-entry pruning)
+        unsigned long stuckLogMs;// last STUCK self-audit line for this hand
+        Lifecycle() : state(LIFE_UNKNOWN), sinceMs(0), touchMs(0),
+                      stuckLogMs(0) {}
+    };
+    std::map<Key, Lifecycle> life_;
+    static const char* lifeName(int s);
+    // Record a state observation for a hand: logs one LIFE line on CHANGE,
+    // refreshes touchMs always. Returns the previous state. The UNKNOWN ->
+    // PARKED edge is recorded silently (every wilderness NPC's boring birth
+    // would otherwise burst hundreds of lines at session start).
+    int lifeSet(const Key& k, int to, const char* reason);
+    // ~5 s sweep: drop entries not touched for a while (left interest) and
+    // self-audit DISCOVERED entries older than STUCK_MS whose census position
+    // sits in a locally LOADED zone (mintable but never minted - the
+    // "join never sees the raid the host is fighting" failure the lifecycle
+    // oracle gates on; an unloaded far zone is a legitimate indefinite defer).
+    void lifeSweep(GameWorld* gw, unsigned long now);
+    unsigned long lifeSweepMs_;
+
+    // Debug marker HUD labels (KENSHICOOP_DEBUG_MARKERS=1, spike-47 substrate):
+    // pin a colored label to each judged body so authority states are visible
+    // live - green DRV = host-driven, red HID = suppressed/culled, yellow
+    // LOC = local-sim copy that exists in the host census. No-op (single env
+    // check) unless the flag is set. Labels are created once per body and
+    // re-captioned only on state change.
+    struct DebugMarker { void* label; int color; };
+    std::map<Character*, DebugMarker> debugMarkers_;
+    void debugMark(Character* c, int colorId, const char* tag);
+    // Lifetime guard (2026-07-11 join crash): the map is keyed by raw
+    // Character* the engine can free (and REUSE for a new body, silently
+    // stealing the old label). enforceHostAuthority prunes entries whose
+    // pointer wasn't vouched live this pass (enumerations / driven / proxy /
+    // validated suppressed); the label object is ours to destroy safely.
+    void pruneDebugMarkers(const std::set<Character*>& live);
+    // v38 census position parking: snap a census-present unstreamed local
+    // copy back onto the host's census position once it diverges past
+    // censusParkDist_. Called from both authority passes with this tick's
+    // live enumeration pointer.
+    void parkDivergedCopy(Character* c, const EntityState& st, const Key& k);
     // Phase B: combat-scoped world-NPC vitals (host side). Keys of streamed
     // NPCs that are fighting / being fought / down, with last-qualified time;
     // publishMedical streams their vitals at ~1 Hz while fresh. The join's
@@ -1142,19 +1356,56 @@ private:
     // by pointer via drivenChars_ (hide on stale stream / restore on return
     // come free from the existing hysteresis).
     std::map<Key, Character*> proxyByKey_;
+    // Lifetime guard (2026-07-11 join crash): the ENGINE owns the proxy body
+    // and can despawn it (zone streaming, cleanup) while proxyByKey_ still
+    // holds the pointer - every later touch would be a use-after-free.
+    // syncSpawns runs a ~1 s liveness sweep: SEH-read each pointer's current
+    // hand and resolve it back; anything but the same pointer unbinds the
+    // entry untouched.
     // JOIN: per-hand request state - debounce, retry cap, negative-reply
     // backoff (deniedMs = when the host said "can't resolve either" or the
     // local proxy spawn failed; retried only after a long cooldown).
     struct SpawnReqState {
         unsigned long lastSendMs; unsigned int sends; unsigned long deniedMs;
-        SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0) {}
+        // Census-mint far-deferral (2026-07-11): the host's reply resolved the
+        // hand but its position was outside the mint radius. NOT a denial -
+        // the NPC may be walking toward us - so re-ask on a short cadence
+        // instead of the long deniedMs cooldown, and reset the send cap so a
+        // slow approach can't exhaust it.
+        unsigned long farMs;
+        // Phase 1 spawn parity: the REQ came from the census-missing scan (the
+        // hand is host-census-vouched). Census-sourced replies may FAR-MINT
+        // beyond the radius gate when the reply position sits in a locally
+        // LOADED zone (an unresolvable hand there is a genuine runtime spawn).
+        bool fromCensus;
+        // First time the census-missing scan saw this hand unresolvable. The
+        // far mint requires a sustained miss (FAR_MINT_ARM_MS): a zone can
+        // report loaded a few seconds before its baked bodies resolve, and
+        // minting inside that window stands a short-lived double (run
+        // 20260712_092921: 8/12 far mints DUPE-HEALed within 3 s). Runtime
+        // spawns never resolve locally, so they pass the dwell unharmed.
+        unsigned long firstMissMs;
+        SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0), farMs(0),
+                          fromCensus(false), firstMissMs(0) {}
     };
     std::map<Key, SpawnReqState> spawnReq_;
     // JOIN: hands applyTargets failed to resolve this tick, with the streamed
     // position (the request-authoring queue; proximity-gated in syncSpawns so
-    // a far unloaded BAKED zone doesn't breed duplicate proxies).
-    struct UnresolvedHand { float x, y, z; };
+    // a far unloaded BAKED zone doesn't breed duplicate proxies). fromCensus
+    // entries came from the census-missing scan instead of the stream: they
+    // carry NO position (the census is a bare hand list), so the send-side
+    // proximity gate is skipped and the mint decision moves to the reply
+    // (which carries the host's authoritative position).
+    struct UnresolvedHand {
+        float x, y, z; bool fromCensus;
+        UnresolvedHand() : x(0), y(0), z(0), fromCensus(false) {}
+    };
     std::map<Key, UnresolvedHand> unresolvedHands_;
+    // JOIN: census-mint reach (see setSpawnMintRadius) + the census-missing
+    // scan throttle (the resolve sweep over censusHands_ runs at ~0.5 Hz, not
+    // per tick).
+    float         spawnMintRadius_;
+    unsigned long censusScanMs_;
     // Phase 0 telemetry: hands already reported unresolved (log once per hand).
     std::set<Key> spawnLogged_;
     // HOST: per-hand reply throttle (a re-request within the window is a

@@ -61,7 +61,8 @@ void loadConfig(Config& c) {
                      (c.scenario == "world_weapon_drop") || // W2 drop must beat the inv-reconcile destroy
                      (c.scenario == "world_armor_drop") ||
                      (c.scenario == "trade_probe") ||  // cross-owner drag baseline needs the live channel
-                     (c.scenario == "trade_peer");     // protocol 37 fix rides + suppresses this channel
+                     (c.scenario == "trade_peer") ||   // protocol 37 fix rides + suppresses this channel
+                     (c.scenario == "weapon_loot");    // acquisition crosses on the snapshot channel
         c.invSync = (env == "1") || (env != "0" && auto_);
     }
 
@@ -211,6 +212,12 @@ void loadConfig(Config& c) {
     // power cross-apply absence) that protocol 33 exists to close.
     if (c.scenario == "prod_probe") c.prodSync = false;
 
+    c.researchSync = envOr("KENSHICOOP_RESEARCH_SYNC", "1") != "0";
+    // Forced OFF for the research_probe diagnostic - it measures the UNSYNCED
+    // tech-tree baseline (host unlock never crossing, join-side startResearch
+    // lever stickiness) that protocol 38 exists to close.
+    if (c.scenario == "research_probe") c.researchSync = false;
+
     c.storeSync = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
     // Forced OFF for the store_probe diagnostic - it measures the UNSYNCED
     // container baseline (building-container capture/reconcile levers, the
@@ -260,10 +267,24 @@ void loadConfig(Config& c) {
         c.catchupK = (f > 0.0) ? (float)f : 2.0f;
         f = std::atof(envOr("KENSHICOOP_SNAP_DIST", "0").c_str());
         c.snapDist = (f > 0.0) ? (float)f : 8.0f;
+        f = std::atof(envOr("KENSHICOOP_SNAP_SECONDS", "0").c_str());
+        c.snapSeconds = (f > 0.0) ? (float)f : 0.75f;
         // Census radius: "0" (explicit) disables; absent = 2000 u default.
         std::string cr = envOr("KENSHICOOP_CENSUS_RADIUS", "");
         c.censusRadius = cr.empty() ? 2000.0f : (float)std::atof(cr.c_str());
         if (c.censusRadius < 0.0f) c.censusRadius = 0.0f;
+        // Census-mint radius: "0" (explicit) disables; absent = 600 u default.
+        std::string mr = envOr("KENSHICOOP_SPAWN_MINT_RADIUS", "");
+        c.spawnMintRadius = mr.empty() ? 600.0f : (float)std::atof(mr.c_str());
+        if (c.spawnMintRadius < 0.0f) c.spawnMintRadius = 0.0f;
+        // Census park distance: "0" (explicit) disables; absent = 120 u
+        // default. Deliberately ABOVE town-schedule divergence (~50 u for a
+        // bar NPC seated at a different stool per sim - run 185524 showed
+        // parking those fights the seat AI every frame); a genuinely
+        // divergent wanderer (the pack-hidden class) measures 500-900 u.
+        std::string cp = envOr("KENSHICOOP_CENSUS_PARK", "");
+        c.censusParkDist = cp.empty() ? 120.0f : (float)std::atof(cp.c_str());
+        if (c.censusParkDist < 0.0f) c.censusParkDist = 0.0f;
         // Starve hold: "0" (explicit) restores legacy release-on-stale;
         // absent = 10 s guard-hold default.
         std::string sh = envOr("KENSHICOOP_STARVE_HOLD_MS", "");

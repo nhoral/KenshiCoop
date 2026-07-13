@@ -1,3 +1,6 @@
+# Public-repo export staging (pushed to github.com/nhoral/KenshiCoop, not tracked here)
+dist/public-export/
+
 # Build outputs
 src/plugin/x64/
 build/
@@ -9,15 +12,32 @@ dist/KenshiCoop-remote-kit-*.zip
 third_party/enet/enet/
 third_party/KenshiLib_deps/
 
-# Test-run artifacts (logs, screenshots, verdicts)
+# Test-run artifacts (logs, screenshots, verdicts, history)
 tools/test-runs/
 tools/*.log
+tools/_*.log
 
-# Root-level run logs
+# Ad-hoc debug scratch scripts and captured screenshots
+tools/_*.ps1
+tools/_wip_*.dll
+tools/float_fix*/
+tools/p*_validate/
+tools/last_dev_cycle.txt
+
+# Downloaded toolchain installers (large Microsoft binaries)
+tools/*.exe
+
+# Root-level run logs (build/deploy/run drivers)
 /*.log
 
 # Machine-specific config (committed template: scripts/lan.config.example.json)
 scripts/lan.config.json
+
+# Spike raw captures (findings docs are tracked; raw logs/screenshots are not)
+resources/spikes/*/raw/
+
+# Demo video (45 MB; too large for git)
+resources/Kenshi_Coop.mp4
 
 # Stray shell artifact
 nul

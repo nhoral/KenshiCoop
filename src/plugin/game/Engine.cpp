@@ -25,6 +25,7 @@
 #include <kenshi/RootObjectBase.h>  // getGameData/getFaction (spawn template + owner)
 #include <kenshi/RootObjectFactory.h> // createRandomCharacter / createBuilding / createItem
 #include <kenshi/GameData.h>        // GameData::name / stringID / type (template scan + inv)
+#include <kenshi/GameSaveState.h>   // native object snapshot round-trip probe
 #include <kenshi/Inventory.h>       // Inventory (Phase 4a container contents)
 #include <kenshi/Item.h>            // Item / InventoryItemBase (quantity/quality/equipped)
 #include <kenshi/CharBody.h>        // CharBody::currentAction / _NV_setCurrentAction
@@ -33,6 +34,7 @@
 #include <kenshi/Tasker.h>          // Tasker::key() -> TaskType, Tasker::subject (hand)
 #include <kenshi/util/hand.h>       // hand (5-field identity, getRootObject)
 #include <kenshi/util/lektor.h>     // lektor<T> (playerCharacters, interest query)
+#include <kenshi/Gear.h>            // Sword (spike 451 weapon-mint ctor trace)
 #include <kenshi/Faction.h>         // Faction::getData / FactionManager::getFactionByStringID (protocol 21)
 #include <kenshi/FactionRelations.h> // FactionRelations (protocol 24 faction-relation sync)
 #include <kenshi/Platoon.h>         // Platoon / ActivePlatoon / Ownerships (wallet, protocol 22)
@@ -45,11 +47,16 @@
 #include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
 #include <kenshi/gui/ForgottenGUI.h> // ForgottenGUI::mainbar
 #include <kenshi/gui/MainBarGUI.h>  // MainBarGUI::speedButtons (vote-button probe)
+// NOTE: kenshi/ZoneManager.h cannot be included here - it redefines ParticlePool
+// (also defined by CombatClass.h above). The zone-loaded query lives in its own
+// TU (game/ZoneQuery.cpp); see engine::isZoneLoadedAt / engine::resolveZoneQuery.
 #include <mygui/MyGUI_Button.h>     // MyGUI::Button::getStateSelected
 #include <ogre/OgreVector3.h>
 #include <ogre/OgreQuaternion.h>
 #include <cmath>
 #include <cstdlib> // getenv (KENSHICOOP_INV_DUMP reconcile-trace gate)
+#include <intrin.h> // _ReturnAddress (spike 451 weapon-mint caller RVAs)
+#pragma intrinsic(_ReturnAddress)
 #include <map>     // squad roster pointer->hand baseline (protocol 35)
 #include <set>
 #include <utility>
@@ -939,6 +946,18 @@ typedef void (__fastcall* AffectRelAmtFn)(FactionRelations* self, Faction* p, fl
 AffectRelEvFn  g_affectEvOrig  = 0;
 AffectRelAmtFn g_affectAmtOrig = 0;
 
+// Per-pair log debounce (2026-07-11 field session: an NPC-vs-NPC wildlife war
+// on the join fired 1,840 AFFECT lines in minutes - two factions re-asserting
+// an already-clamped relation every engine tick). The DELTA RECORDING is
+// untouched (the sync layer drains g_facDeltas); only the log line is gated:
+// each (me, whom) pair logs at most once per 5 s, with the skipped count
+// carried into the next emitted line. POD-only (SEH legal), oldest-slot reuse.
+struct FacLogGate {
+    char meSid[48]; char whomSid[48];
+    unsigned long lastMs; unsigned long skipped;
+};
+static FacLogGate g_facLogGates[16];
+
 void recordFactionDelta(FactionRelations* self, Faction* p, int isEvent,
                         int ev, float amount, float mult) {
     __try {
@@ -950,16 +969,39 @@ void recordFactionDelta(FactionRelations* self, Faction* p, int isEvent,
         r.after = -999.0f;
         if (self && p && g_relGetFn) r.after = g_relGetFn(self, p);
         if (g_facDeltas.size() < 64) g_facDeltas.push_back(r);
+        unsigned long now = GetTickCount();
+        FacLogGate* gate = 0;
+        FacLogGate* oldest = &g_facLogGates[0];
+        for (int gi = 0; gi < 16; ++gi) {
+            FacLogGate* g = &g_facLogGates[gi];
+            if (g->lastMs != 0 && strcmp(g->meSid, r.meSid) == 0 &&
+                strcmp(g->whomSid, r.whomSid) == 0) { gate = g; break; }
+            if (g->lastMs < oldest->lastMs) oldest = g;
+        }
+        if (!gate) {
+            gate = oldest;
+            strncpy(gate->meSid, r.meSid, sizeof(gate->meSid) - 1);
+            gate->meSid[sizeof(gate->meSid) - 1] = '\0';
+            strncpy(gate->whomSid, r.whomSid, sizeof(gate->whomSid) - 1);
+            gate->whomSid[sizeof(gate->whomSid) - 1] = '\0';
+            gate->lastMs = 0; gate->skipped = 0;
+        }
+        if (gate->lastMs != 0 && (now - gate->lastMs) < 5000) {
+            ++gate->skipped;
+            return;
+        }
+        gate->lastMs = now ? now : 1;
         char b[224];
         if (isEvent) {
             _snprintf(b, sizeof(b) - 1,
-                      "[fac] AFFECT-EV me='%s' whom='%s' event=%d mult=%.3f after=%.2f",
-                      r.meSid, r.whomSid, ev, mult, r.after);
+                      "[fac] AFFECT-EV me='%s' whom='%s' event=%d mult=%.3f after=%.2f skipped=%lu",
+                      r.meSid, r.whomSid, ev, mult, r.after, gate->skipped);
         } else {
             _snprintf(b, sizeof(b) - 1,
-                      "[fac] AFFECT-AMT me='%s' whom='%s' amount=%.3f mult=%.3f after=%.2f",
-                      r.meSid, r.whomSid, amount, mult, r.after);
+                      "[fac] AFFECT-AMT me='%s' whom='%s' amount=%.3f mult=%.3f after=%.2f skipped=%lu",
+                      r.meSid, r.whomSid, amount, mult, r.after, gate->skipped);
         }
+        gate->skipped = 0;
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
@@ -1225,6 +1267,9 @@ void resolve() {
     g_createObjFn = (CreateObjFn)KenshiLib::GetRealAddress(&RootObjectFactory::create);
     g_destroyObjFn = (DestroyObjFn)KenshiLib::GetRealAddress(
         static_cast<bool (GameWorld::*)(RootObject*, bool, const char*)>(&GameWorld::destroy));
+    // Phase 1 spawn parity (non-fatal: unresolved -> far minting stays
+    // radius-gated). Lives in game/ZoneQuery.cpp (header-collision quarantine).
+    resolveZoneQuery();
     g_getDataOfTypeFn = (GetDataOfTypeFn)KenshiLib::GetRealAddress(
         &GameDataContainer::getDataOfType);
     // Phase 4a inventory: createItem is overloaded, so disambiguate the 6-arg form.
@@ -1279,6 +1324,81 @@ void resolve() {
     g_underMeleeFn   = (CharBodyBoolFn)KenshiLib::GetRealAddress(
         &Character::isLiterallyUnderMeleeAttackRightNowForSure);
     g_fleeingFn      = (CharBodyBoolFn)KenshiLib::GetRealAddress(&Character::isFleeing);
+
+    // Spike 402: prove which executable is actually mapped and record the
+    // KenshiLib-remapped entry points for the native save/object-serialisation
+    // pipeline.  This is deliberately address-only: no serialiser is invoked.
+    const char* spikeId = std::getenv("KENSHICOOP_SPIKE");
+    if (spikeId && strcmp(spikeId, "402") == 0) {
+        const unsigned __int64 base =
+            (unsigned __int64)GetModuleHandleA(NULL);
+        char modulePath[MAX_PATH];
+        modulePath[0] = '\0';
+        GetModuleFileNameA(NULL, modulePath, MAX_PATH);
+        modulePath[MAX_PATH - 1] = '\0';
+
+        typedef void (RootObjectContainer::*SerialiseThingsAllMemFn)(
+            GameData*, GameDataContainer*, PosRotPair*, const std::string&);
+        typedef void (RootObjectContainer::*SerialiseThingsSomeMemFn)(
+            const lektor<RootObject*>&, GameData*, GameDataContainer*,
+            PosRotPair*, const std::string&);
+
+        struct AddrProbe {
+            const char* name;
+            unsigned __int64 address;
+        };
+        const AddrProbe probes[] = {
+            { "RootObjectContainer::serialiseThings(all)",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  static_cast<SerialiseThingsAllMemFn>(
+                      &RootObjectContainer::serialiseThings)) },
+            { "RootObjectContainer::serialiseThings(list)",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  static_cast<SerialiseThingsSomeMemFn>(
+                      &RootObjectContainer::serialiseThings)) },
+            { "Character::serialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Character::_NV_serialise) },
+            { "Character::loadFromSerialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Character::_NV_loadFromSerialise) },
+            { "Building::serialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Building::_NV_serialise) },
+            { "Building::loadFromSerialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Building::_NV_loadFromSerialise) },
+            { "Item::serialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Item::_NV_serialise) },
+            { "Item::loadFromSerialise",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &Item::_NV_loadFromSerialise) },
+            { "GameDataContainer::save",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &GameDataContainer::save) },
+            { "GameDataContainer::load",
+              (unsigned __int64)KenshiLib::GetRealAddress(
+                  &GameDataContainer::load) }
+        };
+
+        char line[480];
+        _snprintf(line, sizeof(line) - 1,
+                  "[r402] module='%s' base=%016llx", modulePath, base);
+        line[sizeof(line) - 1] = '\0';
+        coop::logLine(line);
+        for (unsigned int i = 0;
+             i < sizeof(probes) / sizeof(probes[0]); ++i) {
+            const unsigned __int64 rva =
+                probes[i].address && probes[i].address >= base
+                    ? probes[i].address - base : 0;
+            _snprintf(line, sizeof(line) - 1,
+                      "[r402] %-48s addr=%016llx rva=%08llx",
+                      probes[i].name, probes[i].address, rva);
+            line[sizeof(line) - 1] = '\0';
+            coop::logLine(line);
+        }
+    }
 }
 
 bool gameplayLive(GameWorld* gw) {
@@ -1287,6 +1407,82 @@ bool gameplayLive(GameWorld* gw) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+int probeNativeSnapshot(GameWorld* gw) {
+    Character* c = leader(gw);
+    if (!c) return 0;
+
+    // Keep every allocation in probe-owned containers. Character::serialise
+    // writes state GameData records into `output`'s source container; nothing
+    // is inserted into GameWorld::savedata or the live platoon container.
+    GameDataContainer output;
+    output.setName("KenshiCoop r402 native snapshot");
+    const std::string sid("kenshicoop-r402-instances");
+    const std::string displayName("KenshiCoop r402 instances");
+    GameData* instances =
+        output.createNewData(INSTANCE_COLLECTION, sid, displayName);
+    if (!instances) {
+        coop::logErrLine("[r402] native snapshot: INSTANCE_COLLECTION create failed");
+        return 0;
+    }
+
+    GameSaveState state = c->serialise(&output, instances, 0);
+    const unsigned int stateCount = (unsigned int)state.states.size();
+    const unsigned int instanceCount =
+        (unsigned int)instances->instances.size();
+    const unsigned int recordCount =
+        (unsigned int)output._getAllData().size();
+
+    char tempDir[MAX_PATH];
+    tempDir[0] = '\0';
+    if (!GetTempPathA(MAX_PATH, tempDir)) {
+        coop::logErrLine("[r402] native snapshot: GetTempPath failed");
+        return -1;
+    }
+    char filename[MAX_PATH];
+    _snprintf(filename, sizeof(filename) - 1,
+              "%sKenshiCoop-r402-%lu.mod", tempDir,
+              (unsigned long)GetCurrentProcessId());
+    filename[sizeof(filename) - 1] = '\0';
+
+    const std::string file(filename);
+    const bool saved = output.save(file, 0);
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    memset(&attr, 0, sizeof(attr));
+    const bool fileExists =
+        GetFileAttributesExA(filename, GetFileExInfoStandard, &attr) != 0;
+    const unsigned __int64 fileBytes = fileExists
+        ? (((unsigned __int64)attr.nFileSizeHigh << 32) |
+           (unsigned __int64)attr.nFileSizeLow)
+        : 0;
+
+    GameDataContainer loaded;
+    const std::string modName("KenshiCoop-r402");
+    const bool loadedOk = saved &&
+        loaded.load(file, modName, 0, 0, true);
+    GameData* loadedInstances =
+        loadedOk ? loaded.getData(sid, INSTANCE_COLLECTION) : 0;
+    const unsigned int loadedInstanceCount = loadedInstances
+        ? (unsigned int)loadedInstances->instances.size() : 0;
+    const unsigned int loadedRecordCount = loadedOk
+        ? (unsigned int)loaded._getAllData().size() : 0;
+
+    char line[480];
+    _snprintf(line, sizeof(line) - 1,
+              "[r402] native snapshot states=%u instances=%u records=%u "
+              "save=%d bytes=%llu load=%d loadedInstances=%u "
+              "loadedRecords=%u file='%s'",
+              stateCount, instanceCount, recordCount, saved ? 1 : 0,
+              fileBytes, loadedOk ? 1 : 0, loadedInstanceCount,
+              loadedRecordCount, filename);
+    line[sizeof(line) - 1] = '\0';
+    coop::logLine(line);
+
+    if (!saved || !loadedOk) return -1;
+    return stateCount > 0 && instanceCount == 1 &&
+           loadedInstanceCount == instanceCount &&
+           loadedRecordCount == recordCount ? 1 : 0;
 }
 
 bool loadSave(const std::string& name) {
@@ -2172,19 +2368,34 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[2]) {
 unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
     if (!g_getCharsFn || !gw || !out || maxOut == 0) return 0;
     unsigned int n = 0;
+    // Capture-bubble hysteresis (2026-07-11 choppiness fix): a hard 200 u
+    // edge flapped boundary NPCs in/out of the streamed set as the two
+    // clients disagreed slightly on their positions, starving the join's
+    // interp buffer right when the NPC was visibly walking away. ACQUIRE at
+    // 200 u, RETAIN out to 260 u for NPCs captured on the previous call, so
+    // a body must genuinely leave interest (not jitter across the line) to
+    // stop streaming. Previous-set keyed by (hIndex, hSerial); static
+    // arrays, main-thread only (no C++ unwinding inside __try).
+    const float NPC_CAPTURE_ACQUIRE = 200.0f;
+    const float NPC_CAPTURE_KEEP    = 260.0f;
+    static unsigned int prevKeys[512][2];
+    static unsigned int prevN = 0;
+    static unsigned int newKeys[512][2];
+    unsigned int newN = 0;
     __try {
         // Interest: one sphere per squad-tab leader (dual-interest, step 5). The
         // query radii approximate a town-block footprint (~200u far) per sphere.
         Ogre::Vector3 centers[2];
         unsigned int nc = interestCenters(gw, centers);
-        if (nc == 0) return 0;
+        if (nc == 0) { prevN = 0; return 0; }
 
         // Dedupe across the (possibly overlapping) spheres by object pointer.
         static RootObject* appended[512]; // main-thread only
         unsigned int nApp = 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {
             g_npcQuery.clear();
-            g_getCharsFn(gw, &g_npcQuery, &centers[ci], 200.0f, 120.0f, 30.0f, 96, 96, 0);
+            g_getCharsFn(gw, &g_npcQuery, &centers[ci], NPC_CAPTURE_KEEP,
+                         120.0f, 30.0f, 96, 96, 0);
             unsigned int total = g_npcQuery.size();
             for (unsigned int i = 0; i < total && n < maxOut; ++i) {
                 RootObject* obj = g_npcQuery[i];
@@ -2196,13 +2407,37 @@ unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
                 if (dup) continue;
                 // getCharactersWithinSphere returns Characters as RootObject* bases.
                 if (captureOne(static_cast<Character*>(obj), &out[n])) {
+                    float dx = out[n].x - centers[ci].x;
+                    float dy = out[n].y - centers[ci].y;
+                    float dz = out[n].z - centers[ci].z;
+                    float distSq = dx * dx + dy * dy + dz * dz;
+                    if (distSq > NPC_CAPTURE_ACQUIRE * NPC_CAPTURE_ACQUIRE) {
+                        // Retention band: only NPCs already streaming stay in.
+                        // Skipping without appending lets an overlapping
+                        // second sphere still acquire it inside ITS 200 u.
+                        bool held = false;
+                        for (unsigned int k = 0; k < prevN && !held; ++k)
+                            held = prevKeys[k][0] == out[n].hIndex &&
+                                   prevKeys[k][1] == out[n].hSerial;
+                        if (!held) continue;
+                    }
                     if (nApp < 512) appended[nApp++] = obj;
+                    if (newN < 512) {
+                        newKeys[newN][0] = out[n].hIndex;
+                        newKeys[newN][1] = out[n].hSerial;
+                        ++newN;
+                    }
                     ++n;
                 }
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return n;
+        // fall through: publish whatever was captured before the fault
+    }
+    prevN = newN;
+    for (unsigned int k = 0; k < newN; ++k) {
+        prevKeys[k][0] = newKeys[k][0];
+        prevKeys[k][1] = newKeys[k][1];
     }
     return n;
 }
@@ -2244,6 +2479,21 @@ void restoreNpc(GameWorld* gw, Character* c) {
         g_addUpdateFn(gw, c);
         static_cast<RootObject*>(c)->setVisible(true);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+bool captureNpcByHand(GameWorld* gw, unsigned int hIndex, unsigned int hSerial,
+                      unsigned int hType, unsigned int hContainer,
+                      unsigned int hContainerSerial, EntityState* out) {
+    if (!gw || !out) return false;
+    Character* c = resolveCharByHand(hIndex, hSerial, hType, hContainer,
+                                     hContainerSerial);
+    if (!c) return false;
+    __try {
+        if (isPlayerSquad(gw, static_cast<RootObject*>(c))) return false;
+        return captureOne(c, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 
@@ -2316,6 +2566,104 @@ unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
         return n;
     }
     return n;
+}
+
+namespace {
+// getName() returns std::string by value (needs C++ unwinding), so the copy
+// lives in a callee; the SEH guard in charName only has POD locals (C2712).
+void charNameCopy(Character* c, char* out, unsigned int cap) {
+    std::string nm = static_cast<RootObjectBase*>(c)->getName();
+    strncpy(out, nm.c_str(), cap - 1);
+    out[cap - 1] = '\0';
+}
+} // namespace
+
+void charName(Character* c, char* out, unsigned int cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!c) return;
+    __try {
+        charNameCopy(c, out, cap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = '\0';
+    }
+}
+
+// ---- Debug marker HUD labels (KENSHICOOP_DEBUG_MARKERS, spike-47 substrate) --
+// ForgottenGUI::createScreenLabel + ScreenLabel::setTracking pin a colored text
+// label to a character; the engine's own per-frame projection keeps it on the
+// body (spike 47 render proof). The Replicator uses these to make join-side
+// authority states self-explaining on screen: who is host-driven, who is
+// hidden, who is a local-only ghost. C2712 split: the outer fns build the
+// std::string/Colour/Vector3 (unwindable), POD-only inner fns hold the SEH.
+
+namespace {
+
+void markerColour(int colorId, MyGUI::Colour* col) {
+    switch (colorId) {
+    case 0:  *col = MyGUI::Colour(0.30f, 1.00f, 0.30f, 1.0f); break; // driven
+    case 1:  *col = MyGUI::Colour(1.00f, 0.25f, 0.25f, 1.0f); break; // hidden
+    case 2:  *col = MyGUI::Colour(1.00f, 0.90f, 0.25f, 1.0f); break; // local-only
+    default: *col = MyGUI::Colour(0.80f, 0.80f, 0.80f, 1.0f); break;
+    }
+}
+
+ScreenLabel* markerCreateSeh(ForgottenGUI* g, Character* c,
+                             const std::string* text, const MyGUI::Colour* col,
+                             const Ogre::Vector3* off) {
+    __try {
+        ScreenLabel* l = g->createScreenLabel(*text, *col, ScreenLabel::LS_SMALL,
+                                              ScreenLabel::RS_STOPPED);
+        if (l) {
+            l->_NV_setRisingSpeed(ScreenLabel::RS_STOPPED);
+            l->_NV_setTracking(c->handle, *off);
+        }
+        return l;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+bool markerUpdateSeh(ScreenLabel* l, const std::string* text,
+                     const MyGUI::Colour* col) {
+    __try {
+        l->_NV_setCaption(*text);
+        l->_NV_setColor(*col);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool markerDestroySeh(ForgottenGUI* g, ScreenLabel* l) {
+    __try {
+        g->destroy(l);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+} // namespace
+
+void* markerCreate(Character* c, const char* text, int colorId) {
+    if (!c || !text) return 0;
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return 0;
+    std::string t(text);
+    MyGUI::Colour col;
+    markerColour(colorId, &col);
+    Ogre::Vector3 off(0.0f, 2.2f, 0.0f); // head height (spike 47)
+    return markerCreateSeh(g, c, &t, &col, &off);
+}
+
+bool markerUpdate(void* label, const char* text, int colorId) {
+    if (!label || !text) return false;
+    std::string t(text);
+    MyGUI::Colour col;
+    markerColour(colorId, &col);
+    return markerUpdateSeh((ScreenLabel*)label, &t, &col);
+}
+
+void markerDestroy(void* label) {
+    if (!label) return;
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return;
+    markerDestroySeh(g, (ScreenLabel*)label);
 }
 
 namespace {
@@ -2716,6 +3064,22 @@ GameData* findItemTemplateImpl(GameWorld* gw, const char* sid, unsigned int type
     return 0;
 }
 
+// SEH-guarded: a generic WEAPON_MANUFACTURER GameData for weapon fabrication when the
+// wire carried no manufacturer sid (spike 451: the manufacturer record is the REQUIRED
+// first arg of a weapon createItem - without one the weapon cannot fabricate at all,
+// so a generic maker beats a lost weapon). First enumerated record, cached per session.
+GameData* fallbackWeaponManufacturer(GameWorld* gw) {
+    static GameData* cached = 0;
+    if (cached) return cached;
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, WEAPON_MANUFACTURER);
+        if (g_dataScratch.size() > 0) cached = g_dataScratch[0];
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return cached;
+}
+
 // SEH-guarded: create `qty` of the template (sid, typeCat) and add it to inv. The
 // join reconstructs items locally (their hands are host-only / unresolvable), so a
 // fresh blank handle is fine - the host stays authoritative for the contents. When
@@ -2730,24 +3094,47 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
     __try {
         GameData* tmpl = findItemTemplateImpl(gw, sid, typeCat);
         if (!tmpl) { if (dbg) coop::logLine("[mk] tmpl-null"); return false; }
-        // A WEAPON needs its manufacturer (mesh/company) GameData or createItem returns
-        // null; resolve it (and the material spec) by the replicated stringIDs. Armour and
-        // items pass null for both (their templates instantiate directly).
+        // A WEAPON needs its manufacturer (company) GameData; resolve it (and the material
+        // spec) by the replicated stringIDs. Armour and items pass null for both (their
+        // templates instantiate directly).
         GameData* man = (manufacturer && manufacturer[0])
                         ? findItemTemplateImpl(gw, manufacturer, (unsigned int)WEAPON_MANUFACTURER) : 0;
         GameData* mat = (material && material[0])
                         ? findItemTemplateImpl(gw, material, (unsigned int)MATERIAL_SPECS_WEAPON) : 0;
-        char buf[sizeof(hand) + 16];
-        memset(buf, 0, sizeof(buf));
-        hand* h = reinterpret_cast<hand*>(buf);
-        g_handCtorFn(h, 0, 0, (itemType)typeCat, 0, 0); // blank handle (factory owns id)
-        Item* it = g_createItemFn(gw->theFactory, tmpl, h, man, mat, -1, 0);
-        // NOTE (weapon limitation): the 6-arg factory createItem returns null for WEAPONS in
-        // this context even with the correct manufacturer+material (confirmed: 0/24 base
-        // weapon templates instantiate), while armour/items create fine. Newly-ACQUIRED
-        // weapons (loot/pickup/trade) therefore cannot yet be reconstructed on a peer; save-
-        // shared weapons still sync (they MOVE, never CREATE). Needs the engine's real
-        // weapon-spawn path (TODO) - tracked as a follow-up.
+        Item* it = 0;
+        if ((itemType)typeCat == WEAPON) {
+            // KENSHICOOP_WEAPON_FAB=0: escape hatch back to the pre-spike-451 behaviour
+            // (weapons never fabricate - conservation-only gear sync). Covers EVERY
+            // weapon-fabrication site at once: reconcile CREATE, xfer shortfall, probes.
+            static int fabOn = -1;
+            if (fabOn < 0) { const char* e = getenv("KENSHICOOP_WEAPON_FAB"); fabOn = (e && e[0] == '0') ? 0 : 1; }
+            if (!fabOn) {
+                if (dbg) coop::logLine("[mk] weapon-fab disabled (KENSHICOOP_WEAPON_FAB=0)");
+                return false;
+            }
+            // Spike 451: for WEAPONS the 6-arg createItem's first two GameData roles
+            // are SWAPPED - the engine passes the WEAPON_MANUFACTURER record FIRST and
+            // the weapon template THIRD (the header's misleading "weaponMesh" slot).
+            // Template-first returns null for every weapon template (the old 0/24);
+            // manufacturer-first fabricates (replay proved created=1 added=1). The
+            // engine's own mint shape: blank NULL_ITEM hand, levelOverride 0, no faction.
+            if (!man) man = fallbackWeaponManufacturer(gw);
+            if (man) {
+                char wb[sizeof(hand) + 16];
+                memset(wb, 0, sizeof(wb));
+                hand* wh = reinterpret_cast<hand*>(wb);
+                g_handCtorFn(wh, 0, 0, NULL_ITEM, 0, 0);
+                it = g_createItemFn(gw->theFactory, man, wh, tmpl, mat, 0, 0);
+            } else if (dbg) {
+                coop::logLine("[mk] weapon manufacturer unresolved (no provenance, no fallback)");
+            }
+        } else {
+            char buf[sizeof(hand) + 16];
+            memset(buf, 0, sizeof(buf));
+            hand* h = reinterpret_cast<hand*>(buf);
+            g_handCtorFn(h, 0, 0, (itemType)typeCat, 0, 0); // blank handle (factory owns id)
+            it = g_createItemFn(gw->theFactory, tmpl, h, man, mat, -1, 0);
+        }
         if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; }
         if (qualityBucket > 0) it->quality = (float)qualityBucket / 100.0f;
         if (!inv->tryAddItem(it, qty)) { if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] tryAddItem-fail sid='%s' type=%u equip=%d",sid,typeCat,equip?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; } // virtual
@@ -4003,74 +4390,767 @@ int reequipLooseItem(GameWorld* gw, const unsigned int cHand[5],
     return moved;
 }
 
-// DIAGNOSTIC: classify why createItem returns null for WEAPONS. Walks the first `maxTry`
-// WEAPON base templates and tries to instantiate each with no manufacturer, with a
-// manufacturer, and with manufacturer+material, logging the success counts. Tells us
-// whether weapon creation via the 6-arg factory is broken in general (all fail) or only
-// for the specific save weapon (some base weapons succeed). Created trials are added to
-// `inv` and immediately destroyed so nothing leaks.
+// ---- Spike 451: weapon-mint recipe trace ------------------------------------
+// The engine mints weapons at runtime constantly (armed NPC spawns, vendor stock,
+// crafting) while OUR 6-arg createItem returns null for every weapon template
+// (diagWeaponCreate: 0/24 even with a live weapon's exact man/mat pointers). These
+// detours watch the ENGINE do it: both createItem overloads + copyItem + the
+// Sword constructor + chooseDataFromList (list picks scoped to weapon mints), each
+// logging full args, the caller's RVA and the result as "[mkspy] ..." lines. The
+// last SUCCESSFUL engine weapon mint's args are captured so probeReplayWeaponMint
+// can re-issue the identical call from plugin context - proving (or refuting) the
+// recipe in the same run.
+namespace {
+
+typedef Item*     (__fastcall* CreateItemStateFn)(RootObjectFactory* self, GameData* itemState);
+typedef Item*     (__fastcall* CopyItemFn)(RootObjectFactory* self, Item* from);
+typedef GameData* (__fastcall* ChooseDataFn)(RootObjectFactory* self, GameData* dataList,
+                                             const std::string* listName,
+                                             itemType materialDataType, int useVal012);
+typedef Sword*    (__fastcall* SwordCtorFn)(Sword* self, GameData* baseData,
+                                            GameData* companyData, GameData* materialData,
+                                            hand* handle, int level);
+
+CreateItemFn      g_mk6Orig   = 0;
+CreateItemStateFn g_mkSOrig   = 0;
+CopyItemFn        g_cpyOrig   = 0;
+ChooseDataFn      g_cdlOrig   = 0;
+SwordCtorFn       g_swordOrig = 0;
+
+// Module base for caller RVAs: g_createItemFn is base + 0x57FFD0 (RootObjectFactory.h).
+unsigned __int64 g_mkspyBase = 0;
+// Depth flag: >0 while inside a WEAPON-template createItem6, so the (very hot)
+// chooseDataFromList detour only logs the picks belonging to a weapon mint.
+// Main-thread only (the factory runs on the game's main thread).
+int g_inWeaponMk = 0;
+
+// Last successful ENGINE weapon mint (template pointers persist for the session).
+GameData* g_wmGd = 0; GameData* g_wmMesh = 0; GameData* g_wmMat = 0;
+int g_wmLevel = 0; Faction* g_wmFaction = 0; bool g_wmHave = false;
+
+void mkspySid(GameData* gd, char* out, unsigned int len) {
+    if (!out || !len) return;
+    out[0] = '\0';
+    if (!gd) { strncpy(out, "(null)", len - 1); out[len - 1] = '\0'; return; }
+    __try {
+        strncpy(out, gd->stringID.c_str(), len - 1);
+        out[len - 1] = '\0';
+    } __except (EXCEPTION_EXECUTE_HANDLER) { strncpy(out, "(fault)", len - 1); out[len - 1] = '\0'; }
+}
+
+int mkspyType(GameData* gd) {
+    if (!gd) return -1;
+    __try { return (int)gd->type; } __except (EXCEPTION_EXECUTE_HANDLER) { return -2; }
+}
+
+unsigned __int64 mkspyRva(void* retAddr) {
+    if (!g_mkspyBase) return 0;
+    unsigned __int64 a = (unsigned __int64)retAddr;
+    return (a > g_mkspyBase) ? (a - g_mkspyBase) : 0;
+}
+
+// Line caps so an all-calls trace can't flood a long session (spike runs only).
+int g_mk6Logged = 0;
+int g_cdlLogged = 0;
+const int MK6_LOG_CAP = 300;
+
+// SEH-guarded: is this freshly created Item actually a weapon (virtual isWeapon)?
+bool mkspyIsWeapon(Item* it) {
+    if (!it) return false;
+    __try { return it->isWeapon() != 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+Item* __fastcall mk6_hook(RootObjectFactory* self, GameData* gd, const hand* handle,
+                          GameData* weaponMesh, GameData* matData, int levelOverride,
+                          Faction* flagUniform) {
+    void* caller = _ReturnAddress();
+    const int gdt = mkspyType(gd);
+    const bool isWpn = (gdt == (int)WEAPON);
+    // Run-1 finding: the engine's weapon mints call the Sword ctor from INSIDE
+    // createItem6's address range (+0x5805F2) yet no WEAPON-typed gd ever entered
+    // this hook - the entry gd must be typed differently (state record?). So run 2
+    // traces EVERY entry (capped) and scopes the chooseDataFromList trace to any
+    // in-flight createItem6.
+    ++g_inWeaponMk;
+    Item* it = g_mk6Orig(self, gd, handle, weaponMesh, matData, levelOverride, flagUniform);
+    --g_inWeaponMk;
+    if (g_mk6Logged < MK6_LOG_CAP) {
+        ++g_mk6Logged;
+        __try {
+            char gsid[48], msid[48], xsid[48];
+            mkspySid(gd, gsid, sizeof(gsid));
+            mkspySid(weaponMesh, msid, sizeof(msid));
+            mkspySid(matData, xsid, sizeof(xsid));
+            unsigned int hi = 0, hs = 0, ht = 0, hc = 0, hcs = 0;
+            if (handle) { hi = handle->index; hs = handle->serial; ht = (unsigned int)handle->type;
+                          hc = handle->container; hcs = handle->containerSerial; }
+            char b[440];
+            _snprintf(b, sizeof(b) - 1,
+                "[mkspy] mk6 gd='%s'/%d mesh='%s'/%d mat='%s'/%d lvl=%d fac=%d "
+                "hand={i=%u s=%u t=%u c=%u cs=%u} ret=%d caller=+0x%I64X",
+                gsid, gdt, msid, mkspyType(weaponMesh), xsid, mkspyType(matData),
+                levelOverride, flagUniform ? 1 : 0, hi, hs, ht, hc, hcs,
+                it ? 1 : 0, mkspyRva(caller));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            // Capture by RESULT type, not entry type: run 1 proved the engine's
+            // weapon mints reach the Sword ctor from inside createItem6 while NO
+            // WEAPON-typed gd ever entered the hook - the entry record is typed
+            // differently, so classify off the constructed item itself.
+            if (it && (isWpn || mkspyIsWeapon(it))) {
+                g_wmGd = gd; g_wmMesh = weaponMesh; g_wmMat = matData;
+                g_wmLevel = levelOverride; g_wmFaction = flagUniform; g_wmHave = true;
+                char c[100];
+                _snprintf(c, sizeof(c) - 1, "[mkspy] CAPTURED weapon recipe (entry gdType=%d)", gdt);
+                c[sizeof(c) - 1] = '\0'; coop::logLine(c);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return it;
+}
+
+Item* __fastcall mkS_hook(RootObjectFactory* self, GameData* itemState) {
+    void* caller = _ReturnAddress();
+    Item* it = g_mkSOrig(self, itemState);
+    __try {
+        if (mkspyType(itemState) == (int)WEAPON || g_inWeaponMk) {
+            char gsid[48];
+            mkspySid(itemState, gsid, sizeof(gsid));
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "[mkspy] mkState gd='%s'/%d ret=%d caller=+0x%I64X",
+                      gsid, mkspyType(itemState), it ? 1 : 0, mkspyRva(caller));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return it;
+}
+
+Item* __fastcall cpy_hook(RootObjectFactory* self, Item* from) {
+    void* caller = _ReturnAddress();
+    Item* it = g_cpyOrig(self, from);
+    __try {
+        GameData* gd = from ? from->getGameData() : 0;
+        if (mkspyType(gd) == (int)WEAPON) {
+            char gsid[48];
+            mkspySid(gd, gsid, sizeof(gsid));
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "[mkspy] copyItem gd='%s' ret=%d caller=+0x%I64X",
+                      gsid, it ? 1 : 0, mkspyRva(caller));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return it;
+}
+
+GameData* __fastcall cdl_hook(RootObjectFactory* self, GameData* dataList,
+                              const std::string* listName, itemType materialDataType,
+                              int useVal012) {
+    GameData* r = g_cdlOrig(self, dataList, listName, materialDataType, useVal012);
+    if (g_inWeaponMk > 0 && g_cdlLogged < MK6_LOG_CAP) {
+        ++g_cdlLogged;
+        __try {
+            char lsid[48], rsid[48], lname[48];
+            mkspySid(dataList, lsid, sizeof(lsid));
+            mkspySid(r, rsid, sizeof(rsid));
+            lname[0] = '\0';
+            if (listName) { strncpy(lname, listName->c_str(), sizeof(lname) - 1); lname[sizeof(lname) - 1] = '\0'; }
+            char b[280];
+            _snprintf(b, sizeof(b) - 1,
+                "[mkspy] chooseList list='%s' name='%s' matType=%d use=%d -> '%s'/%d",
+                lsid, lname, (int)materialDataType, useVal012, rsid, mkspyType(r));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return r;
+}
+
+Sword* __fastcall swordCtor_hook(Sword* self, GameData* baseData, GameData* companyData,
+                                 GameData* materialData, hand* handle, int level) {
+    void* caller = _ReturnAddress();
+    Sword* r = g_swordOrig(self, baseData, companyData, materialData, handle, level);
+    __try {
+        char gsid[48], csid[48], msid[48];
+        mkspySid(baseData, gsid, sizeof(gsid));
+        mkspySid(companyData, csid, sizeof(csid));
+        mkspySid(materialData, msid, sizeof(msid));
+        unsigned int hi = 0, hs = 0, ht = 0, hc = 0, hcs = 0;
+        if (handle) { hi = handle->index; hs = handle->serial; ht = (unsigned int)handle->type;
+                      hc = handle->container; hcs = handle->containerSerial; }
+        char b[340];
+        _snprintf(b, sizeof(b) - 1,
+            "[mkspy] swordCtor gd='%s' company='%s'/%d mat='%s'/%d lvl=%d "
+            "hand={i=%u s=%u t=%u c=%u cs=%u} ret=%d caller=+0x%I64X",
+            gsid, csid, mkspyType(companyData), msid, mkspyType(materialData),
+            level, hi, hs, ht, hc, hcs, r ? 1 : 0, mkspyRva(caller));
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return r;
+}
+
+} // namespace
+
+bool installCreateItemTraceHook() {
+    // Base for caller RVAs: createItem6's documented RVA anchors the module base.
+    intptr_t a6 = KenshiLib::GetRealAddress(
+        static_cast<Item* (RootObjectFactory::*)(GameData*, const hand&, GameData*,
+                                                 GameData*, int, Faction*)>(
+            &RootObjectFactory::createItem));
+    if (a6) g_mkspyBase = (unsigned __int64)a6 - 0x57FFD0ull;
+    intptr_t aS = KenshiLib::GetRealAddress(
+        static_cast<Item* (RootObjectFactory::*)(GameData*)>(&RootObjectFactory::createItem));
+    intptr_t aC = KenshiLib::GetRealAddress(&RootObjectFactory::copyItem);
+    intptr_t aL = KenshiLib::GetRealAddress(&RootObjectFactory::chooseDataFromList);
+    intptr_t aW = KenshiLib::GetRealAddress(
+        static_cast<Sword* (Sword::*)(GameData*, GameData*, GameData*, hand, int)>(
+            &Sword::_CONSTRUCTOR));
+    int ok = 0, want = 0;
+    if (a6) { ++want; if (KenshiLib::AddHook(a6, (void*)&mk6_hook,  (void**)&g_mk6Orig)   == KenshiLib::SUCCESS) ++ok; }
+    if (aS) { ++want; if (KenshiLib::AddHook(aS, (void*)&mkS_hook,  (void**)&g_mkSOrig)   == KenshiLib::SUCCESS) ++ok; }
+    if (aC) { ++want; if (KenshiLib::AddHook(aC, (void*)&cpy_hook,  (void**)&g_cpyOrig)   == KenshiLib::SUCCESS) ++ok; }
+    if (aL) { ++want; if (KenshiLib::AddHook(aL, (void*)&cdl_hook,  (void**)&g_cdlOrig)   == KenshiLib::SUCCESS) ++ok; }
+    if (aW) { ++want; if (KenshiLib::AddHook(aW, (void*)&swordCtor_hook, (void**)&g_swordOrig) == KenshiLib::SUCCESS) ++ok; }
+    char b[160];
+    _snprintf(b, sizeof(b) - 1,
+        "[mkspy] hooks installed %d/%d (mk6=%d mkState=%d copy=%d chooseList=%d swordCtor=%d)",
+        ok, want, g_mk6Orig ? 1 : 0, g_mkSOrig ? 1 : 0, g_cpyOrig ? 1 : 0,
+        g_cdlOrig ? 1 : 0, g_swordOrig ? 1 : 0);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return ok == want && want >= 1;
+}
+
+int probeReplayWeaponMint(GameWorld* gw, const unsigned int cHand[5]) {
+    if (!g_wmHave) { coop::logLine("[mkspy] replay: nothing captured"); return 0; }
+    if (!gw || !gw->theFactory || !g_createItemFn || !g_handCtorFn) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    Inventory* inv = 0;
+    if (ro) { __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; } }
+    if (!inv) { coop::logLine("[mkspy] replay: no inv"); return 0; }
+    __try {
+        char buf[sizeof(hand) + 16]; memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, 0, 0, WEAPON, 0, 0);
+        Item* it = g_createItemFn(gw->theFactory, g_wmGd, h, g_wmMesh, g_wmMat,
+                                  g_wmLevel, g_wmFaction);
+        int added = 0;
+        if (it) added = inv->tryAddItem(it, 1) ? 1 : 0;
+        char gsid[48];
+        mkspySid(g_wmGd, gsid, sizeof(gsid));
+        char b[220];
+        _snprintf(b, sizeof(b) - 1,
+            "[mkspy] replay gd='%s' lvl=%d fac=%d -> created=%d added=%d",
+            gsid, g_wmLevel, g_wmFaction ? 1 : 0, it ? 1 : 0, added);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return (it && added) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[mkspy] replay SEH-except");
+        return -1;
+    }
+}
+
+int probeFabricateWeaponLoose(GameWorld* gw, const unsigned int cHand[5],
+                              char* outSid, unsigned int outLen) {
+    if (outSid && outLen) outSid[0] = '\0';
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    Inventory* inv = 0;
+    if (ro) { __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; } }
+    if (!inv) return 0;
+    char sid[48]; sid[0] = '\0';
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, WEAPON);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* t = g_dataScratch[i];
+            if (!t) continue;
+            const char* s = t->stringID.c_str();
+            if (!s || !s[0]) continue;
+            if (strcmp(s, "FISTS") == 0) continue; // natural weapon - not a real fabrication test
+            strncpy(sid, s, sizeof(sid) - 1);
+            sid[sizeof(sid) - 1] = '\0';
+            break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    if (!sid[0]) return 0;
+    if (outSid && outLen) { strncpy(outSid, sid, outLen - 1); outSid[outLen - 1] = '\0'; }
+    return createItemAndAdd(gw, inv, sid, (unsigned int)WEAPON, 1, 0, false) ? 1 : 0;
+}
+
+int commonNovelWeaponSid(GameWorld* gw, const unsigned int cHand[5],
+                         char* outSid, unsigned int outLen) {
+    if (outSid && outLen) outSid[0] = '\0';
+    if (!gw || !g_getDataOfTypeFn || !outSid || outLen == 0) return 0;
+    // Current contents first (own SEH guard): the pick must EXCLUDE any weapon the
+    // container already holds, so the scenario's arrival gate can't false-pass on a
+    // baked copy of the same template.
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    unsigned int nc = captureContainerContents(gw, cHand, cur, MAXC, 0);
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, WEAPON);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* t = g_dataScratch[i];
+            if (!t) continue;
+            const char* s = t->stringID.c_str();
+            if (!s || !s[0]) continue;
+            if (strcmp(s, "FISTS") == 0) continue; // natural weapon - never a real acquisition
+            bool held = false;
+            for (unsigned int j = 0; j < nc && !held; ++j)
+                if (cur[j].itemType == (unsigned int)WEAPON &&
+                    strcmp(cur[j].stringID, s) == 0) held = true;
+            if (held) continue;
+            strncpy(outSid, s, outLen - 1); outSid[outLen - 1] = '\0';
+            return 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 0;
+}
+
+// ---- Spike 401: research tech-tree store probe ------------------------------
+// Real-RVA surfaces recovered from the on-disk 1.0.65 exe (string-xref +
+// disassembly of the "Research already known" caller at 0x2b65d0 - the research
+// UI's click handler: canResearch -> isKnown -> startResearch):
+//   0x2134690  .data global whose +0x38 slot is the engine's LIVE Research*
+//              (matches PlayerInterface::technology @ 0x38 - the global is the
+//              PlayerInterface singleton the UI code reads)
+//   0x82f300   Research::isKnown(GameData*) -> bool (special path for type 0x15,
+//              else walks a vector reached through the container at this+0x10)
+//   0x832fa0   Research::canResearch(GameData*, bool, bool) -> bool (the UI
+//              passes false,false)
+//   0x834550   Research::startResearch(GameData*) (dedupes the queue at
+//              +0x38/+0x58, activates, fires the UI toast natively)
+// These are ON-DISK 1.0.65 RVAs from disassembling the installed exe, so the
+// only correct base is GetModuleHandle(NULL). Deriving the base from a
+// KenshiLib-resolved neighbour (run 211124) crashed BOTH clients through the
+// SEH guards - KenshiLib's GetRealAddress space need not be base+headerRVA
+// (version remap), and a mid-instruction jump can land on __fastfail, which
+// no SEH frame catches. The two bases are logged once for the evidence trail.
+
+namespace {
+
+const unsigned int R401_WIN = 0x800; // Research-object snapshot window (bytes)
+unsigned char g_r401Snap[0x800];
+bool  g_r401Have = false;
+void* g_r401Ptr  = 0;
+
+typedef bool (__fastcall* R401BoolGdFn)(void* research, GameData* gd);
+typedef bool (__fastcall* R401CanFn)(void* research, GameData* gd,
+                                     bool a, bool b);
+typedef void (__fastcall* R401StartFn)(void* research, GameData* gd);
+
+// SEH-guarded prologue compare - a raw-RVA call is only allowed when the live
+// bytes are EXACTLY the disassembled function's prologue. A wrong base (or a
+// different exe build) fails the compare instead of jumping into garbage,
+// where a mid-instruction landing can hit __fastfail - unrecoverable by SEH
+// (run 211124 killed both clients that way).
+bool r401SigOk(unsigned __int64 addr, const unsigned char* sig,
+               unsigned int n) {
+    __try {
+        return memcmp((const void*)addr, sig, n) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+struct R401Levers {
+    R401BoolGdFn isKnown;
+    R401CanFn    can;
+    R401StartFn  start;
+};
+
+unsigned __int64 r401Base() {
+    static unsigned __int64 base = 0;
+    if (!base) base = (unsigned __int64)GetModuleHandleA(NULL);
+    return base;
+}
+
+// Scan the running module's .text for a unique byte signature. The on-disk exe
+// RVAs do NOT map to the live image by base+RVA (run 212346: klib's getTechLevel
+// resolved to base+0x2ADE00, 0x470 past the on-disk 0x2AD990, and the on-disk
+// bytes there are unrelated - the executing image differs from the file on
+// disk). A prologue scan finds each function at its TRUE runtime address no
+// matter the skew (each signature was verified count==1 in the file's .text).
+// SEH-guarded page walk; returns 0 if not found.
+unsigned __int64 r401ScanText(const unsigned char* sig, unsigned int n) {
+    unsigned __int64 base = r401Base();
+    if (!base || !sig || n == 0) return 0;
+    __try {
+        const unsigned char* p = (const unsigned char*)base;
+        // PE -> optional header -> section table; find .text.
+        unsigned int peOff = *(unsigned int*)(p + 0x3c);
+        const unsigned char* pe = p + peOff;
+        unsigned short nsec = *(unsigned short*)(pe + 6);
+        unsigned short optSz = *(unsigned short*)(pe + 20);
+        const unsigned char* sec = pe + 24 + optSz;
+        unsigned __int64 txtVa = 0, txtSz = 0;
+        for (unsigned short i = 0; i < nsec; ++i) {
+            const unsigned char* s = sec + i * 40;
+            if (memcmp(s, ".text", 5) == 0) {
+                txtVa = *(unsigned int*)(s + 12);
+                txtSz = *(unsigned int*)(s + 8);
+                break;
+            }
+        }
+        if (!txtVa || txtSz < n) return 0;
+        const unsigned char* start = p + txtVa;
+        const unsigned char* end = start + txtSz - n;
+        unsigned char first = sig[0];
+        for (const unsigned char* q = start; q <= end; ++q) {
+            if (*q != first) continue;
+            if (memcmp(q, sig, n) == 0) return (unsigned __int64)q;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 0;
+}
+
+// Locate the three lever entry points once by prologue scan. All-or-nothing:
+// any miss disables every raw call this spike makes.
+const R401Levers* r401GetLevers() {
+    static R401Levers lv = { 0, 0, 0 };
+    static int state = 0; // 0 unresolved, 1 ok, -1 refused
+    if (state == 0) {
+        state = -1;
+        // 24-byte prologues (verified unique in the 1.0.65 .text).
+        static const unsigned char sigKnown[] = {
+            0x48,0x89,0x54,0x24,0x10,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,
+            0xDA,0x48,0x83,0xC2,0x50,0x83,0x3A,0x15,0x74,0x39,0x48,0x83 };
+        static const unsigned char sigCan[] = {
+            0x40,0x55,0x56,0x57,0x48,0x8D,0x6C,0x24,0xB9,0x48,0x81,0xEC,
+            0xA0,0x00,0x00,0x00,0x48,0xC7,0x45,0xFF,0xFE,0xFF,0xFF,0xFF };
+        static const unsigned char sigStart[] = {
+            0x48,0x8B,0xC4,0x55,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x48,
+            0x8D,0xA8,0x38,0xFE,0xFF,0xFF,0x48,0x81,0xEC,0xA0,0x02,0x00 };
+        unsigned __int64 a = r401ScanText(sigKnown, sizeof(sigKnown));
+        unsigned __int64 b = r401ScanText(sigCan, sizeof(sigCan));
+        unsigned __int64 c = r401ScanText(sigStart, sizeof(sigStart));
+        char msg[200];
+        _snprintf(msg, sizeof(msg) - 1,
+                  "[r401] lever scan isKnown=%016llx can=%016llx start=%016llx",
+                  a, b, c);
+        msg[sizeof(msg) - 1] = '\0'; coop::logLine(msg);
+        if (a && b && c) {
+            lv.isKnown = (R401BoolGdFn)a;
+            lv.can     = (R401CanFn)b;
+            lv.start   = (R401StartFn)c;
+            state = 1;
+            coop::logLine("[r401] levers located by prologue scan");
+        } else {
+            coop::logLine("[r401] levers REFUSED (prologue not found)");
+        }
+    }
+    return state == 1 ? &lv : 0;
+}
+
+// The live Research* is gw->player->technology (the KenshiLib header member at
+// PlayerInterface+0x38). The on-disk-RVA global chain was dropped: the running
+// image is base-skewed from the file (see r401ScanText), so a base+RVA global
+// read returned null (run 212346). The header member resolved to a real object.
+void* r401Research(GameWorld* gw) {
+    __try {
+        if (gw && gw->player) return gw->player->technology;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
+// SEH-guarded lookup of a RESEARCH GameData by sid (main-thread scratch).
+GameData* r401FindResearch(GameWorld* gw, const char* sid) {
+    if (!gw || !sid || !sid[0] || !g_getDataOfTypeFn) return 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, RESEARCH);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* t = g_dataScratch[i];
+            if (!t) continue;
+            const char* s = t->stringID.c_str();
+            if (s && strcmp(s, sid) == 0) return t;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 0;
+}
+
+// SEH-guarded: true when p reads as a plausible GameData record (small type
+// enum + short printable stringID). Bogus pointers fault into the handler or
+// fail the plausibility checks - the mkspy classification trick.
+bool r401GdProbe(void* p, int* outType, char* outSid, unsigned int outLen) {
+    if (!p || ((ULONG_PTR)p & 0x7) || outLen < 2) return false;
+    __try {
+        GameData* gd = (GameData*)p;
+        int t = (int)gd->type;
+        if (t < 0 || t > 90) return false;
+        const char* s = gd->stringID.c_str();
+        if (!s || !s[0]) return false;
+        unsigned int i = 0;
+        for (; i < outLen - 1 && s[i]; ++i) {
+            if ((unsigned char)s[i] < 0x20 || (unsigned char)s[i] > 0x7e)
+                return false;
+            outSid[i] = s[i];
+        }
+        outSid[i] = '\0';
+        *outType = t;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+} // namespace
+
+int probeResearchStore(GameWorld* gw, int phase) {
+    if (!gw) return 0;
+    unsigned char cur[R401_WIN];
+    void* tech = r401Research(gw);
+    if (!tech) return 0;
+    // The interim out-of-process probing of this object CRASHED the host, so
+    // every read stays in-process under its own SEH frame.
+    __try {
+        memcpy(cur, tech, R401_WIN);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[r401] store read FAULTED");
+        return -1;
+    }
+    char b[240];
+    if (tech != g_r401Ptr) { g_r401Ptr = tech; g_r401Have = false; }
+    if (phase == 0 || !g_r401Have) {
+        memcpy(g_r401Snap, cur, R401_WIN);
+        g_r401Have = true;
+        _snprintf(b, sizeof(b) - 1, "[r401] store ptr=%p win=0x%x",
+                  tech, R401_WIN);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        for (unsigned int off = 0; off < 0x100; off += 32) {
+            unsigned __int64 q[4];
+            memcpy(q, cur + off, sizeof(q));
+            _snprintf(b, sizeof(b) - 1,
+                      "[r401] hex 0x%03x: %016llx %016llx %016llx %016llx",
+                      off, q[0], q[1], q[2], q[3]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        for (unsigned int off = 0; off + 8 <= 0x400; off += 8) {
+            void* p = 0;
+            memcpy(&p, cur + off, sizeof(p));
+            int t = -1; char sid[48];
+            if (r401GdProbe(p, &t, sid, sizeof(sid))) {
+                _snprintf(b, sizeof(b) - 1,
+                          "[r401] slot 0x%03x -> GameData type=%d sid='%s'",
+                          off, t, sid);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        return 1;
+    }
+    int nd = 0;
+    for (unsigned int off = 0; off + 4 <= R401_WIN; off += 4) {
+        unsigned int a, c;
+        memcpy(&a, g_r401Snap + off, 4);
+        memcpy(&c, cur + off, 4);
+        if (a == c) continue;
+        float fa, fc;
+        memcpy(&fa, &a, 4); memcpy(&fc, &c, 4);
+        _snprintf(b, sizeof(b) - 1,
+                  "[r401] diff 0x%03x %08x->%08x (f %.5g->%.5g)",
+                  off, a, c, fa, fc);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (++nd >= 40) { coop::logLine("[r401] diff TRUNCATED"); break; }
+    }
+    if (nd == 0) coop::logLine("[r401] diff none");
+    memcpy(g_r401Snap, cur, R401_WIN);
+    return 1;
+}
+
+int probeCurrentResearchSid(char* outSid, unsigned int outLen) {
+    if (outSid && outLen) outSid[0] = '\0';
+    // Unresolvable for now: ManagementScreen.h does not compile under VC100
+    // (its inline ReorderableList template trips C2065), and the KenshiLib
+    // header RVAs (getSingleton 0x2967F0 / singleton 0x212C428) live in
+    // GetRealAddress's REMAPPED space, not at base+RVA on the 1.0.65 exe -
+    // the on-disk bytes at those offsets are unrelated code (spike-401 run
+    // 211124 finding). The current-research identity comes from the store
+    // diff instead; a UI read can be re-added if a real on-disk anchor for
+    // the ManagementScreen singleton is ever recovered.
+    return 0;
+}
+
+int researchQueryBySid(GameWorld* gw, const char* sid, int* outKnown,
+                       int* outCan) {
+    if (outKnown) *outKnown = -1;
+    if (outCan)   *outCan   = -1;
+    void* res = r401Research(gw);
+    const R401Levers* lv = r401GetLevers();
+    if (!res || !lv) return 0;
+    GameData* gd = r401FindResearch(gw, sid);
+    if (!gd) return 0;
+    __try {
+        if (outKnown) *outKnown = lv->isKnown(res, gd) ? 1 : 0;
+        // The research UI's click handler passes (gd, false, false).
+        if (outCan)   *outCan   = lv->can(res, gd, false, false) ? 1 : 0;
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int researchStartBySid(GameWorld* gw, const char* sid) {
+    void* res = r401Research(gw);
+    const R401Levers* lv = r401GetLevers();
+    if (!res || !lv) return 0;
+    GameData* gd = r401FindResearch(gw, sid);
+    if (!gd) return 0;
+    __try {
+        lv->start(res, gd);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+int researchPickSubject(GameWorld* gw, char* outSid, unsigned int outLen) {
+    if (outSid && outLen) outSid[0] = '\0';
+    void* res = r401Research(gw);
+    const R401Levers* lv = r401GetLevers();
+    if (!gw || !res || !lv || !g_getDataOfTypeFn || !outSid || outLen < 2)
+        return 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, RESEARCH);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* t = g_dataScratch[i];
+            if (!t) continue;
+            if (lv->isKnown(res, t)) continue;
+            if (!lv->can(res, t, false, false)) continue;
+            const char* s = t->stringID.c_str();
+            if (!s || !s[0]) continue;
+            strncpy(outSid, s, outLen - 1);
+            outSid[outLen - 1] = '\0';
+            return 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return 0;
+}
+
+unsigned int probeResearchEnum(GameWorld* gw, unsigned int maxLog) {
+    void* res = r401Research(gw);
+    const R401Levers* lv = r401GetLevers();
+    if (!gw || !res || !lv || !g_getDataOfTypeFn) return 0;
+    unsigned int logged = 0, total = 0, known = 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, RESEARCH);
+        unsigned int n = g_dataScratch.size();
+        total = n;
+        char b[220];
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* t = g_dataScratch[i];
+            if (!t) continue;
+            bool k = lv->isKnown(res, t);
+            if (k) ++known;
+            if (logged < maxLog) {
+                bool c = lv->can(res, t, false, false);
+                _snprintf(b, sizeof(b) - 1,
+                          "[r401] research[%u] sid='%s' name='%s' known=%d can=%d",
+                          i, t->stringID.c_str(), t->name.c_str(),
+                          k ? 1 : 0, c ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                ++logged;
+            }
+        }
+        _snprintf(b, sizeof(b) - 1, "[r401] research total=%u known=%u",
+                  total, known);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[r401] enum FAULTED");
+        return logged;
+    }
+    return total;
+}
+
+unsigned int researchEnumKnown(GameWorld* gw, char* outSids,
+                               unsigned int sidCap, unsigned int maxN) {
+    void* res = r401Research(gw);
+    const R401Levers* lv = r401GetLevers();
+    if (!gw || !res || !lv || !g_getDataOfTypeFn || !outSids || sidCap < 2)
+        return 0;
+    unsigned int written = 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, RESEARCH);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n && written < maxN; ++i) {
+            GameData* t = g_dataScratch[i];
+            if (!t) continue;
+            if (!lv->isKnown(res, t)) continue;
+            const char* s = t->stringID.c_str();
+            if (!s || !s[0]) continue;
+            char* dst = outSids + (size_t)written * sidCap;
+            strncpy(dst, s, sidCap - 1);
+            dst[sidCap - 1] = '\0';
+            ++written;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return written; }
+    return written;
+}
+
+int probeResearchBenchRead(const unsigned int mHand[5], int* outTech,
+                           float* outProg, int* outPower) {
+    if (outTech)  *outTech  = -1;
+    if (outProg)  *outProg  = -1.0f;
+    if (outPower) *outPower = -1;
+    if (!mHand) return 0;
+    RootObject* ro = resolveObjectByHand(mHand);
+    if (!ro) return 0;
+    __try {
+        Building* bd = static_cast<Building*>(ro);
+        if ((int)bd->classType != (int)BCTYPE_RESEARCH) return 0;
+        UseableStuff* us = static_cast<UseableStuff*>(bd);
+        if (outProg)  *outProg  = us->progressBarLevel;
+        if (outPower) *outPower = us->powerOn ? 1 : 0;
+        if (outTech && g_machTechLvlFn)
+            *outTech = g_machTechLvlFn(static_cast<ResearchBuilding*>(bd));
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+// DIAGNOSTIC: prove weapon fabrication over the template set. Walks the first `maxTry`
+// WEAPON base templates and instantiates each with the spike-451 recipe (manufacturer
+// GameData FIRST, weapon template in the third "weaponMesh" slot, blank NULL_ITEM hand,
+// lvl 0) - the engine's own mint shape. Logs per-template result + the success count
+// (historically 0/24 with the old template-first args). Trials are added to `inv` and
+// immediately destroyed so nothing leaks.
 void diagWeaponCreate(GameWorld* gw, const unsigned int cHand[5], int maxTry) {
-    (void)maxTry;
-    if (!gw || !gw->theFactory || !g_createItemFn || !g_handCtorFn) {
+    if (maxTry <= 0) maxTry = 24;
+    if (!gw || !gw->theFactory || !g_createItemFn || !g_handCtorFn || !g_getDataOfTypeFn) {
         coop::logLine("[wpndiag] missing fns"); return;
     }
     RootObject* ro = resolveObjectByHand(cHand);
     Inventory* inv = 0;
     if (ro) { __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; } }
     if (!inv) { coop::logLine("[wpndiag] no inv"); return; }
-    // Find a REAL worn/loose WEAPON already on this character and read its GENUINE
-    // manufacturer/material/colorise GameData POINTERS + its base gd. createItem with the
-    // exact pointers the live weapon uses is the cleanest possible recipe; if THAT fails we
-    // know the blocker is not stringID resolution but the call itself (hand/faction/mesh).
-    Item* w = 0; GameData *gd = 0, *man = 0, *mat = 0, *col = 0;
-    // Worn weapons live in equip SECTIONS / the primary-secondary getters, NOT _allItems.
+    GameData* man = fallbackWeaponManufacturer(gw);
+    if (!man) { coop::logLine("[wpndiag] no WEAPON_MANUFACTURER record"); return; }
+    unsigned int n = 0;
     __try {
-        if (g_getPrimaryWeaponFn) { Item* it = g_getPrimaryWeaponFn(inv); if (it && it->getGameData()) w = it; }
-        if (!w && g_getSecondaryWeaponFn) { Item* it = g_getSecondaryWeaponFn(inv); if (it && it->getGameData()) w = it; }
-        if (!w && g_getSectionsFn) {
-            lektor<InventorySection*>* secs = g_getSectionsFn(inv);
-            unsigned int ns = secs ? secs->size() : 0;
-            for (unsigned int s = 0; s < ns && !w; ++s) {
-                InventorySection* sec = (*secs)[s]; if (!sec || !sec->isAnEquippedItemSection) continue;
-                const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
-                for (unsigned int i = 0; i < its.size(); ++i) {
-                    Item* it = its[i].item; if (!it) continue; GameData* g = it->getGameData(); if (!g) continue;
-                    if ((unsigned int)g->type == (unsigned int)WEAPON) { w = it; break; }
-                }
-            }
-        }
-        if (w) { gd = w->getGameData(); man = w->manufacturerData; mat = w->materialData; col = w->coloriseData; }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    if (!w || !gd) { coop::logLine("[wpndiag] no live weapon on char"); return; }
-    char b[220];
-    __try {
-        _snprintf(b, sizeof(b)-1, "[wpndiag] live wpn sid='%s' gdType=%u manType=%d matType=%d colType=%d",
-            gd->stringID.c_str(), (unsigned int)gd->type,
-            man ? (int)man->type : -1, mat ? (int)mat->type : -1, col ? (int)col->type : -1);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { b[0]='\0'; }
-    b[sizeof(b)-1]='\0'; coop::logLine(b);
-    // Recipe matrix with the REAL pointers: vary hand (blank vs non-blank) and grade.
-    struct R { const char* tag; int idx; int ser; GameData* mm; GameData* mt; int lvl; };
-    R recipes[] = {
-        { "real man,mat lvl-1 blankH", 0, 0, man, mat, -1 },
-        { "real man,mat lvl0  blankH", 0, 0, man, mat,  0 },
-        { "real man,mat lvl0  realH ", 1, 1, man, mat,  0 },
-        { "real man only lvl0 realH ", 1, 1, man, 0,    0 },
-        { "no man/mat   lvl0  realH ", 1, 1, 0,   0,    0 },
-        { "colorise asMesh   realH ", 1, 1, col, mat,  0 },
-    };
-    for (int r = 0; r < 6; ++r) {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, WEAPON);
+        n = g_dataScratch.size();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
+    int tried = 0, okCount = 0;
+    for (unsigned int i = 0; i < n && tried < maxTry; ++i) {
+        GameData* tmpl = 0;
+        __try { tmpl = g_dataScratch[i]; } __except (EXCEPTION_EXECUTE_HANDLER) { tmpl = 0; }
+        if (!tmpl) continue;
+        ++tried;
         Item* it = 0;
+        char sid[48]; sid[0] = '\0';
         __try {
+            strncpy(sid, tmpl->stringID.c_str(), sizeof(sid) - 1); sid[sizeof(sid) - 1] = '\0';
             char buf[sizeof(hand) + 16]; memset(buf, 0, sizeof(buf));
             hand* h = reinterpret_cast<hand*>(buf);
-            g_handCtorFn(h, recipes[r].idx, recipes[r].ser, WEAPON, 0, 0);
-            it = g_createItemFn(gw->theFactory, gd, h, recipes[r].mm, recipes[r].mt, recipes[r].lvl, 0);
-            if (it && inv) inv->removeItemAutoDestroy(it, 1);
+            g_handCtorFn(h, 0, 0, NULL_ITEM, 0, 0);
+            // Spike-451 shape: manufacturer first, template as "weaponMesh", lvl 0.
+            it = g_createItemFn(gw->theFactory, man, h, tmpl, 0, 0, 0);
+            if (it) { ++okCount; inv->removeItemAutoDestroy(it, 1); }
         } __except (EXCEPTION_EXECUTE_HANDLER) { it = (Item*)0; }
-        char e[140]; _snprintf(e, sizeof(e)-1, "[wpndiag] recipe[%d] %s -> %s", r, recipes[r].tag, it ? "OK" : "null");
-        e[sizeof(e)-1]='\0'; coop::logLine(e);
+        char e[140];
+        _snprintf(e, sizeof(e) - 1, "[wpndiag] tmpl[%d] sid='%s' -> %s", tried - 1, sid, it ? "OK" : "null");
+        e[sizeof(e) - 1] = '\0'; coop::logLine(e);
     }
+    char s[120];
+    _snprintf(s, sizeof(s) - 1, "[wpndiag] RESULT ok=%d/%d (spike-451 manufacturer-first recipe)",
+              okCount, tried);
+    s[sizeof(s) - 1] = '\0'; coop::logLine(s);
 }
 
 // SEH-guarded: find a template the character at cHand can actually WEAR and equip it,
@@ -4278,10 +5358,10 @@ Faction* nonPlayerFactionGuarded(GameWorld* gw) {
     }
 }
 Character* createCharGuarded(GameWorld* gw, GameData* tmpl, Faction* fac,
-                             float x, float y, float z) {
+                             float x, float y, float z, float age) {
     __try {
         Ogre::Vector3 pos(x, y, z);
-        RootObject* r = g_createCharFn(gw->theFactory, fac, pos, 0, tmpl, 0, 25.0f);
+        RootObject* r = g_createCharFn(gw->theFactory, fac, pos, 0, tmpl, 0, age);
         return r ? static_cast<Character*>(r) : 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
@@ -4291,10 +5371,12 @@ Character* createCharGuarded(GameWorld* gw, GameData* tmpl, Faction* fac,
 
 bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
                        char* facSid, unsigned int facSidLen,
-                       float* x, float* y, float* z, float* heading, bool* dead) {
+                       float* x, float* y, float* z, float* heading, bool* dead,
+                       float* age) {
     if (!c || !charSid || charSidLen == 0 || !facSid || facSidLen == 0) return false;
     charSid[0] = '\0';
     facSid[0]  = '\0';
+    if (age) *age = 0.0f;
     __try {
         GameData* gd = c->getGameData();
         if (!gd) return false;
@@ -4318,18 +5400,66 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
         if (z) *z = p.z;
         if (heading) *heading = c->getOrientation().getYaw().valueRadians();
         if (dead) *dead = (g_isDeadCharFn && g_isDeadCharFn(c));
+        // Age drives animal body SCALE (CharacterAnimal ageSizeMin/Max) - the
+        // join mints its proxy with this value (protocol 39). Virtual call
+        // through the vtable; humans return their cosmetic age (no scaling).
+        if (age) *age = c->getAge();
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
 
+// SEH-guarded (join, mint duplicate guard 2026-07-11): return a world NPC with
+// the SAME template stringID standing within 'radius' of (x,y,z), or 0. The
+// census-missing hand may be THAT body under a hand we cannot correlate
+// (engine re-container, baked block just loaded) - minting would stand a
+// double on top of it. 'excl'/'exclCount' skips bodies the caller already
+// accounts for (bound proxies, suppressed culls).
+Character* sameTemplateNear(GameWorld* gw, const char* charSid,
+                            float x, float y, float z, float radius,
+                            Character* const* excl, unsigned int exclCount) {
+    if (!gw || !g_getCharsFn || !charSid || !charSid[0]) return 0;
+    __try {
+        Ogre::Vector3 center(x, y, z);
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &center, radius, radius, radius, 96, 96, 0);
+        unsigned int total = g_npcQuery.size();
+        for (unsigned int i = 0; i < total; ++i) {
+            RootObject* obj = g_npcQuery[i];
+            if (!obj || isPlayerSquad(gw, obj)) continue;
+            Character* ch = static_cast<Character*>(obj);
+            bool skip = false;
+            for (unsigned int e = 0; e < exclCount && !skip; ++e)
+                if (excl[e] == ch) skip = true;
+            if (skip) continue;
+            GameData* gd = ch->getGameData();
+            if (!gd) continue;
+            const char* sid = gd->stringID.c_str();
+            if (sid && strcmp(sid, charSid) == 0) return ch;
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
-                         float x, float y, float z, float heading) {
+                         float x, float y, float z, float heading, float age) {
     if (!gw || !gw->theFactory || !g_createCharFn || !charSid || !charSid[0]) return 0;
+    // Creature-size sync (protocol 39): animals scale body size by age, so the
+    // proxy must be CREATED at the host's age or it spawns full-grown (the
+    // 2026-07-12 "giant goats" session). A non-finite or <= 0 wire value means
+    // the host couldn't read it - keep the historical adult default.
+    if (!(age > 0.0f && age < 1.0e6f)) age = 25.0f;
     // Template by CHARACTER stringID (the same category-scan lookup the
-    // inventory reconstructor uses for items).
+    // inventory reconstructor uses for items). Animal templates live in the
+    // SEPARATE ANIMAL_CHARACTER category (2026-07-11 pack-hidden session:
+    // Bonedog sid '3979-gamedata.base' MISSed the CHARACTER scan forever, so
+    // host wildlife packs could never appear on the join) - scan it second.
     GameData* tmpl = findItemTemplateImpl(gw, charSid, (unsigned int)CHARACTER);
+    if (!tmpl)
+        tmpl = findItemTemplateImpl(gw, charSid, (unsigned int)ANIMAL_CHARACTER);
     if (!tmpl) {
         char b[128];
         _snprintf(b, sizeof(b) - 1, "[spawn] proxy template MISS sid='%s'", charSid);
@@ -4348,7 +5478,7 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
         coop::logLine("[spawn] proxy faction MISS (no non-player faction loaded)");
         return 0;
     }
-    Character* c = createCharGuarded(gw, tmpl, fac, x, y, z);
+    Character* c = createCharGuarded(gw, tmpl, fac, x, y, z, age);
     if (!c) {
         char b[128];
         _snprintf(b, sizeof(b) - 1, "[spawn] proxy create FAILED sid='%s'", charSid);
@@ -4363,6 +5493,16 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
     detachFromTownAI(c);
     clearGoals(c);
     return c;
+}
+
+bool despawnProxyNpc(GameWorld* gw, Character* proxy) {
+    if (!gw || !proxy || !g_destroyObjFn) return false;
+    __try {
+        return g_destroyObjFn(gw, static_cast<RootObject*>(proxy),
+                              /*justUnloaded*/false, "coop-proxy-dupe-heal");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 unsigned int spawnRuntimeSquad(GameWorld* gw, unsigned int count,
@@ -7201,7 +8341,9 @@ bool operateMachineByHand(GameWorld* gw, const unsigned int mHand[5], float amou
 // Deterministic machine template for the probe's programmatic placement.
 // kind 0 = power generator (BCTYPE_PRODUCTION, has getPowerOutput), kind 1 =
 // crafting bench (BCTYPE_CRAFTING, has input/output buffers), kind 2 =
-// storage container (BCTYPE_STORAGE - protocol 34's chest subject). `skip`
+// storage container (BCTYPE_STORAGE - protocol 34's chest subject), kind 3 =
+// research bench (BCTYPE_RESEARCH - spike 401's subject; NOT reachable through
+// findMachineTemplate, whose preference order tops out at training dummies). `skip`
 // selects the skip-th DISTINCT candidate in preference order: a template's
 // NAME does not reveal its BuildingClassType (run-170508: the first
 // "general storage" match placed as a non-STORAGE class), so the kind-2
@@ -7219,10 +8361,13 @@ static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
                                  "weapon smith", "engineering bench" };
     const char* storePrefs[] = { "general storage", "storage box", "storage chest",
                                  "chest", "storage" };
+    const char* resPrefs[]   = { "small research bench", "research bench",
+                                 "research" };
     const char** prefs;
     unsigned int nPrefs;
     if (kind == 0)      { prefs = genPrefs;   nPrefs = 4; }
     else if (kind == 2) { prefs = storePrefs; nPrefs = 5; }
+    else if (kind == 3) { prefs = resPrefs;   nPrefs = 3; }
     else                { prefs = craftPrefs; nPrefs = 4; }
     GameData* seen[16];
     unsigned int nSeen = 0;
@@ -7270,7 +8415,7 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
     // container census rightly skipped), so walk the preference-ordered
     // candidates: place, verify the LIVE building's class, destroy + retry on
     // mismatch. kinds 0/1 accept any machine class (the original behaviour);
-    // kind 2 demands BCTYPE_STORAGE.
+    // kind 2 demands BCTYPE_STORAGE, kind 3 demands BCTYPE_RESEARCH.
     const int MAX_CANDIDATES = 8;
     for (int cand = 0; cand < MAX_CANDIDATES; ++cand) {
         GameData* tmpl = 0;
@@ -7299,14 +8444,16 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
             return rc;
         }
         int liveClass = readBuildingClassByHand(localHand);
-        bool classOk = (kind == 2) ? (liveClass == (int)BCTYPE_STORAGE)
-                                   : true;
+        bool classOk = true;
+        if (kind == 2) classOk = (liveClass == (int)BCTYPE_STORAGE);
+        if (kind == 3) classOk = (liveClass == (int)BCTYPE_RESEARCH);
         if (!classOk) {
             char b[160];
             _snprintf(b, sizeof(b) - 1,
                       "[prod] probe-place kind=%d REJECT sid='%s' class=%d "
-                      "(want STORAGE) - destroy + next candidate",
-                      kind, sid, liveClass);
+                      "(want %s) - destroy + next candidate",
+                      kind, sid, liveClass,
+                      kind == 3 ? "RESEARCH" : "STORAGE");
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             destroyBuildingByHand(gw, localHand);
             continue;

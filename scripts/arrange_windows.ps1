@@ -35,7 +35,15 @@ param(
     # window when it switches from the load screen to gameplay, so a one-shot move
     # made during loading gets undone. Re-applying every second through the load
     # period pins it. 0 = arrange once and exit.
-    [int]$RepeatSec = 0
+    [int]$RepeatSec = 0,
+    # Enforce this CLIENT (render area) size in physical pixels on both windows,
+    # re-applied along with the position. Needed when the staging monitor's DPI
+    # scale differs from the primary's: Kenshi is system-DPI-aware, so Windows
+    # rescales its window when it crosses onto a different-DPI monitor (e.g.
+    # 175% laptop primary -> 100% ultrawide shrinks it by 96/168) - a move-only
+    # pin leaves the window the wrong size. 0 = move only (legacy behavior).
+    [int]$ClientW = 0,
+    [int]$ClientH = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -101,11 +109,20 @@ public static class WinArrange
     }
 
     public static RECT GetRect(IntPtr h) { RECT r; GetWindowRect(h, out r); return r; }
+    public static RECT GetClient(IntPtr h) { RECT r; GetClientRect(h, out r); return r; }
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
 
     public static void MoveTo(IntPtr h, int x, int y)
     {
         ShowWindow(h, SW_RESTORE); // un-minimize if needed
         SetWindowPos(h, IntPtr.Zero, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // Move AND size in one call (outer window size in physical pixels).
+    public static void MoveSizeTo(IntPtr h, int x, int y, int w, int hh)
+    {
+        ShowWindow(h, SW_RESTORE);
+        SetWindowPos(h, IntPtr.Zero, x, y, w, hh, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 "@
@@ -173,20 +190,52 @@ function Set-Placement {
     param([bool]$Verbose0)
     $ord = Get-Ordered
     if ($ord.Count -lt 1) { return }
+    $enforceSize = ($ClientW -gt 0 -and $ClientH -gt 0)
+    # Target OUTER size PER WINDOW: requested client size + that window's own
+    # chrome (borders + title bar, measured live - the two installs' windows can
+    # carry different chrome, so a shared measurement leaves one client short).
     $r0 = [WinArrange]::GetRect($ord[0].Hwnd)
     $wW = $r0.Right - $r0.Left
     $wH = $r0.Bottom - $r0.Top
     if ($wW -le 0 -or $wH -le 0) { return }
+    $sizes = @()
+    foreach ($w in $ord) {
+        if ($enforceSize) {
+            $r = [WinArrange]::GetRect($w.Hwnd)
+            $c = [WinArrange]::GetClient($w.Hwnd)
+            $chromeW = ($r.Right - $r.Left) - ($c.Right - $c.Left)
+            $chromeH = ($r.Bottom - $r.Top) - ($c.Bottom - $c.Top)
+            if ($chromeW -lt 0 -or $chromeW -gt 80)  { $chromeW = 24 } # sane fallback
+            if ($chromeH -lt 0 -or $chromeH -gt 120) { $chromeH = 64 }
+            $sizes += [pscustomobject]@{ W = $ClientW + $chromeW; H = $ClientH + $chromeH }
+        } else {
+            $sizes += [pscustomobject]@{ W = $wW; H = $wH }
+        }
+    }
+    # Layout math uses the widest target so the pair always fits.
+    $slotW = ($sizes | Measure-Object -Property W -Maximum).Maximum
+    $slotH = ($sizes | Measure-Object -Property H -Maximum).Maximum
     $gap = $GapPx
-    $total = ($wW * 2) + $gap
-    if ($total -gt $monW) { $gap = 0; $total = $wW * 2 }
+    $total = ($slotW * 2) + $gap
+    if ($total -gt $monW) { $gap = 0; $total = $slotW * 2 }
     $startX = $mon.Left + [int][Math]::Max(0, ($monW - $total) / 2)
-    $y = $mon.Top + [int][Math]::Max(0, ($monH - $wH) / 2)
+    $y = $mon.Top + [int][Math]::Max(0, ($monH - $slotH) / 2)
     $labels = @("host (left)", "join (right)")
     for ($i = 0; $i -lt $ord.Count -and $i -lt 2; $i++) {
-        $x = $startX + ($i * ($wW + $gap))
-        [WinArrange]::MoveTo($ord[$i].Hwnd, $x, $y)
-        if ($Verbose0) { Write-Host ("  moved PID {0} -> ({1},{2})  [{3}]" -f $ord[$i].Pid, $x, $y, $labels[$i]) }
+        $x = $startX + ($i * ($slotW + $gap))
+        $tw = $sizes[$i].W; $th = $sizes[$i].H
+        if ($enforceSize) {
+            # Skip the resize when already conformant (a same-size SetWindowPos is
+            # still a WM_SIZE to the D3D swapchain; don't spam it every second).
+            $cur = [WinArrange]::GetRect($ord[$i].Hwnd)
+            $needSize = ((($cur.Right - $cur.Left) -ne $tw) -or (($cur.Bottom - $cur.Top) -ne $th))
+            if ($needSize) { [WinArrange]::MoveSizeTo($ord[$i].Hwnd, $x, $y, $tw, $th) }
+            elseif ($cur.Left -ne $x -or $cur.Top -ne $y) { [WinArrange]::MoveTo($ord[$i].Hwnd, $x, $y) }
+            if ($Verbose0) { Write-Host ("  placed PID {0} -> ({1},{2}) {3}x{4} (resized={5})  [{6}]" -f $ord[$i].Pid, $x, $y, $tw, $th, $needSize, $labels[$i]) }
+        } else {
+            [WinArrange]::MoveTo($ord[$i].Hwnd, $x, $y)
+            if ($Verbose0) { Write-Host ("  moved PID {0} -> ({1},{2})  [{3}]" -f $ord[$i].Pid, $x, $y, $labels[$i]) }
+        }
     }
 }
 

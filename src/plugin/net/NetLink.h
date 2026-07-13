@@ -65,9 +65,11 @@ public:
     void queueWorldRemove(u32 ownerId, const u32* netIds, unsigned int count);
 
     // MAIN thread: queue a reliable wide-radius NPC existence census (protocol
-    // 36, host -> join, 1 Hz). 'hands' is count*5 u32s (readObjectHand layout).
-    // [NpcCensusHeader][u32 hand[5] * count].
-    void queueNpcCensus(u32 ownerId, const u32* hands, unsigned int count);
+    // 36, host -> join, 1 Hz). 'hands' is count*5 u32s (readObjectHand layout);
+    // 'pos' is count*3 floats (v38: host position per row, park authority).
+    // [NpcCensusHeader][u32 hand[5] * count][f32 pos[3] * count].
+    void queueNpcCensus(u32 ownerId, const u32* hands, const float* pos,
+                        unsigned int count);
 
     // MAIN thread: queue a reliable conservation DROP intent (Phase W2). A fixed-size POD
     // (like an event), sent once on the RELIABLE channel; the peer relocates its own copy
@@ -107,6 +109,9 @@ public:
     // MAIN thread: queue a reliable host-authoritative machine state row
     // (protocol 33). Change-gated + safety-resent by the caller.
     void queueProd(const ProdPacket& pkt);
+    // MAIN thread: queue a reliable host-authoritative known-research row
+    // (protocol 38). First-sight sent + safety-resent by the caller.
+    void queueResearch(const ResearchPacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -206,7 +211,7 @@ private:
     std::vector<OutWorldRemove> outWorldRemove_;
     // Reliable NPC existence census (protocol 36): 5xu32 hands, flat. Guarded
     // by outCs_. 1 Hz from the host, so at most a couple pending at once.
-    struct OutNpcCensus { u32 ownerId; std::vector<u32> hands; };
+    struct OutNpcCensus { u32 ownerId; std::vector<u32> hands; std::vector<float> pos; };
     std::vector<OutNpcCensus> outNpcCensus_;
     // Reliable conservation DROP intents (Phase W2), fixed-size PODs. Guarded by outCs_.
     std::vector<WorldDropPacket> outWorldDrops_;
@@ -227,6 +232,8 @@ private:
     std::vector<DoorPacket>      outDoor_;
     // Reliable machine state rows (protocol 33). Guarded by outCs_.
     std::vector<ProdPacket>      outProd_;
+    // Reliable known-research rows (protocol 38). Guarded by outCs_.
+    std::vector<ResearchPacket>  outResearch_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;

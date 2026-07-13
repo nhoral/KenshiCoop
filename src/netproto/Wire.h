@@ -300,7 +300,34 @@ typedef double         f64;
 // reconcile it back in the interim. Gear transfers also suppress the W2
 // weapon-census drop/pickup interpretation for that sid on both ends (a
 // bag-to-bag trade is not a ground drop).
-const u16 PROTOCOL_VERSION = 36;
+//
+// v37 (protocol 38): RESEARCH TECH-TREE sync (PKT_RESEARCH). The unlock store
+// (PlayerInterface::technology, a per-client Research object) never crossed:
+// a tech the host researched stayed un-known on the join forever (spike 401 -
+// host isKnown(subject) 0->1 after startResearch while the join read 0 for
+// the whole run). Host-authoritative snapshot rows (the world-simulation
+// precedent): the host samples its known set ~1 Hz through the engine's own
+// Research::isKnown over the shared RESEARCH GameData enumeration and streams
+// one reliable row per known stringID (first sight sends the whole set as the
+// baseline, then a lost-row safety resend); the join applies each row through
+// Research::startResearch - the exact lever a research-UI click commits, which
+// flips isKnown in the same tick and is idempotent against already-known sids.
+// The engine levers are located at runtime by unique prologue scan (the
+// running image is base-skewed from the on-disk exe, spike 401).
+//
+// v38 (pack-hidden investigation, 2026-07-11): NPC census rows carry the
+// host's POSITION alongside each hand (5xu32 -> 5xu32 + 3xf32 per NPC). The
+// existence census answered only "does this NPC exist"; two locally-simulated
+// copies of the SAME census-present NPC could wander arbitrarily far apart at
+// render range (the join's copy visible somewhere the host's copy isn't).
+// With positions on the wire the join can PARK a census-present local copy
+// that diverged past a threshold back onto the host's authoritative spot.
+//
+// v39 (creature-size sync, 2026-07-12): SpawnInfoPacket carries the host
+// body's AGE. Animals scale body size by age; minting proxies with a fixed
+// adult age made every join-side creature full-grown regardless of the
+// host's actual (often juvenile) animal.
+const u16 PROTOCOL_VERSION = 39;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -342,7 +369,8 @@ enum PacketType {
     PKT_LOAD_NACK        = 36,// RELIABLE join copy missing/diverged (join -> host, protocol 32); LoadNackPacket
     PKT_PROD             = 37,// RELIABLE host-authoritative machine state row (protocol 33); ProdPacket
     PKT_NPC_CENSUS       = 38,// RELIABLE wide-radius NPC existence list (protocol 36); NpcCensusHeader
-    PKT_INV_XFER         = 39 // RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
+    PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
+    PKT_RESEARCH         = 40 // RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1177,6 +1205,11 @@ struct SpawnInfoPacket {
     f32 heading;      // radians (yaw)
     u8  found;        // 1 = resolved + described; 0 = negative (stop retrying)
     u8  dead;         // body was dead at reply time (join spawns + death-latches)
+    // Host body's age (protocol 39). Animals derive body SCALE from age
+    // (CharacterAnimal ageSizeMin/Max), so the join must mint with the host's
+    // value or every proxy creature spawns full-grown ("giant goats", manual
+    // session 2026-07-12). <= 0 = unreadable -> join uses its adult default.
+    f32 age;
 };
 
 // ---- Protocol 31: coordinated save + session resume --------------------------
@@ -1335,17 +1368,35 @@ struct ProdPacket {
     f32 harvested; // int on the engine side; carried as f32 (-1 = not a farm)
 };
 
+// ---- Protocol 38: research tech-tree sync -------------------------------------
+// One KNOWN-research row, HOST-authoritative (world-simulation precedent: the
+// host's tech tree is the party's). Identity is the RESEARCH GameData stringID
+// - cross-client stable (both clients enumerate the identical record set from
+// the shared save, spike 401). The host streams a row for every sid its
+// Research store reports known (first sight = the session baseline, then a
+// safety resend); the join applies via Research::startResearch, which is
+// idempotent (already-known sids are skipped by an isKnown pre-check).
+// Un-learning does not exist in the engine, so rows only ever ADD knowledge.
+struct ResearchPacket {
+    u8  type;      // = PKT_RESEARCH
+    u32 ownerId;   // network player id of the sender (the host)
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    char sid[48];  // RESEARCH GameData stringID (the wire key)
+};
+
 // NPC existence census (protocol 36): the host's 1 Hz wide-radius hand list.
 // The positional stream stays at the ~200 u interest bubble; this list only
 // says WHICH world NPCs exist on the host within the census radius, so the
 // join can cull local-only ghosts long before they enter the stream bubble
 // (the 2026-07-09 field report: join-visible NPCs vanishing on approach).
-// Layout: [NpcCensusHeader][u32 hand[5] * count] - 20 B per NPC, reliable
-// (ENet fragments large lists), a few KB/s at worst.
+// v38 adds the host position per row: existence AND whereabouts, so the join
+// can park a census-present local copy that wandered off the host's spot.
+// Layout: [NpcCensusHeader][u32 hand[5] * count][f32 pos[3] * count] -
+// 32 B per NPC, reliable (ENet fragments large lists), a few KB/s at worst.
 struct NpcCensusHeader {
     u8  type;    // = PKT_NPC_CENSUS
     u32 ownerId; // network player id of the sender (the host)
-    u16 count;   // number of 5xu32 hands that follow
+    u16 count;   // number of 5xu32 hands (then 3xf32 positions) that follow
 };
 
 // Hard cap on hands per census packet (512 * 20 B = ~10 KB, fragmented fine).

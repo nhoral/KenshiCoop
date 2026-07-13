@@ -117,8 +117,14 @@ if ($Scenario -eq "spike") { $armTimeoutMs = 0 }
 # Scenario clocks now start at PEER-READY (~a join-load after host gameplay), so
 # the self-exit backstop measured from gameplay start needs headroom for the
 # arming delay + the longest host scenario window (60 s) - unless the caller
-# explicitly chose a duration.
-if ($Scenario -ne "" -and -not $PSBoundParameters.ContainsKey("Seconds")) { $Seconds = 150 }
+# explicitly chose a duration. Long scenarios (travel_parity's 2400 u march)
+# override the backstop per-entry in the manifest (Seconds / KillGraceSec).
+if ($Scenario -ne "" -and -not $PSBoundParameters.ContainsKey("Seconds")) {
+    $Seconds = 150
+    if ($null -ne $manifestEntry -and $manifestEntry.ContainsKey("Seconds")) {
+        $Seconds = $manifestEntry.Seconds
+    }
+}
 
 if ($OutDir -eq "") {
     $stamp  = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -262,6 +268,14 @@ function Start-PastLauncher {
     return 0
 }
 
+# Automated layout: 1280x1024 pair on the PRIMARY (laptop) monitor - the
+# screenshot-stable baseline. Written every run because manual_session.ps1
+# resizes the same kenshi.cfg files for the ultrawide manual layout; this
+# guarantees automated runs always come back to the known-good geometry.
+Write-Host "Window layout: automated (1280x1024 x2, $ArrangeMonitor monitor)"
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "set_video_mode.ps1") `
+    -Width 1280 -Height 1024 -HostDir $HostDir -JoinDir $JoinDir
+
 Write-Host "Launching HOST (and clicking through the launcher) ..."
 Set-CoopEnv -Mode "host" -Log $hostLog
 $hostPid = Start-PastLauncher -Exe $hostExe -WorkDir $HostDir
@@ -357,6 +371,12 @@ if (-not $shotsTaken) {
 # Wait for self-exit, with a hard-timeout kill so unattended runs never hang.
 $killGrace = if ($Scenario -ne "") { 75 } else { $ShotLeadSec + 60 }
 if ($manifest.Profiles.ContainsKey($Profile)) { $killGrace = [Math]::Max($killGrace, $manifest.Profiles[$Profile].KillGraceSec) }
+# Long scenarios: the kill grace runs from the (early) screenshot anchors, so a
+# scenario window longer than ~KillGraceSec gets killed before RESULT unless
+# the manifest entry raises it.
+if ($null -ne $manifestEntry -and $manifestEntry.ContainsKey("KillGraceSec")) {
+    $killGrace = [Math]::Max($killGrace, $manifestEntry.KillGraceSec)
+}
 $killDeadline = (Get-Date).AddSeconds($killGrace)
 foreach ($p in @($hostPid, $joinPid)) {
     if ($p -eq 0) { continue }

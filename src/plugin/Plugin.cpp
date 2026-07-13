@@ -908,6 +908,16 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         else
             g_repl.applyProd(gw, g_inbound);
     }
+    // Research tech-tree sync (protocol 38): the HOST is the tech-tree
+    // authority - it samples its Research store's known set ~1 Hz and streams
+    // one reliable PKT_RESEARCH row per known sid; the join applies via
+    // Research::startResearch (idempotent). Host-only direction, no echo path.
+    if (g_cfg.researchSync) {
+        if (g_cfg.isHost)
+            g_repl.publishResearch(gw, g_net, g_net.localId());
+        else
+            g_repl.applyResearch(gw, g_inbound);
+    }
         // Stealth sync (protocol 20): the HOST is the world-detection authority
         // - it streams each DRIVEN sneaker's whoSeesMeSneaking back to the
         // sneaker's owner; every client replays received snapshots onto the
@@ -1264,19 +1274,30 @@ __declspec(dllexport) void startPlugin() {
         ic.staleMs     = g_cfg.interpStaleMs;
         ic.snapDistSq  = g_cfg.interpSnapDist * g_cfg.interpSnapDist;
         g_repl.setInterpConfig(ic);
-        g_repl.setDriveTuning(g_cfg.catchupK, g_cfg.snapDist);
+        g_repl.setDriveTuning(g_cfg.catchupK, g_cfg.snapDist, g_cfg.snapSeconds);
         g_repl.setSendStamp(g_cfg.sendStamp);
         g_repl.setCensusRadius(g_cfg.censusRadius);
+        g_repl.setSpawnMintRadius(g_cfg.spawnMintRadius);
+        g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
-        char b[224];
+        // travel_parity needs the 5 s SCENARIO WORLD/WNPC worldstate rows on
+        // both sides; npc_sync feeds the same rows to the anti-zombie oracle
+        // (Phase 2 mid-band tier: a populated town run has moving census-band
+        // NPCs, which the hop corridor mostly lacks). Every other scenario
+        // stays quiet (log volume).
+        g_repl.setAuditRows(g_cfg.scenario == "travel_parity" ||
+                            g_cfg.scenario == "npc_sync");
+        char b[260];
         _snprintf(b, sizeof(b) - 1,
                   "KenshiCoop: interp delay=%u-%ums extrap=%ums stale=%ums snap=%.0fu "
-                  "drive catchupK=%.2f snapDist=%.1fu sendStamp=%d census=%.0fu "
-                  "starveHold=%ums",
+                  "drive catchupK=%.2f snapDist=%.1fu snapSec=%.2f sendStamp=%d "
+                  "census=%.0fu mint=%.0fu park=%.0fu starveHold=%ums",
                   g_cfg.interpMinDelayMs, g_cfg.interpMaxDelayMs,
                   g_cfg.interpMaxExtrapMs, g_cfg.interpStaleMs, g_cfg.interpSnapDist,
-                  g_cfg.catchupK, g_cfg.snapDist, g_cfg.sendStamp ? 1 : 0,
-                  g_cfg.censusRadius, g_cfg.starveHoldMs);
+                  g_cfg.catchupK, g_cfg.snapDist, g_cfg.snapSeconds,
+                  g_cfg.sendStamp ? 1 : 0,
+                  g_cfg.censusRadius, g_cfg.spawnMintRadius, g_cfg.censusParkDist,
+                  g_cfg.starveHoldMs);
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
     }
@@ -1380,6 +1401,7 @@ __declspec(dllexport) void startPlugin() {
     g_repl.setBdoorSync(g_cfg.bdoorSync);
     g_repl.setHungerSync(g_cfg.hungerSync);
     g_repl.setProdSync(g_cfg.prodSync);
+    g_repl.setResearchSync(g_cfg.researchSync);
     // Protocol 34: the HOST authors every storage/machine container near the
     // interest centers (the ~1 Hz census inside publishInventories); the join
     // reconciles via the translated key. Host-only flag - the join must never

@@ -148,11 +148,13 @@ void NetLink::queueWorldRemove(u32 ownerId, const u32* netIds, unsigned int coun
     LeaveCriticalSection(&outCs_);
 }
 
-void NetLink::queueNpcCensus(u32 ownerId, const u32* hands, unsigned int count) {
+void NetLink::queueNpcCensus(u32 ownerId, const u32* hands, const float* pos,
+                             unsigned int count) {
     OutNpcCensus oc;
     oc.ownerId = ownerId;
     if (count > NPC_CENSUS_MAX) count = NPC_CENSUS_MAX;
     if (hands && count > 0) oc.hands.assign(hands, hands + count * 5);
+    if (pos && count > 0) oc.pos.assign(pos, pos + count * 3);
     EnterCriticalSection(&outCs_);
     outNpcCensus_.push_back(oc);
     LeaveCriticalSection(&outCs_);
@@ -215,6 +217,12 @@ void NetLink::queueDoor(const DoorPacket& pkt) {
 void NetLink::queueProd(const ProdPacket& pkt) {
     EnterCriticalSection(&outCs_);
     outProd_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
+void NetLink::queueResearch(const ResearchPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outResearch_.push_back(pkt);
     LeaveCriticalSection(&outCs_);
 }
 
@@ -626,18 +634,24 @@ void NetLink::threadLoop() {
                         }
                     } else if (type == PKT_NPC_CENSUS) {
                         // Reliable wide-radius NPC existence census (protocol
-                        // 36). Latest-wins on the game thread; delivered whole.
+                        // 36; v38 rows carry positions too). Latest-wins on
+                        // the game thread; delivered whole.
                         const unsigned len = (unsigned)ev.packet->dataLength;
                         if (len >= sizeof(NpcCensusHeader) && inbound_) {
                             NpcCensusHeader hdr;
                             std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
                             unsigned need = sizeof(NpcCensusHeader)
-                                          + (unsigned)hdr.count * 5 * sizeof(u32);
+                                          + (unsigned)hdr.count * 5 * sizeof(u32)
+                                          + (unsigned)hdr.count * 3 * sizeof(float);
                             if (len >= need && hdr.count <= NPC_CENSUS_MAX) {
                                 const enet_uint8* p = ev.packet->data + sizeof(NpcCensusHeader);
                                 const u32* hands =
                                     (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
-                                inbound_->pushNpcCensus(hdr.ownerId, hands, hdr.count);
+                                const float* pos = (hdr.count > 0)
+                                    ? reinterpret_cast<const float*>(
+                                          p + (unsigned)hdr.count * 5 * sizeof(u32))
+                                    : 0;
+                                inbound_->pushNpcCensus(hdr.ownerId, hands, pos, hdr.count);
                             }
                         }
                     } else if (type == PKT_WORLD_DROP) {
@@ -733,6 +747,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pp)
                             && inbound_) {
                             inbound_->pushProd(pp.ownerId, pp);
+                        }
+                    } else if (type == PKT_RESEARCH) {
+                        // Reliable host-authoritative known-research row
+                        // (protocol 38), applied via Research::startResearch.
+                        ResearchPacket rp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
+                            && inbound_) {
+                            inbound_->pushResearch(rp.ownerId, rp);
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -1065,16 +1087,25 @@ void NetLink::threadLoop() {
         for (size_t i = 0; i < censuses.size(); ++i) {
             unsigned count = (unsigned)(censuses[i].hands.size() / 5);
             if (count > NPC_CENSUS_MAX) count = NPC_CENSUS_MAX;
-            unsigned bytes = sizeof(NpcCensusHeader) + count * 5 * sizeof(u32);
+            // v38 layout: hands block then positions block. A queue call that
+            // somehow lacked positions still sends a well-formed packet
+            // (zeroed positions), never a short one.
+            unsigned bytes = sizeof(NpcCensusHeader) + count * 5 * sizeof(u32)
+                           + count * 3 * sizeof(float);
             ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
             NpcCensusHeader hdr;
             hdr.type    = (u8)PKT_NPC_CENSUS;
             hdr.ownerId = censuses[i].ownerId;
             hdr.count   = (u16)count;
             std::memcpy(out->data, &hdr, sizeof(hdr));
-            if (count > 0)
+            if (count > 0) {
                 std::memcpy(out->data + sizeof(hdr), &censuses[i].hands[0],
                             count * 5 * sizeof(u32));
+                enet_uint8* pp = out->data + sizeof(hdr) + count * 5 * sizeof(u32);
+                std::memset(pp, 0, count * 3 * sizeof(float));
+                if (censuses[i].pos.size() >= count * 3)
+                    std::memcpy(pp, &censuses[i].pos[0], count * 3 * sizeof(float));
+            }
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
@@ -1296,6 +1327,26 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < prodPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&prodPkts[i], sizeof(ProdPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued known-research rows on CH_RELIABLE
+        // (protocol 38). Host -> joins only (the Replicator only publishes on
+        // the host); first-sight + safety-resent by the caller, so a settled
+        // tech tree is near-silent.
+        std::vector<ResearchPacket> researchPkts;
+        EnterCriticalSection(&outCs_);
+        researchPkts.swap(outResearch_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < researchPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&researchPkts[i], sizeof(ResearchPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

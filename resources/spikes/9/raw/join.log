@@ -1,0 +1,1238 @@
+[00:08:30.794] [JOIN] INFO: log opened
+[00:08:30.794] [JOIN] INFO: KenshiCoop loaded! (clean rebuild)
+[00:08:30.794] [JOIN] INFO: KenshiCoop: build Jun 19 2026 23:58:02
+[00:08:30.794] [JOIN] INFO: KenshiCoop: role=JOIN proto=v11 port=27800 save='battle40'
+[00:08:30.844] [JOIN] INFO: KenshiCoop: ownership ranks = {1} (bidirectional presence)
+[00:08:30.905] [JOIN] INFO: KenshiCoop: auto-load armed for save 'battle40'
+[00:08:30.906] [JOIN] INFO: KenshiCoop: test mode - self-exit 45 s after gameplay starts
+[00:08:30.906] [JOIN] INFO: KenshiCoop: scenario armed 'spike'
+[00:08:30.906] [JOIN] INFO: KenshiCoop: starting as CLIENT
+[00:08:30.913] [JOIN] INFO: [net] connecting
+[00:08:30.913] [JOIN] INFO: [net] connected to host; sent HELLO
+[00:08:30.914] [JOIN] INFO: [net] peer connected id=1 (proto v11) - received WELCOME
+[00:08:37.400] [JOIN] INFO: KenshiCoop: auto-load issued for save 'battle40' (after 5000 ms settle)
+[00:08:40.661] [JOIN] INFO: handshake: peer present id=0 (local id=1)
+[00:08:47.952] [JOIN] INFO: [event] RECV id=1 ev=1 owner=0 hand=1,3,1144164992,1,3823120128 actor=2,2703369216
+[00:08:49.652] [JOIN] INFO: KenshiCoop: gameplay started
+[00:08:49.652] [JOIN] INFO: SCENARIO spike start
+[00:08:49.652] [JOIN] INFO: SPIKE 9 start id=9 host=0 arg=-
+[00:08:49.654] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=1,1667968768 tgt=1,3808471552 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=1,1723144576 tgt=1,3996215808 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=2,2703369216 tgt=1,3996215808 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=4,1276245120 tgt=1,3996215808 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=5,1919189504 tgt=1,3996215808 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=1,3808471552 tgt=1,1667968768 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=1,2534790144 tgt=1,2630004992 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=1,1903686528 tgt=1,1187988224 localFight=0 r=2
+[00:08:49.654] [JOIN] INFO: [combat] order hand=1,1187988224 tgt=1,1903686528 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2916748032 tgt=1,1668334976 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3179565312 tgt=1,3357788160 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1067504896 tgt=1,2764526336 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2764526336 tgt=1,1067504896 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3767700224 tgt=1,2442138624 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1192016640 tgt=1,3133178624 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3133178624 tgt=1,1192016640 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3253906176 tgt=1,2534545920 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3996215808 tgt=1,1723144576 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1117553664 tgt=1,598754880 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1152832000 tgt=1,2109741184 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3676879872 tgt=1,332397472 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3521240320 tgt=1,3627929600 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,598754880 tgt=1,1117553664 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1683227520 tgt=1,176269536 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,932983424 tgt=1,3677246208 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3911499008 tgt=1,1565307648 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3143920896 tgt=1,2034301696 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2034301696 tgt=1,3143920896 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,332397472 tgt=1,3676879872 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2109741184 tgt=1,1152832000 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3677246208 tgt=1,932983424 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3218505984 tgt=1,243774416 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3357788160 tgt=1,3179565312 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1245605504 tgt=1,2543212800 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1135253888 tgt=1,2131347712 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2534545920 tgt=1,3253906176 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,243774416 tgt=1,3218505984 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2131347712 tgt=1,1135253888 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2442138624 tgt=1,3767700224 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1668334976 tgt=1,2916748032 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,176269536 tgt=1,1683227520 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,1565307648 tgt=1,3911499008 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3627929600 tgt=1,3521240320 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,3054809600 tgt=1,213134768 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2630004992 tgt=1,2534790144 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,2543212800 tgt=1,1245605504 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [combat] order hand=1,213134768 tgt=1,3054809600 localFight=0 r=2
+[00:08:49.655] [JOIN] INFO: [authority] suppress NPC hand=1,2590331904 (streamed=50 local=45 supp=1)
+[00:08:49.655] [JOIN] INFO: [authority] suppress NPC hand=3,3090698240 (streamed=50 local=45 supp=2)
+[00:08:49.655] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51236.39,1549.80,2840.38
+[00:08:49.665] [JOIN] INFO: [taskkey] key=6 desc='Equipping weapon' repro=0 subject=1
+[00:08:49.665] [JOIN] INFO: [authority] suppress NPC hand=1,3235595776 (streamed=50 local=48 supp=3)
+[00:08:49.665] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51227.45,1558.99,2817.46
+[00:08:49.695] [JOIN] INFO: [authority] suppress NPC hand=1,1507568384 (streamed=50 local=50 supp=4)
+[00:08:49.695] [JOIN] INFO: [authority] suppress NPC hand=1,2567382784 (streamed=50 local=50 supp=5)
+[00:08:49.706] [JOIN] INFO: [taskkey] key=61 desc='Attacking target unprovoked' repro=0 subject=1
+[00:08:49.841] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:49.851] [JOIN] INFO: [taskkey] key=1 desc='Moving' repro=0 subject=0
+[00:08:49.945] [JOIN] INFO: [gate] hand=1,524536128 host=65535 local=61  agree=10/11 (90%)
+[00:08:50.041] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:50.166] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51227.45,1558.99,2817.46
+[00:08:50.294] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:50.504] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:50.672] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.74,1558.81,2817.25
+[00:08:50.701] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:50.903] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:51.102] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:51.160] [JOIN] INFO: [combat] order hand=4,1276245120 tgt=1,3996215808 localFight=0 r=2
+[00:08:51.169] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.74,1558.81,2817.25
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,524536128 pos=-51205.88,1581.76,2623.68 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1723144576 pos=-51279.38,1561.49,2681.32 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3996215808 pos=-51272.25,1569.52,2676.13 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=0
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3676879872 pos=-51227.02,1553.96,2863.74 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,332397472 pos=-51219.26,1555.93,2850.12 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3253906176 pos=-51221.48,1557.55,2832.04 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2534545920 pos=-51212.40,1557.12,2832.43 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1245605504 pos=-51251.17,1559.38,2831.27 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2543212800 pos=-51245.42,1559.82,2820.29 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2630004992 pos=-51196.09,1548.37,2893.24 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2534790144 pos=-51187.88,1547.77,2895.91 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1903686528 pos=-51266.00,1550.16,2891.17 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1187988224 pos=-51271.55,1546.45,2902.50 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3179565312 pos=-51231.02,1556.65,2846.39 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3357788160 pos=-51239.85,1555.53,2853.98 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1067504896 pos=-51242.78,1553.68,2865.13 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2764526336 pos=-51243.91,1556.76,2847.02 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1192016640 pos=-51250.74,1548.77,2889.11 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3133178624 pos=-51241.13,1545.96,2896.76 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1117553664 pos=-51214.23,1547.11,2897.55 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,598754880 pos=-51217.42,1551.71,2876.77 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1683227520 pos=-51195.93,1556.13,2811.28 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,176269536 pos=-51195.21,1555.82,2825.96 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3143920896 pos=-51285.23,1558.91,2866.60 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2034301696 pos=-51273.91,1557.37,2867.48 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1135253888 pos=-51167.57,1553.05,2820.07 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2131347712 pos=-51159.84,1552.29,2810.52 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2442138624 pos=-51193.30,1552.47,2871.51 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3767700224 pos=-51196.60,1550.68,2882.10 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1565307648 pos=-51237.94,1561.25,2790.31 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3911499008 pos=-51222.17,1559.47,2794.10 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3627929600 pos=-51225.43,1550.86,2878.50 body=0 combat=1
+[00:08:51.169] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3521240320 pos=-51227.74,1547.36,2891.56 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2916748032 pos=-51274.25,1562.21,2827.44 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1668334976 pos=-51276.17,1562.02,2837.83 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3054809600 pos=-51175.47,1553.60,2840.78 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,213134768 pos=-51167.39,1552.30,2852.94 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,2109741184 pos=-51240.86,1560.08,2813.54 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1152832000 pos=-51254.07,1561.20,2809.27 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3218505984 pos=-51252.63,1558.16,2843.21 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,243774416 pos=-51236.97,1557.67,2837.68 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,932983424 pos=-51208.16,1553.09,2871.41 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3677246208 pos=-51210.39,1550.29,2885.49 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,1667968768 pos=-51161.25,1552.17,2829.30 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 unit role=J t=1516 hand=1,3808471552 pos=-51130.94,1549.14,2824.57 body=0 combat=1
+[00:08:51.170] [JOIN] INFO: SPIKE 9 units role=J t=1516 n=50
+[00:08:51.303] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:51.560] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:51.671] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.59,1558.88,2815.97
+[00:08:52.169] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.59,1558.88,2815.94
+[00:08:52.590] [JOIN] INFO: [gate] hand=1,524536128 host=65535 local=1  agree=76/135 (56%)
+[00:08:52.621] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:52.663] [JOIN] INFO: [combat] order hand=4,1276245120 tgt=1,3996215808 localFight=0 r=2
+[00:08:52.673] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.59,1558.88,2815.94
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,524536128 pos=-51204.92,1581.73,2622.99 body=0 combat=0
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3996215808 pos=-51279.72,1562.77,2681.31 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3676879872 pos=-51222.05,1555.03,2856.72 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,332397472 pos=-51218.42,1556.08,2849.07 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3253906176 pos=-51227.41,1558.53,2824.35 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2534545920 pos=-51215.48,1557.26,2830.77 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1245605504 pos=-51251.74,1559.20,2833.36 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2543212800 pos=-51244.50,1559.91,2818.52 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2630004992 pos=-51189.12,1546.44,2902.55 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2534790144 pos=-51180.58,1547.88,2895.25 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1903686528 pos=-51264.79,1548.78,2895.60 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1187988224 pos=-51272.53,1545.82,2904.08 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3179565312 pos=-51234.98,1556.51,2847.59 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3357788160 pos=-51241.61,1554.67,2859.56 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1067504896 pos=-51249.98,1553.25,2870.28 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2764526336 pos=-51247.57,1556.06,2852.81 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1192016640 pos=-51250.42,1548.37,2890.38 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3133178624 pos=-51244.33,1542.10,2907.24 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1117553664 pos=-51214.91,1550.90,2881.45 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,598754880 pos=-51217.45,1553.25,2868.51 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1683227520 pos=-51189.10,1555.49,2806.27 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,176269536 pos=-51192.48,1555.61,2822.06 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3143920896 pos=-51283.91,1558.83,2866.96 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2034301696 pos=-51270.70,1557.49,2864.64 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1135253888 pos=-51175.64,1553.70,2836.05 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2131347712 pos=-51171.66,1553.40,2827.64 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2442138624 pos=-51194.76,1554.00,2862.78 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3767700224 pos=-51191.60,1552.64,2869.98 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1565307648 pos=-51238.10,1561.29,2789.54 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3911499008 pos=-51222.57,1559.62,2788.09 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3627929600 pos=-51231.55,1550.95,2877.80 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3521240320 pos=-51224.77,1544.67,2902.04 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2916748032 pos=-51284.63,1563.92,2826.02 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1668334976 pos=-51272.68,1562.28,2822.22 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3054809600 pos=-51165.29,1552.19,2851.04 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,213134768 pos=-51155.48,1551.05,2854.00 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,2109741184 pos=-51250.23,1561.23,2805.96 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1152832000 pos=-51262.34,1561.74,2807.38 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3218505984 pos=-51258.07,1558.69,2844.02 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,243774416 pos=-51237.64,1558.28,2831.95 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,932983424 pos=-51208.51,1552.76,2873.32 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3677246208 pos=-51204.88,1550.08,2885.84 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1667968768 pos=-51148.25,1550.84,2828.69 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,3808471552 pos=-51138.99,1549.92,2825.42 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 unit role=J t=3016 hand=1,1723144576 pos=-51291.16,1562.97,2693.80 body=0 combat=1
+[00:08:52.673] [JOIN] INFO: SPIKE 9 units role=J t=3016 n=50
+[00:08:52.824] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:53.034] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:53.175] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.59,1558.88,2815.94
+[00:08:53.231] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:53.431] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:53.637] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:53.673] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.59,1558.88,2815.94
+[00:08:53.835] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:54.036] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:54.173] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.59,1558.88,2815.94
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,524536128 pos=-51204.92,1581.72,2622.99 body=0 combat=0
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3676879872 pos=-51210.91,1555.66,2854.07 body=0 combat=1
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,332397472 pos=-51219.43,1556.87,2843.44 body=0 combat=1
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3253906176 pos=-51226.35,1558.39,2825.10 body=0 combat=1
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2534545920 pos=-51215.17,1557.45,2828.26 body=0 combat=1
+[00:08:54.173] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1245605504 pos=-51250.42,1559.30,2831.15 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2543212800 pos=-51250.49,1560.24,2819.29 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2630004992 pos=-51192.92,1545.99,2904.58 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2534790144 pos=-51179.75,1547.04,2899.75 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1903686528 pos=-51268.04,1547.98,2898.57 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1187988224 pos=-51276.86,1543.29,2910.43 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3179565312 pos=-51234.45,1556.47,2847.80 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3357788160 pos=-51241.05,1554.71,2859.27 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1067504896 pos=-51250.41,1553.37,2869.97 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2764526336 pos=-51246.92,1556.22,2851.27 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1192016640 pos=-51252.05,1548.65,2890.14 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3133178624 pos=-51244.22,1541.91,2907.73 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1117553664 pos=-51215.07,1550.81,2881.76 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,598754880 pos=-51217.91,1553.00,2869.60 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1683227520 pos=-51192.95,1555.69,2820.18 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,176269536 pos=-51192.36,1555.46,2830.08 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3143920896 pos=-51267.25,1556.88,2864.80 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2034301696 pos=-51257.40,1556.07,2861.61 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1135253888 pos=-51176.13,1553.72,2837.88 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2131347712 pos=-51169.73,1553.28,2820.67 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2442138624 pos=-51195.88,1554.89,2851.57 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3767700224 pos=-51186.69,1553.33,2863.40 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1565307648 pos=-51236.92,1561.17,2789.57 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3911499008 pos=-51222.57,1559.62,2788.09 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3627929600 pos=-51239.23,1552.29,2872.07 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3521240320 pos=-51231.26,1549.90,2882.03 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2916748032 pos=-51288.36,1564.25,2828.01 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1668334976 pos=-51275.16,1562.83,2820.15 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3054809600 pos=-51167.21,1552.19,2854.79 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,213134768 pos=-51147.55,1550.10,2854.63 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,2109741184 pos=-51252.41,1561.69,2800.60 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1152832000 pos=-51264.46,1562.37,2801.55 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3218505984 pos=-51246.72,1557.94,2839.18 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,243774416 pos=-51238.95,1558.33,2832.03 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,932983424 pos=-51203.87,1552.43,2873.87 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3677246208 pos=-51200.45,1550.01,2885.54 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1667968768 pos=-51165.50,1552.62,2831.99 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3808471552 pos=-51151.80,1551.19,2827.62 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,1723144576 pos=-51297.87,1563.54,2697.84 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 unit role=J t=4516 hand=1,3996215808 pos=-51285.82,1562.76,2694.94 body=0 combat=1
+[00:08:54.174] [JOIN] INFO: SPIKE 9 units role=J t=4516 n=50
+[00:08:54.238] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:54.439] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:54.592] [JOIN] INFO: [gate] hand=1,524536128 host=65535 local=1  agree=158/256 (61%)
+[00:08:54.669] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.48,1558.85,2816.23
+[00:08:54.814] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:55.021] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:55.167] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:55.409] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:55.673] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,524536128 pos=-51204.92,1582.29,2622.99 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3676879872 pos=-51212.02,1555.79,2852.45 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,332397472 pos=-51219.30,1556.80,2844.30 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3253906176 pos=-51223.01,1558.17,2825.09 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2534545920 pos=-51211.87,1557.23,2828.96 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1245605504 pos=-51252.79,1559.23,2834.16 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2543212800 pos=-51253.28,1560.67,2816.32 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2630004992 pos=-51190.56,1546.13,2904.01 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2534790144 pos=-51177.18,1547.26,2898.74 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1903686528 pos=-51277.01,1543.80,2909.27 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1187988224 pos=-51275.09,1540.80,2916.88 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3179565312 pos=-51235.30,1556.34,2848.66 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3357788160 pos=-51246.58,1556.00,2852.32 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1067504896 pos=-51254.38,1553.35,2873.05 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2764526336 pos=-51254.26,1555.91,2859.75 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1192016640 pos=-51258.71,1550.97,2885.48 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3133178624 pos=-51249.09,1548.07,2890.80 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1117553664 pos=-51218.10,1553.62,2866.67 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,598754880 pos=-51230.41,1554.08,2863.11 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1683227520 pos=-51193.18,1555.71,2820.07 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,176269536 pos=-51186.77,1554.85,2833.40 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3143920896 pos=-51272.36,1558.91,2858.03 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2034301696 pos=-51261.13,1556.07,2864.48 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1135253888 pos=-51170.29,1553.33,2818.69 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2131347712 pos=-51167.13,1553.04,2799.91 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2442138624 pos=-51198.71,1555.31,2848.45 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3767700224 pos=-51190.55,1554.45,2853.05 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1565307648 pos=-51237.89,1561.27,2788.35 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3911499008 pos=-51223.52,1559.73,2787.91 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3627929600 pos=-51229.89,1549.50,2883.42 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3521240320 pos=-51222.16,1547.47,2892.57 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2916748032 pos=-51286.61,1564.09,2827.15 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1668334976 pos=-51277.07,1562.89,2823.92 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3054809600 pos=-51167.58,1550.82,2870.98 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,213134768 pos=-51163.76,1551.64,2858.89 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,2109741184 pos=-51252.54,1561.71,2800.40 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1152832000 pos=-51264.11,1562.31,2801.74 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3218505984 pos=-51237.31,1558.20,2832.48 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,243774416 pos=-51239.53,1559.34,2821.82 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,932983424 pos=-51203.29,1552.35,2874.19 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3677246208 pos=-51204.14,1549.95,2886.31 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1667968768 pos=-51156.75,1551.69,2828.84 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3808471552 pos=-51139.49,1550.03,2822.32 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,1723144576 pos=-51296.99,1563.83,2711.75 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 unit role=J t=6016 hand=1,3996215808 pos=-51268.81,1561.86,2690.17 body=0 combat=1
+[00:08:55.673] [JOIN] INFO: SPIKE 9 units role=J t=6016 n=50
+[00:08:56.015] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:56.174] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:56.213] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:56.421] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:56.620] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:56.669] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:56.771] [JOIN] INFO: [gate] hand=1,524536128 host=65535 local=61  agree=183/338 (54%)
+[00:08:56.827] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:57.025] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:57.167] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,524536128 pos=-51204.92,1581.72,2622.99 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3676879872 pos=-51211.45,1555.75,2852.99 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,332397472 pos=-51219.89,1556.88,2843.33 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3253906176 pos=-51223.79,1558.23,2824.76 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2534545920 pos=-51210.30,1557.17,2829.75 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1245605504 pos=-51255.16,1559.82,2828.62 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2543212800 pos=-51257.16,1560.78,2817.92 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2630004992 pos=-51172.53,1547.13,2899.11 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2534790144 pos=-51170.80,1548.27,2891.28 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1903686528 pos=-51277.70,1543.83,2909.29 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1187988224 pos=-51283.27,1539.54,2940.01 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3179565312 pos=-51233.90,1556.38,2848.26 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3357788160 pos=-51245.39,1555.91,2852.24 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1067504896 pos=-51253.75,1551.99,2879.39 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2764526336 pos=-51250.97,1554.38,2865.32 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1192016640 pos=-51265.87,1550.22,2890.96 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3133178624 pos=-51253.34,1547.46,2894.99 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1117553664 pos=-51219.73,1553.58,2866.61 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,598754880 pos=-51227.96,1553.46,2865.91 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1683227520 pos=-51193.92,1555.78,2820.37 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,176269536 pos=-51187.58,1554.95,2832.59 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3143920896 pos=-51270.56,1558.39,2859.71 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2034301696 pos=-51261.41,1555.81,2865.97 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1135253888 pos=-51166.95,1553.00,2815.26 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2131347712 pos=-51168.93,1553.20,2807.08 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2442138624 pos=-51207.37,1556.50,2842.30 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3767700224 pos=-51191.92,1554.68,2851.59 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1565307648 pos=-51235.49,1561.03,2788.53 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3911499008 pos=-51221.55,1559.50,2787.76 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3627929600 pos=-51226.14,1548.99,2885.84 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3521240320 pos=-51221.99,1545.43,2900.53 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2916748032 pos=-51304.61,1565.50,2833.50 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1668334976 pos=-51298.41,1565.54,2828.58 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3054809600 pos=-51167.97,1550.44,2874.76 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,213134768 pos=-51165.11,1551.83,2857.73 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,2109741184 pos=-51253.53,1561.91,2798.12 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1152832000 pos=-51266.16,1563.04,2795.82 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3218505984 pos=-51243.63,1558.23,2834.89 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,243774416 pos=-51241.43,1559.49,2821.10 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,932983424 pos=-51203.51,1552.21,2875.10 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3677246208 pos=-51203.71,1549.46,2888.33 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1667968768 pos=-51150.71,1551.08,2830.52 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3808471552 pos=-51137.56,1549.85,2821.04 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,1723144576 pos=-51278.59,1562.97,2723.64 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 unit role=J t=7516 hand=1,3996215808 pos=-51268.80,1560.87,2700.76 body=0 combat=1
+[00:08:57.168] [JOIN] INFO: SPIKE 9 units role=J t=7516 n=50
+[00:08:57.632] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:57.671] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:57.833] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:58.038] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:58.174] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:58.245] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:08:58.671] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,524536128 pos=-51204.92,1581.72,2622.99 body=0 combat=0
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3676879872 pos=-51214.21,1555.68,2852.77 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,332397472 pos=-51226.96,1557.31,2839.37 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3253906176 pos=-51223.06,1558.18,2825.11 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2534545920 pos=-51209.05,1557.18,2826.66 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1245605504 pos=-51257.22,1559.59,2834.13 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2543212800 pos=-51265.51,1561.33,2818.52 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2630004992 pos=-51171.01,1547.41,2897.01 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2534790144 pos=-51166.03,1548.81,2885.70 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1903686528 pos=-51291.27,1543.63,2908.26 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1187988224 pos=-51282.31,1540.01,2922.01 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3179565312 pos=-51234.34,1555.45,2854.30 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3357788160 pos=-51246.72,1555.92,2852.91 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1067504896 pos=-51253.36,1547.28,2895.62 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2764526336 pos=-51256.35,1551.92,2881.14 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1192016640 pos=-51266.11,1549.41,2893.70 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3133178624 pos=-51258.85,1544.27,2905.38 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1117553664 pos=-51216.96,1552.62,2871.92 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,598754880 pos=-51230.38,1552.13,2872.23 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1683227520 pos=-51190.98,1555.56,2815.00 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,176269536 pos=-51183.38,1554.52,2833.02 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3143920896 pos=-51261.27,1555.59,2867.01 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2034301696 pos=-51253.22,1554.05,2868.66 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1135253888 pos=-51170.38,1553.34,2810.52 body=0 combat=1
+[00:08:58.671] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2131347712 pos=-51176.32,1554.02,2804.95 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2442138624 pos=-51218.24,1557.07,2836.69 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3767700224 pos=-51208.09,1556.58,2841.83 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1565307648 pos=-51236.77,1561.16,2789.87 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3911499008 pos=-51224.16,1559.79,2787.42 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3627929600 pos=-51224.67,1545.55,2899.31 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3521240320 pos=-51220.72,1544.63,2903.47 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2916748032 pos=-51304.45,1565.61,2832.08 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1668334976 pos=-51295.88,1565.42,2825.73 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3054809600 pos=-51167.01,1550.84,2870.38 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,213134768 pos=-51164.29,1551.85,2855.74 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,2109741184 pos=-51252.04,1561.83,2798.30 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1152832000 pos=-51268.46,1563.56,2790.24 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3218505984 pos=-51248.43,1558.59,2835.24 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,243774416 pos=-51242.26,1559.41,2822.84 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,932983424 pos=-51200.17,1552.62,2871.96 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3677246208 pos=-51203.48,1549.94,2886.23 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1667968768 pos=-51154.82,1551.49,2842.64 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3808471552 pos=-51139.64,1550.03,2822.87 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,1723144576 pos=-51262.29,1561.34,2723.80 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 unit role=J t=9016 hand=1,3996215808 pos=-51256.06,1560.50,2695.37 body=0 combat=1
+[00:08:58.672] [JOIN] INFO: SPIKE 9 units role=J t=9016 n=50
+[00:08:59.171] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:59.671] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:08:59.847] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:00.175] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,524536128 pos=-51204.92,1581.72,2622.99 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3676879872 pos=-51212.64,1555.68,2853.30 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,332397472 pos=-51229.79,1557.38,2839.66 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3253906176 pos=-51223.63,1558.22,2824.96 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2534545920 pos=-51210.87,1557.39,2823.90 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1245605504 pos=-51257.70,1559.77,2831.93 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2543212800 pos=-51264.88,1561.08,2820.76 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2630004992 pos=-51172.14,1546.88,2900.28 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2534790144 pos=-51167.30,1548.55,2887.85 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1903686528 pos=-51279.09,1539.84,2923.23 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1187988224 pos=-51301.45,1544.14,2909.57 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3179565312 pos=-51228.20,1555.42,2854.53 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3357788160 pos=-51237.15,1555.37,2854.88 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1067504896 pos=-51261.72,1553.78,2876.44 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2764526336 pos=-51267.70,1556.55,2866.67 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1192016640 pos=-51282.57,1550.96,2892.59 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3133178624 pos=-51270.23,1550.31,2891.40 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1117553664 pos=-51224.57,1549.01,2886.14 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,598754880 pos=-51230.19,1550.85,2878.17 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1683227520 pos=-51191.41,1555.62,2814.78 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,176269536 pos=-51182.51,1554.59,2814.00 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3143920896 pos=-51255.68,1555.14,2865.08 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2034301696 pos=-51245.03,1552.50,2871.04 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1135253888 pos=-51169.36,1553.24,2803.69 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2131347712 pos=-51183.33,1554.96,2797.97 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2442138624 pos=-51220.21,1557.10,2836.76 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3767700224 pos=-51206.84,1556.45,2843.13 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1565307648 pos=-51234.73,1560.96,2788.44 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3911499008 pos=-51222.79,1559.62,2786.35 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3627929600 pos=-51224.70,1543.10,2907.06 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3521240320 pos=-51215.27,1541.90,2916.98 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2916748032 pos=-51304.51,1565.45,2834.04 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1668334976 pos=-51301.50,1565.97,2826.66 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3054809600 pos=-51167.22,1551.05,2868.74 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,213134768 pos=-51165.59,1551.80,2859.28 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,2109741184 pos=-51253.12,1561.92,2797.65 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1152832000 pos=-51267.66,1563.49,2790.92 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3218505984 pos=-51247.11,1558.69,2833.06 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,243774416 pos=-51244.91,1559.88,2819.14 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,932983424 pos=-51199.75,1552.29,2873.85 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3677246208 pos=-51203.25,1550.08,2885.61 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1667968768 pos=-51143.60,1550.28,2837.15 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3808471552 pos=-51137.51,1549.92,2817.04 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,1723144576 pos=-51257.15,1561.08,2723.69 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 unit role=J t=10516 hand=1,3996215808 pos=-51254.11,1560.14,2699.69 body=0 combat=1
+[00:09:00.175] [JOIN] INFO: SPIKE 9 units role=J t=10516 n=50
+[00:09:00.402] [JOIN] INFO: [gate] hand=1,524536128 host=65535 local=1  agree=212/372 (56%)
+[00:09:00.413] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:00.615] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:00.672] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:01.165] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:01.573] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:01.672] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,524536128 pos=-51204.92,1581.72,2622.99 body=0 combat=0
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3676879872 pos=-51209.41,1555.76,2852.84 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,332397472 pos=-51227.01,1556.79,2845.23 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3253906176 pos=-51225.29,1558.32,2825.18 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2534545920 pos=-51208.96,1557.23,2823.70 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1245605504 pos=-51262.20,1560.51,2825.46 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2543212800 pos=-51270.19,1561.66,2825.20 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2630004992 pos=-51170.79,1547.23,2898.19 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2534790144 pos=-51156.45,1546.89,2895.43 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1903686528 pos=-51299.82,1541.93,2902.19 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1187988224 pos=-51287.96,1541.43,2919.03 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3179565312 pos=-51229.47,1555.42,2854.55 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3357788160 pos=-51237.89,1554.82,2858.57 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1067504896 pos=-51262.48,1553.69,2877.43 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2764526336 pos=-51269.21,1556.37,2868.61 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1192016640 pos=-51286.47,1550.15,2894.19 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3133178624 pos=-51268.83,1548.59,2896.92 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1117553664 pos=-51223.32,1548.80,2887.25 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,598754880 pos=-51231.10,1551.39,2875.70 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1683227520 pos=-51196.23,1556.07,2816.93 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,176269536 pos=-51181.55,1554.46,2819.05 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3143920896 pos=-51255.80,1554.50,2868.37 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2034301696 pos=-51244.98,1552.58,2870.66 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1135253888 pos=-51172.46,1553.55,2808.03 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2131347712 pos=-51182.23,1554.82,2798.59 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2442138624 pos=-51215.03,1556.93,2839.33 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3767700224 pos=-51200.84,1555.85,2844.89 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1565307648 pos=-51233.28,1560.71,2791.57 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3911499008 pos=-51219.64,1559.23,2785.02 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3627929600 pos=-51223.48,1542.84,2908.27 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3521240320 pos=-51214.08,1541.84,2917.71 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2916748032 pos=-51309.43,1564.90,2839.81 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1668334976 pos=-51314.79,1565.09,2838.76 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3054809600 pos=-51168.25,1550.67,2872.86 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,213134768 pos=-51166.79,1551.85,2860.69 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,2109741184 pos=-51257.75,1562.42,2795.26 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1152832000 pos=-51275.10,1564.05,2787.80 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3218505984 pos=-51247.91,1558.69,2833.87 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,243774416 pos=-51245.26,1559.83,2820.12 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,932983424 pos=-51200.35,1552.14,2874.89 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3677246208 pos=-51203.34,1549.84,2886.64 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1667968768 pos=-51142.19,1550.23,2829.85 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3808471552 pos=-51137.51,1549.92,2817.04 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,1723144576 pos=-51244.21,1560.03,2723.96 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 unit role=J t=12016 hand=1,3996215808 pos=-51250.92,1559.98,2702.51 body=0 combat=1
+[00:09:01.672] [JOIN] INFO: SPIKE 9 units role=J t=12016 n=50
+[00:09:01.776] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:02.171] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:02.483] [JOIN] INFO: [gate] hand=1,524536128 host=65535 local=61  agree=223/388 (57%)
+[00:09:02.529] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:02.673] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:02.739] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:02.940] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:03.170] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,524536128 pos=-51201.51,1581.53,2627.88 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3676879872 pos=-51219.16,1555.97,2849.85 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,332397472 pos=-51230.17,1556.95,2844.50 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3253906176 pos=-51222.97,1558.17,2825.08 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2534545920 pos=-51209.09,1557.25,2823.03 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1245605504 pos=-51275.70,1563.01,2815.68 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2543212800 pos=-51287.76,1564.54,2809.70 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2630004992 pos=-51168.69,1545.88,2904.43 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2534790144 pos=-51154.95,1546.50,2897.36 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1903686528 pos=-51304.64,1545.26,2905.47 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1187988224 pos=-51292.55,1541.72,2914.86 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3179565312 pos=-51239.47,1555.19,2856.09 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3357788160 pos=-51251.90,1557.08,2850.58 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1067504896 pos=-51264.45,1553.07,2881.19 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2764526336 pos=-51270.89,1555.87,2872.22 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1192016640 pos=-51286.23,1550.17,2894.18 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3133178624 pos=-51271.13,1548.82,2896.52 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1117553664 pos=-51227.83,1547.50,2891.00 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,598754880 pos=-51229.36,1550.53,2879.56 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1683227520 pos=-51194.86,1555.94,2816.76 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,176269536 pos=-51183.91,1554.71,2817.07 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3143920896 pos=-51262.98,1554.86,2871.94 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2034301696 pos=-51257.11,1555.94,2862.13 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1135253888 pos=-51187.15,1555.47,2793.71 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2131347712 pos=-51195.97,1556.55,2789.71 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2442138624 pos=-51210.33,1556.83,2839.97 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3767700224 pos=-51200.80,1555.84,2844.90 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1565307648 pos=-51236.56,1561.14,2789.58 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3911499008 pos=-51220.85,1559.38,2785.36 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3627929600 pos=-51223.13,1542.75,2908.65 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3521240320 pos=-51214.20,1541.77,2917.83 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2916748032 pos=-51305.96,1565.26,2836.83 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1668334976 pos=-51310.97,1564.83,2836.88 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3054809600 pos=-51164.63,1548.15,2889.01 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,213134768 pos=-51166.98,1550.18,2876.50 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,2109741184 pos=-51263.73,1563.24,2790.19 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1152832000 pos=-51275.81,1564.10,2787.62 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3218505984 pos=-51249.75,1558.93,2833.69 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,243774416 pos=-51246.96,1560.15,2817.55 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,932983424 pos=-51199.97,1552.38,2873.36 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3677246208 pos=-51203.44,1549.51,2888.10 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1667968768 pos=-51145.13,1550.46,2837.09 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3808471552 pos=-51137.51,1549.92,2817.04 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,1723144576 pos=-51239.59,1559.68,2715.92 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 unit role=J t=13516 hand=1,3996215808 pos=-51246.88,1559.90,2711.17 body=0 combat=1
+[00:09:03.170] [JOIN] INFO: SPIKE 9 units role=J t=13516 n=50
+[00:09:03.667] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:03.899] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=1 r=2
+[00:09:04.102] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=1 r=2
+[00:09:04.170] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:04.305] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:04.504] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:04.666] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,524536128 pos=-51200.95,1581.53,2630.27 body=0 combat=0
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3676879872 pos=-51218.68,1556.11,2848.88 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,332397472 pos=-51230.53,1556.98,2844.31 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3253906176 pos=-51220.07,1557.98,2825.20 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2534545920 pos=-51208.71,1557.21,2823.46 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1245605504 pos=-51273.18,1562.70,2816.96 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2543212800 pos=-51281.76,1563.74,2814.49 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2630004992 pos=-51167.99,1545.73,2904.98 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2534790144 pos=-51154.09,1545.22,2903.92 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1903686528 pos=-51311.84,1543.78,2912.52 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1187988224 pos=-51301.74,1544.59,2906.78 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3179565312 pos=-51235.07,1554.94,2857.73 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3357788160 pos=-51250.04,1556.63,2851.61 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1067504896 pos=-51255.04,1548.81,2891.00 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2764526336 pos=-51266.45,1552.82,2882.38 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1192016640 pos=-51285.58,1550.30,2893.93 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3133178624 pos=-51277.98,1546.45,2903.26 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1117553664 pos=-51233.71,1547.84,2889.70 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,598754880 pos=-51229.52,1550.47,2879.84 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1683227520 pos=-51196.38,1556.09,2816.65 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,176269536 pos=-51182.49,1554.55,2817.57 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3143920896 pos=-51261.78,1554.73,2871.70 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2034301696 pos=-51263.96,1556.93,2862.30 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1135253888 pos=-51175.25,1554.09,2793.53 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2131347712 pos=-51182.65,1554.90,2796.35 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2442138624 pos=-51209.32,1556.73,2840.91 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3767700224 pos=-51201.37,1555.99,2843.23 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1565307648 pos=-51235.29,1561.01,2789.62 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3911499008 pos=-51220.71,1559.36,2785.18 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3627929600 pos=-51223.33,1542.63,2908.96 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3521240320 pos=-51214.61,1541.99,2917.06 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2916748032 pos=-51317.00,1564.69,2841.36 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1668334976 pos=-51326.92,1566.35,2847.82 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3054809600 pos=-51170.90,1550.96,2872.66 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,213134768 pos=-51180.83,1552.81,2863.61 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,2109741184 pos=-51275.20,1564.08,2786.26 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1152832000 pos=-51290.66,1565.25,2786.15 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3218505984 pos=-51253.88,1559.51,2832.09 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,243774416 pos=-51249.25,1560.20,2818.76 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,932983424 pos=-51208.05,1554.92,2860.21 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3677246208 pos=-51204.28,1552.83,2871.79 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1667968768 pos=-51149.10,1550.38,2852.49 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3808471552 pos=-51140.32,1550.05,2826.22 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,1723144576 pos=-51241.82,1559.59,2714.60 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 unit role=J t=15016 hand=1,3996215808 pos=-51246.12,1559.72,2707.70 body=0 combat=1
+[00:09:04.666] [JOIN] INFO: SPIKE 9 units role=J t=15016 n=50
+[00:09:05.171] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:05.642] [JOIN] INFO: [combat] order hand=1,1723144576 tgt=1,3996215808 localFight=0 r=2
+[00:09:05.672] [JOIN] INFO: [event] RECV id=2 ev=1 owner=0 hand=1,6,1483154304,1,1723144576 actor=1,3996215808
+[00:09:05.674] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:05.674] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:05.806] [JOIN] INFO: [combat] order hand=1,3996215808 tgt=1,1723144576 localFight=0 r=2
+[00:09:05.872] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:05.872] [JOIN] INFO: [gate] hand=1,3996215808 host=65535 local=61  agree=253/436 (58%)
+[00:09:05.919] [JOIN] INFO: [combat] order hand=1,3996215808 tgt=1,1723144576 localFight=1 r=2
+[00:09:06.118] [JOIN] INFO: [combat] order hand=1,3996215808 tgt=1,1723144576 localFight=0 r=2
+[00:09:06.166] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,524536128 pos=-51200.48,1581.40,2633.77 body=0 combat=0
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=1
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3676879872 pos=-51218.51,1556.03,2849.36 body=0 combat=1
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,332397472 pos=-51229.59,1556.85,2845.00 body=0 combat=1
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3253906176 pos=-51224.91,1558.29,2825.62 body=0 combat=1
+[00:09:06.166] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2534545920 pos=-51209.63,1557.30,2823.38 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1245605504 pos=-51275.53,1562.98,2816.39 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2543212800 pos=-51288.17,1564.57,2815.48 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2630004992 pos=-51169.58,1545.71,2905.47 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2534790144 pos=-51155.06,1545.35,2903.83 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1903686528 pos=-51319.96,1544.32,2918.07 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1187988224 pos=-51301.49,1544.87,2907.17 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3179565312 pos=-51237.44,1555.11,2856.60 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3357788160 pos=-51251.39,1556.93,2851.04 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1067504896 pos=-51259.05,1548.88,2892.64 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2764526336 pos=-51270.90,1552.17,2885.64 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1192016640 pos=-51301.23,1554.39,2881.51 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3133178624 pos=-51288.22,1551.30,2890.97 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1117553664 pos=-51232.74,1548.30,2887.93 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,598754880 pos=-51229.84,1550.38,2880.21 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1683227520 pos=-51193.88,1555.83,2817.14 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,176269536 pos=-51175.40,1553.84,2818.62 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3143920896 pos=-51262.05,1554.99,2870.60 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2034301696 pos=-51270.43,1558.24,2860.70 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1135253888 pos=-51166.50,1553.11,2791.35 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2131347712 pos=-51179.12,1554.52,2795.00 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2442138624 pos=-51208.24,1556.61,2841.32 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3767700224 pos=-51193.57,1555.33,2843.88 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1565307648 pos=-51239.24,1560.87,2797.99 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3911499008 pos=-51232.12,1560.69,2788.59 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3627929600 pos=-51223.18,1542.38,2909.81 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3521240320 pos=-51212.27,1539.56,2923.61 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2916748032 pos=-51310.13,1565.90,2831.70 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1668334976 pos=-51308.57,1564.51,2841.54 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3054809600 pos=-51174.73,1551.79,2868.42 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,213134768 pos=-51180.84,1552.80,2863.67 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,2109741184 pos=-51268.79,1563.70,2783.70 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1152832000 pos=-51276.16,1564.14,2786.60 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3218505984 pos=-51252.65,1559.43,2831.93 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,243774416 pos=-51248.85,1560.36,2816.58 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,932983424 pos=-51208.84,1555.17,2858.33 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3677246208 pos=-51204.18,1552.77,2872.07 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1667968768 pos=-51144.49,1550.33,2840.30 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3808471552 pos=-51142.52,1550.25,2831.81 body=0 combat=1
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,1723144576 pos=-51240.55,1562.73,2711.31 body=3 combat=0
+[00:09:06.167] [JOIN] INFO: SPIKE 9 unit role=J t=16516 hand=1,3996215808 pos=-51240.34,1559.60,2715.78 body=0 combat=0
+[00:09:06.167] [JOIN] INFO: SPIKE 9 units role=J t=16516 n=50
+[00:09:06.320] [JOIN] INFO: [combat] order hand=1,3996215808 tgt=1,1723144576 localFight=0 r=2
+[00:09:06.531] [JOIN] INFO: [event] RECV id=3 ev=1 owner=0 hand=1,35,3661377024,1,3996215808 actor=5,1919189504
+[00:09:06.666] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:06.732] [JOIN] INFO: [event] RECV id=4 ev=1 owner=0 hand=1,5,3003784192,1,1667968768 actor=1,3808471552
+[00:09:06.829] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:06.829] [JOIN] INFO: [combat] order hand=1,3808471552 tgt=1,1667968768 localFight=0 r=2
+[00:09:06.952] [JOIN] INFO: [taskkey] key=35 desc='Running away' repro=0 subject=1
+[00:09:07.030] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:07.031] [JOIN] INFO: [taskkey] key=7 desc='Sheathing weapon' repro=0 subject=1
+[00:09:07.166] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:07.671] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,524536128 pos=-51201.46,1581.47,2631.38 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=0
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3676879872 pos=-51225.70,1556.42,2847.59 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,332397472 pos=-51232.54,1557.11,2843.55 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3253906176 pos=-51222.66,1558.15,2825.23 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2534545920 pos=-51210.18,1557.37,2822.19 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1245605504 pos=-51275.08,1562.94,2816.00 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2543212800 pos=-51285.89,1564.26,2815.76 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2630004992 pos=-51167.11,1545.59,2905.47 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2534790144 pos=-51153.30,1545.20,2903.56 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1903686528 pos=-51304.04,1545.00,2906.76 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1187988224 pos=-51324.10,1545.07,2918.02 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3179565312 pos=-51237.94,1555.18,2856.11 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3357788160 pos=-51255.09,1557.17,2852.89 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1067504896 pos=-51251.41,1544.19,2903.21 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2764526336 pos=-51257.48,1548.23,2894.18 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1192016640 pos=-51287.95,1551.63,2890.13 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3133178624 pos=-51281.20,1552.95,2887.16 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1117553664 pos=-51234.65,1542.95,2905.10 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,598754880 pos=-51237.26,1546.29,2895.50 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1683227520 pos=-51191.47,1555.76,2806.57 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,176269536 pos=-51180.75,1554.38,2818.41 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3143920896 pos=-51261.91,1554.94,2870.73 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2034301696 pos=-51270.59,1558.08,2862.06 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1135253888 pos=-51165.91,1553.03,2792.22 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2131347712 pos=-51173.74,1553.87,2783.54 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2442138624 pos=-51204.81,1556.33,2840.06 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3767700224 pos=-51186.02,1554.32,2848.26 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1565307648 pos=-51249.29,1561.15,2806.41 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3911499008 pos=-51241.30,1560.95,2799.89 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3627929600 pos=-51229.33,1545.68,2897.79 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3521240320 pos=-51224.14,1544.20,2903.74 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2916748032 pos=-51307.70,1565.55,2834.09 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1668334976 pos=-51315.33,1561.65,2854.98 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3054809600 pos=-51172.75,1551.78,2867.19 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,213134768 pos=-51185.53,1553.10,2864.22 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,2109741184 pos=-51263.58,1563.36,2782.96 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1152832000 pos=-51275.14,1564.12,2783.64 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3218505984 pos=-51251.01,1559.17,2832.84 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,243774416 pos=-51251.76,1559.90,2824.48 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,932983424 pos=-51214.43,1556.14,2848.18 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3677246208 pos=-51208.97,1555.28,2857.29 body=0 combat=1
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1667968768 pos=-51146.10,1552.10,2848.22 body=3 combat=0
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3808471552 pos=-51142.46,1550.27,2825.64 body=0 combat=0
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,1723144576 pos=-51237.56,1560.40,2713.58 body=3 combat=0
+[00:09:07.671] [JOIN] INFO: SPIKE 9 unit role=J t=18016 hand=1,3996215808 pos=-51241.21,1562.24,2715.27 body=3 combat=0
+[00:09:07.671] [JOIN] INFO: SPIKE 9 units role=J t=18016 n=50
+[00:09:07.873] [JOIN] INFO: [gate] hand=5,1919189504 host=240 local=65535  agree=305/669 (45%)
+[00:09:08.175] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:08.533] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:08.674] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:09.165] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,524536128 pos=-51202.71,1581.41,2638.17 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=0
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3676879872 pos=-51215.43,1555.12,2857.97 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,332397472 pos=-51222.38,1555.55,2853.05 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3253906176 pos=-51224.87,1558.28,2825.99 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2534545920 pos=-51209.49,1557.31,2822.07 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1245605504 pos=-51276.44,1563.09,2816.02 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2543212800 pos=-51289.39,1564.72,2816.04 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2630004992 pos=-51167.35,1545.44,2906.28 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2534790144 pos=-51155.54,1545.43,2903.73 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1903686528 pos=-51311.53,1544.90,2908.33 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1187988224 pos=-51324.39,1545.32,2920.54 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3179565312 pos=-51241.41,1554.36,2861.61 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3357788160 pos=-51255.63,1556.73,2856.06 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1067504896 pos=-51250.86,1543.39,2905.13 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2764526336 pos=-51259.42,1548.07,2895.67 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1192016640 pos=-51301.46,1551.19,2889.79 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3133178624 pos=-51282.09,1553.21,2886.76 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1117553664 pos=-51229.76,1546.33,2895.37 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,598754880 pos=-51240.63,1546.81,2893.55 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1683227520 pos=-51186.95,1555.17,2810.27 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,176269536 pos=-51179.19,1554.22,2820.13 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3143920896 pos=-51251.54,1550.98,2881.89 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2034301696 pos=-51260.73,1554.41,2872.51 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1135253888 pos=-51145.54,1550.87,2804.34 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2131347712 pos=-51162.46,1552.55,2796.53 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2442138624 pos=-51200.31,1555.97,2838.92 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3767700224 pos=-51187.56,1554.82,2839.90 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1565307648 pos=-51250.83,1561.29,2805.53 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3911499008 pos=-51237.54,1560.88,2795.30 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3627929600 pos=-51218.98,1549.90,2884.21 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3521240320 pos=-51215.85,1545.20,2903.19 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2916748032 pos=-51309.63,1565.38,2836.93 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1668334976 pos=-51302.41,1564.87,2840.11 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3054809600 pos=-51152.78,1549.12,2874.19 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,213134768 pos=-51167.77,1550.70,2872.24 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,2109741184 pos=-51259.81,1563.08,2784.72 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1152832000 pos=-51266.73,1563.63,2779.67 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3218505984 pos=-51238.75,1555.74,2852.63 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,243774416 pos=-51247.04,1557.74,2841.20 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,932983424 pos=-51201.97,1554.65,2859.70 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3677246208 pos=-51189.81,1553.87,2861.11 body=0 combat=1
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1667968768 pos=-51141.33,1550.07,2850.86 body=3 combat=0
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3808471552 pos=-51142.27,1550.23,2830.71 body=0 combat=0
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,1723144576 pos=-51237.56,1560.40,2713.57 body=3 combat=0
+[00:09:09.165] [JOIN] INFO: SPIKE 9 unit role=J t=19516 hand=1,3996215808 pos=-51241.17,1561.79,2714.70 body=3 combat=0
+[00:09:09.165] [JOIN] INFO: SPIKE 9 units role=J t=19516 n=50
+[00:09:09.674] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:09.878] [JOIN] INFO: [gate] hand=5,1919189504 host=224 local=65535  agree=455/1073 (42%)
+[00:09:10.013] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:10.171] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:10.221] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:10.367] [JOIN] INFO: [combat] order hand=5,1919189504 tgt=1,1152832000 localFight=0 r=2
+[00:09:10.416] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:10.620] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:10.668] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,524536128 pos=-51228.73,1582.52,2639.73 body=0 combat=0
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=0
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3676879872 pos=-51211.68,1554.38,2864.25 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,332397472 pos=-51219.28,1555.14,2856.48 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3253906176 pos=-51223.51,1558.20,2825.73 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2534545920 pos=-51210.34,1557.39,2821.60 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1245605504 pos=-51277.46,1563.21,2815.91 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2543212800 pos=-51289.93,1564.79,2815.95 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2630004992 pos=-51167.07,1545.49,2905.95 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2534790144 pos=-51150.23,1544.03,2907.96 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1903686528 pos=-51327.19,1544.67,2914.41 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1187988224 pos=-51306.52,1542.61,2914.33 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3179565312 pos=-51255.39,1556.97,2854.42 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3357788160 pos=-51262.89,1558.37,2850.69 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1067504896 pos=-51249.59,1542.43,2907.30 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2764526336 pos=-51262.32,1546.29,2901.62 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1192016640 pos=-51281.69,1550.41,2893.99 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3133178624 pos=-51280.52,1554.62,2882.57 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1117553664 pos=-51230.65,1546.42,2895.01 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,598754880 pos=-51241.09,1546.98,2892.92 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1683227520 pos=-51191.78,1555.82,2804.91 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,176269536 pos=-51184.05,1554.80,2812.31 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3143920896 pos=-51244.92,1550.91,2879.01 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2034301696 pos=-51254.99,1552.07,2879.96 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1135253888 pos=-51148.30,1551.14,2803.26 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2131347712 pos=-51154.06,1551.72,2793.26 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2442138624 pos=-51213.09,1556.75,2843.85 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3767700224 pos=-51204.55,1556.38,2837.02 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1565307648 pos=-51251.84,1561.20,2807.65 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3911499008 pos=-51242.45,1561.29,2796.58 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3627929600 pos=-51217.69,1548.48,2890.15 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3521240320 pos=-51213.77,1544.43,2907.91 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2916748032 pos=-51310.82,1562.56,2850.65 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1668334976 pos=-51308.11,1562.71,2850.71 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3054809600 pos=-51153.56,1549.25,2873.86 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,213134768 pos=-51167.66,1550.45,2874.34 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,2109741184 pos=-51252.66,1561.95,2796.91 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1152832000 pos=-51262.57,1563.30,2782.65 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3218505984 pos=-51240.27,1556.43,2848.63 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,243774416 pos=-51244.60,1558.07,2836.76 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,932983424 pos=-51201.45,1554.39,2862.45 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3677246208 pos=-51189.41,1553.80,2861.73 body=0 combat=1
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1667968768 pos=-51141.34,1549.82,2850.85 body=3 combat=0
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3808471552 pos=-51141.72,1550.17,2830.68 body=0 combat=0
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,1723144576 pos=-51237.55,1560.41,2713.57 body=3 combat=0
+[00:09:10.668] [JOIN] INFO: SPIKE 9 unit role=J t=21016 hand=1,3996215808 pos=-51241.07,1561.71,2714.60 body=3 combat=0
+[00:09:10.668] [JOIN] INFO: SPIKE 9 units role=J t=21016 n=50
+[00:09:11.174] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:11.671] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:11.871] [JOIN] INFO: [combat] order hand=5,1919189504 tgt=1,1152832000 localFight=0 r=2
+[00:09:11.909] [JOIN] INFO: [gate] hand=1,3808471552 host=65535 local=1  agree=566/1353 (41%)
+[00:09:12.120] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:12.170] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,524536128 pos=-51219.88,1582.56,2634.14 body=0 combat=0
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=0
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3676879872 pos=-51218.98,1552.58,2871.40 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,332397472 pos=-51218.60,1555.08,2857.30 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3253906176 pos=-51223.98,1558.22,2825.99 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2534545920 pos=-51208.65,1557.23,2821.49 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1245605504 pos=-51273.31,1562.75,2814.87 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2543212800 pos=-51281.95,1563.76,2814.23 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2630004992 pos=-51166.07,1545.39,2906.22 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2534790144 pos=-51151.89,1544.23,2907.93 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1903686528 pos=-51337.30,1547.08,2926.29 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1187988224 pos=-51328.98,1546.70,2912.91 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3179565312 pos=-51258.84,1557.80,2851.41 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3357788160 pos=-51276.07,1561.02,2847.83 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1067504896 pos=-51241.66,1537.89,2919.65 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2764526336 pos=-51249.03,1540.00,2913.52 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1192016640 pos=-51282.76,1551.50,2891.16 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3133178624 pos=-51284.96,1554.27,2883.61 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1117553664 pos=-51222.36,1544.19,2904.35 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,598754880 pos=-51234.83,1547.77,2889.93 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1683227520 pos=-51199.65,1556.87,2793.59 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,176269536 pos=-51182.95,1554.86,2801.31 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3143920896 pos=-51248.25,1549.56,2885.15 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2034301696 pos=-51263.78,1554.23,2875.68 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1135253888 pos=-51146.96,1551.01,2803.85 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2131347712 pos=-51151.23,1551.43,2795.26 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2442138624 pos=-51212.15,1556.74,2843.75 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3767700224 pos=-51190.44,1555.23,2832.82 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1565307648 pos=-51246.93,1560.67,2811.31 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3911499008 pos=-51241.89,1561.23,2796.57 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3627929600 pos=-51217.23,1550.34,2882.98 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3521240320 pos=-51214.54,1548.20,2892.73 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2916748032 pos=-51309.21,1562.45,2851.16 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1668334976 pos=-51318.43,1562.55,2851.65 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3054809600 pos=-51170.41,1550.98,2872.09 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,213134768 pos=-51182.88,1551.00,2877.51 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,2109741184 pos=-51253.65,1562.30,2793.42 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1152832000 pos=-51262.91,1563.32,2782.62 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3218505984 pos=-51240.23,1556.53,2848.00 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,243774416 pos=-51244.65,1558.03,2837.05 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,932983424 pos=-51214.72,1554.17,2864.65 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3677246208 pos=-51208.42,1555.05,2859.18 body=0 combat=1
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1667968768 pos=-51141.34,1549.82,2850.85 body=3 combat=0
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3808471552 pos=-51142.18,1550.23,2830.25 body=0 combat=0
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,1723144576 pos=-51237.55,1560.41,2713.57 body=3 combat=0
+[00:09:12.170] [JOIN] INFO: SPIKE 9 unit role=J t=22516 hand=1,3996215808 pos=-51241.08,1561.71,2714.60 body=3 combat=0
+[00:09:12.170] [JOIN] INFO: SPIKE 9 units role=J t=22516 n=50
+[00:09:12.668] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:13.166] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:13.377] [JOIN] INFO: [combat] order hand=5,1919189504 tgt=1,1152832000 localFight=0 r=2
+[00:09:13.628] [JOIN] INFO: [combat] order hand=1,524536128 tgt=1,3823120128 localFight=0 r=2
+[00:09:13.671] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,524536128 pos=-51235.49,1582.04,2647.87 body=0 combat=0
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=0
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3676879872 pos=-51222.38,1552.10,2873.07 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,332397472 pos=-51221.66,1554.60,2861.11 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3253906176 pos=-51223.54,1557.89,2829.61 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2534545920 pos=-51214.90,1557.69,2821.73 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1245605504 pos=-51264.06,1561.16,2817.48 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2543212800 pos=-51274.85,1562.85,2818.94 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2630004992 pos=-51166.13,1545.33,2906.55 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2534790144 pos=-51152.76,1544.40,2907.59 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1903686528 pos=-51337.14,1548.39,2926.80 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1187988224 pos=-51330.95,1546.29,2916.87 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3179565312 pos=-51258.84,1557.78,2851.53 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3357788160 pos=-51273.68,1560.45,2848.70 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1067504896 pos=-51237.72,1538.76,2917.70 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2764526336 pos=-51245.39,1539.07,2915.17 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1192016640 pos=-51280.88,1552.26,2888.87 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3133178624 pos=-51287.84,1556.55,2876.78 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1117553664 pos=-51219.60,1543.62,2907.01 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,598754880 pos=-51236.63,1546.98,2892.93 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1683227520 pos=-51201.71,1557.14,2792.67 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,176269536 pos=-51182.93,1554.85,2801.29 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3143920896 pos=-51247.81,1549.12,2886.50 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2034301696 pos=-51256.55,1552.39,2879.53 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1135253888 pos=-51155.05,1551.82,2781.79 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2131347712 pos=-51156.77,1552.00,2773.87 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2442138624 pos=-51206.37,1556.46,2840.22 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3767700224 pos=-51192.25,1555.36,2835.64 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1565307648 pos=-51246.09,1560.80,2809.11 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3911499008 pos=-51241.76,1561.19,2797.07 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3627929600 pos=-51217.23,1550.40,2882.75 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3521240320 pos=-51213.18,1547.73,2895.33 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2916748032 pos=-51304.41,1562.53,2850.37 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1668334976 pos=-51317.04,1562.99,2849.91 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3054809600 pos=-51170.11,1550.89,2872.55 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,213134768 pos=-51181.97,1550.99,2877.36 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,2109741184 pos=-51241.52,1561.64,2784.94 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1152832000 pos=-51251.73,1562.29,2792.01 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3218505984 pos=-51242.27,1556.47,2848.55 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,243774416 pos=-51245.38,1558.24,2835.59 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,932983424 pos=-51216.38,1553.60,2867.03 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3677246208 pos=-51208.44,1555.09,2858.77 body=0 combat=1
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1667968768 pos=-51141.34,1549.82,2850.85 body=3 combat=0
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3808471552 pos=-51141.92,1550.20,2830.62 body=0 combat=0
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,1723144576 pos=-51237.55,1560.41,2713.57 body=3 combat=0
+[00:09:13.671] [JOIN] INFO: SPIKE 9 unit role=J t=24016 hand=1,3996215808 pos=-51241.08,1561.71,2714.60 body=3 combat=0
+[00:09:13.671] [JOIN] INFO: SPIKE 9 units role=J t=24016 n=50
+[00:09:13.925] [JOIN] INFO: [gate] hand=1,3808471552 host=65535 local=1  agree=670/1569 (42%)
+[00:09:14.168] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,524536128 (streamed=0 local=50 supp=6)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3676879872 (streamed=0 local=50 supp=7)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,332397472 (streamed=0 local=50 supp=8)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3253906176 (streamed=0 local=50 supp=9)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2534545920 (streamed=0 local=50 supp=10)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1245605504 (streamed=0 local=50 supp=11)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2543212800 (streamed=0 local=50 supp=12)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2630004992 (streamed=0 local=50 supp=13)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2534790144 (streamed=0 local=50 supp=14)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1903686528 (streamed=0 local=50 supp=15)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1187988224 (streamed=0 local=50 supp=16)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3179565312 (streamed=0 local=50 supp=17)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3357788160 (streamed=0 local=50 supp=18)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1067504896 (streamed=0 local=50 supp=19)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2764526336 (streamed=0 local=50 supp=20)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1192016640 (streamed=0 local=50 supp=21)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3133178624 (streamed=0 local=50 supp=22)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1117553664 (streamed=0 local=50 supp=23)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,598754880 (streamed=0 local=50 supp=24)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1683227520 (streamed=0 local=50 supp=25)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,176269536 (streamed=0 local=50 supp=26)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3143920896 (streamed=0 local=50 supp=27)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2034301696 (streamed=0 local=50 supp=28)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1135253888 (streamed=0 local=50 supp=29)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2131347712 (streamed=0 local=50 supp=30)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2442138624 (streamed=0 local=50 supp=31)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3767700224 (streamed=0 local=50 supp=32)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1565307648 (streamed=0 local=50 supp=33)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3911499008 (streamed=0 local=50 supp=34)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3627929600 (streamed=0 local=50 supp=35)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3521240320 (streamed=0 local=50 supp=36)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2916748032 (streamed=0 local=50 supp=37)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1668334976 (streamed=0 local=50 supp=38)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3054809600 (streamed=0 local=50 supp=39)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,213134768 (streamed=0 local=50 supp=40)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,2109741184 (streamed=0 local=50 supp=41)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1152832000 (streamed=0 local=50 supp=42)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3218505984 (streamed=0 local=50 supp=43)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,243774416 (streamed=0 local=50 supp=44)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,932983424 (streamed=0 local=50 supp=45)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3677246208 (streamed=0 local=50 supp=46)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,1667968768 (streamed=0 local=50 supp=47)
+[00:09:14.542] [JOIN] INFO: [authority] suppress NPC hand=1,3808471552 (streamed=0 local=50 supp=48)
+[00:09:14.543] [JOIN] INFO: [authority] suppress NPC hand=1,1723144576 (streamed=0 local=50 supp=49)
+[00:09:14.543] [JOIN] INFO: [authority] suppress NPC hand=1,3996215808 (streamed=0 local=50 supp=50)
+[00:09:14.670] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:15.169] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,524536128 pos=-51234.57,1582.04,2647.11 body=0 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3676879872 pos=-51223.95,1551.38,2873.76 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,332397472 pos=-51219.99,1554.10,2856.79 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3253906176 pos=-51224.88,1557.02,2830.73 body=0 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2534545920 pos=-51217.41,1557.39,2823.73 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1245605504 pos=-51263.09,1560.42,2817.13 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2543212800 pos=-51272.57,1561.34,2819.08 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2630004992 pos=-51165.41,1544.95,2907.14 body=0 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2534790144 pos=-51152.83,1543.80,2907.67 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1903686528 pos=-51336.00,1548.67,2928.31 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1187988224 pos=-51333.39,1547.53,2911.65 body=0 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3179565312 pos=-51258.84,1557.31,2851.53 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3357788160 pos=-51275.97,1559.97,2848.13 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1067504896 pos=-51231.48,1537.57,2922.24 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2764526336 pos=-51243.48,1539.49,2915.83 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1192016640 pos=-51280.04,1550.26,2890.05 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3133178624 pos=-51286.72,1554.64,2878.48 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1117553664 pos=-51218.34,1542.63,2907.62 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,598754880 pos=-51236.83,1546.71,2893.19 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1683227520 pos=-51201.13,1556.27,2793.10 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,176269536 pos=-51185.94,1554.30,2799.91 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3143920896 pos=-51249.32,1550.10,2885.50 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2034301696 pos=-51259.30,1552.99,2877.77 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1135253888 pos=-51152.38,1550.70,2785.89 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2131347712 pos=-51156.87,1551.09,2776.95 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2442138624 pos=-51209.84,1555.76,2840.89 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3767700224 pos=-51192.25,1555.03,2835.64 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1565307648 pos=-51246.75,1559.80,2810.86 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3911499008 pos=-51241.56,1560.32,2797.75 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3627929600 pos=-51216.72,1549.47,2883.81 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3521240320 pos=-51210.26,1547.47,2893.55 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2916748032 pos=-51302.11,1562.46,2850.40 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1668334976 pos=-51316.37,1562.84,2850.11 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3054809600 pos=-51170.11,1550.00,2872.55 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,213134768 pos=-51183.25,1550.48,2878.04 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,2109741184 pos=-51246.37,1561.08,2787.86 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1152832000 pos=-51252.80,1561.21,2792.79 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3218505984 pos=-51241.95,1556.21,2851.09 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,243774416 pos=-51244.16,1557.75,2836.49 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,932983424 pos=-51215.98,1552.49,2867.07 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3677246208 pos=-51209.11,1553.69,2860.09 body=0 combat=1
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1667968768 pos=-51141.34,1549.82,2850.85 body=3 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3808471552 pos=-51142.13,1549.46,2830.40 body=0 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,1723144576 pos=-51237.55,1560.41,2713.57 body=3 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 unit role=J t=25516 hand=1,3996215808 pos=-51241.08,1561.71,2714.60 body=3 combat=0
+[00:09:15.169] [JOIN] INFO: SPIKE 9 units role=J t=25516 n=50
+[00:09:15.667] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:16.170] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:16.667] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,524536128 pos=-51234.57,1582.04,2647.11 body=0 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3676879872 pos=-51223.95,1551.38,2873.76 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,332397472 pos=-51219.99,1554.10,2856.79 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3253906176 pos=-51224.88,1557.02,2830.73 body=0 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2534545920 pos=-51217.41,1557.39,2823.73 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1245605504 pos=-51263.09,1560.42,2817.13 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2543212800 pos=-51272.57,1561.34,2819.08 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2630004992 pos=-51165.41,1544.95,2907.14 body=0 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2534790144 pos=-51152.83,1543.80,2907.67 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1903686528 pos=-51336.00,1548.67,2928.31 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1187988224 pos=-51333.39,1547.53,2911.65 body=0 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3179565312 pos=-51258.84,1557.31,2851.53 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3357788160 pos=-51275.97,1559.97,2848.13 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1067504896 pos=-51231.48,1537.57,2922.24 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2764526336 pos=-51243.48,1539.49,2915.83 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1192016640 pos=-51280.04,1550.26,2890.05 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3133178624 pos=-51286.72,1554.64,2878.48 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1117553664 pos=-51218.34,1542.63,2907.62 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,598754880 pos=-51236.83,1546.71,2893.19 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1683227520 pos=-51201.13,1556.27,2793.10 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,176269536 pos=-51185.94,1554.30,2799.91 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3143920896 pos=-51249.32,1550.10,2885.50 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2034301696 pos=-51259.30,1552.99,2877.77 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1135253888 pos=-51152.38,1550.70,2785.89 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2131347712 pos=-51156.87,1551.09,2776.95 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2442138624 pos=-51209.84,1555.76,2840.89 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3767700224 pos=-51192.25,1555.03,2835.64 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1565307648 pos=-51246.75,1559.80,2810.86 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3911499008 pos=-51241.56,1560.32,2797.75 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3627929600 pos=-51216.72,1549.47,2883.81 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3521240320 pos=-51210.26,1547.47,2893.55 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2916748032 pos=-51302.11,1562.46,2850.40 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1668334976 pos=-51316.37,1562.84,2850.11 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3054809600 pos=-51170.11,1550.00,2872.55 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,213134768 pos=-51183.25,1550.48,2878.04 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,2109741184 pos=-51246.37,1561.08,2787.86 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1152832000 pos=-51252.80,1561.21,2792.79 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3218505984 pos=-51241.95,1556.21,2851.09 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,243774416 pos=-51244.16,1557.75,2836.49 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,932983424 pos=-51215.98,1552.49,2867.07 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3677246208 pos=-51209.11,1553.69,2860.09 body=0 combat=1
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1667968768 pos=-51141.34,1549.82,2850.85 body=3 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3808471552 pos=-51142.13,1549.46,2830.40 body=0 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,1723144576 pos=-51237.55,1560.41,2713.57 body=3 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 unit role=J t=27016 hand=1,3996215808 pos=-51241.08,1561.71,2714.60 body=3 combat=0
+[00:09:16.667] [JOIN] INFO: SPIKE 9 units role=J t=27016 n=50
+[00:09:17.170] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:17.667] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:18.168] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,524536128 pos=-51234.57,1582.04,2647.11 body=0 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=3,3090698240 pos=-51208.11,1647.33,2648.73 body=0 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2567382784 pos=-51242.83,1583.05,2638.75 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2590331904 pos=-51162.47,1579.30,2678.16 body=0 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3235595776 pos=-51152.07,1645.33,2646.39 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1507568384 pos=-51254.57,1582.21,2659.95 body=0 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3676879872 pos=-51223.95,1551.38,2873.76 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,332397472 pos=-51219.99,1554.10,2856.79 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3253906176 pos=-51224.88,1557.02,2830.73 body=0 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2534545920 pos=-51217.41,1557.39,2823.73 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1245605504 pos=-51263.09,1560.42,2817.13 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2543212800 pos=-51272.57,1561.34,2819.08 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2630004992 pos=-51165.41,1544.95,2907.14 body=0 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2534790144 pos=-51152.83,1543.80,2907.67 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1903686528 pos=-51336.00,1548.67,2928.31 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1187988224 pos=-51333.39,1547.53,2911.65 body=0 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3179565312 pos=-51258.84,1557.31,2851.53 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3357788160 pos=-51275.97,1559.97,2848.13 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1067504896 pos=-51231.48,1537.57,2922.24 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2764526336 pos=-51243.48,1539.49,2915.83 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1192016640 pos=-51280.04,1550.26,2890.05 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3133178624 pos=-51286.72,1554.64,2878.48 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1117553664 pos=-51218.34,1542.63,2907.62 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,598754880 pos=-51236.83,1546.71,2893.19 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1683227520 pos=-51201.13,1556.27,2793.10 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,176269536 pos=-51185.94,1554.30,2799.91 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3143920896 pos=-51249.32,1550.10,2885.50 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2034301696 pos=-51259.30,1552.99,2877.77 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1135253888 pos=-51152.38,1550.70,2785.89 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2131347712 pos=-51156.87,1551.09,2776.95 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2442138624 pos=-51209.84,1555.76,2840.89 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3767700224 pos=-51192.25,1555.03,2835.64 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1565307648 pos=-51246.75,1559.80,2810.86 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3911499008 pos=-51241.56,1560.32,2797.75 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3627929600 pos=-51216.72,1549.47,2883.81 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3521240320 pos=-51210.26,1547.47,2893.55 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2916748032 pos=-51302.11,1562.46,2850.40 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1668334976 pos=-51316.37,1562.84,2850.11 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3054809600 pos=-51170.11,1550.00,2872.55 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,213134768 pos=-51183.25,1550.48,2878.04 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,2109741184 pos=-51246.37,1561.08,2787.86 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1152832000 pos=-51252.80,1561.21,2792.79 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3218505984 pos=-51241.95,1556.21,2851.09 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,243774416 pos=-51244.16,1557.75,2836.49 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,932983424 pos=-51215.98,1552.49,2867.07 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3677246208 pos=-51209.11,1553.69,2860.09 body=0 combat=1
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1667968768 pos=-51141.34,1549.82,2850.85 body=3 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3808471552 pos=-51142.13,1549.46,2830.40 body=0 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,1723144576 pos=-51237.55,1560.41,2713.57 body=3 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 unit role=J t=28516 hand=1,3996215808 pos=-51241.08,1561.71,2714.60 body=3 combat=0
+[00:09:18.168] [JOIN] INFO: SPIKE 9 units role=J t=28516 n=50
+[00:09:18.240] [JOIN] INFO: [net] disconnected from host
+[00:09:18.244] [JOIN] INFO: handshake: peer left id=4294967295
+[00:09:18.291] [JOIN] INFO: [net] reconnecting
+[00:09:18.668] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:19.172] [JOIN] INFO: SCENARIO RECV hand=1,2637329152,1,1,3079467776 pos=-51225.42,1558.86,2815.87
+[00:09:19.654] [JOIN] INFO: SCENARIO SMOOTH active=447 zeroWhileActive=242 zeroFrac=0.541 maxStep=16.817
+[00:09:19.654] [JOIN] INFO: SCENARIO ANIM translate=190 walkTruth=183 floatFrac=0.037
+[00:09:19.654] [JOIN] INFO: SCENARIO MARCH restSamples=3753 march=0 marchFrac=0.000
+[00:09:19.654] [JOIN] INFO: SCENARIO RESULT PASS
