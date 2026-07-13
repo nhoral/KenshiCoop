@@ -67,5 +67,52 @@ the Stage 4 oracle split; "diag" = human/log-diff diagnostic only).
 | `[taskkey] key` | EngineEntity.cpp `logTaskKeyOnce` | first sighting of each task key (self-documenting enum) | diag |
 | `SETUP:` | EngineEntity/SpawnCombat scene helpers | scenario scene-setup progress | scenario oracles (setup evidence) |
 
-<!-- Stage 2 (replication plane), Stage 3 (scenario plane) and Stage 4
-     (oracle plane) sections are appended by their stages. -->
+## Replication plane (`src/plugin/sync/`)
+
+ONE `Replicator` class (Plugin.cpp drives ~35 entry points on `g_repl`);
+`Replicator.h` unchanged by the split. The implementation is partial-class
+across seven TUs; `ReplicatorUtil.h` is the shared private prelude (includes,
+`nowMs()`, tuning constants, `dist3`/`isGearType`) - its helpers are
+anonymous-namespace ON PURPOSE (per-TU internal copies, monolith semantics).
+Never add file-scope mutable state there: cross-TU state is a class member.
+
+### File inventory
+
+| File | Responsibility |
+|---|---|
+| `ReplicatorCore.cpp` | ctor defaults, Phase 3 lifecycle audit (`lifeName`/`lifeSet`/`lifeSweep`), `resetSession` (the ONE reset point), `ingest`/`ingestInv`, tab latch/rank, `logSmoothSummary` |
+| `ReplicatorPublish.cpp` | `publishOwned` (owned squad + near band + 2 Hz mid band + combat-intent capture incl. canonical-hand `CAP xlate`), `publishNpcCensus` |
+| `ReplicatorDrive.cpp` | `applyTargets` (per-frame drive: walk/park/combat/carry/furniture/stealth + interp consumption + snap gates), `applyRest`, `sweepCarries`, `logHardSnap` |
+| `ReplicatorAuthority.cpp` | `applyNpcCensus`, `enforceHostAuthority` (suppress/park/cull + far-mint requests), `parkDivergedCopy`, debug markers |
+| `ReplicatorSpawn.cpp` | `syncSpawns` (protocol 21 mint incl. far mint + age/size), `applyEvents` (EVT_* reliable edges), `rekeyPeerBody` |
+| `ReplicatorItems.cpp` | inventories (4a), world items (W1), weapon drops/pickups (W2), cross-owner transfers (protocol 37) |
+| `ReplicatorChannels.cpp` | medical(+treatments)/stats/money/factions/doors/prod/research/builds(+doors)/recruits/squad-moves/stealth/speed/time channels, `onPeerConnected`; owns `medicalHash`/`statsHash`/`fillMedicalPacket` |
+
+### Shared-hub contracts (Replicator members; authoritative comments in Replicator.h)
+
+| Hub | Writer | Readers | Invariant / reset rule |
+|---|---|---|---|
+| `targets_` | net intake (`ingest`, Core) | drive tick (`applyTargets`) | Keyed by wire Key; entries carry interp buffers. Cleared in `resetSession`; rekeyed in place by `rekeyPeerBody`. |
+| `ownHands_` / `tabRank_` | `publishOwned` (per tick) / `latchTabs` (on container list) | Items + Channels TUs (ownership scoping) | `ownHands_` is a PER-TICK snapshot - never carry it across ticks. Tab rank is deterministic (both clients sort the same container list). |
+| `proxyByKey_` | `syncSpawns` (mint/cull) | Authority (census parks), Drive | A proxy Character* is valid only while its Key stays in the map; culls remove both. Cleared in `resetSession`. |
+| `suppressed_` | `enforceHostAuthority`, Drive | Drive (skip), Authority (restore) | Suppression is reversible (restore on census corroboration); cleared in `resetSession`. |
+| `censusHands_` | `applyNpcCensus` | `enforceHostAuthority` | Host-authored existence set with receive stamp; entries age out (stale census must not cull). Cleared in `resetSession`. |
+| `life_` | `lifeSet` ONLY (called from every TU) | `lifeSweep`, lifecycle oracle (via `[life]` lines) | Audit layer over authority/mint/drive - never drives behavior. Swept on a timer; cleared in `resetSession`. |
+| `drivenChars_` / `drivenSeen_` / `canonicalOf_` | drive tick (`applyTargets`) + starve-hold paths | `publishOwned` (CAP xlate), guards | Stamped only in the drive tick; pruned on `drivenSeen_`'s 30 s horizon; Character* compared, NEVER dereferenced after prune. Cleared in `resetSession`. |
+| per-channel `*SeqOut_`/`*SampleMs_` | owning channel (Channels TU) | same channel | Seq monotonic per channel; sample throttles are per-channel cadence gates. Reset in `resetSession`. |
+
+### Log-tag index (replication plane emitters)
+
+| Tag family | Emitter TU | Consumer oracle (scripts/CoopOracles.psm1) |
+|---|---|---|
+| `[life]` | Core (`lifeSet`) | Test-EntityLifecycle |
+| `[combat]` (order/CAP/CAP xlate), `[victim]` | Publish (capture) + Drive (order/apply) | Test-PlayerCombat / Test-AssaultTown / Test-CombatOrder |
+| `[snap]`, `[interp]`, `[pose]`, `[ai]`, `[gate]`, `[trust]`, `[oi]` | Drive | Test-Smoothness / Test-AntiZombie / gate diagnostics |
+| `[census]`, `[audit]`, `[authority]`, `[ck]` | Authority (+Publish send half) | Test-NpcParity / authority gates |
+| `[spawn]`, `[limb]`, `[event]`, `[med]` (apply half) | Spawn | Test-SpawnParity / Test-LimbLoss / event oracles |
+| `[inv]`, `[wi]`, `[wd]`, `[dk]`/`[pk]`/`[sk]`, `[xfer]`, `[key]` | Items | Test-InventorySync / Test-WorldItems / Test-WeaponConservation / Test-Transfers |
+| `[stats]`, `[money]`, `[fac]`, `[door]`, `[bdoor]`, `[build]`, `[prod]`, `[research]`, `[recruit]`, `[squad]`, `[sneak]`, `[speed]`, `[time]`, `[latejoin]`, `[rank]` | Channels | matching per-channel oracles (Test-StatsSync, Test-MoneySync, ...) |
+| `[carry]`, `[furn]` | Publish (SEND) + Drive (drive/sweep) + Spawn (RECV edges) | Test-CarrySync / Test-FurnitureSync |
+
+<!-- Stage 3 (scenario plane) and Stage 4 (oracle plane) sections are
+     appended by their stages. -->

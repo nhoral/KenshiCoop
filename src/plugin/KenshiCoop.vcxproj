@@ -82,7 +82,13 @@
     <ClCompile Include="game\EngineWorld.cpp" />
     <ClCompile Include="game\ZoneQuery.cpp" />
     <ClCompile Include="sync\Interp.cpp" />
-    <ClCompile Include="sync\Replicator.cpp" />
+    <ClCompile Include="sync\ReplicatorCore.cpp" />
+    <ClCompile Include="sync\ReplicatorPublish.cpp" />
+    <ClCompile Include="sync\ReplicatorDrive.cpp" />
+    <ClCompile Include="sync\ReplicatorAuthority.cpp" />
+    <ClCompile Include="sync\ReplicatorSpawn.cpp" />
+    <ClCompile Include="sync\ReplicatorItems.cpp" />
+    <ClCompile Include="sync\ReplicatorChannels.cpp" />
     <ClCompile Include="sync\SaveXfer.cpp" />
     <ClCompile Include="test\Scenario.cpp" />
     <!-- ENet (Windows source set). unix.c is intentionally excluded. -->
