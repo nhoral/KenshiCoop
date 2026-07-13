@@ -91,6 +91,17 @@
     <ClCompile Include="sync\ReplicatorChannels.cpp" />
     <ClCompile Include="sync\SaveXfer.cpp" />
     <ClCompile Include="test\Scenario.cpp" />
+    <ClCompile Include="test\ScenarioSupport.cpp" />
+    <ClCompile Include="test\ScenarioMovement.cpp" />
+    <ClCompile Include="test\ScenarioNpc.cpp" />
+    <ClCompile Include="test\ScenarioCombat.cpp" />
+    <ClCompile Include="test\ScenarioMedical.cpp" />
+    <ClCompile Include="test\ScenarioInventory.cpp" />
+    <ClCompile Include="test\ScenarioWorldItems.cpp" />
+    <ClCompile Include="test\ScenarioCharState.cpp" />
+    <ClCompile Include="test\ScenarioProbes.cpp" />
+    <ClCompile Include="test\ScenarioBuildings.cpp" />
+    <ClCompile Include="test\ScenarioSession.cpp" />
     <!-- ENet (Windows source set). unix.c is intentionally excluded. -->
     <ClCompile Include="..\..\third_party\enet\enet\callbacks.c" />
     <ClCompile Include="..\..\third_party\enet\enet\compress.c" />
@@ -112,6 +123,7 @@
     <ClInclude Include="sync\Replicator.h" />
     <ClInclude Include="sync\SaveXfer.h" />
     <ClInclude Include="test\Scenario.h" />
+    <ClInclude Include="test\ScenarioSupport.h" />
     <ClInclude Include="..\netproto\Wire.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

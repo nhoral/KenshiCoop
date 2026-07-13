@@ -114,5 +114,52 @@ Never add file-scope mutable state there: cross-TU state is a class member.
 | `[stats]`, `[money]`, `[fac]`, `[door]`, `[bdoor]`, `[build]`, `[prod]`, `[research]`, `[recruit]`, `[squad]`, `[sneak]`, `[speed]`, `[time]`, `[latejoin]`, `[rank]` | Channels | matching per-channel oracles (Test-StatsSync, Test-MoneySync, ...) |
 | `[carry]`, `[furn]` | Publish (SEND) + Drive (drive/sweep) + Spawn (RECV edges) | Test-CarrySync / Test-FurnitureSync |
 
-<!-- Stage 3 (scenario plane) and Stage 4 (oracle plane) sections are
-     appended by their stages. -->
+## Scenario plane (`src/plugin/test/`)
+
+`Scenario.h` is unchanged: `makeScenario(name)` is still the only public
+entry point. `Scenario.cpp` is now just that factory, chaining the ten
+per-domain makers declared in `ScenarioSupport.h` (each returns 0 when the
+name is not its own). Scenario classes are TU-PRIVATE (anonymous namespace)
+by design - to add a scenario, write the class in its domain TU and register
+it in that TU's maker; nothing else changes. Shared SCENARIO-line emitters
+(`logScenarioLine`/`logScenarioEntity`/`logVitalsLine`) and squad-tab
+classification (`tabRankOf`/`tabLeaderIdx`/`handFromEntity`) live in
+`ScenarioSupport.cpp` with external linkage.
+
+### File inventory (which scenario lives where)
+
+| File | Scenarios |
+|---|---|
+| `ScenarioSupport.cpp` | (helpers only - no scenarios) |
+| `ScenarioMovement.cpp` | leader_move, fast_march, coop_presence, travel_parity, split_interest |
+| `ScenarioNpc.cpp` | npc_sync, craft_order, down_order, death_order, spawn_probe, spawn_sync, npc_census, spawn_far |
+| `ScenarioCombat.cpp` | combat_probe, combat_order, combat_kill, player_combat, assault_town, player_ko, combat_crowd |
+| `ScenarioMedical.cpp` | medic_order, limb_loss, stats_sync |
+| `ScenarioInventory.cpp` | inv_order, inv_bidir, trade_probe, trade_peer, inv_equip, inv_reequip, inv_wpnseq, inv_addequip, wpn_relocate |
+| `ScenarioWorldItems.cpp` | drop_probe, world_item_sync, world_item_join, world_weapon_drop, world_armor_drop, weapon_loot |
+| `ScenarioCharState.cpp` | carry_order, npc_carry, bed_pose, bed_put, cage_put, cage_peer_sync, sneak_probe, sneak_pose, sneak_detect, speed_sync, speed_probe |
+| `ScenarioProbes.cpp` | spike (numbered-probe dispatcher), shop_probe, money_sync, vendor_trade, recruit_probe/sync, squad_probe/sync, faction_probe/sync, time_probe/sync, hunger_probe/sync |
+| `ScenarioBuildings.cpp` | door_probe/sync, build_probe/sync, bdoor_probe/sync, prod_probe/sync, research_probe/sync, store_probe/sync |
+| `ScenarioSession.cpp` | latejoin_probe/sync, save_probe, save_sync, save_stage1, resume_check, load_probe, load_sync |
+
+### SCENARIO marker families (emitter domain -> consuming oracle)
+
+`SCENARIO <MARKER> ...` lines are the scenario-to-oracle wire; phrasing and
+field order are frozen. Emitters below are the domain TUs; consumers are the
+oracle fragments (`scripts/oracles/*.ps1`, Stage 4).
+
+| Marker family | Emitter TU(s) | Consumer oracle |
+|---|---|---|
+| `MEMBER` / `RECV` (via logScenarioLine/Entity) | every domain TU | Test-Crosscheck, Measure-NpcSync, Test-CoopPresence, Test-NpcPose* (Npc.ps1) |
+| `VITALS` (via logVitalsLine) | Combat, Medical, Session | Get-VitalsSeries family (Medical.ps1) |
+| `PCOMBAT`, `ASSAULT`, `PKO`, `CROWD` | Combat | Test-PlayerCombat / Test-AssaultTown / Test-PlayerKo / Test-CombatCrowd (Combat.ps1) |
+| `CARRY`, `FURN`, `SNEAK*`, `SPEED` | CharState | Get-CarrySeries/Test-CarryOrder, Get-FurnSeries/Test-FurnPut, Test-Sneak*, Test-Speed* (Npc.ps1) |
+| `INV`, `TINV`, `TRADE`, `EQUIP` | Inventory | Test-Inventory*/Test-Trade* (Inventory.ps1) |
+| `DROP`, `GEAR`, `WITEM` | WorldItems | Test-DropProbe / Test-WorldItemSync / Test-WeaponDrop / Test-WeaponLoot (Inventory.ps1) |
+| `VENDOR`, `WALLET`, `SHOPBUY`, `RECRUIT*`, `SQMOVE`/`SQEDGE`/`SQTABS`, `FACREL`/`FACWRITE`, `GTIME`, `HUNGER*` | Probes | Get-WalletSeries, Test-ShopProbe/MoneySync/VendorTrade, Test-Recruit*, Test-Squad*, Test-Faction*, Test-Time*, Test-Hunger* (World.ps1) |
+| `DOOR*`, `BUILD*`, `BDOOR*`/`BDESTROY`, `PROD*`, `RESEARCH*`, `CONT*` | Buildings | Test-Door*/Build*/Bdoor*/Prod*/Research*/Store* (World.ps1) |
+| `LJ*` (latejoin censuses), `SAVE*`, `LOAD*` | Session | Get-Latejoin*, Test-Latejoin*, Test-Save*/Load* (Session.ps1) |
+| `SPAWN`, `WNPC`, `WORLD` (census rows) | Npc, Movement | Get-SpawnHands/Test-Spawn* (Npc.ps1), Get-WnpcRows/Test-TravelParity (Motion.ps1) |
+| `SPIKE <id>` | Probes (SpikeScenario) | run_spike.ps1 evidence collection (diagnostic, ungated) |
+| `RESULT pass=` | every domain TU (base-class exit) | Test-ScenarioResultPass (CoreChecks.ps1) |
+
