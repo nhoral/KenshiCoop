@@ -322,7 +322,12 @@ typedef double         f64;
 // render range (the join's copy visible somewhere the host's copy isn't).
 // With positions on the wire the join can PARK a census-present local copy
 // that diverged past a threshold back onto the host's authoritative spot.
-const u16 PROTOCOL_VERSION = 38;
+//
+// v39 (creature-size sync, 2026-07-12): SpawnInfoPacket carries the host
+// body's AGE. Animals scale body size by age; minting proxies with a fixed
+// adult age made every join-side creature full-grown regardless of the
+// host's actual (often juvenile) animal.
+const u16 PROTOCOL_VERSION = 39;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -1200,6 +1205,11 @@ struct SpawnInfoPacket {
     f32 heading;      // radians (yaw)
     u8  found;        // 1 = resolved + described; 0 = negative (stop retrying)
     u8  dead;         // body was dead at reply time (join spawns + death-latches)
+    // Host body's age (protocol 39). Animals derive body SCALE from age
+    // (CharacterAnimal ageSizeMin/Max), so the join must mint with the host's
+    // value or every proxy creature spawns full-grown ("giant goats", manual
+    // session 2026-07-12). <= 0 = unreadable -> join uses its adult default.
+    f32 age;
 };
 
 // ---- Protocol 31: coordinated save + session resume --------------------------

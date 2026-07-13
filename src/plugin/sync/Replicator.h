@@ -1238,6 +1238,50 @@ private:
     void logHardSnap(Character* c, const EntityState& out, const char* kind,
                      float gap, float srcVel, float gate, bool hadDest);
 
+    // ---- Phase 3: unified entity lifecycle (join side) ---------------------
+    // One explicit, logged state per hand replacing the implicit union of
+    // suppressed_/proxyByKey_/drivenChars_/censusHands_ membership tests as
+    // the AUDIT view of an entity's journey. The mechanics stay where they
+    // were validated (authority passes, mint pipeline, drive tiers); every
+    // decision point REPORTS its outcome here, so the log tells one coherent
+    // story per hand ("LIFE hand=.. from=.. to=.. reason=..") and the
+    // lifecycle oracle can gate on illegal journeys (e.g. a hand stuck in
+    // DISCOVERED while mintable, or a body driven while culled).
+    enum LifeState {
+        LIFE_UNKNOWN = 0,   // never judged (or pruned after leaving interest)
+        LIFE_DISCOVERED,    // known to exist (census) but NO local body yet
+        LIFE_RESOLVED,      // local body bound (baked resolve / minted proxy),
+                            //   not driven this tick
+        LIFE_HI,            // driven at near-tier (20 Hz) cadence; PCs live
+                            //   here permanently (Phase 3 unification)
+        LIFE_MID,           // driven at mid-tier (round-robin) cadence
+        LIFE_PARKED,        // local-AI copy under census existence (park
+                            //   fallback owns divergence repair)
+        LIFE_CULLED         // suppressed (hidden + frozen; census-absent ghost)
+    };
+    struct Lifecycle {
+        u8            state;
+        unsigned long sinceMs;   // when the current state was entered
+        unsigned long touchMs;   // last confirmation (stale-entry pruning)
+        unsigned long stuckLogMs;// last STUCK self-audit line for this hand
+        Lifecycle() : state(LIFE_UNKNOWN), sinceMs(0), touchMs(0),
+                      stuckLogMs(0) {}
+    };
+    std::map<Key, Lifecycle> life_;
+    static const char* lifeName(int s);
+    // Record a state observation for a hand: logs one LIFE line on CHANGE,
+    // refreshes touchMs always. Returns the previous state. The UNKNOWN ->
+    // PARKED edge is recorded silently (every wilderness NPC's boring birth
+    // would otherwise burst hundreds of lines at session start).
+    int lifeSet(const Key& k, int to, const char* reason);
+    // ~5 s sweep: drop entries not touched for a while (left interest) and
+    // self-audit DISCOVERED entries older than STUCK_MS whose census position
+    // sits in a locally LOADED zone (mintable but never minted - the
+    // "join never sees the raid the host is fighting" failure the lifecycle
+    // oracle gates on; an unloaded far zone is a legitimate indefinite defer).
+    void lifeSweep(GameWorld* gw, unsigned long now);
+    unsigned long lifeSweepMs_;
+
     // Debug marker HUD labels (KENSHICOOP_DEBUG_MARKERS=1, spike-47 substrate):
     // pin a colored label to each judged body so authority states are visible
     // live - green DRV = host-driven, red HID = suppressed/culled, yellow

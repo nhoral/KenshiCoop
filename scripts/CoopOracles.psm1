@@ -6804,6 +6804,66 @@ function Test-AntiZombie {
                             zombieHands = $zombieHands.Count })
 }
 
+# Phase 3 unified entity lifecycle: every join-side authority/mint/drive
+# decision reports its outcome as a "[life] hand=.. from=.. to=.. reason=.."
+# transition; the sweep self-audits hands stuck in DISCOVERED while MINTABLE
+# (census position in a locally loaded zone) as "[life] STUCK .. (mintable)".
+# Gates:
+#   1. STUCK = 0: a mintable census-vouched hand must resolve through the
+#      REQ/mint pipeline within its dwell budget - a stuck hand is the
+#      invisible-raid failure (the join fights nothing the host sees).
+#   2. ILLEGAL = 0: existence-authority contradictions. DISCOVERED means "no
+#      local body exists for this hand"; CULLED means "we hold a local body
+#      suppressed under it". A direct edge between them in either direction
+#      says two subsystems disagree about whether the body exists.
+# Everything else (tier handoffs, mint/cull/restore churn) is recorded as
+# metrics for trend analysis, not gated here (churn has its own oracle).
+function Test-Lifecycle {
+    param([string]$JoinFile, [string]$Label = "join")
+    if (-not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "lifecycle" -Status SKIP -Detail "no join log")
+    }
+    $trans = @(Select-String -Path $JoinFile `
+        -Pattern '\[life\] hand=(\d+,\d+,\d+,\d+,\d+) from=(\w+) to=(\w+) reason=(\S+)' `
+        -ErrorAction SilentlyContinue)
+    $stuck = @(Select-String -Path $JoinFile `
+        -Pattern '\[life\] STUCK hand=(\d+,\d+,\d+,\d+,\d+) state=DISCOVERED age=(\d+)s \(mintable\)' `
+        -ErrorAction SilentlyContinue)
+    if ($trans.Count -eq 0 -and $stuck.Count -eq 0) {
+        Write-Host "  [$Label] lifecycle SKIP - no [life] lines (plugin predates Phase 3?)"
+        return (Add-GateResult -Name "lifecycle" -Status SKIP -Detail "no lifecycle lines")
+    }
+    $hands = @{}; $illegal = @(); $perHand = @{}
+    foreach ($m in $trans) {
+        $h = $m.Matches[0].Groups[1].Value
+        $f = $m.Matches[0].Groups[2].Value
+        $t = $m.Matches[0].Groups[3].Value
+        $hands[$h] = $true
+        if ($perHand.ContainsKey($h)) { $perHand[$h]++ } else { $perHand[$h] = 1 }
+        if (($f -eq 'DISCOVERED' -and $t -eq 'CULLED') -or
+            ($f -eq 'CULLED' -and $t -eq 'DISCOVERED')) {
+            $illegal += "$h ($f->$t)"
+        }
+    }
+    $stuckHands = @{}
+    foreach ($m in $stuck) { $stuckHands[$m.Matches[0].Groups[1].Value] = $true }
+    $worstHand = 0
+    foreach ($k in $perHand.Keys) {
+        if ($perHand[$k] -gt $worstHand) { $worstHand = $perHand[$k] }
+    }
+    $ok = ($stuckHands.Count -eq 0 -and $illegal.Count -eq 0)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $detail = ""
+    if ($stuckHands.Count -gt 0) { $detail += "stuck-mintable hands: " + (@($stuckHands.Keys) -join " ") + "; " }
+    if ($illegal.Count -gt 0)    { $detail += "illegal transitions: " + ($illegal -join " ") }
+    Write-Host "  [$Label] lifecycle $v - $($trans.Count) transition(s) over $($hands.Count) hand(s), worst=$worstHand/hand, stuck-mintable=$($stuckHands.Count), illegal=$($illegal.Count) $detail"
+    return (Add-GateResult -Name "lifecycle" -Status $v `
+                -Metrics @{ transitions = $trans.Count; hands = $hands.Count
+                            worstPerHand = $worstHand
+                            stuckMintable = $stuckHands.Count
+                            illegal = $illegal.Count } -Detail $detail)
+}
+
 # Phase 1 spawn parity: proxy mint-distance distribution. Every join "[spawn]
 # proxy BOUND" line carries mintDist (distance from the join squad at mint) and
 # cen (census-sourced vs stream-sourced). Spawn parity means host runtime
@@ -6956,6 +7016,7 @@ function Invoke-OneOracle {
         "travel_parity" { return (Test-TravelParity    -HostFile $HostLog -JoinFile $JoinLog) }
         "mint_dist"     { return (Test-MintDistance    -JoinFile $JoinLog) }
         "anti_zombie"   { return (Test-AntiZombie      -HostFile $HostLog -JoinFile $JoinLog) }
+        "lifecycle"     { return (Test-Lifecycle       -JoinFile $JoinLog) }
         "clock_sync"    { return (Test-ClockSync       -HostFile $HostLog -JoinFile $JoinLog -ExpectedSkewMs $ExpectedSkewMs) }
         default {
             Write-Host "  WARNING: unknown oracle id '$Id' (manifest error)"
@@ -7139,6 +7200,6 @@ Export-ModuleMember -Function @(
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",
     "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
-    "Test-MintDistance", "Test-AntiZombie",
+    "Test-MintDistance", "Test-AntiZombie", "Test-Lifecycle",
     "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"
 )

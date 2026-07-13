@@ -5358,10 +5358,10 @@ Faction* nonPlayerFactionGuarded(GameWorld* gw) {
     }
 }
 Character* createCharGuarded(GameWorld* gw, GameData* tmpl, Faction* fac,
-                             float x, float y, float z) {
+                             float x, float y, float z, float age) {
     __try {
         Ogre::Vector3 pos(x, y, z);
-        RootObject* r = g_createCharFn(gw->theFactory, fac, pos, 0, tmpl, 0, 25.0f);
+        RootObject* r = g_createCharFn(gw->theFactory, fac, pos, 0, tmpl, 0, age);
         return r ? static_cast<Character*>(r) : 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
@@ -5371,10 +5371,12 @@ Character* createCharGuarded(GameWorld* gw, GameData* tmpl, Faction* fac,
 
 bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
                        char* facSid, unsigned int facSidLen,
-                       float* x, float* y, float* z, float* heading, bool* dead) {
+                       float* x, float* y, float* z, float* heading, bool* dead,
+                       float* age) {
     if (!c || !charSid || charSidLen == 0 || !facSid || facSidLen == 0) return false;
     charSid[0] = '\0';
     facSid[0]  = '\0';
+    if (age) *age = 0.0f;
     __try {
         GameData* gd = c->getGameData();
         if (!gd) return false;
@@ -5398,6 +5400,10 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
         if (z) *z = p.z;
         if (heading) *heading = c->getOrientation().getYaw().valueRadians();
         if (dead) *dead = (g_isDeadCharFn && g_isDeadCharFn(c));
+        // Age drives animal body SCALE (CharacterAnimal ageSizeMin/Max) - the
+        // join mints its proxy with this value (protocol 39). Virtual call
+        // through the vtable; humans return their cosmetic age (no scaling).
+        if (age) *age = c->getAge();
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -5439,8 +5445,13 @@ Character* sameTemplateNear(GameWorld* gw, const char* charSid,
 }
 
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
-                         float x, float y, float z, float heading) {
+                         float x, float y, float z, float heading, float age) {
     if (!gw || !gw->theFactory || !g_createCharFn || !charSid || !charSid[0]) return 0;
+    // Creature-size sync (protocol 39): animals scale body size by age, so the
+    // proxy must be CREATED at the host's age or it spawns full-grown (the
+    // 2026-07-12 "giant goats" session). A non-finite or <= 0 wire value means
+    // the host couldn't read it - keep the historical adult default.
+    if (!(age > 0.0f && age < 1.0e6f)) age = 25.0f;
     // Template by CHARACTER stringID (the same category-scan lookup the
     // inventory reconstructor uses for items). Animal templates live in the
     // SEPARATE ANIMAL_CHARACTER category (2026-07-11 pack-hidden session:
@@ -5467,7 +5478,7 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
         coop::logLine("[spawn] proxy faction MISS (no non-player faction loaded)");
         return 0;
     }
-    Character* c = createCharGuarded(gw, tmpl, fac, x, y, z);
+    Character* c = createCharGuarded(gw, tmpl, fac, x, y, z, age);
     if (!c) {
         char b[128];
         _snprintf(b, sizeof(b) - 1, "[spawn] proxy create FAILED sid='%s'", charSid);

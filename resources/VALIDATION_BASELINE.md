@@ -1941,6 +1941,96 @@ join was only allowed to proxy-mint census-missing hands within
 Manual validation gate 1 (horizon fade-in, no spawn-on-top): pending user
 travel session.
 
+## Phase 3 unified entity lifecycle + PC/NPC drive unification (2026-07-12, addendum)
+
+No wire change. Phase 3 of the universal tier-management plan: one explicit,
+logged state per hand replacing the implicit union of
+suppressed_/proxyByKey_/drivenChars_/censusHands_ membership tests as the
+AUDIT view of an entity's journey, plus the PC and NPC drive paths merged
+into a single code path with per-kind policies.
+
+- **`EntityLifecycle` record (join side).** Per-hand state machine:
+  `UNKNOWN -> DISCOVERED (census-vouched, no local body) -> RESOLVED (body
+  bound: baked resolve / minted proxy / re-key) -> HI (20 Hz drive) | MID
+  (round-robin drive) | PARKED (local-AI copy under census existence) |
+  CULLED (suppressed ghost)`. Every authority/mint/drive decision point
+  reports its outcome via `lifeSet` -> one `[life] hand=.. from=.. to=..
+  reason=..` line per CHANGE (reasons: census-miss, mint, dupe-heal, rekey,
+  proxy-despawned, drive, mid-rest, census-local, census-wide, restore,
+  restore-wide, suppress, cull-wide). The mechanics stay where they were
+  validated - this is the audit layer their outcomes meet. The
+  `UNKNOWN->PARKED` birth of every wilderness NPC is recorded silently (a
+  session start would otherwise burst hundreds of lines). Tier
+  classification holds toward MID for 10 s (run 145113 baselined 3 s:
+  boundary bodies flapped HI<->MID ~100x/run) and the drive observation sits
+  AFTER the mid-rest release (the first placement double-logged every
+  stationary mid body PARKED<->MID each tick). Debug markers now read the
+  lifecycle names (HI green / MID gray / PARKED yellow / CULLED red).
+- **STUCK self-audit.** A ~5 s sweep prunes hands untouched for 30 s and
+  flags hands sitting in DISCOVERED > 30 s whose census position lies in a
+  locally LOADED zone ("[life] STUCK .. (mintable)") - the invisible-raid
+  failure (mintable but never minted). Unloaded far zones defer legitimately
+  and are not flagged.
+- **PC/NPC drive unification.** The duplicated squad branch of applyTargets
+  is folded into the NPC walk/rest/snap tree; kinds differ by POLICY only:
+  squad classifies by the host's cMoving flag (trustworthy for player
+  bodies) and keeps the validated instant absolute snap gate; NPCs classify
+  by debounced stream velocity and snap only past the 3x divergence bound
+  (+ mid cooldown). Walk mechanics (cadence-adaptive lead, 2.5x-capped
+  catch-up, reissue threshold) and the rest path (applyRest) are now
+  literally shared - PCs are permanent Hi-tier entities in the same
+  lifecycle record.
+- **Slew-window snap accounting.** Session-start catch-up (timeSlew != 1)
+  reconciliation teleports are classed to the coverage/mid ledger, matching
+  the smoothness oracle's existing slew exclusion (run 150302:
+  coop_presence spent its whole 25 s window at slew=2.00 and 4 catch-up
+  snaps tripped the steady-state npc gate at 9.59/min).
+- **`Test-Lifecycle` oracle** (advisory on npc_sync + travel_parity for its
+  first cycle): parses the `[life]` stream and gates STUCK-mintable = 0 and
+  existence-authority contradictions = 0 (a direct DISCOVERED<->CULLED edge
+  in either direction means two subsystems disagree about whether the body
+  exists); transition volume/worst-per-hand recorded as trend metrics.
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| prototest | - | PASS | 227/227 (v38 unchanged - no wire change) |
+| npc_sync (regression) | sync | PASS x2 (one intervening run failed smoothness at zeroFrac 0.928 over only 373 counted frames - a slew-heavy run left a ~24 s scoring window and one seat-anchored walker dominated it; reruns 0.315/0.22 over 603/2793 frames) | lifecycle 69-78 transitions / 37-39 hands, worst 5/hand, stuck 0, illegal 0; npc_track/pose/march/snap_rate green |
+| travel_parity (regression) | sync | PASS | travel 60,014 u, follow median gap 14.3 u, max lag run 1; ghostFrac 0.032 maxRun 1, hostOnly 0; lifecycle 158 transitions / 131 hands, worst 3/hand, stuck 0, illegal 0 |
+| coop_presence (regression) | squad1 | PASS (first run FAILed snap_rate 9.59/min - all 4 npc snaps inside the slew=2.00 catch-up window; slew accounting fix above, rerun 0/min) | all gating green |
+| spawn_far (regression) | sync | PASS | 4/4 far hands minted, no dupes |
+
+Manual validation gate 3 (full free-play session - travel, combat pop-in,
+town entry/exit): pending user session.
+
+## Creature-size (age) sync for minted proxies - protocol 39 (2026-07-12)
+
+Free-play after Phase 3 reported join-side creatures "very large compared to
+the host" (giant goats standing over the player). Root cause: every proxy
+minted on the join was created through `RootObjectFactory::
+createRandomCharacter(..., age)` with a hard-coded adult `25.0f`, and Kenshi
+animals derive body SCALE from age (`CharacterAnimal` `ageSizeMin`/`Max`) -
+so a juvenile goat on the host minted as a full-grown one on the join.
+
+- **Wire.** `SpawnInfoPacket` carries `f32 age` (139 -> 143 bytes),
+  PROTOCOL_VERSION 38 -> 39; prototest size/version pins updated.
+- **Host.** `engine::describeCharacter` reads the body's age via the virtual
+  `Character::getAge()` inside its existing SEH guard; the reply path logs
+  `INFO send ... age=`.
+- **Join.** `engine::spawnProxyNpc` creates the proxy at the host's age
+  (non-finite / <= 0 wire value falls back to the historical `25.0f`);
+  `proxy BOUND ... age=` makes size parity auditable in run logs.
+- Age is a CREATION-time property: proxies minted by an older build keep
+  their wrong size until re-minted (fresh session / rejoin).
+
+| Scenario | Save | clean | Key values |
+|---|---|---|---|
+| prototest | - | PASS | 227/227 (v39, SpawnInfoPacket 143 B) |
+| spawn_far (regression) | sync | PASS | 4/4 far hands minted, no dupes; host `INFO send age=1.00` == join `proxy BOUND age=1.00` on every mint |
+| npc_sync (regression) | sync | PASS (first run failed smoothness at zeroFrac 0.457 over a 1340-frame slew-shortened window - the known late-slew flake; rerun clean) | lifecycle 68 transitions / 38 hands, worst 5/hand, stuck 0, illegal 0 |
+
+Manual validation (2026-07-12, ultrawide side-by-side free-play): animals
+spawned on the join at the correct size - confirmed by the user.
+
 ## Known limitations (honest edges)
 
 - Both clients still share one GPU/CPU in local runs; genuinely asymmetric

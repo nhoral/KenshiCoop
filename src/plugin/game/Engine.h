@@ -316,20 +316,25 @@ bool woundSubject(GameWorld* gw, const unsigned int subjHand[5], float blood);
 
 // SEH-guarded (host): describe the runtime spawn at 'c' - template GameData
 // stringID, faction stringID (via Faction::getData; "" when unreadable),
-// world transform, dead flag. Returns false when the template stringID is
-// unreadable (nothing to describe -> negative reply).
+// world transform, dead flag, and age (Character::getAge; animals derive body
+// SCALE from it - protocol 39 creature-size sync; 0 when unreadable). Returns
+// false when the template stringID is unreadable (nothing to describe ->
+// negative reply).
 bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
                        char* facSid, unsigned int facSidLen,
-                       float* x, float* y, float* z, float* heading, bool* dead);
+                       float* x, float* y, float* z, float* heading, bool* dead,
+                       float* age);
 
 // SEH-guarded (join): mint a LOCAL proxy body from a host description: template
 // by CHARACTER stringID, faction by FACTION stringID (FactionManager::
 // getFactionByStringID; falls back to a nearby non-player faction when the sid
-// doesn't resolve), parked at the host transform. Appearance/equipment are the
-// template's (randomized gear) - cosmetic; combat outcomes stay host-
-// authoritative + damage-guarded. Returns the proxy Character* or 0.
+// doesn't resolve), parked at the host transform, created at the host's 'age'
+// (animals scale body size by age; <= 0 or non-finite falls back to the adult
+// default). Appearance/equipment are the template's (randomized gear) -
+// cosmetic; combat outcomes stay host-authoritative + damage-guarded. Returns
+// the proxy Character* or 0.
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
-                         float x, float y, float z, float heading);
+                         float x, float y, float z, float heading, float age);
 
 // SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
 // (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block

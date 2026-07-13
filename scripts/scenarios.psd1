@@ -137,7 +137,9 @@
             Gating   = @('npc_track', 'pose', 'pose_state', 'body_state',
                          'smoothness', 'anim_truth', 'march', 'suppress_churn',
                          'snap_rate', 'rest_flap', 'clock_sync')
-            Advisory = @('existence_parity', 'anti_zombie')
+            # lifecycle (Phase 3): the [life] transition audit - advisory for
+            # its first regression cycle, promoted once its baseline is known.
+            Advisory = @('existence_parity', 'anti_zombie', 'lifecycle')
             Tier = 'smoke'; WanVariant = $true
             # DELIBERATE WAN-regime adjustments (re-validation matrix, 2026-07-05):
             # 120ms +/-40ms 5%-loss puts a walking NPC one-plus update interval
@@ -998,8 +1000,8 @@
             PrimaryGate = 'follow_travel'
             Gating   = @('follow_travel', 'travel_parity', 'clock_sync')
             Advisory = @('existence_parity', 'mint_dist', 'anti_zombie',
-                         'suppress_churn', 'snap_rate', 'smoothness',
-                         'anim_truth', 'march', 'crosscheck')
+                         'lifecycle', 'suppress_churn', 'snap_rate',
+                         'smoothness', 'anim_truth', 'march', 'crosscheck')
             Tier = 'full'; WanVariant = $false
         }
 
