@@ -163,3 +163,33 @@ oracle fragments (`scripts/oracles/*.ps1`, Stage 4).
 | `SPIKE <id>` | Probes (SpikeScenario) | run_spike.ps1 evidence collection (diagnostic, ungated) |
 | `RESULT pass=` | every domain TU (base-class exit) | Test-ScenarioResultPass (CoreChecks.ps1) |
 
+## Oracle plane (`scripts/`)
+
+`CoopOracles.psm1` is the module root: the gate infrastructure
+(`Reset-/Add-/Get-GateResults`, `Merge-Status`), the manifest loader
+(`Get-ScenarioManifest`), the central dispatch (`Invoke-OneOracle`,
+`Invoke-RunAnalysis`) and the single `Export-ModuleMember`. The oracle
+bodies live in `scripts/oracles/*.ps1`, DOT-SOURCED into the module scope,
+so `$script:` state (Gates, ClockOffsetCache, the `*Regex` patterns) is
+shared exactly as before the split. Importers (`run_test.ps1`,
+`analyze_run.ps1`, `regress.ps1`) are unchanged.
+
+### File inventory (which oracle lives where)
+
+| Fragment | Contents |
+|---|---|
+| `oracles/Parsing.ps1` | clock offset + series parsers: Get-LogClockOffsetMs, Get-ClockSyncStats, Convert-StampToMs, Get-ScenarioLines, Get-ScenarioSeries, Get-MarkerTimeMs |
+| `oracles/CoreChecks.ps1` | every-scenario gates: Test-LogHealth, Test-NoCheckFail, Test-ScenarioResultPass, Test-ClockSync |
+| `oracles/Npc.ps1` | Test-Crosscheck, Measure-NpcSync, Test-NpcTrack, Test-CoopPresence, pose/body-state, craft/down/death orders, carry/furniture/cage, sneak, speed, split_interest, spawn probes, Test-SpawnSync, Test-NpcCensus |
+| `oracles/Combat.ps1` | Test-CombatProbe/Order/Kill, Test-DamageGuard, Test-PlayerCombat, Test-AssaultTown, Test-PlayerKo, Test-CombatCrowd |
+| `oracles/Medical.ps1` | Get-VitalsSeries, Test-NpcVitals, Test-LimbLoss, Get-StatsSeries, Test-StatsSync, Test-MedicOrder |
+| `oracles/Inventory.ps1` | Test-Inventory*/Trade*, Test-DropProbe, Test-WorldItemSync, Test-WpnRelocate, Test-WeaponDrop, Test-WeaponLoot |
+| `oracles/World.ps1` | wallet/shop/money/vendor, recruit, squad, faction, time (+Get-SlewSummary), door, build, bdoor, hunger, prod, research, store oracles |
+| `oracles/Session.ps1` | latejoin census parsers + probes, save/load/resume oracles |
+| `oracles/Motion.ps1` | Test-Smoothness, Test-AnimTruth, Test-MarchInPlace, Test-SnapRate, Test-SuppressChurn, Test-SpawnFarBind, Test-RestFlap, Test-ExistenceParity, travel_parity family, Test-AntiZombie, Test-Lifecycle, Test-MintDistance |
+
+Rules: fragments define functions only (nothing runs at dot-source time
+except `$script:*Regex` assignments); gate names and marker regexes are
+frozen API; a new oracle goes in its domain fragment, its dispatch entry in
+`Invoke-OneOracle`, its export in the root `Export-ModuleMember`, and its
+gate wiring in `scenarios.psd1`.
