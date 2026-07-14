@@ -39,6 +39,11 @@ SteamId selfId();
 // and allows Valve-relay fallback. Call before the net thread starts.
 void setPeer(SteamId id);
 
+// Accept an inbound P2P session from a specific SteamID. Used by the Steam
+// invite layer's P2PSessionRequest_t callback so a session opens even if the
+// request arrives before setPeer() pre-accepts it. No-op until init() succeeds.
+void accept(SteamId id);
+
 // Spike harness (KENSHICOOP_STEAM_PING=<steamid64>): ping/echo on P2P channel 1
 // + periodic session-state logging, driven by tick() from the net thread. Works
 // with either transport, so a UDP build can still prove Steam reachability.

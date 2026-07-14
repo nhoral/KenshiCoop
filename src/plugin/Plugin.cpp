@@ -31,6 +31,7 @@
 #include "core/Inbound.h"
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
+#include "net/SteamInvite.h"
 #include "game/Engine.h"
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
@@ -106,6 +107,13 @@ const DWORD  LOAD_PUMP_GRACE_MS = 2000;
 // Original function pointers, filled by KenshiLib::AddHook.
 void (*g_mainLoop_orig)(GameWorld*, float) = 0;
 void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
+
+// In-game co-op panel (F2) connect/disconnect handlers. Defined after
+// startNetworking() (which coopUiConnect reuses); forward-declared here so
+// mainLoop_hook can hand their addresses to coopPanelTick.
+void startNetworking();
+void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
+void coopUiDisconnect();
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
 // and the engine's kenshi.log (handy when attached live).
@@ -539,6 +547,40 @@ void driveLoadSync(GameWorld* gw) {
 // Main-thread tick hook: the one safe point where we touch game state.
 void mainLoop_hook(GameWorld* gw, float dt) {
     ++g_tick;
+
+    // In-game co-op session panel (F2) + status overlay. Interactive sessions
+    // only - the unattended harness (scenario / self-exit timer) never touches
+    // the panel, and keeping the GUI stack out of those runs avoids perturbing
+    // the scenario oracles. Both calls are SEH-guarded internally and touch only
+    // GUI + input + (guarded) leader read, so they are safe this early in the tick.
+    if (g_cfg.scenario.empty() && g_cfg.testSeconds == 0) {
+        coop::engine::CoopPanelState ps;
+        ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
+        ps.peerSteamId  = g_cfg.steamPeer;
+        ps.running      = g_net.isRunning();
+        ps.peerPresent  = g_peerPresent;
+        ps.isHost       = g_cfg.isHost;
+        ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
+        std::string detail;
+        int ostate;
+        if (g_peerPresent) {
+            detail = g_cfg.isHost ? "Connected - peer joined" : "Connected to host";
+            ostate = 2;
+        } else if (g_net.isRunning()) {
+            detail = g_cfg.isHost ? "Hosting - waiting for peer..." : "Connecting...";
+            ostate = 1;
+        } else {
+            detail = "Offline - press F2, then set Connection to ONLINE";
+            ostate = 0;
+        }
+        ps.detail = detail.c_str();
+        // Still pump Steam callbacks so an inbound "Join Game" (a friend inviting
+        // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
+        coop::steaminvite::tick();
+
+        coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
+        coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
+    }
 
     // Protocol 32: world-swap edge detection. Runs FIRST so the reload edge
     // (and, under load-sync, the session reset) lands before any sync code
@@ -1205,6 +1247,47 @@ void startNetworking() {
     if (!ok) coopErr("KenshiCoop: networking failed to start");
 }
 
+// In-game panel handlers. coopUiConnect tears down any live session, re-arms the
+// config from the panel's choices, and restarts via the shared startNetworking()
+// path (NetLink cleanly supports stop() then start again; Steam is re-armed and
+// the Replicator/Inbound session state is reset for a clean handshake).
+void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
+    if (g_net.isRunning()) g_net.stop();
+    coop::steamp2p::shutdown();
+    g_peerPresent = false;
+    g_repl.resetSession();
+    g_inbound.flushWorldState();
+
+    g_cfg.isHost    = isHost;
+    g_cfg.transport = useSteam ? "steam" : "udp";
+    // Re-read the connection TARGET from coop_config.json so editing the friend
+    // code / UDP endpoint then hitting Connect works without restarting the game.
+    coop::reloadPeerFromFile(g_cfg);
+    if (peerId != 0) g_cfg.steamPeer = peerId; // (panel passes 0; config wins)
+    g_repl.setStreamNpcs(isHost);            // host streams world NPCs; join drives
+    if (g_cfg.ownRanks.empty()) g_cfg.ownRanks.insert(isHost ? 0u : 1u);
+    g_repl.setOwnRanks(g_cfg.ownRanks);
+
+    char b[128];
+    _snprintf(b, sizeof(b) - 1,
+              "[coop-ui] connect: role=%s transport=%s peer=%llu",
+              isHost ? "HOST" : "JOIN", g_cfg.transport.c_str(),
+              (unsigned long long)g_cfg.steamPeer);
+    b[sizeof(b) - 1] = '\0';
+    coopLog(b);
+    startNetworking();
+}
+
+void coopUiDisconnect() {
+    coopLog("[coop-ui] disconnect");
+    if (g_net.isRunning()) g_net.stop();
+    coop::steaminvite::reset(); // leave any Steam lobby
+    coop::steamp2p::shutdown();
+    g_peerPresent = false;
+    g_repl.resetSession();
+    g_inbound.flushWorldState();
+}
+
 } // namespace
 
 // RE_Kenshi resolves the entry by its C++-mangled name (?startPlugin@@YAXXZ), so
@@ -1557,5 +1640,28 @@ __declspec(dllexport) void startPlugin() {
         }
     }
 
-    startNetworking();
+    // Session start policy (in-game panel, 2026-07-14): the unattended harness
+    // (a scenario or a self-exit timer) ALWAYS auto-starts - it never touches the
+    // F2 panel. An interactive install DEFERS the session to the panel's Connect
+    // unless KENSHICOOP_AUTOCONNECT=1 restores load-time auto-start from the
+    // env/config role+transport+peer (the legacy launcher behaviour).
+    bool autoStart = g_cfg.autoConnect || !g_cfg.scenario.empty() || g_cfg.testSeconds > 0;
+
+    // Bring Steam up now (when the panel may be used, or Steam is configured) so
+    // the panel can show THIS player's SteamID for the two-code exchange before
+    // any connection is made. init() is idempotent; startNetworking re-uses it.
+    // When Steam is up, also arm the invite layer so this player can RECEIVE a
+    // Steam "Join Game"/invite (GameLobbyJoinRequested) even before touching the
+    // panel - the joiner never has to open it or type an ID.
+    if (!autoStart || g_cfg.transport == "steam" || g_cfg.steamPing != 0) {
+        if (coop::steamp2p::init())
+            coop::steaminvite::init(&coopUiConnect);
+    }
+
+    if (autoStart) {
+        startNetworking();
+    } else {
+        coopLog("KenshiCoop: session DEFERRED - press F2 in-game to pick role/transport, "
+                "enter the friend's Steam ID, and check CONNECTED");
+    }
 }

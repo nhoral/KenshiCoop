@@ -334,6 +334,15 @@ void setPeer(SteamId id) {
     }
 }
 
+void accept(SteamId id) {
+    if (!g_ready || id == 0) return;
+    g_accept(g_iface, id);
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "accepted inbound session from %llu", id);
+    b[sizeof(b) - 1] = '\0';
+    steamLog(b);
+}
+
 void setPingPeer(SteamId id) {
     g_pingPeer = id;
     if (g_ready && id != 0) {

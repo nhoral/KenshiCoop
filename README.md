@@ -39,7 +39,9 @@ third_party/      ENet patches, VC10 compat shim (deps are fetched, not committe
 
 ## Try it (play with a friend)
 
-Two players, two machines. Takes about 10 minutes the first time.
+Two players, two machines. You configure the session **inside the game** with
+an in-game panel (press **F2**) plus a small `coop_config.json` file - there are
+no launcher scripts to run.
 
 ### Before you start (both players)
 
@@ -49,68 +51,75 @@ Two players, two machines. Takes about 10 minutes the first time.
    (free Nexus mod - it loads the co-op plugin into the game).
 3. **Steam running and online** on both machines. That's the whole network
    setup: the connection is Steam P2P, so there's no port forwarding, no
-   router configuration, and no IP addresses.
+   router configuration, and no IP addresses. (A direct-UDP mode is also
+   available for LAN / port-forwarded games.)
 
-### 1. Download the kit
+### 1. Install the mod
 
 Grab `KenshiCoop-kit.zip` from the
 [latest release](https://github.com/nhoral/KenshiCoop/releases/latest) and
 unzip it anywhere (both players). You do not need to clone this repository -
-but if you did, the same kit is in [dist/kit](dist/kit).
+but if you did, the same kit is in [dist/mod-kit](dist/mod-kit).
 
-### 2. Launch and swap codes
+Double-click **`INSTALL.cmd`** to copy the mod into `<Kenshi>\mods\KenshiCoop`,
+then launch Kenshi and enable **KenshiCoop** in the Mods menu.
 
-- One player double-clicks **`HOST.cmd`** in the kit folder.
-- The other double-clicks **`JOIN.cmd`**.
+### 2. Swap Steam IDs
 
-Each launcher starts by printing **your own Steam friend code** (read
-straight from Steam), so you and your friend just read your codes to each
-other and type in the other player's - no digging through Steam profiles.
-(A 17-digit SteamID64 works too.)
+Each player needs the *other* player's Steam ID. The easy way: launch Kenshi,
+press **F2**, and click **"Copy my Steam ID"** - it puts your 17-digit ID on
+the clipboard so you can paste it to your friend (and vice versa).
 
-The script then does everything
-else: checks your setup (and tells you exactly what to fix if something is
-missing), installs the mod and the shared starter save, launches Kenshi, and
-connects the two games. When both of you are in-game, you're playing co-op.
+Then each of you opens `<Kenshi>\mods\KenshiCoop\coop_config.json` and sets
+`"steamPeer"` to the *other* player's ID:
 
-Prefer a terminal? The same flow is available as
-`powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <code>`
-(and `friend_join.ps1 -HostSteamId <code>`). Direct UDP (`-HostIp`, with port
-forwarding) is also supported.
+```json
+"transport": "steam",
+"steamPeer": "76561198000000000"
+```
+
+(For a LAN / direct-UDP game instead, set `"transport": "udp"` and put the
+host's address in `"ip"` / `"port"`.)
+
+### 3. Connect in-game (press F2)
+
+1. **Both players load the exact same save** (co-op resolves units by identity,
+   so the two games must start from an identical save).
+2. Press **F2** to open the Co-op panel.
+3. One player sets **Role: HOST**, the other **Role: JOIN** (click to toggle).
+4. Set **Transport** (STEAM recommended - it must match your `coop_config.json`).
+5. Toggle **Connection** to **ONLINE**. The white status line shows live state
+   (and a banner over your leader shows it too). Toggle to **OFFLINE** to leave.
+
+You can edit `coop_config.json` any time; the panel re-reads the friend code /
+address whenever you go ONLINE (toggle Connection OFF then ON), so no restart
+is needed.
 
 ### Good to know
 
-- **You each control your own squad.** The starter save has one squad tab per
-  player: the host runs squad 1, the joining player squad 2. Your friend's
-  squad is visible and synced on your screen, but answers only to them.
-- **Both players must load the exact same save** - that's why the kit installs
-  the shared `squad1` save on both machines. Don't substitute your own save
-  unless you copy the identical folder to both sides.
-- **You can play your own world.** Pick "Your own save" at the launcher's save
-  prompt: the games connect on the bundled save first, then the host loads any
-  save from Kenshi's menu - the other player's game follows automatically (the
-  save is streamed to them if they don't have it). Give your friend a crew by
-  moving units into your save's second squad tab.
+- **You each control your own squad.** With one squad tab per player, the host
+  runs squad 1 and the joining player squad 2. Your friend's squad is visible
+  and synced on your screen, but answers only to them. If your save has only
+  one squad, move some units into a second squad tab in-game to give them a crew.
+- **Both players must load the exact same save.** Pick a save you both have, or
+  copy the identical save folder to both machines first.
 - **Saving just works.** Any save either player makes during a session becomes
-  one shared save on both machines. To resume next time, pick "Your own save"
-  and load it from Kenshi's menu - it's already on both machines.
+  one shared save on both machines, streamed to the other side automatically.
+  To resume next time, both load that save and connect again.
 
 ### If something goes wrong
 
-- **"Running scripts is disabled" / SmartScreen warning** - right-click the
-  zip before extracting and choose Properties > Unblock, or use the `.cmd`
-  launchers (they bypass this automatically).
-- **"RE_Kenshi not found"** - install
-  [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847) into your Kenshi
-  folder and re-run.
-- **No connection after launch** - both Steams must be online (not offline
-  mode), and each side must have entered the *other* player's code. Re-check
-  the codes and re-run.
-- **"protocol mismatch" in the log** - one of you has an older kit; both
-  players should re-download the latest release.
+- **"The co-op plugin has not started"** - RE_Kenshi didn't load it. Check
+  `<Kenshi>\RE_Kenshi_log.txt` for `KenshiCoop`; reinstalling
+  [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847) usually fixes it.
+- **No connection (Steam)** - both Steams must be online (not offline mode),
+  and each side's `steamPeer` must be the *other* player's ID (a typo fails
+  silently). Look for `[steam] session ... active=1` in
+  `<Kenshi>\KenshiCoop_*.log`.
+- **"protocol mismatch" in the log** - one of you has an older build; both
+  players should re-install from the same release.
 
-The kit's `README.txt` has the full troubleshooting list, including manual
-install steps.
+The kit's `README.txt` has the full setup + troubleshooting list.
 
 ## Building
 

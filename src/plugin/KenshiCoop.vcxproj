@@ -74,6 +74,7 @@
     <ClCompile Include="core\Config.cpp" />
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
+    <ClCompile Include="net\SteamInvite.cpp" />
     <ClCompile Include="game\EngineInternal.cpp" />
     <ClCompile Include="game\EngineEntity.cpp" />
     <ClCompile Include="game\EngineInventory.cpp" />

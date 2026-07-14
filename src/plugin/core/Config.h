@@ -419,10 +419,27 @@ struct Config {
     // that peer on P2P channel 1 every 2 s and log RTT + punch-vs-relay,
     // independent of the transport in use. 0 = off.
     unsigned long long steamPing;
+
+    // In-game co-op panel session control (2026-07-13). When the mod is driven
+    // by the F2 panel instead of the env launchers, networking is DEFERRED at
+    // load: the session (host listen / client connect) only starts when the
+    // player hits Connect in the panel, using the role/transport/peer chosen
+    // there. autoConnect (KENSHICOOP_AUTOCONNECT=1) restores the legacy behaviour
+    // - start the session immediately from the env/config role+transport+peer.
+    // A test scenario or KENSHICOOP_TEST_SECONDS ALWAYS auto-starts regardless
+    // (the unattended harness never touches the panel); see Plugin.cpp.
+    bool               autoConnect;
 };
 
-// Read every KENSHICOOP_* var into 'out', applying host/join defaults.
+// Read every KENSHICOOP_* var into 'out', applying host/join defaults. Values in
+// coop_config.json (next to the DLL) are used as the defaults, so precedence is
+// env var > config file > hard-coded default.
 void loadConfig(Config& out);
+
+// Re-read only the connection target (steamPeer / ip / port) from
+// coop_config.json into 'c'. Called on the panel's Connect so a friend-code edit
+// applies without restarting the game. No-op for keys absent from the file.
+void reloadPeerFromFile(Config& c);
 
 } // namespace coop
 

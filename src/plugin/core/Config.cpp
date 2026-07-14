@@ -2,6 +2,10 @@
 
 #include "Config.h"
 #include <cstdlib>
+#include <map>
+#include <fstream>
+#include <iterator>
+#include <windows.h>
 
 namespace coop {
 namespace {
@@ -11,13 +15,98 @@ std::string envOr(const char* key, const char* def) {
     return std::string(v ? v : def);
 }
 
+// ---- coop_config.json (flat, tolerant) --------------------------------------
+// The interactive install configures the friend code (steamPeer) + connection
+// defaults in coop_config.json next to the DLL. This is a deliberately small
+// parser: flat "key": value pairs only (string / number / bool), // line
+// comments stripped. Values feed loadConfig as the DEFAULTS for envOr(), so the
+// env-var test harness still wins (env > file > hard-coded).
+
+std::map<std::string, std::string> parseFlatJson(const std::string& text) {
+    std::map<std::string, std::string> m;
+    // Strip // line comments first (our values never contain "//").
+    std::string s;
+    size_t i = 0;
+    while (i <= text.size()) {
+        size_t nl = text.find('\n', i);
+        std::string line = text.substr(i, nl == std::string::npos ? std::string::npos : nl - i);
+        size_t c = line.find("//");
+        if (c != std::string::npos) line = line.substr(0, c);
+        s += line;
+        s += '\n';
+        if (nl == std::string::npos) break;
+        i = nl + 1;
+    }
+    // Scan "key" : <value>. Quoted values read to the closing quote; bare values
+    // (numbers/bools) read to the next , } or newline.
+    size_t p = 0;
+    while (true) {
+        size_t q1 = s.find('"', p);
+        if (q1 == std::string::npos) break;
+        size_t q2 = s.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        std::string key = s.substr(q1 + 1, q2 - q1 - 1);
+        size_t colon = s.find(':', q2 + 1);
+        if (colon == std::string::npos) break;
+        size_t v = colon + 1;
+        while (v < s.size() && (s[v] == ' ' || s[v] == '\t' || s[v] == '\r' || s[v] == '\n')) ++v;
+        std::string val;
+        if (v < s.size() && s[v] == '"') {
+            size_t ve = s.find('"', v + 1);
+            if (ve == std::string::npos) break;
+            val = s.substr(v + 1, ve - v - 1);
+            p = ve + 1;
+        } else {
+            size_t ve = v;
+            while (ve < s.size() && s[ve] != ',' && s[ve] != '}' && s[ve] != '\n' && s[ve] != '\r') ++ve;
+            val = s.substr(v, ve - v);
+            while (!val.empty() && (val[val.size() - 1] == ' ' || val[val.size() - 1] == '\t')) val.erase(val.size() - 1);
+            p = ve;
+        }
+        m[key] = val;
+    }
+    return m;
+}
+
+// Absolute path to coop_config.json next to KenshiCoop.dll (fallback: cwd).
+std::string configFilePath() {
+    char buf[MAX_PATH];
+    HMODULE h = GetModuleHandleA("KenshiCoop.dll");
+    DWORD n = GetModuleFileNameA(h, buf, MAX_PATH); // h == 0 would give the exe path
+    if (h == 0 || n == 0 || n >= MAX_PATH) return "coop_config.json";
+    std::string p(buf, n);
+    size_t slash = p.find_last_of("\\/");
+    p = (slash != std::string::npos) ? p.substr(0, slash + 1) : std::string();
+    return p + "coop_config.json";
+}
+
+std::map<std::string, std::string> readConfigFile() {
+    std::map<std::string, std::string> m;
+    std::ifstream f(configFilePath().c_str(), std::ios::binary);
+    if (!f) return m;
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return parseFlatJson(text);
+}
+
+// File value for 'key' if present + non-empty, else 'def'. Used as the default
+// argument to envOr() so precedence is env > file > hard-coded.
+std::string fileOr(const std::map<std::string, std::string>& f, const char* key, const char* def) {
+    std::map<std::string, std::string>::const_iterator it = f.find(key);
+    if (it != f.end() && !it->second.empty()) return it->second;
+    return std::string(def);
+}
+
 } // namespace
 
 void loadConfig(Config& c) {
-    std::string mode = envOr("KENSHICOOP_MODE", "host");
+    // coop_config.json (next to the DLL) supplies the interactive-install
+    // defaults; env vars still override every one of them (test harness).
+    std::map<std::string, std::string> f = readConfigFile();
+
+    std::string mode = envOr("KENSHICOOP_MODE", fileOr(f, "role", "host").c_str());
     c.isHost      = (mode != "join");
-    c.ip          = envOr("KENSHICOOP_IP", "127.0.0.1");
-    c.port        = std::atoi(envOr("KENSHICOOP_PORT", "27800").c_str());
+    c.ip          = envOr("KENSHICOOP_IP", fileOr(f, "ip", "127.0.0.1").c_str());
+    c.port        = std::atoi(envOr("KENSHICOOP_PORT", fileOr(f, "port", "27800").c_str()).c_str());
     c.save        = envOr("KENSHICOOP_SAVE", "");
     c.testSeconds = std::atoi(envOr("KENSHICOOP_TEST_SECONDS", "0").c_str());
 
@@ -260,9 +349,19 @@ void loadConfig(Config& c) {
     // harness runs on it); "steam" tunnels ENet over Steam P2P by SteamID (no
     // port forwarding / CGNAT-immune). steamPeer is the OTHER player's steamid64
     // (two-code exchange); steamPing arms the channel-1 reachability spike.
-    c.transport = envOr("KENSHICOOP_TRANSPORT", "udp");
-    c.steamPeer = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PEER", "0").c_str(), 0, 10);
+    c.transport = envOr("KENSHICOOP_TRANSPORT", fileOr(f, "transport", "udp").c_str());
+    c.steamPeer = (unsigned long long)_strtoui64(
+        envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str()).c_str(), 0, 10);
     c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
+
+    // In-game panel session control: opt-in legacy auto-start. Default OFF so a
+    // panel-driven (env-free) install defers the session to the Connect button;
+    // the test harness overrides this in Plugin.cpp (scenario / test-seconds).
+    // Accepts "1"/"true" from the file's JSON bool.
+    {
+        std::string ac = envOr("KENSHICOOP_AUTOCONNECT", fileOr(f, "autoConnect", "0").c_str());
+        c.autoConnect = (ac == "1" || ac == "true");
+    }
 
     // Protocol 36 movement-smoothness knobs. Defaults are the historical
     // constants; any positive env value overrides for live A/B tuning.
@@ -336,6 +435,22 @@ void loadConfig(Config& c) {
         if (have) c.ownRanks.insert(v);
         if (c.ownRanks.empty()) c.ownRanks.insert(c.isHost ? 0u : 1u);
     }
+}
+
+void reloadPeerFromFile(Config& c) {
+    // Re-read only the connection TARGET (friend code + UDP endpoint) from
+    // coop_config.json, so editing the file then hitting Connect in the panel
+    // takes effect without a game restart. Role/transport come from the panel
+    // toggles at Connect time and are left untouched here.
+    std::map<std::string, std::string> f = readConfigFile();
+    std::map<std::string, std::string>::const_iterator it;
+    it = f.find("steamPeer");
+    if (it != f.end() && !it->second.empty())
+        c.steamPeer = (unsigned long long)_strtoui64(it->second.c_str(), 0, 10);
+    it = f.find("ip");
+    if (it != f.end() && !it->second.empty()) c.ip = it->second;
+    it = f.find("port");
+    if (it != f.end() && !it->second.empty()) c.port = std::atoi(it->second.c_str());
 }
 
 } // namespace coop
