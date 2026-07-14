@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS 1 // getenv/atoi are fine; silence VC10 C4996
 
 #include "Config.h"
+#include "OwnRanks.h"
 #include <cstdlib>
 #include <map>
 #include <fstream>
@@ -426,14 +427,8 @@ void loadConfig(Config& c) {
     c.ownRanks.clear();
     {
         std::string ranks = envOr("KENSHICOOP_OWN_SQUAD", envOr("KENSHICOOP_OWN_RANK", "").c_str());
-        unsigned int v = 0; bool have = false;
-        for (size_t i = 0; i < ranks.size(); ++i) {
-            char ch = ranks[i];
-            if (ch >= '0' && ch <= '9') { v = v * 10u + (unsigned int)(ch - '0'); have = true; }
-            else if (have) { c.ownRanks.insert(v); v = 0; have = false; }
-        }
-        if (have) c.ownRanks.insert(v);
-        if (c.ownRanks.empty()) c.ownRanks.insert(c.isHost ? 0u : 1u);
+        c.ownRanksFromEnv = parseRankList(ranks, c.ownRanks);
+        resolveOwnRanks(c.ownRanks, c.isHost, c.ownRanksFromEnv);
     }
 }
 

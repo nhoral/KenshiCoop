@@ -24,6 +24,9 @@
 #include "../netproto/Wire.h"
 #include "../netproto/ContentHash.h"
 #include "../plugin/sync/Interp.h"
+#include "../plugin/core/OwnRanks.h"
+
+#include <set>
 
 using namespace coop;
 
@@ -59,7 +62,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
     CHECK_EQ("sizeof(WorldItemRemoveHeader)",   sizeof(WorldItemRemoveHeader),   6);
     CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         191);
-    CHECK_EQ("sizeof(WorldPickupPacket)",       sizeof(WorldPickupPacket),       83);
+    CHECK_EQ("sizeof(WorldPickupPacket)",       sizeof(WorldPickupPacket),       91); // v40: +item identity
     CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           201); // v36
 
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
@@ -183,7 +186,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v39: spawn info carries age)", (int)PROTOCOL_VERSION, 39);
+    CHECK_EQ("PROTOCOL_VERSION (v40: cross-squad trade + hardened drops)", (int)PROTOCOL_VERSION, 40);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -626,6 +629,82 @@ static void testInterp() {
     }
 }
 
+// ---- 6. Ownership rank resolution (OwnRanks.h) ----------------------------------
+// Guards the squad-tab ownership partition, especially the F2-panel role switch
+// regression (2026-07-14): a session launched as HOST resolves ranks to {0};
+// switching to JOIN must re-resolve to {1}, or the client claims the host's
+// rank-0 player squad and that unit never moves. An explicit env override is
+// preserved across the switch.
+
+static bool ranksAre(const std::set<unsigned int>& r, int a, int b) {
+    if (b < 0) return r.size() == 1 && r.count((unsigned)a) == 1;
+    return r.size() == 2 && r.count((unsigned)a) == 1 && r.count((unsigned)b) == 1;
+}
+
+static void testOwnRanks() {
+    std::printf("== ownership rank resolution (OwnRanks.h) ==\n");
+
+    // Role defaults from a clean slate.
+    {
+        std::set<unsigned int> r;
+        resolveOwnRanks(r, true, false);
+        CHECK("host default owns {0}", ranksAre(r, 0, -1));
+        r.clear();
+        resolveOwnRanks(r, false, false);
+        CHECK("join default owns {1}", ranksAre(r, 1, -1));
+    }
+
+    // THE FIX: a session that started HOST (ranks {0}) switches to JOIN via the
+    // panel and MUST end up owning {1}, not the host's {0}.
+    {
+        std::set<unsigned int> r;
+        resolveOwnRanks(r, true, false);          // launched HOST -> {0}
+        CHECK("pre-switch ranks are {0}", ranksAre(r, 0, -1));
+        resolveOwnRanks(r, false, false);         // panel switch to JOIN
+        CHECK("HOST->JOIN switch re-resolves to {1}", ranksAre(r, 1, -1));
+        resolveOwnRanks(r, true, false);          // and back to HOST
+        CHECK("JOIN->HOST switch re-resolves to {0}", ranksAre(r, 0, -1));
+    }
+
+    // An explicit env override is preserved across a role switch (the user asked
+    // for a specific partition; the panel must not clobber it).
+    {
+        std::set<unsigned int> r;
+        r.insert(2u); r.insert(3u);
+        resolveOwnRanks(r, false, true);          // fromEnv -> untouched
+        CHECK("env override preserved as JOIN", ranksAre(r, 2, 3));
+        resolveOwnRanks(r, true, true);           // still untouched as HOST
+        CHECK("env override preserved as HOST", ranksAre(r, 2, 3));
+    }
+
+    // CSV parse (KENSHICOOP_OWN_SQUAD/OWN_RANK surface).
+    {
+        std::set<unsigned int> r;
+        CHECK("parse '' -> no ranks",        !parseRankList("", r) && r.empty());
+        r.clear();
+        CHECK("parse '0' -> {0}",            parseRankList("0", r) && ranksAre(r, 0, -1));
+        r.clear();
+        CHECK("parse '1,2' -> {1,2}",        parseRankList("1,2", r) && ranksAre(r, 1, 2));
+        r.clear();
+        CHECK("parse ' 3 ; 5 ' tolerant",    parseRankList(" 3 ; 5 ", r) && ranksAre(r, 3, 5));
+        r.clear();
+        CHECK("parse '2,2' dedups to {2}",   parseRankList("2,2", r) && ranksAre(r, 2, -1));
+    }
+
+    // Config-style resolution: env-provided ranks set fromEnv true and survive;
+    // empty env falls back to the role default.
+    {
+        std::set<unsigned int> r;
+        bool fromEnv = parseRankList("1", r);
+        resolveOwnRanks(r, true, fromEnv);        // env said {1} even though HOST
+        CHECK("env {1} wins over HOST default", fromEnv && ranksAre(r, 1, -1));
+        r.clear();
+        fromEnv = parseRankList("", r);
+        resolveOwnRanks(r, false, fromEnv);       // no env -> JOIN default {1}
+        CHECK("empty env -> JOIN default {1}", !fromEnv && ranksAre(r, 1, -1));
+    }
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -636,6 +715,7 @@ int main() {
     testFolderFingerprint();
     testContentHash();
     testInterp();
+    testOwnRanks();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

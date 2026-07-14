@@ -140,6 +140,11 @@ struct Config {
     // driven from its stream. Default: host owns {0}, join owns {1} - one squad tab
     // each. On a single-tab save the join owns nothing (one-directional, as before).
     std::set<unsigned int> ownRanks;
+    // True only when ownRanks came from KENSHICOOP_OWN_SQUAD/OWN_RANK. When false
+    // the ranks are the role default and must follow a mid-session role switch
+    // (F2 panel Host<->Join), so the client owns {1} and does not claim the
+    // host's rank-0 player squad (which would freeze that unit locally).
+    bool          ownRanksFromEnv;
 
     // Phase 4a inventory sync (KENSHICOOP_INV_SYNC: "1" force on, "0" force off,
     // unset = ON for real sessions [scenario == ""] and the inventory scenarios).

@@ -28,6 +28,7 @@
 
 #include "CoopLog.h"
 #include "core/Config.h"
+#include "core/OwnRanks.h"
 #include "core/Inbound.h"
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
@@ -1265,14 +1266,27 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     coop::reloadPeerFromFile(g_cfg);
     if (peerId != 0) g_cfg.steamPeer = peerId; // (panel passes 0; config wins)
     g_repl.setStreamNpcs(isHost);            // host streams world NPCs; join drives
-    if (g_cfg.ownRanks.empty()) g_cfg.ownRanks.insert(isHost ? 0u : 1u);
+    // Ownership ranks must follow the role chosen in the panel. Only an explicit
+    // KENSHICOOP_OWN_SQUAD override is preserved; otherwise recompute the default
+    // (host owns {0}, join owns {1}). Without this, a session launched as HOST
+    // that switches to JOIN keeps rank {0} and wrongly claims the host's player
+    // squad, so that unit never moves on the client (unowned NPCs still sync).
+    coop::resolveOwnRanks(g_cfg.ownRanks, isHost, g_cfg.ownRanksFromEnv);
     g_repl.setOwnRanks(g_cfg.ownRanks);
 
-    char b[128];
+    std::string ranks;
+    for (std::set<unsigned int>::const_iterator it = g_cfg.ownRanks.begin();
+         it != g_cfg.ownRanks.end(); ++it) {
+        char n[16]; _snprintf(n, sizeof(n) - 1, "%u", *it); n[sizeof(n) - 1] = '\0';
+        if (!ranks.empty()) ranks += ",";
+        ranks += n;
+    }
+    char b[176];
     _snprintf(b, sizeof(b) - 1,
-              "[coop-ui] connect: role=%s transport=%s peer=%llu",
+              "[coop-ui] connect: role=%s transport=%s peer=%llu ownRanks={%s} src=%s",
               isHost ? "HOST" : "JOIN", g_cfg.transport.c_str(),
-              (unsigned long long)g_cfg.steamPeer);
+              (unsigned long long)g_cfg.steamPeer, ranks.c_str(),
+              g_cfg.ownRanksFromEnv ? "env" : "role");
     b[sizeof(b) - 1] = '\0';
     coopLog(b);
     startNetworking();

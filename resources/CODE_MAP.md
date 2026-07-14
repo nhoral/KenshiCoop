@@ -116,6 +116,7 @@ Consumer column = oracle function + its `scripts/oracles/*.ps1` fragment.
 | `[inv]`, `[wi]`, `[wd]`, `[dk]`/`[pk]`/`[sk]`, `[xfer]`, `[key]` | Items | Test-InventorySync / Test-WorldItemSync / Test-WeaponDrop / Test-WeaponLoot / Test-TradePeer (Inventory.ps1) |
 | `[stats]`, `[money]`, `[fac]`, `[door]`, `[bdoor]`, `[build]`, `[prod]`, `[research]`, `[recruit]`, `[squad]`, `[sneak]`, `[speed]`, `[time]`, `[latejoin]`, `[rank]` | Channels | matching per-channel oracles: Test-StatsSync (Medical.ps1); Test-Sneak*/Test-Speed* (Npc.ps1); Test-Money*/Faction*/Door*/Bdoor*/Build*/Prod*/Research*/Recruit*/Squad*/Time* (World.ps1); Test-Latejoin* (Session.ps1) |
 | `[carry]`, `[furn]` | Publish (SEND) + Drive (drive/sweep) + Spawn (RECV edges) | Test-CarryOrder / Test-NpcCarry / Test-FurnPut / Test-CagePeer (Npc.ps1) |
+| `[coop-ui]` | EngineEntity (panel intent) + Plugin (`coopUiConnect` resolved) | Test-PanelConfig (Panel.ps1) - hand-driven, run via `check_panel_log.ps1` |
 
 ## Scenario plane (`src/plugin/test/`)
 
@@ -190,6 +191,7 @@ shared exactly as before the split. Importers (`run_test.ps1`,
 | `oracles/World.ps1` | wallet/shop/money/vendor, recruit, squad, faction, time (+Get-SlewSummary), door, build, bdoor, hunger, prod, research, store oracles |
 | `oracles/Session.ps1` | latejoin census parsers + probes, save/load/resume oracles |
 | `oracles/Motion.ps1` | Test-Smoothness, Test-AnimTruth, Test-MarchInPlace, Test-SnapRate, Test-SuppressChurn, Test-SpawnFarBind, Test-RestFlap, Test-ExistenceParity, travel_parity family, Test-AntiZombie, Test-Lifecycle, Test-MintDistance |
+| `oracles/Panel.ps1` | Get-PanelConnects, Get-PanelIntents, Test-PanelConfig - judges the hand-driven F2 panel `[coop-ui]` lines (role->rank resolution + selection reaching connect). Not scenario-gated; run via `scripts/check_panel_log.ps1`. Log contract: `[coop-ui] CONNECT role=… transport=…` (intent) and `[coop-ui] connect: role=… ownRanks={…} src=env\|role` (resolved, Plugin.cpp). |
 
 Rules: fragments define functions only (nothing runs at dot-source time
 except `$script:*Regex` assignments); gate names and marker regexes are

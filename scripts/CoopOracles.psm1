@@ -73,6 +73,7 @@ function Merge-Status {
 . (Join-Path $PSScriptRoot 'oracles\World.ps1')
 . (Join-Path $PSScriptRoot 'oracles\Session.ps1')
 . (Join-Path $PSScriptRoot 'oracles\Motion.ps1')
+. (Join-Path $PSScriptRoot 'oracles\Panel.ps1')
 
 # ---- Manifest + top-level analysis ---------------------------------------------------
 
@@ -186,6 +187,7 @@ function Invoke-OneOracle {
         "anti_zombie"   { return (Test-AntiZombie      -HostFile $HostLog -JoinFile $JoinLog) }
         "lifecycle"     { return (Test-Lifecycle       -JoinFile $JoinLog) }
         "clock_sync"    { return (Test-ClockSync       -HostFile $HostLog -JoinFile $JoinLog -ExpectedSkewMs $ExpectedSkewMs) }
+        "panel_config"  { return (Test-PanelConfig     -File $HostLog) }
         default {
             Write-Host "  WARNING: unknown oracle id '$Id' (manifest error)"
             return (Add-GateResult -Name $Id -Status FAIL -Detail "unknown oracle id")
@@ -369,5 +371,6 @@ Export-ModuleMember -Function @(
     "Test-ExistenceParity",
     "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
     "Test-MintDistance", "Test-AntiZombie", "Test-Lifecycle",
+    "Get-PanelConnects", "Get-PanelIntents", "Test-PanelConfig",
     "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"
 )

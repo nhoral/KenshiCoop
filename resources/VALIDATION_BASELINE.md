@@ -23,8 +23,9 @@ recorded FLAKY, see findings). Plugin protocol v12.
 
 | Layer | What it proves | Where |
 |---|---|---|
-| `prototest` (unit) | Wire contract (packed sizes/offsets), reader truncation safety, content-hash determinism/field-sensitivity/order-independence, interpolation invariants | `src/prototest`, runs first in every tier |
+| `prototest` (unit) | Wire contract (packed sizes/offsets), reader truncation safety, content-hash determinism/field-sensitivity/order-independence, interpolation invariants, ownership-rank resolution (incl. the F2 panel role-switch fix) | `src/prototest`, runs first in every tier |
 | Scenario oracles | Per-pipeline replication correctness from structured logs; three-state gates, primary-gate no-signal guard | `scripts/CoopOracles.psm1` + `scripts/scenarios.psd1` |
+| Panel check | F2 in-game panel configurability from `[coop-ui]` log lines: role->rank resolution + role/transport selection reaching connect. Hand-driven, so log-judged (not scenario-gated) | `scripts/check_panel_log.ps1` -> `Test-PanelConfig` |
 | Tiers | smoke = one scenario per wire pipeline (~5 runs); full = everything + WAN variants | `scripts/regress.ps1` |
 | Trending | per-gate metrics -> `tools/test-runs/history.jsonl`; drift vs rolling median | `scripts/report_history.ps1` |
 | Offline judge | Same verdicts on ANY collected log pair (the remote-session path) | `scripts/analyze_run.ps1` |
@@ -2125,6 +2126,41 @@ load from the 83-run marathon; the save's bar population drifting is the
 usual suspect) - not a split regression. Everything that distinguishes the
 split (compile units, linkage, factory chain, module dot-sourcing) is
 exercised by the 75 green runs.
+
+## F2 panel role-switch ownership fix + validation (2026-07-14)
+
+First real friend session (Steam P2P, config-driven friend code) surfaced a
+join-side bug: connected, host save auto-transferred and loaded, ~33 host town
+NPCs proxied and moved - but the host's single **player** unit stood frozen.
+Root cause: the client launched as HOST (ownership ranks resolved to `{0}`),
+then switched to JOIN via the F2 panel; `coopUiConnect` only set ranks when the
+set was empty, so the client kept `{0}` - the host's player-squad rank - and
+treated that unit as locally owned (never driven by the host's motion stream).
+Unowned NPCs (neither peer's rank) replicated normally, which masked it.
+
+Fix: rank resolution follows the panel role. Extracted the decision into a
+pure, game-free header `src/plugin/core/OwnRanks.h` (`resolveOwnRanks` +
+`parseRankList`), shared by `Config.cpp` (load-time) and `Plugin.cpp`
+(`coopUiConnect`); an explicit `KENSHICOOP_OWN_SQUAD` override is preserved via
+`Config.ownRanksFromEnv`. The resolved connect now logs
+`[coop-ui] connect: role=… ownRanks={…} src=env|role`.
+
+Validation added:
+- `prototest` `testOwnRanks()` - 14 checks: role defaults, the HOST->JOIN and
+  JOIN->HOST re-resolve, env override preserved across a switch, and the CSV
+  parse. Runs first in every tier. (Also re-locked two stale contract pins the
+  protocol-40 commit missed: `PROTOCOL_VERSION` 39->40, `WorldPickupPacket`
+  83->91.) Full run: **241/241 PASS**.
+- `Test-PanelConfig` oracle (`scripts/oracles/Panel.ps1`) + `check_panel_log.ps1`
+  runner: judges the hand-driven `[coop-ui]` panel lines from any real/manual
+  session - role-sourced connects must own `{0}`/`{1}` per role, and every panel
+  role/transport selection must reach the connect path. FAILs the exact bug
+  signature (JOIN resolving `ownRanks={0}` src=role). The panel is hand-driven,
+  so it is log-judged rather than scenario-gated.
+
+Note: on a single-squad save the join owns no controllable units (one-
+directional presence, as designed); a proper two-player session needs >= 2
+squad tabs so each peer drives its own.
 
 ## Known limitations (honest edges)
 
