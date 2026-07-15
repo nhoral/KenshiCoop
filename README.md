@@ -40,8 +40,9 @@ third_party/      ENet patches, VC10 compat shim (deps are fetched, not committe
 ## Try it (play with a friend)
 
 Two players, two machines. You configure the session **inside the game** with
-an in-game panel (press **F2**) plus a small `coop_config.json` file - there are
-no launcher scripts to run.
+an in-game panel (press **F2**) - you swap Steam IDs by clipboard right in the
+panel, so there's no config file to edit and no launcher scripts to run. (A tiny
+`coop_config.json` is only needed for LAN / direct-UDP games.)
 
 ### Before you start (both players)
 
@@ -61,39 +62,32 @@ Grab `KenshiCoop-kit.zip` from the
 unzip it anywhere (both players). You do not need to clone this repository -
 but if you did, the same kit is in [dist/mod-kit](dist/mod-kit).
 
-Double-click **`INSTALL.cmd`** to copy the mod into `<Kenshi>\mods\KenshiCoop`,
-then launch Kenshi and enable **KenshiCoop** in the Mods menu.
+The zip contains a single **`KenshiCoop`** folder. Copy that folder into your
+Kenshi `mods` directory so you end up with
+`<Kenshi>\mods\KenshiCoop\KenshiCoop.dll` (default Steam path:
+`C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\`). Then launch
+Kenshi and enable **KenshiCoop** in the Mods menu.
 
-### 2. Swap Steam IDs
-
-Each player needs the *other* player's Steam ID. The easy way: launch Kenshi,
-press **F2**, and click **"Copy my Steam ID"** - it puts your 17-digit ID on
-the clipboard so you can paste it to your friend (and vice versa).
-
-Then each of you opens `<Kenshi>\mods\KenshiCoop\coop_config.json` and sets
-`"steamPeer"` to the *other* player's ID:
-
-```json
-"transport": "steam",
-"steamPeer": "76561198000000000"
-```
-
-(For a LAN / direct-UDP game instead, set `"transport": "udp"` and put the
-host's address in `"ip"` / `"port"`.)
-
-### 3. Connect in-game (press F2)
+### 2. Connect in-game (press F2)
 
 1. **Both players load the exact same save** (co-op resolves units by identity,
    so the two games must start from an identical save).
 2. Press **F2** to open the Co-op panel.
-3. One player sets **Role: HOST**, the other **Role: JOIN** (click to toggle).
-4. Set **Transport** (STEAM recommended - it must match your `coop_config.json`).
-5. Toggle **Connection** to **ONLINE**. The white status line shows live state
+3. **Swap Steam IDs.** Each player clicks **"Copy my Steam ID"** and sends it to
+   the other (Steam chat, Discord, ...). When you receive your friend's ID, copy
+   it, then click **"Paste friend's Steam ID"** - the panel shows the ID it
+   captured. This is per-session (nothing is written to disk), so re-paste it if
+   you relaunch Kenshi.
+4. One player sets **Role: HOST**, the other **Role: JOIN** (click to toggle).
+5. Leave **Transport** on **STEAM**.
+6. Toggle **Connection** to **ONLINE**. The white status line shows live state
    (and a banner over your leader shows it too). Toggle to **OFFLINE** to leave.
 
-You can edit `coop_config.json` any time; the panel re-reads the friend code /
-address whenever you go ONLINE (toggle Connection OFF then ON), so no restart
-is needed.
+**LAN / direct-UDP (advanced):** skip the Steam ID swap. Open
+`<Kenshi>\mods\KenshiCoop\coop_config.json`, set `"transport": "udp"`, and put
+the host's address in `"ip"` / `"port"`. Then in the panel set **Transport: UDP**
+and go ONLINE. The `ip`/`port` are re-read whenever you go ONLINE, so no restart
+is needed after an edit.
 
 ### Good to know
 
@@ -112,10 +106,11 @@ is needed.
 - **"The co-op plugin has not started"** - RE_Kenshi didn't load it. Check
   `<Kenshi>\RE_Kenshi_log.txt` for `KenshiCoop`; reinstalling
   [RE_Kenshi](https://www.nexusmods.com/kenshi/mods/847) usually fixes it.
-- **No connection (Steam)** - both Steams must be online (not offline mode),
-  and each side's `steamPeer` must be the *other* player's ID (a typo fails
-  silently). Look for `[steam] session ... active=1` in
-  `<Kenshi>\KenshiCoop_*.log`.
+- **No connection (Steam)** - both Steams must be online (not offline mode), and
+  each side must have **Pasted** the *other* player's ID (the panel shows the
+  captured ID - confirm it matches). If "Paste friend's Steam ID" reports the
+  clipboard wasn't a Steam ID, have your friend re-copy theirs. Look for
+  `[steam] session ... active=1` in `<Kenshi>\KenshiCoop_*.log`.
 - **"protocol mismatch" in the log** - one of you has an older build; both
   players should re-install from the same release.
 

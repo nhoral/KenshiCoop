@@ -211,6 +211,15 @@ if ($Sync) {
 function Set-CoopEnv {
     param([string]$Mode, [string]$Log)
     $env:KENSHICOOP_MODE         = $Mode
+    # Loopback regression is ALWAYS direct-UDP on 127.0.0.1: two Kenshi instances
+    # on one machine (same Steam account) cannot establish a Steam P2P session, so
+    # force the transport here rather than inheriting the deployed coop_config.json
+    # (which may be left on transport=steam + a real steamPeer from a manual friend
+    # session - that silently breaks every scenario's connection). Env overrides the
+    # config file, so this makes the harness self-contained. LAN runs use a separate
+    # runner (run_lan_test.ps1) and are unaffected.
+    $env:KENSHICOOP_TRANSPORT    = "udp"
+    $env:KENSHICOOP_STEAM_PEER   = "0"
     # The join connects through the WAN proxy when one is active.
     $env:KENSHICOOP_PORT         = if ($Mode -eq "join") { "$joinPort" } else { "$Port" }
     $env:KENSHICOOP_IP           = if ($Mode -eq "join") { $joinIp } else { $Ip }

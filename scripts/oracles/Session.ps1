@@ -437,6 +437,59 @@ function Test-SaveSync {
                 -Metrics @{ sentFiles = $sFiles; sentBytes = $sBytes; commitFiles = $cFiles; commitBytes = $cBytes; xferMs = $xferMs } -Detail $detail)
 }
 
+# connect_bootstrap (push-save-on-connect): the seamless-join proof. The HOST
+# is in a game; a JOIN with no matching save goes ONLINE. On the connect edge
+# (or the host's gameplay-start edge if the join beat it) the host BAKES its
+# live world and announces it with a LOAD_GO. The join - which may still be at
+# the main menu - either loads it directly (identical on-disk copy) or NACKs,
+# pulls the folder over the existing fallback transfer, and loads after commit.
+# Gated on both logs:
+#   1. host: connect-push armed ([boot] baking save '<name>' ...);
+#   2. host: the freshly-baked save announced ([boot] GO->join ...);
+#   3. join: it ENTERED the host's world - either a direct MATCH load
+#      ([load] GO ... MATCH -> loading) or a post-transfer load
+#      ([load] transfer committed -> loading '<name>').
+# Findings (not gated): whether the join was MISSING/DIVERGED (needed the
+# transfer) and, if so, the fallback-transfer edge on the host.
+function Test-ConnectBootstrap {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    # 1. the host armed a connect-push.
+    $bake = Select-String -Path $HostFile -Pattern "\[boot\] baking save '([^']*)' to push to join on connect" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $pushName = ''
+    if ($null -eq $bake) { $why += "host never armed a connect-push ([boot] baking save)" }
+    else { $pushName = $bake.Matches[0].Groups[1].Value }
+
+    # 2. the host announced the baked save.
+    $go = Select-String -Path $HostFile -Pattern "\[boot\] GO->join id=(\d+) name='([^']*)' fp=([0-9a-fA-F]+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $go) { $why += "host never announced the baked save ([boot] GO->join)" }
+    else { Write-Host "    FINDING: host pushed save '$($go.Matches[0].Groups[2].Value)' fp=$($go.Matches[0].Groups[3].Value) on connect" }
+
+    # 3. the join entered the host's world (direct MATCH or post-transfer load).
+    $matchLoad = Select-String -Path $JoinFile -Pattern "\[load\] GO id=\d+ name='([^']*)' fp=[0-9a-fA-F]+ MATCH -> loading" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $xferLoad  = Select-String -Path $JoinFile -Pattern "\[load\] transfer committed -> loading '([^']*)'" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $matchLoad -and $null -eq $xferLoad) {
+        $why += "join never loaded the pushed save (no MATCH load, no post-transfer load)"
+    }
+    elseif ($null -ne $xferLoad) {
+        Write-Host "    FINDING: join needed the folder - loaded '$($xferLoad.Matches[0].Groups[1].Value)' after the fallback transfer"
+        # The MISSING/DIVERGED NACK that drove the transfer, plus the host edge.
+        $nack = Select-String -Path $JoinFile -Pattern "\[load\] GO id=\d+ name='[^']*' hostFp=[0-9a-fA-F]+ localFp=[0-9a-fA-F]+ (MISSING|DIVERGED) -> NACK" -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $nack) { Write-Host "    FINDING: join copy was $($nack.Matches[0].Groups[1].Value) before the push (the seamless-join case)" }
+        $fb = Select-String -Path $HostFile -Pattern "\[load\] starting fallback transfer name='([^']*)'" -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $fb) { $why += "join NACKed but the host never started the fallback transfer" }
+    }
+    else {
+        Write-Host "    FINDING: join already had an identical copy - direct MATCH load of '$($matchLoad.Matches[0].Groups[1].Value)'"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  CONNECT-BOOTSTRAP $v - pushName='$pushName' $detail"
+    return (Add-GateResult -Name "connect_bootstrap" -Status $v -Detail $detail)
+}
+
 # save_resume (protocol 31 phase 12c, resume_test.ps1 stage 2): the identity-
 # reset proof. Both clients were relaunched on 'coopresume' - the save the
 # stage-1 coordinated transfer delivered to the join (stage 2 runs with NO

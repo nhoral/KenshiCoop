@@ -80,6 +80,15 @@ bool         g_peerPresent   = false; // a peer is connected right now
 std::string  g_savePending;           // host: save name awaiting quiescence
 coop::u32    g_saveReqId     = 0;     // join: monotonic PKT_SAVE_REQ counter
 
+// Push-save-on-connect bootstrap (host). When a peer connects the host bakes a
+// fresh save of its live world and, once that folder quiesces, sends the join a
+// LOAD_GO for it (NOT a blind stream): the join loads it if it already has an
+// identical copy, otherwise NACKs and the existing fallback-transfer path (see
+// driveLoadSync) streams the folder before the join loads. This lets a joiner
+// enter the host's world from the main menu with no pre-shared save.
+bool         g_bootstrapArmed = false; // host: a connect-triggered save is baking
+std::string  g_bootstrapName;          // host: that save's name (matches g_savePending)
+
 // Coordinated load (protocol 32) state. World-swap edge detection: after
 // gameplay has started once, gameplayLive dropping means the engine is
 // swapping worlds (a load); live again = the reload edge (session reset
@@ -137,6 +146,27 @@ void warnIfNoPortraits(const std::string& name) {
     }
 }
 
+// Push-save-on-connect (host): bake a fresh save of the live world and arm the
+// bootstrap so driveSaveSync announces it to the join with a LOAD_GO once the
+// folder quiesces. Called for either connect ordering: a peer connecting while
+// the host is already in-game (processNetEvents), or the host's gameplay
+// starting with a peer already connected (mainLoop_hook gameplay-start edge).
+// Host + saveSync + in-game are the caller's responsibility.
+void armConnectPush() {
+    char cur[64];
+    cur[0] = '\0';
+    coop::engine::saveInfo(cur, sizeof(cur), 0, 0);
+    std::string name = cur[0] ? cur : "coopresume";
+    g_bootstrapArmed = true;
+    g_bootstrapName  = name;
+    char b[144];
+    _snprintf(b, sizeof(b) - 1,
+              "[boot] baking save '%s' to push to join on connect", name.c_str());
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+    if (!coop::engine::saveGameAs(name))
+        coopErr("[boot] connect-push save FAILED to issue");
+}
+
 // Drain peer connect/leave events and surface a single game-thread confirmation
 // per event. The net thread already logs the handshake; this proves the event
 // reached the game thread cleanly (and is where later stages spawn/sweep).
@@ -164,6 +194,12 @@ void processNetEvents(GameWorld* gw) {
             coop::engine::setSaveSuppress(true);
             coopLog("[save] JOIN save suppression ON (host save is authoritative)");
         }
+        // Push-save-on-connect (host): if already in a game, bake+announce the
+        // live world so the join can enter it with no pre-shared save. If the
+        // host is NOT yet in-game (title/loading), the gameplay-start edge in
+        // mainLoop_hook arms this instead - covers either connect ordering.
+        if (g_cfg.isHost && g_cfg.saveSync && g_gameStarted)
+            armConnectPush();
     }
     for (std::deque<coop::u32>::iterator it = leaves.begin(); it != leaves.end(); ++it) {
         char b[64];
@@ -252,7 +288,32 @@ void driveSaveSync() {
                           rc == 1 ? "settled" : "timeout", g_savePending.c_str(),
                           files, bytes, waited);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
-                if (g_peerPresent)
+                if (g_bootstrapArmed && g_savePending == g_bootstrapName) {
+                    // Connect-push: announce the freshly-baked save with a
+                    // LOAD_GO instead of a blind stream. The join loads it
+                    // directly if its on-disk copy matches the fingerprint;
+                    // otherwise it NACKs and driveLoadSync's fallback transfer
+                    // streams the folder before the join loads. Reuses the
+                    // whole existing LOAD_GO/NACK/transfer/commit machinery.
+                    coop::LoadGoPacket go;
+                    memset(&go, 0, sizeof(go));
+                    go.type        = (coop::u8)coop::PKT_LOAD_GO;
+                    go.ownerId     = g_net.localId();
+                    go.loadId      = ++g_loadIdOut;
+                    go.fingerprint = coop::savexfer::folderFingerprint(g_bootstrapName);
+                    strncpy(go.name, g_bootstrapName.c_str(), sizeof(go.name) - 1);
+                    g_net.queueLoadGo(go);
+                    g_loadPumpArmTick = GetTickCount();
+                    char b2[192];
+                    _snprintf(b2, sizeof(b2) - 1,
+                              "[boot] GO->join id=%u name='%s' fp=%08x (push on connect)",
+                              go.loadId, g_bootstrapName.c_str(), go.fingerprint);
+                    b2[sizeof(b2) - 1] = '\0'; coopLog(b2);
+                    warnIfNoPortraits(g_bootstrapName);
+                    g_bootstrapArmed = false;
+                    g_bootstrapName.clear();
+                    g_savePending.clear();
+                } else if (g_peerPresent)
                     coop::savexfer::beginSend(g_net, g_net.localId(), g_savePending);
                 else
                     coopLog("[save] no peer connected; transfer skipped");
@@ -457,15 +518,36 @@ void driveLoadSync(GameWorld* gw) {
             coop::u32 fp = coop::savexfer::folderFingerprint(name);
             char b[192];
             if (fp != 0 && fp == it->pkt.fingerprint) {
-                _snprintf(b, sizeof(b) - 1,
-                          "[load] GO id=%u name='%s' fp=%08x MATCH -> loading",
-                          it->pkt.loadId, name, fp);
-                b[sizeof(b) - 1] = '\0'; coopLog(b);
-                warnIfNoPortraits(name);
-                g_loadAfterCommit.clear();
-                coop::engine::setLoadBypassOnce();
-                if (!coop::engine::loadSave(name))
-                    coopErr("[load] coordinated load FAILED to issue");
+                // Already in this exact save? A connect-triggered push (host
+                // bakes its current save and announces it) would otherwise
+                // reload the join into the world it is already in - a pointless
+                // load-screen hitch for the classic "both pre-loaded the same
+                // save" flow. Skip only when in-game AND the loaded save name
+                // matches; a title-screen join (not yet in-game) must still
+                // load to actually enter the world.
+                char curp[64]; curp[0] = '\0';
+                bool alreadyIn = false;
+                if (g_gameStarted) {
+                    coop::engine::saveInfo(curp, sizeof(curp), 0, 0);
+                    alreadyIn = (curp[0] && _stricmp(curp, name) == 0);
+                }
+                if (alreadyIn) {
+                    _snprintf(b, sizeof(b) - 1,
+                              "[load] GO id=%u name='%s' fp=%08x MATCH - already loaded, skip",
+                              it->pkt.loadId, name, fp);
+                    b[sizeof(b) - 1] = '\0'; coopLog(b);
+                    g_loadAfterCommit.clear();
+                } else {
+                    _snprintf(b, sizeof(b) - 1,
+                              "[load] GO id=%u name='%s' fp=%08x MATCH -> loading",
+                              it->pkt.loadId, name, fp);
+                    b[sizeof(b) - 1] = '\0'; coopLog(b);
+                    warnIfNoPortraits(name);
+                    g_loadAfterCommit.clear();
+                    coop::engine::setLoadBypassOnce();
+                    if (!coop::engine::loadSave(name))
+                        coopErr("[load] coordinated load FAILED to issue");
+                }
             } else {
                 _snprintf(b, sizeof(b) - 1,
                           "[load] GO id=%u name='%s' hostFp=%08x localFp=%08x %s -> NACK (transfer)",
@@ -545,43 +627,50 @@ void driveLoadSync(GameWorld* gw) {
     }
 }
 
+// Co-op session panel (F2) + status overlay. Interactive sessions only - the
+// unattended harness (scenario / self-exit timer) never touches the panel, and
+// keeping the GUI stack out of those runs avoids perturbing the scenario
+// oracles. Both calls are SEH-guarded internally and touch only GUI + input +
+// (guarded) leader read, so they are safe wherever the GUI stack is up. gw may
+// be null (title screen): coopOverlayTick then finds no leader and hides the
+// banner, while the panel itself needs no world. Driven from BOTH the in-game
+// mainLoop_hook and the title-screen titleUpdate_hook so a join can go ONLINE
+// (and copy/paste Steam IDs) straight from the main menu.
+void coopPanelDrive(GameWorld* gw) {
+    if (!(g_cfg.scenario.empty() && g_cfg.testSeconds == 0)) return;
+    coop::engine::CoopPanelState ps;
+    ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
+    ps.peerSteamId  = g_cfg.steamPeer;
+    ps.running      = g_net.isRunning();
+    ps.peerPresent  = g_peerPresent;
+    ps.isHost       = g_cfg.isHost;
+    ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
+    std::string detail;
+    int ostate;
+    if (g_peerPresent) {
+        detail = g_cfg.isHost ? "Connected - peer joined" : "Connected to host";
+        ostate = 2;
+    } else if (g_net.isRunning()) {
+        detail = g_cfg.isHost ? "Hosting - waiting for peer..." : "Connecting...";
+        ostate = 1;
+    } else {
+        detail = "Offline - press F2, then set Connection to ONLINE";
+        ostate = 0;
+    }
+    ps.detail = detail.c_str();
+    // Still pump Steam callbacks so an inbound "Join Game" (a friend inviting
+    // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
+    coop::steaminvite::tick();
+
+    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
+    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
+}
+
 // Main-thread tick hook: the one safe point where we touch game state.
 void mainLoop_hook(GameWorld* gw, float dt) {
     ++g_tick;
 
-    // In-game co-op session panel (F2) + status overlay. Interactive sessions
-    // only - the unattended harness (scenario / self-exit timer) never touches
-    // the panel, and keeping the GUI stack out of those runs avoids perturbing
-    // the scenario oracles. Both calls are SEH-guarded internally and touch only
-    // GUI + input + (guarded) leader read, so they are safe this early in the tick.
-    if (g_cfg.scenario.empty() && g_cfg.testSeconds == 0) {
-        coop::engine::CoopPanelState ps;
-        ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
-        ps.peerSteamId  = g_cfg.steamPeer;
-        ps.running      = g_net.isRunning();
-        ps.peerPresent  = g_peerPresent;
-        ps.isHost       = g_cfg.isHost;
-        ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
-        std::string detail;
-        int ostate;
-        if (g_peerPresent) {
-            detail = g_cfg.isHost ? "Connected - peer joined" : "Connected to host";
-            ostate = 2;
-        } else if (g_net.isRunning()) {
-            detail = g_cfg.isHost ? "Hosting - waiting for peer..." : "Connecting...";
-            ostate = 1;
-        } else {
-            detail = "Offline - press F2, then set Connection to ONLINE";
-            ostate = 0;
-        }
-        ps.detail = detail.c_str();
-        // Still pump Steam callbacks so an inbound "Join Game" (a friend inviting
-        // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
-        coop::steaminvite::tick();
-
-        coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
-        coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
-    }
+    coopPanelDrive(gw);
 
     // Protocol 32: world-swap edge detection. Runs FIRST so the reload edge
     // (and, under load-sync, the session reset) lands before any sync code
@@ -648,6 +737,12 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             coopLog("[speed] intent hooks installed (setGameSpeed/userPause/togglePause)");
         else
             coopLog("[speed] FAILED to install intent hooks (vote capture degraded)");
+        // Push-save-on-connect ordering: if a peer connected while we were still
+        // at the menu / loading, its connect edge could not bake a save (no live
+        // world yet). Now that gameplay is live, arm the connect-push so the
+        // waiting join gets pulled into this world.
+        if (g_cfg.isHost && g_cfg.saveSync && g_peerPresent)
+            armConnectPush();
     }
 
     // Test-runner self-exit: quit cleanly after the configured duration so
@@ -1179,8 +1274,62 @@ void mainLoop_hook(GameWorld* gw, float dt) {
 // Title-screen update hook: a safe main-thread point every frame the menu is up.
 // Wait g_cfg.autoLoadDelayMs after the first title frame AND until the save
 // subsystem reports ready, then issue the deferred load once.
+// SEH-guarded so a fault in the (title-screen-untested) GUI stack can never
+// abort titleUpdate_hook before the bootstrap pump runs. No C++ unwind objects
+// live in titleUpdate_hook, but coopPanelDrive uses std::string internally, so
+// the guarded call lives in its own function (C2712).
+void coopPanelDriveSeh(GameWorld* gw) {
+    __try { coopPanelDrive(gw); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        static bool s_warned = false;
+        if (!s_warned) { s_warned = true;
+            coopErr("[coop-ui] panel tick FAULTED at title screen (guarded)"); }
+    }
+}
+
 void titleUpdate_hook(TitleScreen* self) {
     g_titleUpdate_orig(self);
+
+    // Bring-up trace: log once on the first title tick, then only when the
+    // online state flips (the moment the user toggles ONLINE via F2), so the log
+    // shows the menu hook is live and pinpoints the connect edge without spam.
+    {
+        static int s_lastRunning = -1;
+        int running = g_net.isRunning() ? 1 : 0;
+        if (running != s_lastRunning) {
+            s_lastRunning = running;
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "[boot] title-tick running=%d host=%d started=%d saveEmpty=%d",
+                      running, g_cfg.isHost ? 1 : 0, g_gameStarted ? 1 : 0,
+                      g_cfg.save.empty() ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+        }
+    }
+
+    // Push-save-on-connect (join, main menu). A join that has gone ONLINE must
+    // drain the connect edge, receive the host's pushed save, and load it while
+    // still at the title screen - work that normally only runs in-game from
+    // mainLoop_hook (gated on g_gameStarted). Pump the join half FIRST (before
+    // the panel) so a GUI fault can never block it. gw is null: processNetEvents
+    // only touches it under a gw&& guard, and the JOIN branches of driveSaveSync/
+    // driveLoadSync never deref it. The load path is gated on savesReady():
+    // before then the host's LOAD_GO simply waits in the inbound queue (no NACK
+    // -> no stream yet), and the save-receiver half still commits chunks to disk.
+    if (g_net.isRunning() && !g_cfg.isHost && !g_gameStarted) {
+        processNetEvents(0);
+        if (g_cfg.saveSync) driveSaveSync();
+        if (g_cfg.loadSync && coop::engine::savesReady()) driveLoadSync(0);
+        // F2 panel while the join waits at the menu (guarded; the host's world is
+        // the destination, so we skip the config auto-load for a join session).
+        coopPanelDriveSeh(0);
+        return;
+    }
+
+    // Co-op panel (F2) at the main menu for the HOST / offline case: lets a user
+    // toggle ONLINE and paste a Steam ID before any save is loaded. Guarded
+    // because the title-screen GUI stack is otherwise unexercised.
+    coopPanelDriveSeh(0);
 
     if (g_autoLoadDone || g_cfg.save.empty()) return;
 
@@ -1261,10 +1410,14 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
 
     g_cfg.isHost    = isHost;
     g_cfg.transport = useSteam ? "steam" : "udp";
-    // Re-read the connection TARGET from coop_config.json so editing the friend
-    // code / UDP endpoint then hitting Connect works without restarting the game.
+    // Re-read the UDP endpoint (ip/port) from coop_config.json so editing it then
+    // hitting Connect works without restarting the game. (It also picks up a
+    // steamPeer if one is set for advanced/back-compat use.)
     coop::reloadPeerFromFile(g_cfg);
-    if (peerId != 0) g_cfg.steamPeer = peerId; // (panel passes 0; config wins)
+    // A Steam ID pasted in the F2 panel this session wins over the config: the
+    // normal flow is Copy my Steam ID -> friend Pastes it -> Connect, with no file
+    // editing. peerId is 0 when nothing was pasted, so the config value stands.
+    if (peerId != 0) g_cfg.steamPeer = peerId;
     g_repl.setStreamNpcs(isHost);            // host streams world NPCs; join drives
     // Ownership ranks must follow the role chosen in the panel. Only an explicit
     // KENSHICOOP_OWN_SQUAD override is preserved; otherwise recompute the default
@@ -1619,16 +1772,27 @@ __declspec(dllexport) void startPlugin() {
             coopLog("[load] FAILED to install load detour; coordinated load degraded");
     }
 
-    // Auto-load: only hook the title screen when a save name was provided.
-    if (!g_cfg.save.empty()) {
+    // Title-screen hook. It drives THREE things at the main menu: the config
+    // auto-load (only when a save is set), the F2 co-op panel (go ONLINE / paste
+    // a Steam ID before loading), and the push-save-on-connect bootstrap (a join
+    // with NO save receives + loads the host's world). So install it whenever a
+    // save is configured OR this is an interactive session - NOT only when a save
+    // is present, which was the old behavior that left a join-from-menu with no
+    // title hook (the panel and bootstrap never ran). The scenario/test harness
+    // always sets a save, so its behavior is unchanged. titleUpdate_hook itself
+    // self-gates each of the three concerns.
+    bool interactive = g_cfg.scenario.empty() && g_cfg.testSeconds == 0;
+    if (!g_cfg.save.empty() || interactive) {
         if (KenshiLib::SUCCESS !=
             KenshiLib::AddHook(
                 KenshiLib::GetRealAddress(&TitleScreen::_NV_update),
                 &titleUpdate_hook, &g_titleUpdate_orig)) {
-            coopErr("KenshiCoop: could not install title-screen hook (auto-load disabled)");
-        } else {
-            std::string m = "KenshiCoop: auto-load armed for save '" + g_cfg.save + "'";
+            coopErr("KenshiCoop: could not install title-screen hook (F2 panel + bootstrap + auto-load disabled)");
+        } else if (!g_cfg.save.empty()) {
+            std::string m = "KenshiCoop: title hook armed (auto-load save '" + g_cfg.save + "')";
             coopLog(m.c_str());
+        } else {
+            coopLog("KenshiCoop: title hook armed (F2 panel + push-on-connect at menu; no auto-load save)");
         }
     }
 

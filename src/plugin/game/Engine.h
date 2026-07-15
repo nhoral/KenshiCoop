@@ -216,27 +216,29 @@ void* markerCreate(Character* c, const char* text, int colorId);
 bool  markerUpdate(void* label, const char* text, int colorId);
 void  markerDestroy(void* label);
 
-// ---- In-game co-op session panel (config-driven) -----------------------------
+// ---- In-game co-op session panel ---------------------------------------------
 // A native DatapanelGUI opened with F2 that lets the player pick role + transport
 // (buttons/checkboxes - the only reliably interactive DatapanelGUI controls;
 // MyGUI comboboxes/editboxes have no usable RVAs and don't receive keyboard focus
-// during gameplay) and Connect/Disconnect. The friend code (peer SteamID) and the
-// UDP endpoint come from coop_config.json (shown read-only in the panel); a "Copy
-// my Steam ID" button puts the player's own id on the clipboard to share. The GUI
-// layer stays session-agnostic: live status is passed IN via *st and the user's
-// actions are handed BACK through the callbacks (the plugin root owns the
-// session/config wiring). Main-thread only; SEH-guarded.
+// during gameplay) and Connect/Disconnect. The friend's Steam ID is entered by
+// clipboard: "Copy my Steam ID" puts the player's own id on the clipboard to
+// share, and "Paste friend's Steam ID" reads the friend's id back in (per-session,
+// never written to disk). The UDP endpoint (ip/port) still comes from
+// coop_config.json. The GUI layer stays session-agnostic: live status is passed IN
+// via *st and the user's actions are handed BACK through the callbacks (the plugin
+// root owns the session/config wiring). Main-thread only; SEH-guarded.
 struct CoopPanelState {
     unsigned long long selfSteamId; // steamp2p::selfId (0 = Steam not up)
-    unsigned long long peerSteamId; // configured partner from coop_config.json (0 = unset)
+    unsigned long long peerSteamId; // config steamPeer fallback (0 = unset; pasted id wins)
     bool               running;     // net thread up
     bool               peerPresent; // peer connected
     bool               isHost;      // current armed role (seeds the Host toggle)
     int                transportSel;// current armed transport (0 steam, 1 udp)
     const char*        detail;      // one-line status string for the panel/overlay
 };
-// The panel's role/transport selections at the moment Connect is hit. peerId is
-// always 0 now (the peer comes from the config file, re-read on Connect).
+// The panel's role/transport selections at the moment Connect is hit. peerId is the
+// Steam ID pasted in-panel this session (0 if none), and overrides the config
+// steamPeer in coopUiConnect; the UDP endpoint is re-read from the config there.
 typedef void (*CoopConnectFn)(bool isHost, bool useSteam, unsigned long long peerId);
 typedef void (*CoopDisconnectFn)();
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
@@ -1220,6 +1222,17 @@ int healSubjectBandage(GameWorld* gw, const unsigned int subjHand[5]);
 // ragdoll, clear medical.unconcious, restore blood to a healthy floor) so its
 // owner publishes the upright edge -> reliable EVT_REVIVE. Returns true on ok.
 bool reviveSubject(GameWorld* gw, const unsigned int subjHand[5]);
+
+// Owner-authoritative death veto (2026-07-15). A DRIVEN copy whose owner still
+// reports it ALIVE must never latch DEAD from the local (cosmetic) fight - the
+// melee damage guard blocks new wounds, but a lethal frame in an unguarded
+// window or a non-melee source can still flip medical.dead, and Kenshi's
+// medical model is local-only so nothing reconciles it back (the corpse stays
+// dead here while the owner's copy lives). This clears a spuriously-set
+// medical.dead + unconcious, releases the ragdoll, and floors blood so the
+// body cannot immediately re-die. Death only takes hold on the peer via the
+// owner's reliable EVT_DEATH. Returns true if it actually vetoed a local death.
+bool vetoLocalDeath(Character* c);
 
 // player_combat victim pick: the UPRIGHT non-squad world NPC nearest the body at
 // refHand (excluding, optionally, up to two prior hands - pass 0 for none; the

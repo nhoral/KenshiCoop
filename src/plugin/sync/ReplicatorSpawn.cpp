@@ -635,6 +635,24 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // A chained edge (recruit then move, move then move) leaves the OLD key's
     // pin dead - drop it so the pin sets track only live hands.
     pinPeer_.erase(oldK);
+    // Carry the down/death LATCH across the re-key. A body that dies (or is
+    // KO'd) and then re-containers (host un-squads a corpse, tab move) streams
+    // its EVT_DEATH/EVT_KNOCKOUT under the OLD hand, so deathLatched/koLatched
+    // live on targets_[oldK]. Erasing that record below (without this) drops
+    // the pin, and the join's local AI/KO-timer stands the corpse back up under
+    // the new key - the "dead on one game, alive on the other" desync
+    // (2026-07-15 bone-dog fight: serial 3332275456 died @container121, then an
+    // EVT_SQUAD_MOVE re-keyed it and un-pinned the body). Snapshot the latches
+    // here and re-seed them onto targets_[newK] so the corpse stays down.
+    bool carryDeath = false, carryKo = false, carryDown = false;
+    {
+        std::map<Key, Driven>::iterator oldT = targets_.find(oldK);
+        if (oldT != targets_.end()) {
+            carryDeath = oldT->second.deathLatched;
+            carryKo    = oldT->second.koLatched;
+            carryDown  = oldT->second.downApplied;
+        }
+    }
     // Drop the old key's stream state too (run 192211: the interp TAIL of a
     // re-keyed hand kept replaying after the migration, went unresolved and
     // REQ'd a duplicate proxy). The grace stamp suppresses spawn REQs/mints
@@ -642,6 +660,21 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     targets_.erase(oldK);
     spawnReq_.erase(oldK);
     rekeyedOld_[oldK] = nowMs();
+    if (carryDeath || carryKo) {
+        Driven& nd = targets_[newK]; // stream fills interp; we seed only the latch
+        coop::LatchState merged = coop::rekeyCarryLatch(
+            coop::LatchState(carryDeath, carryKo, carryDown),
+            coop::LatchState(nd.deathLatched, nd.koLatched, nd.downApplied));
+        nd.deathLatched = merged.death;
+        nd.koLatched    = merged.ko;
+        nd.downApplied  = merged.down;
+        char lb[200]; _snprintf(lb, sizeof(lb) - 1,
+            "[event] REKEY-LATCH old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u death=%d ko=%d",
+            oldK.t, oldK.c, oldK.cs, oldK.i, oldK.s,
+            newK.t, newK.c, newK.cs, newK.i, newK.s,
+            carryDeath ? 1 : 0, carryKo ? 1 : 0);
+        lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+    }
     Character* c = engine::resolveCharByHand(oldK.i, oldK.s, oldK.t, oldK.c, oldK.cs);
     if (!c) {
         // The old hand may itself be a MINTED proxy (the sender re-keyed a

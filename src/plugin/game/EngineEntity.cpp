@@ -23,6 +23,8 @@
 #include <mygui/MyGUI_Delegate.h> // MyGUI::newDelegate + CDelegate* (free-fn callbacks)
 #include <windows.h>
 
+#include "../core/SteamId.h" // parseSteamId64 (pure) for the paste-from-clipboard button
+
 namespace coop {
 namespace engine {
 
@@ -1086,6 +1088,41 @@ bool clipboardSetText(const char* text) {
     return ok;
 }
 
+// Read text from the Windows clipboard into out. Prefers CF_UNICODETEXT (what the
+// Steam overlay / browsers usually publish) and falls back to CF_TEXT, converting
+// either to a narrow std::string (the SteamID parse keeps only ASCII digits, so a
+// lossy WideCharToMultiByte is fine here). Used by the "Paste friend's Steam ID"
+// button. Win32 only (no MyGUI). Returns true iff some text was retrieved.
+bool clipboardGetText(std::string& out) {
+    if (!OpenClipboard(0)) return false;
+    bool ok = false;
+    HANDLE hw = GetClipboardData(CF_UNICODETEXT);
+    if (hw) {
+        const wchar_t* src = (const wchar_t*)GlobalLock(hw);
+        if (src) {
+            int need = WideCharToMultiByte(CP_UTF8, 0, src, -1, 0, 0, 0, 0);
+            if (need > 0) {
+                std::string tmp((size_t)need, '\0');
+                if (WideCharToMultiByte(CP_UTF8, 0, src, -1, &tmp[0], need, 0, 0) > 0) {
+                    if (!tmp.empty() && tmp[tmp.size() - 1] == '\0') tmp.resize(tmp.size() - 1);
+                    out = tmp;
+                    ok = true;
+                }
+            }
+            GlobalUnlock(hw);
+        }
+    }
+    if (!ok) {
+        HANDLE ha = GetClipboardData(CF_TEXT);
+        if (ha) {
+            const char* src = (const char*)GlobalLock(ha);
+            if (src) { out = src; ok = true; GlobalUnlock(ha); }
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
 struct CoopPanelUi {
     DatapanelGUI* panel;
     bool          open, built;
@@ -1108,10 +1145,18 @@ DataPanelLine_Button*   g_roleBtn      = 0;
 DataPanelLine_Button*   g_transBtn     = 0;
 DataPanelLine_Button*   g_connBtn      = 0; // Online/Offline toggle (replaces the checkbox)
 DataPanelLine_Button*   g_copyIdBtn    = 0;
+DataPanelLine_Button*   g_pasteIdBtn   = 0; // "Paste friend's Steam ID" from clipboard
 DataPanelLine*          g_debugLine    = 0; // white connection-status debug row
-DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID (config)" row
+DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
 std::string             g_selfIdStr;   // self SteamID as digits (set each tick; "" = none)
+
+// Friend's SteamID pasted in-panel this session (0 = none). Per-session by
+// design: it lives only in memory, so relaunching Kenshi clears it and the
+// friend's id is re-pasted (nothing is written to disk). Passed to onConnect,
+// where it overrides the (usually empty) config steamPeer.
+unsigned long long      g_pastedPeer   = 0;
+bool                    g_pasteFailed  = false; // last paste wasn't a valid Steam ID
 
 // Button callbacks (free functions - MyGUI::newDelegate wraps them without any
 // raw-MyGUI link). A press flips the armed flag and requests a rebuild so the
@@ -1135,7 +1180,7 @@ void onConnBtn(DataPanelLine*) {
                                         : "[coop-ui] connection -> OFFLINE");
 }
 // Copy the player's own SteamID to the clipboard so they can paste it to a friend
-// (who sets it as steamPeer in their coop_config.json).
+// (who pastes it into their panel via "Paste friend's Steam ID").
 void onCopyIdBtn(DataPanelLine*) {
     if (g_selfIdStr.empty()) {
         coop::logLine("[coop-ui] copy Steam ID: none (Steam not running)");
@@ -1148,13 +1193,33 @@ void onCopyIdBtn(DataPanelLine*) {
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
 }
+// Paste the friend's SteamID from the clipboard: read text, extract + validate a
+// SteamID64, and store it as the session peer (used on the next Connect). No
+// typing, no config edit. Rejects arbitrary clipboard junk (g_pasteFailed drives
+// the peer-row hint).
+void onPasteIdBtn(DataPanelLine*) {
+    std::string clip;
+    unsigned long long id = 0;
+    if (clipboardGetText(clip) && coop::parseSteamId64(clip, id)) {
+        g_pastedPeer  = id;
+        g_pasteFailed = false;
+        char b[64];
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] paste friend id=%llu ok=1", id);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    } else {
+        g_pasteFailed = true;
+        coop::logLine("[coop-ui] paste friend id=0 ok=0 (clipboard not a Steam ID)");
+    }
+    g_panel.needsRebuild = true;
+}
 
 // POD-only pointer bundle so the row-build SEH frame constructs no std::string.
 struct PanelStrings {
     const std::string *title, *roleKey, *roleCap, *transKey, *transCap;
     const std::string *connKey, *connCap;
     const std::string *dbgKey, *dbgVal;
-    const std::string *peerKey, *peerVal;
+    const std::string *peerKey, *peerVal, *pasteKey, *pasteCap;
     const std::string *selfKey, *selfVal, *copyKey, *copyCap;
     const std::string *empty;
 };
@@ -1170,8 +1235,9 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
         // Connection-status debug line (coloured white below, outside SEH).
         g_debugLine = p->setLine(*s->dbgKey, *s->dbgVal, *s->empty, 0, false, true);
         p->addSpace(0, 0.35f);
-        // Friend code (peer SteamID) is read-only, sourced from coop_config.json.
+        // Friend's SteamID: pasted in-panel (Copy on their side -> Paste here).
         g_peerLine = p->setLine(*s->peerKey, *s->peerVal, *s->empty, 0, false, true);
+        g_pasteIdBtn = p->setLineButton(*s->pasteKey, *s->pasteCap, 0);
         p->addSpace(0, 0.35f);
         g_selfLine = p->setLine(*s->selfKey, *s->selfVal, *s->empty, 0, false, true);
         g_copyIdBtn = p->setLineButton(*s->copyKey, *s->copyCap, 0);
@@ -1220,6 +1286,10 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                    CoopDisconnectFn onDisconnect) {
     if (!st) return;
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    { static void* s_last = (void*)-1;
+      if ((void*)g != s_last) { s_last = (void*)g;
+          char b[64]; _snprintf(b, sizeof(b) - 1, "[coop-ui] gui ptr=%p", (void*)g);
+          b[sizeof(b) - 1] = '\0'; coop::logLine(b); } }
     if (!g) return;
 
     // Cache the self id as a string for the Copy button (used by onCopyIdBtn).
@@ -1248,6 +1318,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             panelDestroySeh(g, g_panel.panel);
             g_panel.panel = 0; g_panel.built = false;
             g_roleBtn = 0; g_transBtn = 0; g_connBtn = 0; g_copyIdBtn = 0;
+            g_pasteIdBtn = 0;
             g_debugLine = 0; g_peerLine = 0; g_selfLine = 0;
             g_panel.open = false;
             coop::logLine("[coop-ui] panel closed");
@@ -1314,17 +1385,24 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                      " over " + (g_panel.steamFlag ? "Steam" : "UDP") + " on Connect";
         }
 
-        // Friend code (peer SteamID) read-only from coop_config.json.
-        std::string peerKey = "Friend's Steam ID (config)";
+        // Friend's SteamID: prefer the value pasted in-panel this session; fall
+        // back to the config (steamPeer, mainly for advanced/back-compat use).
+        std::string peerKey = "Friend's Steam ID";
         std::string peerVal;
-        if (st->peerSteamId != 0) {
+        unsigned long long peerShown = g_pastedPeer ? g_pastedPeer
+                                                     : (unsigned long long)st->peerSteamId;
+        if (peerShown != 0) {
             char pb[32];
-            _snprintf(pb, sizeof(pb) - 1, "%llu", (unsigned long long)st->peerSteamId);
+            _snprintf(pb, sizeof(pb) - 1, "%llu", peerShown);
             pb[sizeof(pb) - 1] = '\0';
             peerVal = pb;
+        } else if (g_pasteFailed) {
+            peerVal = "(clipboard was not a Steam ID - copy theirs and retry)";
         } else {
-            peerVal = "(set steamPeer in coop_config.json)";
+            peerVal = "(click Paste friend's Steam ID)";
         }
+        std::string pasteKey = "pasteid";
+        std::string pasteCap = "Paste friend's Steam ID";
 
         char selfBuf[40];
         if (st->selfSteamId) {
@@ -1345,6 +1423,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         ps.connKey = &connKey; ps.connCap = &connCap;
         ps.dbgKey = &dbgKey; ps.dbgVal = &dbgVal;
         ps.peerKey = &peerKey; ps.peerVal = &peerVal;
+        ps.pasteKey = &pasteKey; ps.pasteCap = &pasteCap;
         ps.selfKey = &selfKey; ps.selfVal = &selfVal;
         ps.copyKey = &copyKey; ps.copyCap = &copyCap;
         ps.empty = &empty;
@@ -1353,10 +1432,11 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         // Delegate assignment + white-colouring live OUTSIDE the SEH frame (pointer
         // targets are valid post-build; assignment can't fault) so no delegate
         // temporary lands in it.
-        if (g_roleBtn)   g_roleBtn->callback   = MyGUI::newDelegate(&onRoleBtn);
-        if (g_transBtn)  g_transBtn->callback  = MyGUI::newDelegate(&onTransBtn);
-        if (g_connBtn)   g_connBtn->callback   = MyGUI::newDelegate(&onConnBtn);
-        if (g_copyIdBtn) g_copyIdBtn->callback = MyGUI::newDelegate(&onCopyIdBtn);
+        if (g_roleBtn)    g_roleBtn->callback    = MyGUI::newDelegate(&onRoleBtn);
+        if (g_transBtn)   g_transBtn->callback   = MyGUI::newDelegate(&onTransBtn);
+        if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
+        if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
+        if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
         dbgColourSeh(g_debugLine);
         dbgColourSeh(g_peerLine);
         dbgColourSeh(g_selfLine);
@@ -1368,7 +1448,8 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
 
     // Connect / disconnect on the Online/Offline toggle edge (edge, not level, so
     // a connect that hasn't reported running yet is not re-fired every tick). The
-    // peer id comes from coop_config.json (re-read by the plugin on Connect), 0 here.
+    // pasted friend id (0 if none) is handed to the plugin, which lets a non-zero
+    // value override the config steamPeer; UDP ip/port still come from the config.
     if (g_panel.connectedFlag != g_panel.lastChkVal) {
         g_panel.lastChkVal = g_panel.connectedFlag;
         if (g_panel.connectedFlag && !st->running) {
@@ -1378,7 +1459,7 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                       g_panel.steamFlag ? "steam" : "udp");
             b[sizeof(b) - 1] = '\0';
             coop::logLine(b);
-            if (onConnect) onConnect(g_panel.hostFlag, g_panel.steamFlag, 0);
+            if (onConnect) onConnect(g_panel.hostFlag, g_panel.steamFlag, g_pastedPeer);
         } else if (!g_panel.connectedFlag && st->running) {
             coop::logLine("[coop-ui] DISCONNECT requested");
             if (onDisconnect) onDisconnect();

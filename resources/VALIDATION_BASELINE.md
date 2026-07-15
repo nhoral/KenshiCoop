@@ -2162,8 +2162,205 @@ Note: on a single-squad save the join owns no controllable units (one-
 directional presence, as designed); a proper two-player session needs >= 2
 squad tabs so each peer drives its own.
 
+## Mining / resource-node work sync (2026-07-14, addendum)
+
+Manual friend + loopback session on the `mining` save surfaced: a player mining an
+iron node saw the miner **frozen/idle on the peer** (no mining animation) and
+"nothing gathering". Diagnosis (live `[taskkey]`/`[seatres]`/`[pose]` capture):
+
+- Mining an ore node = **operating a mine building**, streamed as task `87`
+  ("Operating machine", already `repro=1`); the subject hand resolves cross-client
+  (`[seatres] ok=1`), so this was never a "task filtered out" gap.
+- Root cause: `applyTaskOrder`'s acceptance gate used a single `SEAT_MATCH_DIST=6 m`
+  tuned for stools, comparing the resolved building ORIGIN to the streamed body
+  position. A mine's operate spot sits far from its origin - measured ~8.9 m for one
+  mine but **57 m (host) / 104 m (join)** for a larger one - so the join rejected the
+  CORRECT mine as "far" (`[pose] applyOrder … r=3`) and **parked** the miner idle,
+  no mining animation. No fixed radius covers both mine sizes.
+- The mine's hand is reliable cross-client: the same subject resolves to the SAME
+  world position on host and join (`subjpos` matched to the metre), unlike generic
+  seats which mis-resolve to a wrong nearby prop.
+- The ore itself already crosses: the mine's output storage syncs via the
+  container-inventory channel (`[inv] APPLY hand=0,2006,11111,1834 items=1` on the
+  join); stats ride `PKT_STATS`. Terrain node **depletion** is unsynced (accepted).
+
+Fix: gate by fixture FAMILY, not a radius. Seats/beds stay distance-gated at 6 m
+(they mis-resolve). WORK fixtures (`OPERATE_MACHINERY`, `OPERATE_AUTOMATIC_MACHINERY`,
+`USE_TRAINING_DUMMY`, `PRETEND_TO_OPERATE_MACHINERY`) are TRUSTED by their reliable
+hand once resolved - no distance gate - so the engine paths the body to the machine's
+own operate point regardless of the origin offset. The policy lives in the pure
+header `src/plugin/core/WorkPose.h` (`poseIsDistanceGated` / `poseFixtureAccepted` /
+`poseFixtureAcceptedSq`), shared by `EngineSpawnCombat.cpp` (`applyTask` /
+`applyTaskOrder`) and `prototest`.
+
+Validation added:
+- `prototest` `testWorkPoseMatch()` - 14 checks: seat gated / work ungated, the
+  exact regression (mine **accepted** at 8.9 / 57 / 104 m as work, **rejected** at
+  8.9 m as seat), the 6 m seat boundary, and the squared-distance engine form. Runs
+  first in every tier. Full run: **270/270 PASS** (incl. the 7 task-clear checks below).
+- `Test-MinePose` oracle (`scripts/oracles/Npc.ps1`): scans a JOIN log for
+  operate-machine pose applies and requires posed (`r=2`) to dominate parked
+  (`r=3`). Runs against a manual `mining` session log (the synthetic harness has no
+  terrain resource nodes, so this is log-judged rather than smoke-gated).
+- Manual re-test on the `mining` save (UDP loopback, `-Inhabit`): the join flipped
+  `[pose] applyOrder … task=87 … r=3` -> `r=2` for both the small AND the large mine
+  after the fix (miner now animates at the mine on the peer). `craft_order` (near
+  fixture, <6 m) is unaffected - a near work fixture is accepted either way.
+
+### Job removal not releasing the held pose (2026-07-15, follow-up)
+
+After the animation fix, a second gap surfaced: **removing** a job on the host did
+not un-assign the peer's copy - the join kept mining. Root cause: `applyRest`
+(`src/plugin/sync/ReplicatorDrive.cpp`) deliberately IGNORES host->`TASK_NONE`
+frames (a committed sit/operate pose must survive transient capture blips), and a
+committed pose is only released when `applyTargets` sees the host copy **move**. A
+job removed while the character **stays stationary** streams `TASK_NONE`
+continuously but never moves, so the `OPERATE_MACHINERY` order was held forever.
+
+Fix: a **debounced task-clear** mirroring the existing `carryNoSeeTick` /
+`furnNoSeeTick` owner-side-exit detectors. `applyRest` records the first tick of a
+sustained host->NONE streak (`Driven::taskNoneTick`); after `TASK_CLEAR_MS` (1200 ms,
+`ReplicatorUtil.h`) of continuous NONE it logs `[pose] task-clear …`, drops the held
+pose (`taskApplied=false`, `issuedTask=TASK_NONE`) and falls through to the existing
+`clearGoals` + `endAction` + `park` path - the peer stops reproducing the order and
+idles at the host transform. Transient NONE blips (< 1.2 s) still hold the pose, so
+the anti-oscillation guarantee is preserved; the movement re-arm path also zeroes the
+streak. The elapsed predicate is the pure `poseClearElapsed(noneTick, now, clearMs)`
+in `src/plugin/core/WorkPose.h` (unsigned tick math, wrap-safe).
+
+Validation added:
+- `prototest` `testTaskClear()` - 7 checks: no-streak never clears, blips at 0 /
+  1199 ms hold, sustained NONE at 1200 ms / 5 s clears, and two `GetTickCount`
+  wrap-boundary cases.
+- `Test-MineClear` oracle (`scripts/oracles/Npc.ps1`): asserts >=1 `[pose]
+  task-clear` fired on the join and no work-task `r=2` re-pose follows it for the
+  same hand (log-judged against a manual session where you add then remove a mining
+  job while the miner stands still).
+
+## Jail / cage occupancy oscillation (2026-07-15, addendum)
+
+Manual session: the player angered guards and got the squad jailed. On the host both
+members sat in the cage correctly. On the join the **host-owned** member kept getting
+"released from jail" (game message), fought the guards, and was **teleported in and
+out** of the cage; the join-owned member was stable.
+
+Root cause (live `[furn]` logs): the caged host-owned member is DRIVEN on the join.
+The furniture carve-out in `src/plugin/sync/ReplicatorDrive.cpp` re-seats a body whose
+streamed `BODY_IN_CAGE` bit is set (`[furn] HEAL ENTER ... kind=2`) every `FURN_HEAL_MS`
+(1.5 s), then `continue`s - it never quiets the AI. AI-suspend (the `periodicUpdate`
+decision-layer detour, default ON) is gated to non-squad bodies, so a **conscious caged
+squad member** kept its local AI: it broke out and fought the guards, and the self-heal
+teleported it back. Measured on the pre-fix log: `occ=2,3587646464` re-entered the cage
+**57 times**. The join-owned member (`occ=1`, host-authored `PEER-ENTER`) was stable
+because the join's own sim held it.
+
+Fix: a caged/bedded DRIVEN body is the exception to the "squad members are never
+AI-suspended" rule. In the furniture carve-out `streamKind != 0` branch we now
+`addAiSuspend(c)` regardless of `isSquad`, and `endAction(c)` on each re-seat to drop
+the in-progress escape/attack walk. The AI-suspend set is rebuilt every drive tick, so
+this self-clears the instant the host streams the body out of furniture (released) and
+its AI resumes. After the first re-seat the suspended body stays put, so the `HEAL
+ENTER` loop stops - the observable signature of the fix.
+
+Validation:
+- `Test-JailHold` oracle (`scripts/oracles/Npc.ps1`): groups cage (`kind=2`) `HEAL
+  ENTER`s by occupant and asserts no occupant re-enters more than 3 times (no sustained
+  oscillation). Verified against the pre-fix log: FAIL at 57 re-enters (the bug).
+- Manual jail re-test: arrest the squad, confirm the host-owned member now stays caged
+  on the join (no "released from jail" spam, no in/out teleport).
+- Open follow-up (empirical): if "released from jail" turns out to be driven by the
+  join's faction/crime sim rather than the prisoner's own `periodicUpdate` AI, suspend
+  alone won't fully stop re-release; the larger follow-up is to replicate the
+  imprisonment/crime flag so the join marks the body a real prisoner.
+
+## Owner-authoritative death consistency (2026-07-15, addendum)
+
+Manual session (bone-dog pack ambush while travelling): squad-member **deaths were not
+consistent across games** - a member dead on one client stayed alive on the other.
+
+Root cause (live `[event]` logs): death events DO cross correctly (each owner authors a
+reliable `EVT_DEATH`/`ev=2` for its own members, bidirectionally). The join-owned member
+(serial `3332275456`) was KO'd under hand container `7`, then its `EVT_DEATH` was authored
+under container `121`, and ~17 s later an `EVT_SQUAD_MOVE` (`ev=11`) re-keyed it. On the
+peer, `EVT_DEATH` latches `targets_[k].deathLatched` (`ReplicatorSpawn.cpp` `applyEvents`),
+but `rekeyPeerBody` then ran `targets_.erase(oldK)` and **never copied the latch to the new
+key** - so the corpse lost its pin, fell through to the drive path, and the local AI/KO-timer
+stood it back up under the new hand. A hand CONTAINER change breaks identity (the #1 desync
+lesson in `NPC_COMBAT_SYNC_HANDOFF.md`); the death latch was a casualty of it. A secondary
+hole: a driven copy could still die locally via a non-melee/bleed path the `hitByMelee`
+damage guard doesn't cover, with no owner event to reconcile it.
+
+Fix (two parts, `src/plugin/sync/` + `src/plugin/game/`):
+1. **Latch carry across re-key** - `rekeyPeerBody` snapshots the old key's
+   `deathLatched`/`koLatched`/`downApplied` and OR-merges them onto `targets_[newK]`
+   (pure helper `coop::rekeyCarryLatch`, `src/plugin/core/DeathLatch.h`), emitting
+   `[event] REKEY-LATCH ... death=.. ko=..`. A dead body that re-containers stays pinned.
+2. **Owner-authoritative local-death veto** - a driven body whose owner stream is NOT dead
+   (`!(bodyState & BODY_DEAD) && !deathLatched`) but that went `isDead()` locally is
+   un-killed via `engine::vetoLocalDeath` (clears `medical.dead`/`unconcious`, releases the
+   ragdoll, floors blood), logging `[death] veto hand=..`. Gated behind the existing
+   `dmgGuard_` knob. Death may only take hold on the peer via the owner's reliable
+   `EVT_DEATH`.
+
+Validation:
+- `prototest testDeathRekey()`: locks the monotone latch-carry rule (never loses a pin,
+  never clears a latch already present on the new key). Full suite **281/281 PASS**.
+- `Test-DeathParity` oracle (`scripts/oracles/Combat.ps1`): cross-checks a manual session -
+  every `EVT_DEATH` SEND has a peer RECV (parity), reports `REKEY-LATCH` carries, and FAILs
+  if a `[death] veto` ever fires on a body that side also received an owner death for.
+  Baselined against the pre-fix bone-dog logs: parity PASS (events crossed), `rekey-latch
+  carries=0` (the build lacked the fix - the latch loss was the actual desync).
+- Manual re-test: bait a fight, kill a squad member, confirm the corpse stays dead on BOTH
+  clients through any squad/container move.
+
+## Push-save-on-connect (seamless join from main menu) (2026-07-15, addendum)
+
+Removes the pre-shared-save requirement: a joiner can go ONLINE from the initial
+main menu (Continue / New Game / ...) with no save, and the host pulls it into
+its live world on connect. No wire change - reuses protocol 31/32 packets
+(`PKT_SAVE_*`, `PKT_LOAD_GO`/`NACK`); the host merely sends a `LOAD_GO` at a new
+time (on connect), so `PROTOCOL_VERSION` is unchanged.
+
+Flow (`src/plugin/Plugin.cpp`):
+1. **Host connect trigger** - when a peer connects while the host is in-game (or
+   when the host's gameplay starts with a peer already waiting), `armConnectPush()`
+   bakes a fresh save of the live world (`engine::saveGameAs`) and arms the
+   bootstrap. Logs `[boot] baking save '<name>' ...`. Covers either ordering of
+   host-load vs join-connect.
+2. **Host announce** - once the baked folder quiesces, `driveSaveSync` sends a
+   `LOAD_GO(name, fingerprint)` instead of a blind stream (`[boot] GO->join ...`).
+3. **Join receive/load** - a join sitting at the title screen runs the connect +
+   save-receive + load pump from `titleUpdate_hook` (normally in-game only, gated
+   on `g_gameStarted`); the load path waits on `savesReady()`. Fingerprint MATCH
+   loads directly; MISSING/DIVERGED NACKs and the existing fallback-transfer path
+   streams the folder before the join loads after commit.
+4. **F2 at the menu** - `coopPanelDrive()` is now driven from both hooks, so the
+   F2 panel (role/transport/ONLINE toggle, copy/paste Steam ID) works at the main
+   menu when the GUI stack is up; the config `autoConnect` path is the guaranteed
+   pre-game fallback.
+
+No-regression guard: a connect `LOAD_GO` whose fingerprint MATCHES the save the
+join is ALREADY in-game on is skipped (`[load] GO ... MATCH - already loaded,
+skip`) - the classic "both pre-loaded the same save" flow incurs no extra reload
+and no folder stream.
+
+Validation:
+- `Test-ConnectBootstrap` oracle (`scripts/oracles/Session.ps1`): gates the host
+  bake + announce and the join actually entering the host's world (direct MATCH
+  load or post-transfer load); reports MISSING/DIVERGED and the fallback edge as
+  findings.
+- Manual: `scripts/manual_session.ps1 -Save <s> -JoinFromMenu` launches the join
+  with no save (stays at the menu) and the host in `<s>`; confirm the join is
+  pulled into the world from the menu. On one machine both installs share the
+  save folder (fingerprint MATCH -> load from disk); the folder-transfer half
+  only engages when the join genuinely lacks the save (a real second machine).
+
 ## Known limitations (honest edges)
 
+- Terrain resource-node **depletion** (remaining ore/stone) is not replicated - each
+  client simulates its own node, so yields can drift on a long shared mine (mining
+  animation, the ore in the mine's storage, and stats DO sync; see the 2026-07-14
+  mining addendum). Host-owned machines are host-authoritative via `PKT_PROD`.
 - Both clients still share one GPU/CPU in local runs; genuinely asymmetric
   machine performance is only exercised by the real remote session.
 - The WAN proxy models delay/jitter/loss (+ reorder via jitter), not bandwidth

@@ -110,6 +110,25 @@ channel:
   body down regardless of whether the next unreliable batch frame was dropped, so
   a death survives 30% packet loss. Validated via `death_order` under induced
   loss + latency.
+- **The latch must survive a hand RE-KEY (2026-07-15).** The latch lives on the
+  per-hand `Driven` record, and a dying body frequently RE-CONTAINERS (host
+  un-squads a corpse / squad-tab move → `EVT_SQUAD_MOVE`). `rekeyPeerBody` erases
+  the old key's record, so it now snapshots `deathLatched`/`koLatched`/
+  `downApplied` and OR-merges them onto the new key (pure `rekeyCarryLatch` in
+  `core/DeathLatch.h`, `[event] REKEY-LATCH` log). Without this a corpse that
+  re-containers loses its pin and the join's local AI stands it back up — the
+  "dead on one game, alive on the other" desync (bone-dog fight, serial
+  3332275456). A container change breaking identity is the #1 desync lesson
+  (below); the death latch was a casualty of it.
+- **Owner-authoritative local-death veto (2026-07-15).** The `hitByMelee` damage
+  guard blocks new melee wounds on a driven copy, but a non-melee/bleed path in
+  an unguarded window can still flip local `medical.dead` with no owner event to
+  reconcile it. `driveTargets` now vetoes it: a driven body the owner reports
+  ALIVE (`!(bodyState & BODY_DEAD) && !deathLatched`) that went `isDead()` locally
+  is un-killed via `engine::vetoLocalDeath` (`[death] veto` log, gated behind
+  `dmgGuard_`). Death only takes hold on the peer via the owner's `EVT_DEATH`.
+  Validated via `Test-DeathParity` (`scripts/oracles/Combat.ps1`) + prototest
+  `testDeathRekey`.
 
 ### L5 — combat (melee intent + host-authoritative outcome)
 

@@ -545,3 +545,85 @@ function Test-CombatCrowd {
                 "maxOrders $maxOrders, snaps $snaps (wait $waitSnaps), tracked $tracked/$judged (worstMedian $($m.worstMedian)u)")
     return (Add-GateResult -Name "combat_crowd" -Status PASS -Metrics $m)
 }
+
+# death_parity (2026-07-15 owner-authoritative death fix): cross-checks a MANUAL
+# side-by-side session for the "dead on one game, alive on the other" desync.
+# Death is authored by a body's OWNER (reliable EVT_DEATH, ev=2) and reproduced on
+# the peer; a body can also RE-CONTAINER as it dies (squad move), which used to
+# WIPE the peer's death pin (rekeyPeerBody erased the Driven latch). Gates, from
+# both logs (bodies matched on the stable index,serial pair - the container/tab
+# fields legitimately change across a re-key):
+#   1. PARITY - every EVT_DEATH SEND on one side has a matching ev=2 RECV on the
+#      other (the death crossed). Unmatched sends = a death that never reached the
+#      peer.
+#   2. LATCH CARRY - report "[event] REKEY-LATCH ... death=1" (the fix carrying a
+#      dead body's pin onto its new hand key); informational unless a violation
+#      below fires.
+#   3. VETO SANITY - "[death] veto" un-kills a driven copy the OWNER still reports
+#      alive; it must NEVER fire for a body that side ALSO received an EVT_DEATH
+#      for (that would be un-killing an owner-authored corpse). Any such overlap
+#      FAILs.
+# Log-judged against a MANUAL fight session; invoke as:
+#   . scripts\oracles\Combat.ps1
+#   Test-DeathParity -HostFile <Kenshi>\KenshiCoop_host.log -JoinFile <Kenshi-Join>\KenshiCoop_join.log
+function Test-DeathParity {
+    param([string]$HostFile, [string]$JoinFile)
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        Write-Host "  DEATH-PARITY FAIL - log(s) not found (host=$HostFile join=$JoinFile)"
+        return (Add-GateResult -Name "death_parity" -Status FAIL -Detail "missing log")
+    }
+    # index,serial are the last two of the 5-field hand (type,container,cs,index,serial):
+    # they SURVIVE a container re-key, so they are the stable identity to match on.
+    $sendRx = [regex]'\[event\] SEND id=\d+ ev=2 hand=\d+,\d+,\d+,(\d+),(\d+)'
+    $recvRx = [regex]'\[event\] RECV id=\d+ ev=2 .*hand=\d+,\d+,\d+,(\d+),(\d+)'
+    $latchRx = [regex]'\[event\] REKEY-LATCH .*death=1'
+    $vetoRx  = [regex]'\[death\] veto hand=(\d+,\d+)'
+    $collect = {
+        param($file, $rx)
+        $set = @{}
+        foreach ($mm in (Select-String -Path $file -Pattern $rx -AllMatches).Matches) {
+            $set[$mm.Groups[1].Value + ',' + $mm.Groups[2].Value] = $true
+        }
+        return $set
+    }
+    $hSends = & $collect $HostFile $sendRx
+    $jSends = & $collect $JoinFile $sendRx
+    $hRecvs = & $collect $HostFile $recvRx
+    $jRecvs = & $collect $JoinFile $recvRx
+    $totalSends = $hSends.Count + $jSends.Count
+    if ($totalSends -lt 1) {
+        Write-Host "  DEATH-PARITY SKIP - no EVT_DEATH (ev=2) in either log; get a squad member killed so a death is authored"
+        return (Add-GateResult -Name "death_parity" -Status SKIP -Detail "no deaths in session")
+    }
+    # 1. Parity: host sends must be received on the join; join sends on the host.
+    $unmatched = @()
+    foreach ($k in $hSends.Keys) { if (-not $jRecvs.ContainsKey($k)) { $unmatched += "host->join $k" } }
+    foreach ($k in $jSends.Keys) { if (-not $hRecvs.ContainsKey($k)) { $unmatched += "join->host $k" } }
+    # 2. Latch carry (informational count).
+    $latch = @(Select-String -Path $HostFile -Pattern $latchRx -ErrorAction SilentlyContinue).Count +
+             @(Select-String -Path $JoinFile -Pattern $latchRx -ErrorAction SilentlyContinue).Count
+    # 3. Veto sanity: a veto on a body that side ALSO got an owner death for = bug.
+    $vetoBad = @()
+    $vetoTotal = 0
+    foreach ($pair in @(@{ f = $HostFile; dead = $hRecvs }, @{ f = $JoinFile; dead = $jRecvs })) {
+        foreach ($vm in (Select-String -Path $pair.f -Pattern $vetoRx -AllMatches).Matches) {
+            $vetoTotal++
+            $is = $vm.Groups[1].Value
+            if ($pair.dead.ContainsKey($is)) { $vetoBad += "$is (owner-dead)" }
+        }
+    }
+    $m = @{ hostSends = $hSends.Count; joinSends = $jSends.Count
+            hostRecvs = $hRecvs.Count; joinRecvs = $jRecvs.Count
+            unmatched = $unmatched.Count; rekeyLatch = $latch
+            vetoes = $vetoTotal; vetoViolations = $vetoBad.Count }
+    $bad = @()
+    if ($unmatched.Count -gt 0) { $bad += "$($unmatched.Count) death(s) never reached the peer: " + ($unmatched -join ', ') }
+    if ($vetoBad.Count -gt 0)   { $bad += "$($vetoBad.Count) veto(es) fired on an owner-dead body: " + ($vetoBad -join ', ') }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  DEATH-PARITY FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "death_parity" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  DEATH-PARITY PASS - deaths host->join $($hSends.Count) join->host $($jSends.Count), all received; " +
+                "rekey-latch carries=$latch, vetoes=$vetoTotal (0 on owner-dead bodies)")
+    return (Add-GateResult -Name "death_parity" -Status PASS -Metrics $m)
+}

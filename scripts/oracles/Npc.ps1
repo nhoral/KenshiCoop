@@ -394,6 +394,128 @@ function Test-CraftOrder {
     return (Add-GateResult -Name "craft_order" -Status $v -Metrics @{ preRatio = $preRatio; postRatio = $postRatio })
 }
 
+# mine_pose (2026-07-14 mining-sync fix): a player mining an ore node operates a
+# MINE BUILDING (task 87/221 "Operating machine") whose operate spot sits ~8-9 m
+# from the resolved building origin. The join must REPRODUCE that work pose
+# (applyTaskOrder r=2 = posed at fixture), not PARK it (r=3 = fixture rejected as
+# "far") the way the old single 6 m seat gate did - a parked miner shows no mining
+# animation on the peer. Scans a JOIN log for the pose-apply results on operate-
+# machine tasks and asserts posed dominates. Runs against a MANUAL mining session
+# log (the automated harness has no terrain resource nodes); invoke as:
+#   . scripts\oracles\Npc.ps1; Test-MinePose -JoinFile <Kenshi-Join>\KenshiCoop_join.log
+function Test-MinePose {
+    param([string]$JoinFile, [int[]]$WorkTasks = @(87, 221), [double]$MinRatio = 0.70)
+    if (-not (Test-Path $JoinFile)) {
+        Write-Host "  MINE-POSE FAIL - join log not found: $JoinFile"
+        return (Add-GateResult -Name "mine_pose" -Status FAIL -Detail "no join log")
+    }
+    $rx = [regex]'\[pose\] applyOrder .*\btask=(\d+)\b.*\br=(-?\d+)\b'
+    $posed = 0; $parked = 0; $other = 0
+    foreach ($m in (Select-String -Path $JoinFile -Pattern $rx -AllMatches).Matches) {
+        $task = [int]$m.Groups[1].Value
+        $r    = [int]$m.Groups[2].Value
+        if ($WorkTasks -notcontains $task) { continue }
+        if     ($r -eq 2) { $posed++ }
+        elseif ($r -eq 3) { $parked++ }
+        else              { $other++ }
+    }
+    $total = $posed + $parked
+    if ($total -lt 1) {
+        Write-Host "  MINE-POSE FAIL - no operate-machine pose applies (task in $($WorkTasks -join ',')) in join log; order a unit to mine an ore node first"
+        return (Add-GateResult -Name "mine_pose" -Status FAIL -Detail "no operate-machine pose applies")
+    }
+    $ratio = [Math]::Round($posed / $total, 3)
+    $ok = ($posed -ge 1 -and $ratio -ge $MinRatio)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  MINE-POSE [join] $v - operate pose posed(r=2) $posed / parked(r=3) $parked (ratio=$ratio >= $MinRatio), other=$other, tasks=$($WorkTasks -join ',')"
+    return (Add-GateResult -Name "mine_pose" -Status $v -Metrics @{ posed = $posed; parked = $parked; ratio = $ratio })
+}
+
+# mine_clear (2026-07-15 job-removal fix): removing a job on the host while the
+# character stays STATIONARY streams task=NONE continuously; the join must RELEASE
+# the held operate pose after TASK_CLEAR_MS (logs "[pose] task-clear ...") instead
+# of holding the mine order forever, and must NOT immediately re-pose the same hand
+# afterwards. Scans a JOIN log: asserts >=1 task-clear fired and (if a work-task
+# operate pose preceded it) that no r=2 operate apply for that hand appears AFTER the
+# last task-clear. Runs against a MANUAL session log where you added then removed a
+# mining job; invoke as:
+#   . scripts\oracles\Npc.ps1; Test-MineClear -JoinFile <Kenshi-Join>\KenshiCoop_join.log
+function Test-MineClear {
+    param([string]$JoinFile, [int[]]$WorkTasks = @(87, 221))
+    if (-not (Test-Path $JoinFile)) {
+        Write-Host "  MINE-CLEAR FAIL - join log not found: $JoinFile"
+        return (Add-GateResult -Name "mine_clear" -Status FAIL -Detail "no join log")
+    }
+    # Line ordinal is a monotonic proxy for time (the plugin writes in tick order),
+    # so "re-pose after clear" = an r=2 operate apply on a line INDEX past the last
+    # task-clear for the same hand. Track per-hand.
+    $clearRx = [regex]'\[pose\] task-clear hand=(\d+,\d+)\b'
+    $poseRx  = [regex]'\[pose\] applyOrder hand=(\d+,\d+) task=(\d+)\b.*\br=(-?\d+)\b'
+    $lastClear = @{}   # hand -> last line index a task-clear fired
+    $clears = 0
+    $rePosed = 0
+    $idx = 0
+    foreach ($line in [System.IO.File]::ReadLines((Resolve-Path $JoinFile))) {
+        $idx++
+        $cm = $clearRx.Match($line)
+        if ($cm.Success) { $clears++; $lastClear[$cm.Groups[1].Value] = $idx; continue }
+        $pm = $poseRx.Match($line)
+        if ($pm.Success) {
+            $hand = $pm.Groups[1].Value
+            $task = [int]$pm.Groups[2].Value
+            $r    = [int]$pm.Groups[3].Value
+            if ($WorkTasks -contains $task -and $r -eq 2 -and
+                $lastClear.ContainsKey($hand) -and $idx -gt $lastClear[$hand]) {
+                $rePosed++   # a work pose re-armed on this hand AFTER its clear
+            }
+        }
+    }
+    if ($clears -lt 1) {
+        Write-Host "  MINE-CLEAR FAIL - no '[pose] task-clear' in join log; on the host, add then REMOVE the mining job (leave the character standing) so the join releases the held pose"
+        return (Add-GateResult -Name "mine_clear" -Status FAIL -Detail "no task-clear")
+    }
+    $ok = ($rePosed -eq 0)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  MINE-CLEAR [join] $v - task-clear fired $clears, work re-pose after clear $rePosed (want 0)"
+    return (Add-GateResult -Name "mine_clear" -Status $v -Metrics @{ clears = $clears; rePosed = $rePosed })
+}
+
+# jail_hold (2026-07-15 jail-oscillation fix): a host-owned squad member arrested
+# and caged is DRIVEN on the join. Before the fix the join re-seated it into the
+# cage every FURN_HEAL_MS while its (un-suspended) local AI broke it out and fought
+# the guards - a sustained "[furn] HEAL ENTER ... kind=2" loop for the same occupant
+# (the "teleported in and out of jail" bug). The fix AI-suspends a caged driven body
+# so, after the first re-seat, it STAYS put and the heal loop stops. Scans a JOIN log:
+# groups cage (kind=2) HEAL ENTERs by occupant and asserts no single occupant re-enters
+# more than MaxEnters times (no sustained oscillation). Log-judged against a MANUAL jail
+# session; invoke as:
+#   . scripts\oracles\Npc.ps1; Test-JailHold -JoinFile <Kenshi-Join>\KenshiCoop_join.log
+function Test-JailHold {
+    param([string]$JoinFile, [int]$MaxEnters = 3)
+    if (-not (Test-Path $JoinFile)) {
+        Write-Host "  JAIL-HOLD FAIL - join log not found: $JoinFile"
+        return (Add-GateResult -Name "jail_hold" -Status FAIL -Detail "no join log")
+    }
+    # kind=2 = cage/prison. Count HEAL ENTER per occupant; a fixed body enters once
+    # (or a couple times as it settles), an oscillating one re-enters indefinitely.
+    $rx = [regex]'\[furn\] HEAL ENTER occ=(\d+,\d+) kind=2\b'
+    $enters = @{}
+    foreach ($m in (Select-String -Path $JoinFile -Pattern $rx -AllMatches).Matches) {
+        $occ = $m.Groups[1].Value
+        if ($enters.ContainsKey($occ)) { $enters[$occ]++ } else { $enters[$occ] = 1 }
+    }
+    if ($enters.Count -lt 1) {
+        Write-Host "  JAIL-HOLD FAIL - no cage HEAL ENTER (kind=2) in join log; on the host, get a squad member arrested/jailed so the join drives it into the cage"
+        return (Add-GateResult -Name "jail_hold" -Status FAIL -Detail "no cage occupancy")
+    }
+    $worst = ($enters.Values | Measure-Object -Maximum).Maximum
+    $worstOcc = ($enters.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1).Key
+    $ok = ($worst -le $MaxEnters)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    Write-Host "  JAIL-HOLD [join] $v - worst caged occupant re-entered $worst times (occ=$worstOcc, max $MaxEnters), occupants=$($enters.Count)"
+    return (Add-GateResult -Name "jail_hold" -Status $v -Metrics @{ worstEnters = $worst; occupants = $enters.Count })
+}
+
 # down_order LIVE-transition: join subject upright BEFORE the host's
 # "SCENARIO DOWN issued" marker, down (bs & 7) AFTER it.
 function Test-DownOrder {

@@ -45,6 +45,15 @@ param(
     [switch]$Inhabit,
     [string]$HostOwn = "0",
     [string]$JoinOwn = "~0",
+    # Push-save-on-connect test: launch the JOIN with NO save so it sits at the
+    # main menu (Continue / New Game / ...). The host loads $Save and, on the
+    # join's connect, bakes + announces its live world (LOAD_GO); the join loads
+    # it straight from the menu. On a single machine both installs share the save
+    # folder, so the join fingerprint MATCHES and it loads from disk (the connect
+    # trigger + title-screen load pump); the folder-transfer half only engages
+    # when the join genuinely lacks the save (a real second machine). Implies
+    # -Inhabit ownership so each side drives a distinct squad subset.
+    [switch]$JoinFromMenu,
     [int]$Port = 27800,
     [string]$Ip = "127.0.0.1",
     [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi",
@@ -122,7 +131,7 @@ if (-not $NoJoin -and -not (Test-Path $joinExe)) { throw "Join Kenshi not found:
 
 if ($JoinSave -eq "") { $JoinSave = $Save }
 
-if ($Inhabit) {
+if ($Inhabit -or $JoinFromMenu) {
     $JoinSave  = $Save   # shared save: NPC resolve-by-hand needs identical hands
     $AutoSpawn = 0       # inhabit drives EXISTING squad members, not spawned ones
 }
@@ -131,7 +140,10 @@ if ($Inhabit) {
 # installs read named saves from the same per-user folder, so a save created in
 # either client is visible to both - no copy/sync needed.
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
-foreach ($s in @($Save, $JoinSave) | Select-Object -Unique) {
+# JoinFromMenu launches the join with no save (it sits at the menu), so only the
+# host's save must exist up front.
+$savesToCheck = if ($JoinFromMenu) { @($Save) } else { @($Save, $JoinSave) }
+foreach ($s in $savesToCheck | Select-Object -Unique) {
     if (-not (Test-Path (Join-Path $saveRoot $s))) {
         $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
         throw "Save '$s' not found in $saveRoot. Available saves: $avail"
@@ -220,6 +232,21 @@ if ($Sync -and ($Save -eq $JoinSave)) {
 function Set-CoopEnv {
     param([string]$Mode, [string]$SaveName, [int]$Spawn, [string]$Own = "")
     $env:KENSHICOOP_MODE         = $Mode
+    # Manual sessions run BOTH clients on this one machine (same Steam account), so
+    # they must use direct-UDP loopback: a same-machine Steam P2P session can't
+    # establish (active=0/err=4). Force it here rather than inheriting the deployed
+    # coop_config.json, which may be left on transport=steam + a real steamPeer from
+    # a friend session (that silently breaks the loopback connection). Env overrides
+    # the file. For a real two-machine Steam test, use the in-game F2 panel instead.
+    $env:KENSHICOOP_TRANSPORT    = "udp"
+    $env:KENSHICOOP_STEAM_PEER   = "0"
+    # Auto-connect at load using the env role/transport above. EXCEPTION: with
+    # -JoinFromMenu the JOIN must WAIT at the main menu so the user can bring up
+    # the F2 panel and go ONLINE by hand (the whole point of that mode - the join
+    # user configures the connection at the menu). The host still auto-connects
+    # (it hosts + loads its save); on the join's manual connect the host pushes
+    # its world.
+    $env:KENSHICOOP_AUTOCONNECT  = if ($Mode -eq "join" -and $JoinFromMenu) { "0" } else { "1" }
     $env:KENSHICOOP_PORT         = "$Port"
     $env:KENSHICOOP_IP           = $Ip
     $env:KENSHICOOP_SAVE         = $SaveName
@@ -254,8 +281,8 @@ function Start-PastLauncher {
 
 $joinPid = 0
 Write-Host ""
-$hostOwnEnv = if ($Inhabit) { $HostOwn } else { "" }
-$joinOwnEnv = if ($Inhabit) { $JoinOwn } else { "" }
+$hostOwnEnv = if ($Inhabit -or $JoinFromMenu) { $HostOwn } else { "" }
+$joinOwnEnv = if ($Inhabit -or $JoinFromMenu) { $JoinOwn } else { "" }
 
 Write-Host "Launching HOST (save $Save, autospawn $AutoSpawn) ..."
 Set-CoopEnv -Mode "host" -SaveName $Save -Spawn $AutoSpawn -Own $hostOwnEnv
@@ -265,8 +292,11 @@ if ($hostPid -eq 0) { throw "Host failed to get past the launcher." }
 if (-not $NoJoin) {
     Write-Host "Waiting $JoinDelaySec s before launching JOIN ..."
     Start-Sleep -Seconds $JoinDelaySec
-    Write-Host "Launching JOIN (save $JoinSave) ..."
-    Set-CoopEnv -Mode "join" -SaveName $JoinSave -Spawn 0 -Own $joinOwnEnv
+    # JoinFromMenu: empty save name -> the join stays at the main menu and the
+    # host's push-on-connect pulls it into the world.
+    $joinSaveName = if ($JoinFromMenu) { "" } else { $JoinSave }
+    Write-Host "Launching JOIN (save $(if ($JoinFromMenu) { '<main menu - no save>' } else { $JoinSave })) ..."
+    Set-CoopEnv -Mode "join" -SaveName $joinSaveName -Spawn 0 -Own $joinOwnEnv
     $joinPid = Start-PastLauncher -Exe $joinExe -WorkDir $JoinDir
     if ($joinPid -eq 0) { Write-Warning "Join failed to get past the launcher; host is up alone." }
 }
@@ -274,9 +304,16 @@ if (-not $NoJoin) {
 Write-Host ""
 Write-Host "== Session live =="
 Write-Host "  host PID=$hostPid  join PID=$joinPid"
-Write-Host "  The host spawns $AutoSpawn squad members a few seconds after gameplay starts."
-Write-Host "  Select them on the HOST and move them around; watch the JOIN render and"
-Write-Host "  follow them. Close both windows when you're done (no auto-exit)."
+if ($JoinFromMenu) {
+    Write-Host "  JOIN is waiting at the MAIN MENU (no save, autoconnect OFF)."
+    Write-Host "  On the JOIN window: press F2 -> set Connection to ONLINE (role JOIN, UDP is"
+    Write-Host "  preset for loopback). The host then pushes its world and the join loads in"
+    Write-Host "  straight from the menu - no save needed on the join. Close windows when done."
+} else {
+    Write-Host "  The host spawns $AutoSpawn squad members a few seconds after gameplay starts."
+    Write-Host "  Select them on the HOST and move them around; watch the JOIN render and"
+    Write-Host "  follow them. Close both windows when you're done (no auto-exit)."
+}
 
 if ($doTile -and $hostPid -ne 0) {
     # Same mechanism the automated tests use (scripts\arrange_windows.ps1): place the
@@ -304,7 +341,7 @@ if ($doTile -and $hostPid -ne 0) {
 # line never appears, the installs are running a stale DLL (the deploy-skip trap)
 # and any validation would be meaningless. Surface it loudly instead of silently
 # validating the wrong build.
-if ($Inhabit) {
+if ($Inhabit -or $JoinFromMenu) {
     $hostLog = Join-Path $HostDir "KenshiCoop_host.log"
     Write-Host ""
     Write-Host "Confirming the deployed build is the inhabit build (watching host log) ..."

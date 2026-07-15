@@ -25,6 +25,9 @@
 #include "../netproto/ContentHash.h"
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
+#include "../plugin/core/SteamId.h"
+#include "../plugin/core/WorkPose.h"
+#include "../plugin/core/DeathLatch.h"
 
 #include <set>
 
@@ -705,6 +708,148 @@ static void testOwnRanks() {
     }
 }
 
+// ---- 7. SteamID64 parse (SteamId.h) ---------------------------------------------
+// Guards the F2 panel "Paste friend's Steam ID" button: clipboard text is noisy
+// (surrounding whitespace, a trailing newline, or a "Steam ID: 7656..." wrapper),
+// so parseSteamId64 keeps only digits and requires a 17-digit community ID
+// (76561... prefix). Arbitrary clipboard junk must be rejected.
+
+static void testSteamIdParse() {
+    std::printf("== SteamID64 parse (SteamId.h) ==\n");
+    unsigned long long id = 0;
+
+    id = 0;
+    CHECK("clean 17-digit id accepted",
+          coop::parseSteamId64("76561198000000000", id) && id == 76561198000000000ull);
+    id = 0;
+    CHECK("surrounding whitespace/newline stripped",
+          coop::parseSteamId64("  76561198012345678 \r\n", id) && id == 76561198012345678ull);
+    id = 0;
+    CHECK("wrapper text 'Steam ID: <n>' stripped",
+          coop::parseSteamId64("Steam ID: 76561198012345678", id) && id == 76561198012345678ull);
+
+    // Rejections leave the caller's value untouched.
+    id = 123ull;
+    CHECK("empty string rejected",        !coop::parseSteamId64("", id) && id == 123ull);
+    CHECK("non-numeric rejected",         !coop::parseSteamId64("not-an-id", id) && id == 123ull);
+    CHECK("too short (16 digits) rejected",
+          !coop::parseSteamId64("7656119800000000", id) && id == 123ull);
+    CHECK("too long (18 digits) rejected",
+          !coop::parseSteamId64("765611980000000000", id) && id == 123ull);
+    CHECK("17 digits, wrong prefix rejected",
+          !coop::parseSteamId64("12345678901234567", id) && id == 123ull);
+}
+
+// ---- 8. Pose-fixture acceptance (WorkPose.h) ------------------------------------
+// Guards the mining-sync fix (2026-07-14): a player mining an ore node operates a
+// mine building. A single 6 m seat gate rejected the CORRECT mine as "far"
+// (applyTaskOrder -> park, no mining animation on the peer). Field distances varied
+// wildly (one mine ~8.9 m from origin, a larger one 57 m host / 104 m join), so no
+// fixed radius covers both. Work fixtures are unique buildings with reliable
+// cross-client hands, so they are TRUSTED (ungated); only seats are distance-gated
+// (they mis-resolve to a wrong nearby prop).
+
+static void testWorkPoseMatch() {
+    std::printf("== pose-fixture acceptance (WorkPose.h) ==\n");
+
+    // Gate applies to seats, never to work fixtures.
+    CHECK("seat radius 6 m",            SEAT_MATCH_DIST == 6.0f);
+    CHECK("seat is distance-gated",     poseIsDistanceGated(false));
+    CHECK("work is NOT distance-gated", !poseIsDistanceGated(true));
+
+    // THE FIX: work fixtures are accepted at ANY resolved distance (the mine origin
+    // can sit 8.9 m, 57 m or 104 m from the operate spot), while a seat at those
+    // distances is rejected as a mis-resolved wrong prop.
+    CHECK("mining 8.9 m accepted as work",  poseFixtureAccepted(true,  8.9f));
+    CHECK("mining 57 m accepted as work",   poseFixtureAccepted(true,  57.0f));
+    CHECK("mining 104 m accepted as work",  poseFixtureAccepted(true,  104.0f));
+    CHECK("mining 8.9 m rejected as seat", !poseFixtureAccepted(false, 8.9f));
+
+    // Seat still tight: a fixture right under the body is accepted, a far stool not.
+    CHECK("seat 3 m accepted",   poseFixtureAccepted(false, 3.0f));
+    CHECK("seat 6 m boundary",   poseFixtureAccepted(false, 6.0f));
+    CHECK("seat 6.1 m rejected", !poseFixtureAccepted(false, 6.1f));
+
+    // Squared-distance form (the engine gate) agrees with the metres form.
+    CHECK("sq: work 104 m accepted",   poseFixtureAcceptedSq(true,  104.0f * 104.0f));
+    CHECK("sq: seat 3 m accepted",     poseFixtureAcceptedSq(false, 3.0f * 3.0f));
+    CHECK("sq: seat 6 m boundary",     poseFixtureAcceptedSq(false, 6.0f * 6.0f));
+    CHECK("sq: seat 6.1 m rejected",  !poseFixtureAcceptedSq(false, 6.1f * 6.1f));
+}
+
+// ---- 9. Debounced task-clear (WorkPose.h poseClearElapsed) ----------------------
+// Guards the job-removal fix (2026-07-14): removing a job on the host while the
+// character stays STATIONARY streams task=NONE continuously (the movement re-arm
+// never fires), so the join must release the held mine/operate pose after a
+// sustained-NONE window instead of holding it forever. Transient NONE blips (1-2
+// capture frames) must NOT clear a committed pose, so the release is DEBOUNCED.
+// clearMs mirrors TASK_CLEAR_MS in ReplicatorUtil.h (game-coupled, so not included
+// here); keep the literal in sync with that constant.
+static void testTaskClear() {
+    std::printf("== debounced task-clear (WorkPose.h) ==\n");
+    const unsigned long clearMs = 1200; // mirror of TASK_CLEAR_MS
+
+    // No streak in progress (noneTick == 0) never clears, regardless of 'now'.
+    CHECK("no streak never clears",       !poseClearElapsed(0,     999999, clearMs));
+
+    // A transient blip below the window holds (anti-oscillation guarantee).
+    CHECK("blip 0 ms holds",              !poseClearElapsed(10000, 10000,  clearMs));
+    CHECK("blip 1199 ms holds",           !poseClearElapsed(10000, 11199,  clearMs));
+
+    // Sustained NONE at/after the window releases (genuine stationary un-assign).
+    CHECK("streak 1200 ms clears",         poseClearElapsed(10000, 11200,  clearMs));
+    CHECK("streak 5 s clears",             poseClearElapsed(10000, 15000,  clearMs));
+
+    // Unsigned tick wrap (GetTickCount rollover): now - noneTick still yields the
+    // elapsed delta, so a streak spanning the wrap boundary still clears on time.
+    // 'now' values are written pre-wrapped (as GetTickCount would report post-rollover)
+    // so the arithmetic under test is the real subtraction, not a constant overflow.
+    const unsigned long nearMax   = 0xFFFFFFFFul - 100; // streak started 100 ms before wrap
+    const unsigned long stillPre  = nearMax + 50;       // 50 ms later, before wrap (no overflow)
+    const unsigned long postWrap  = 1199UL;             // (nearMax + 1300) mod 2^32: 1300 ms later
+    CHECK("wrap: 50 ms elapsed holds",    !poseClearElapsed(nearMax, stillPre, clearMs));
+    CHECK("wrap: 1300 ms elapsed clears",  poseClearElapsed(nearMax, postWrap, clearMs));
+}
+
+// ---- 10. Death/KO latch carry across re-key (DeathLatch.h rekeyCarryLatch) ------
+// Guards the death-consistency fix (2026-07-15): a dead/KO'd body that RE-KEYS
+// (owner re-containers it - squad move / recruit) must keep its down/death pin,
+// or the peer stands the corpse back up under the new hand ("dead on one game,
+// alive on the other"). rekeyPeerBody snapshots the OLD key's latch and OR-merges
+// it onto the new key; this locks that merge (monotone: never loses a pin, never
+// clears a latch already present on the new key).
+static void testDeathRekey() {
+    std::printf("== death/KO latch carry on re-key (DeathLatch.h) ==\n");
+
+    // Dead old key, fresh new key -> death carries.
+    LatchState r1 = rekeyCarryLatch(LatchState(true, true, true), LatchState());
+    CHECK("dead old -> new death latched",  r1.death);
+    CHECK("dead old -> new ko latched",      r1.ko);
+    CHECK("dead old -> new down carried",    r1.down);
+
+    // KO-only old key -> ko carries, death stays clear.
+    LatchState r2 = rekeyCarryLatch(LatchState(false, true, true), LatchState());
+    CHECK("ko old -> new ko latched",        r2.ko);
+    CHECK("ko old -> new death still clear", !r2.death);
+
+    // Alive old key, alive new key -> nothing invented.
+    LatchState r3 = rekeyCarryLatch(LatchState(), LatchState());
+    CHECK("alive+alive -> no death",         !r3.death);
+    CHECK("alive+alive -> no ko",            !r3.ko);
+
+    // New key already has a fresh EVT_DEATH (beat the re-key edge): OR-merge must
+    // PRESERVE it even though the old key was alive.
+    LatchState r4 = rekeyCarryLatch(LatchState(), LatchState(true, true, false));
+    CHECK("alive old + dead new -> death kept", r4.death);
+    CHECK("alive old + dead new -> ko kept",    r4.ko);
+
+    // Monotone: merging can only ADD pins, never remove one present on either key.
+    LatchState r5 = rekeyCarryLatch(LatchState(true, false, false),
+                                    LatchState(false, true, false));
+    CHECK("merge keeps old death", r5.death);
+    CHECK("merge keeps new ko",    r5.ko);
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -716,6 +861,10 @@ int main() {
     testContentHash();
     testInterp();
     testOwnRanks();
+    testSteamIdParse();
+    testWorkPoseMatch();
+    testTaskClear();
+    testDeathRekey();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

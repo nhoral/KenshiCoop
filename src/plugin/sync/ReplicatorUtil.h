@@ -29,6 +29,8 @@
 
 #include "Replicator.h"
 #include "../game/Engine.h"
+#include "../core/WorkPose.h" // poseClearElapsed (debounced task-clear predicate)
+#include "../core/DeathLatch.h" // rekeyCarryLatch (down/death latch carry on re-key)
 #include "../CoopLog.h"
 
 #include <windows.h> // GetTickCount
@@ -86,6 +88,14 @@ const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose
 const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
 const unsigned long TASK_RETRY_MS = 1500;  // throttle between pose apply attempts
+// Debounced task-clear: the host intermittently reads currentAction==NONE for an
+// otherwise-posed NPC (transition frames), so a single NONE frame must NOT tear
+// down a committed sit/operate pose. But a genuine job removal (host un-assigns and
+// the body stays STATIONARY, so the movement re-arm never fires) streams NONE
+// continuously - after this window we release the held pose so the join stops
+// reproducing the order. Above transient blips (1-2 frames at 20 Hz), below the
+// player-perceptible "why is it still mining" threshold.
+const unsigned long TASK_CLEAR_MS = 1200;
 // A far-fixture apply (r=3) is RETRIED, not latched bad: a snap-into-fixture on
 // the owner (bed entry teleports the body ~9 u instantly) streams the task while
 // the join's interp target is still mid-glide, so the first distance gate fails

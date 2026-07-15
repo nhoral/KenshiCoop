@@ -12,6 +12,7 @@
 // the API consumed by the PowerShell oracles (see resources/CODE_MAP.md).
 
 #include "EngineInternal.h"
+#include "../core/WorkPose.h" // SEAT_MATCH_DIST / WORK_MATCH_DIST / poseMatchDist
 
 namespace coop {
 namespace engine {
@@ -1178,10 +1179,25 @@ bool readPoseState(Character* c, float* pelvis, int* idle, int* crouched, int* t
     return any;
 }
 
-// Max horizontal gap (m) between the host's streamed transform and a resolved seat
-// fixture for that seat to be accepted as the correct one. A correct seat is right
-// under the NPC (<~4 m); a mis-resolved cross-client seat is tens of metres away.
-static const float SEAT_MATCH_DIST = 6.0f;
+// The fixture-acceptance policy (SEAT_MATCH_DIST / poseFixtureAcceptedSq) lives in
+// core/WorkPose.h so the no-game prototest layer can lock it. See that header: seats
+// are distance-gated (they mis-resolve to a wrong prop), work fixtures are trusted
+// by their reliable cross-client hand (a large mine's origin can sit 50-100 m from
+// its operate spot, so distance-gating wrongly rejects a correct mine).
+
+// True if a reproduced task pins the body at a WORK fixture (mine/machine/dummy) -
+// these are trusted by identity, not distance-gated (see core/WorkPose.h).
+static bool isWorkFixtureTask(int task) {
+    switch (task) {
+        case OPERATE_MACHINERY:
+        case OPERATE_AUTOMATIC_MACHINERY:
+        case USE_TRAINING_DUMMY:
+        case PRETEND_TO_OPERATE_MACHINERY:
+            return true;
+        default:
+            return false;
+    }
+}
 
 int applyTask(Character* c, const EntityState& e) {
     if (e.task == TASK_NONE) return 0;
@@ -1211,7 +1227,9 @@ int applyTask(Character* c, const EntityState& e) {
         {
             Ogre::Vector3 sp = target->getPosition(); // virtual: safe direct call
             float dx = sp.x - e.x, dz = sp.z - e.z;
-            if ((dx * dx + dz * dz) > (SEAT_MATCH_DIST * SEAT_MATCH_DIST))
+            // Seats: reject a far (mis-resolved) prop. Work fixtures: trusted by
+            // identity - a large mine's origin sits far from its operate spot.
+            if (!coop::poseFixtureAcceptedSq(isWorkFixtureTask((int)e.task), dx * dx + dz * dz))
                 return 3; // fixture resolved but it's the WRONG (far) one -> park
         }
         // Clear any local intent first, then issue a PERSISTENT AI goal to perform
@@ -1280,7 +1298,9 @@ int applyTaskOrder(Character* c, const EntityState& e) {
         Ogre::Vector3 loc = target->getPosition(); // virtual: safe direct call
         {
             float dx = loc.x - e.x, dz = loc.z - e.z;
-            if ((dx * dx + dz * dz) > (SEAT_MATCH_DIST * SEAT_MATCH_DIST))
+            // Seats: reject a far (mis-resolved) prop. Work fixtures: trusted by
+            // identity - a large mine's origin sits far from its operate spot.
+            if (!coop::poseFixtureAcceptedSq(isWorkFixtureTask((int)e.task), dx * dx + dz * dz))
                 return 3; // resolved the WRONG (far) fixture -> caller parks in place
         }
         if (g_clearGoalsFn) g_clearGoalsFn(c);
@@ -1737,6 +1757,24 @@ bool reviveSubject(GameWorld* gw, const unsigned int subjHand[5]) {
     if (!knockDown(s, false)) return false;
     __try {
         MedicalSystem* med = &s->medical;
+        med->unconcious = false;
+        if (med->blood < 80.0f) med->blood = 80.0f; // healthy floor (raise only)
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool vetoLocalDeath(Character* c) {
+    if (!c) return false;
+    // Only act on a body the local sim has actually killed - the caller gates
+    // on the OWNER stream reporting alive, so this un-does a purely-local death.
+    if (!(g_isDeadCharFn && g_isDeadCharFn(c))) return false;
+    // Release the forced KO + ragdoll first (own SEH), same lever as revive.
+    knockDown(c, false);
+    __try {
+        MedicalSystem* med = &c->medical;
+        med->dead       = false; // Character::isDead() reads this -> clears BODY_DEAD
         med->unconcious = false;
         if (med->blood < 80.0f) med->blood = 80.0f; // healthy floor (raise only)
         return true;

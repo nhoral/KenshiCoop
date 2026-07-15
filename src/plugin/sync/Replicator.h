@@ -596,6 +596,11 @@ private:
         bool         taskBad;        // task not reproducible here (fixture missing/drift)
         unsigned long taskTick;      // when the task was issued (drift grace timer)
         unsigned int taskRetries;    // far-fixture (r=3) attempts (interp-lag retry)
+        unsigned long taskNoneTick;  // first tick of the current sustained host->NONE
+                                     //   streak (0 = not in one); after TASK_CLEAR_MS
+                                     //   of continuous NONE the held pose is released
+                                     //   (debounced job-removal detector - mirrors
+                                     //   carryNoSeeTick/furnNoSeeTick)
         bool         detached;       // I9: detached from town-AI (separateIntoMyOwnSquad) once
         bool         downApplied;     // Stage 2: body is currently held in ragdoll (host says down)
         bool         koLatched;       // a reliable EVT_KNOCKOUT pinned this body down
@@ -660,7 +665,7 @@ private:
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), lastSeenMs(0),
                    issuedTask(TASK_NONE), taskApplied(false), taskBad(false),
-                   taskTick(0), taskRetries(0), detached(false), downApplied(false),
+                   taskTick(0), taskRetries(0), taskNoneTick(0), detached(false), downApplied(false),
                    koLatched(false), deathLatched(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),

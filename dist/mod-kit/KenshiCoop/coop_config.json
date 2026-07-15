@@ -1,0 +1,14 @@
+﻿{
+  // KenshiCoop config. For a normal Steam game you do NOT need to edit this file:
+  // your friend's Steam ID is entered in-game (press F2, click "Copy my Steam ID"
+  // to share yours, then "Paste friend's Steam ID" to enter theirs), and nothing
+  // is written back to disk.
+  //
+  // This file only matters for a LAN / direct-UDP game: set "transport": "udp"
+  // and put the host's address in "ip" (and "port" if you changed it). ip/port are
+  // re-read each time you click Connect, so you can edit them without restarting.
+  "transport": "steam",
+  "ip": "127.0.0.1",
+  "port": 27800,
+  "autoConnect": false
+}

@@ -167,6 +167,23 @@ void Replicator::applyTargets(GameWorld* gw) {
         // mutate the local-only medical model; outcomes arrive as host events).
         if (dmgGuard_) engine::addDamageGuard(c);
 
+        // Owner-authoritative death veto (2026-07-15). The damage guard blocks
+        // NEW melee wounds, but a lethal frame in an unguarded window (stream
+        // stall past the starve-hold, above) or a non-melee source can still
+        // flip this copy's local medical.dead - and the medical model is
+        // local-only, so nothing reconciles it while the OWNER still reports the
+        // body alive (no BODY_DEAD in the stream, no latched EVT_DEATH). That is
+        // the "dead on one game, alive on the other" desync. Un-kill it: death
+        // may only take hold on the peer via the owner's reliable EVT_DEATH.
+        if (dmgGuard_ && !(out.bodyState & BODY_DEAD) && !d.deathLatched &&
+            (engine::readBodyState(c) & BODY_DEAD)) {
+            if (engine::vetoLocalDeath(c)) {
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[death] veto hand=%u,%u", out.hIndex, out.hSerial);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
         float ax, ay, az;
         bool haveActual = engine::readPos(c, &ax, &ay, &az);
         bool hostMoving = (out.cMoving != 0) || (out.cSpeed > MOVE_EPS);
@@ -241,15 +258,34 @@ void Replicator::applyTargets(GameWorld* gw) {
             int localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
             if (streamKind != 0) {
                 d.furnNoSeeTick = 0;
+                // A jailed/bedded DRIVEN body must not run its own decision layer.
+                // A CONSCIOUS caged squad member (an arrested player) otherwise
+                // "releases from jail", fights the guards and walks out of the cage
+                // while the self-heal re-seats it every FURN_HEAL_MS - the "teleported
+                // in and out of jail" oscillation (2026-07-15). Squad members are
+                // normally never AI-suspended (the !isSquad gate on the locomotion
+                // path below), but a body the host is holding IN furniture is the
+                // exception: suspend its decisions so it stays put. The suspend set is
+                // rebuilt every drive tick, so this self-clears the moment the host
+                // stops streaming the furniture bit (body released) and its AI resumes.
+                if (aiSuspend_) engine::addAiSuspend(c);
                 if (haveFr && localKind != streamKind &&
                     (now - d.furnHealTick) >= FURN_HEAL_MS) {
                     d.furnHealTick = now;
                     bool ok = engine::enterFurnitureNearPos(
                         gw, c, streamKind, out.x, out.y, out.z, FURN_MATCH_DIST);
+                    // Drop the in-progress escape/attack action so the body doesn't
+                    // finish breaking out before the suspend takes hold. endAction is
+                    // SEH-guarded (same call the rest-park path uses).
+                    engine::endAction(c);
                     char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[furn] HEAL ENTER occ=%u,%u kind=%d ok=%d",
                         out.hIndex, out.hSerial, streamKind, ok ? 1 : 0);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    { char q[160]; _snprintf(q, sizeof(q) - 1,
+                        "[furn] cage-quiet occ=%u,%u kind=%d",
+                        out.hIndex, out.hSerial, streamKind);
+                      q[sizeof(q) - 1] = '\0'; coop::logLine(q); }
                 }
                 d.parked = false; d.haveDest = false;
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
@@ -308,6 +344,12 @@ void Replicator::applyTargets(GameWorld* gw) {
                 d.furnNoSeeTick = 0;
             }
         }
+        // A latched EVT_DEATH/EVT_KNOCKOUT forces the down treatment every tick,
+        // which is what keeps a corpse pinned. That latch lives on this Driven
+        // record, so it MUST survive a hand re-key - rekeyPeerBody carries
+        // deathLatched/koLatched from the old key onto the new one (2026-07-15);
+        // without that carry a dead body that re-containers would fall through
+        // to the drive path below and the local AI would stand it back up.
         if (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched) {
             unsigned short localBs = engine::readBodyState(c);
             if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
@@ -833,6 +875,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
             d.taskApplied = false; d.taskBad = false; d.issuedTask = TASK_NONE;
+            d.taskNoneTick = 0;     // movement already released the task; clear the streak
             d.goalsCleared = false; // next rest episode gets one fresh goal-clear
         }
 
@@ -1182,6 +1225,28 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
             (unsigned)out.task); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
         d.taskApplied = false; d.taskBad = false; d.taskRetries = 0;
         d.issuedTask = out.task;
+    }
+    // Debounced task-clear (job removal). The re-arm above deliberately IGNORES
+    // host->NONE frames so a transient capture blip can't tear down a committed sit/
+    // operate pose. But a genuine un-assign where the body stays STATIONARY (the
+    // movement re-arm in applyTargets never fires) streams NONE continuously - hold
+    // through blips, but after TASK_CLEAR_MS of sustained NONE release the held pose
+    // so the peer stops reproducing the order (falls through to clearGoals+endAction+
+    // park below). Carry is synthetic (owned by the carry self-heal) - never clear on
+    // it. Mirrors carryNoSeeTick/furnNoSeeTick.
+    if (!syntheticCarry && out.task == TASK_NONE &&
+        (d.taskApplied || d.issuedTask != TASK_NONE)) {
+        if (d.taskNoneTick == 0) {
+            d.taskNoneTick = now; // streak starts; hold this frame
+        } else if (coop::poseClearElapsed(d.taskNoneTick, now, TASK_CLEAR_MS)) {
+            { char b[112]; _snprintf(b, sizeof(b) - 1,
+                "[pose] task-clear hand=%u,%u was=%u", out.hIndex, out.hSerial,
+                (unsigned)d.issuedTask); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            d.taskApplied = false; d.taskBad = false; d.taskRetries = 0;
+            d.issuedTask = TASK_NONE; d.taskNoneTick = 0;
+        }
+    } else {
+        d.taskNoneTick = 0; // any real task (incl. a genuine re-arm) cancels the streak
     }
     // Commit a reproducible pose (sit/operate) at the SAME fixture, once.
     // Attempts are throttled (TASK_RETRY_MS) so a retried far-fixture apply
