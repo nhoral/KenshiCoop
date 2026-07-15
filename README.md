@@ -70,18 +70,25 @@ Kenshi and enable **KenshiCoop** in the Mods menu.
 
 ### 2. Connect in-game (press F2)
 
-1. **Both players load the exact same save** (co-op resolves units by identity,
-   so the two games must start from an identical save).
-2. Press **F2** to open the Co-op panel.
-3. **Swap Steam IDs.** Each player clicks **"Copy my Steam ID"** and sends it to
+The Co-op panel works at the **main menu** (before you load a game) as well as
+in-game, so the joining player doesn't need to load anything first.
+
+1. Press **F2** to open the Co-op panel.
+2. **Swap Steam IDs.** Each player clicks **"Copy my Steam ID"** and sends it to
    the other (Steam chat, Discord, ...). When you receive your friend's ID, copy
    it, then click **"Paste friend's Steam ID"** - the panel shows the ID it
    captured. This is per-session (nothing is written to disk), so re-paste it if
    you relaunch Kenshi.
-4. One player sets **Role: HOST**, the other **Role: JOIN** (click to toggle).
-5. Leave **Transport** on **STEAM**.
-6. Toggle **Connection** to **ONLINE**. The white status line shows live state
-   (and a banner over your leader shows it too). Toggle to **OFFLINE** to leave.
+3. Leave **Transport** on **STEAM**.
+4. **Host:** load the save you want to play (or start a new game), set
+   **Role: HOST**, and toggle **Connection** to **ONLINE**.
+5. **Join:** straight from the **main menu** - no save needed - set
+   **Role: JOIN** and toggle **Connection** to **ONLINE**. The host streams its
+   world to you on connect and you load right into it. (If you already have an
+   identical copy of the host's save on disk, it's used as-is instead of
+   transferring.)
+6. The white status line shows live state (and a banner over your leader shows
+   it too, in-game). Toggle **Connection** to **OFFLINE** to leave.
 
 **LAN / direct-UDP (advanced):** skip the Steam ID swap. Open
 `<Kenshi>\mods\KenshiCoop\coop_config.json`, set `"transport": "udp"`, and put
@@ -95,11 +102,14 @@ is needed after an edit.
   runs squad 1 and the joining player squad 2. Your friend's squad is visible
   and synced on your screen, but answers only to them. If your save has only
   one squad, move some units into a second squad tab in-game to give them a crew.
-- **Both players must load the exact same save.** Pick a save you both have, or
-  copy the identical save folder to both machines first.
+- **The joining player doesn't need the host's save.** The host picks the save
+  (or starts a new game); when the join connects from the menu, the host's world
+  is streamed over automatically. Already having an identical copy on disk just
+  skips the transfer.
 - **Saving just works.** Any save either player makes during a session becomes
   one shared save on both machines, streamed to the other side automatically.
-  To resume next time, both load that save and connect again.
+  To resume next time, the host loads that save and goes online, and the join
+  can reconnect straight from the main menu again.
 
 ### If something goes wrong
 
