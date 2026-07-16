@@ -158,6 +158,9 @@ function Invoke-OneOracle {
         "speed_sync"    { return (Test-SpeedSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "speed_probe"   { return (Test-SpeedProbe      -HostFile $HostLog) }
         "combat_crowd"  { return (Test-CombatCrowd     -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
+        "combat_battle" { return (Test-CombatBattle    -HostFile $HostLog -JoinFile $JoinLog) }
+        "combat_win"    { return (Test-CombatWin       -HostFile $HostLog -JoinFile $JoinLog) }
+        "combat_snap_rate" { return (Test-CombatSnapRate -JoinFile $JoinLog) }
         "split_interest" { return (Test-SplitInterest  -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "inv_sync"      { return (Test-InventorySync   -HostFile $HostLog -JoinFile $JoinLog) }
         "inv_bidir"     { return (Test-InventoryBidir  -HostFile $HostLog -JoinFile $JoinLog) }
@@ -346,6 +349,7 @@ Export-ModuleMember -Function @(
     "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose",
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",
     "Test-CombatProbe", "Test-CombatOrder", "Test-CombatKill", "Test-DamageGuard",
+    "Test-CombatSnapRate", "Test-CombatBattle", "Test-CombatWin", "Test-DeathParity",
     "Get-VitalsSeries", "Test-PlayerCombat", "Test-AssaultTown", "Test-PlayerKo", "Test-MedicOrder",
     "Test-MedicPose", "Test-LimbLoss", "Test-NpcVitals",
     "Get-StatsSeries", "Test-StatsSync",

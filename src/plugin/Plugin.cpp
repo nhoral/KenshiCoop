@@ -818,6 +818,17 @@ void mainLoop_hook(GameWorld* gw, float dt) {
                        : "SETUP(bedcage): spawn FAILED");
             if (ok && !g_cfg.bakeSave.empty())
                 g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
+        } else if (g_cfg.setupScene == "buffpc") {
+            // Stat buff BAKE (single client): raise EVERY player-squad PC to 120 in
+            // all stats, then leave the game running so the user can SAVE manually
+            // (or auto-bake if KENSHICOOP_BAKESAVE is set). No coop peer required.
+            unsigned int nb = coop::engine::buffAllPlayerStats(gw, 120.0f);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SETUP(buffpc): buffed %u PC(s) to 120 in every stat - SAVE now", nb);
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+            if (nb > 0 && !g_cfg.bakeSave.empty())
+                g_bakeSaveTick = GetTickCount() + 4000; // let the recalc settle
         } else if (g_cfg.setupScene == "inventory") {
             // Inventory (Phase 4a) BAKE: spawn a save-stable storage container in front
             // of the leader + seed it with items so both clients load an identical
@@ -1537,6 +1548,9 @@ __declspec(dllexport) void startPlugin() {
         ic.snapDistSq  = g_cfg.interpSnapDist * g_cfg.interpSnapDist;
         g_repl.setInterpConfig(ic);
         g_repl.setDriveTuning(g_cfg.catchupK, g_cfg.snapDist, g_cfg.snapSeconds);
+        g_repl.setCombatTuning(g_cfg.combatSoftDist, g_cfg.combatSnapDist,
+                               g_cfg.combatBigSnapDist, g_cfg.combatSlideMax,
+                               g_cfg.combatConvergeMs);
         g_repl.setSendStamp(g_cfg.sendStamp);
         g_repl.setCensusRadius(g_cfg.censusRadius);
         g_repl.setSpawnMintRadius(g_cfg.spawnMintRadius);

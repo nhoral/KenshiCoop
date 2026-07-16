@@ -91,6 +91,47 @@ bool raiseSubjectStat(GameWorld* gw, const unsigned int subjHand[5],
     }
 }
 
+// Raise EVERY stat (STAT_STRENGTH..STAT_END-1) on the body at subjHand to at least
+// 'value' (raise-only, same accessor path as raiseSubjectStat) and recalc ONCE.
+// Returns the count of stats actually raised (0 = unresolved / no engine hooks).
+// combat_win scenario: buff a PC squad so it reliably WINS the fight.
+unsigned int raiseAllStats(GameWorld* gw, const unsigned int subjHand[5], float value) {
+    (void)gw;
+    if (!g_statsGetRefFn) return 0;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return 0;
+    __try {
+        CharStats* st = s->stats;
+        if (!st) return 0;
+        unsigned int n = 0;
+        for (int i = (int)STAT_STRENGTH; i < (int)STAT_END; ++i) {
+            float* p = g_statsGetRefFn(st, i);
+            if (!p) continue;
+            if (*p < value) { *p = value; ++n; }
+        }
+        if (n && g_statsRecalcFn) g_statsRecalcFn(st); // single recalc after the batch
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Raise EVERY player-squad member (all tabs) to at least 'value' in every stat.
+// Returns the count of members buffed. Used by the "buffpc" setup scene to bake a
+// maxed-out save on a single client (no coop peer needed).
+unsigned int buffAllPlayerStats(GameWorld* gw, float value) {
+    EntityState sq[64];
+    unsigned int n = captureSquad(gw, false, sq, 64);
+    unsigned int total = 0;
+    for (unsigned int i = 0; i < n; ++i) {
+        unsigned int h[5] = { sq[i].hType, sq[i].hContainer, sq[i].hContainerSerial,
+                              sq[i].hIndex, sq[i].hSerial };
+        if (raiseAllStats(gw, h, value) > 0) ++total;
+    }
+    return total;
+}
+
 // ---- Protocol 18: carried-body sync ------------------------------------------
 
 bool readCarry(Character* c, CarryRead* out) {

@@ -66,6 +66,14 @@ struct Config {
                                     // driven body only when it trails the newest
                                     // sample by more than this much travel time
                                     // (snapDist stays the slow-mover floor)
+    // Combat-drive convergence bands (2026-07-16 smoothness pass). All default to
+    // the ReplicatorUtil constants when the env is unset/0 (the drive keeps its own
+    // constant-initialized member unless the value is > 0), so ONE build sweeps them.
+    float        combatSoftDist;    // KENSHICOOP_COMBAT_SOFT_DIST     (6 u)
+    float        combatSnapDist;    // KENSHICOOP_COMBAT_SNAP_DIST     (20 u churn ceiling)
+    float        combatBigSnapDist; // KENSHICOOP_COMBAT_BIG_SNAP_DIST (60 u true-leave)
+    float        combatSlideMax;    // KENSHICOOP_COMBAT_SLIDE_MAX     (60 u/s slide cap floor)
+    unsigned int combatConvergeMs;  // KENSHICOOP_COMBAT_CONVERGE_MS   (400 ms hysteresis)
 
     // Protocol 36 NPC existence census: wide-radius ghost-culling reach in
     // world units. The host broadcasts the hand list of every world NPC within

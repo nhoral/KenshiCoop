@@ -386,6 +386,12 @@ void loadConfig(Config& c) {
         c.snapDist = (f > 0.0) ? (float)f : 8.0f;
         f = std::atof(envOr("KENSHICOOP_SNAP_SECONDS", "0").c_str());
         c.snapSeconds = (f > 0.0) ? (float)f : 0.75f;
+        // Combat convergence bands (0 = keep the drive's ReplicatorUtil default).
+        c.combatSoftDist    = (float)std::atof(envOr("KENSHICOOP_COMBAT_SOFT_DIST", "0").c_str());
+        c.combatSnapDist    = (float)std::atof(envOr("KENSHICOOP_COMBAT_SNAP_DIST", "0").c_str());
+        c.combatBigSnapDist = (float)std::atof(envOr("KENSHICOOP_COMBAT_BIG_SNAP_DIST", "0").c_str());
+        c.combatSlideMax    = (float)std::atof(envOr("KENSHICOOP_COMBAT_SLIDE_MAX", "0").c_str());
+        c.combatConvergeMs  = (unsigned int)std::atoi(envOr("KENSHICOOP_COMBAT_CONVERGE_MS", "0").c_str());
         // Census radius: "0" (explicit) disables; absent = 2000 u default.
         std::string cr = envOr("KENSHICOOP_CENSUS_RADIUS", "");
         c.censusRadius = cr.empty() ? 2000.0f : (float)std::atof(cr.c_str());

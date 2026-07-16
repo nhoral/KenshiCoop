@@ -109,7 +109,7 @@ Consumer column = oracle function + its `scripts/oracles/*.ps1` fragment.
 | Tag family | Emitter TU | Consumer oracle |
 |---|---|---|
 | `[life]` | Core (`lifeSet`) | Test-Lifecycle (Motion.ps1) |
-| `[combat]` (order/CAP/CAP xlate), `[victim]` | Publish (capture) + Drive (order/apply) | Test-PlayerCombat / Test-AssaultTown / Test-CombatOrder / Test-CombatCrowd (Combat.ps1) |
+| `[combat]` (order/CAP/CAP xlate/snap/stats), `[victim]` | Publish (capture) + Drive (order/apply/convergence-first correction: fast-SLIDE for drift past the churn band, instant `snap` only on a true leave; `snap` line carries drift/srcVel/localFight/wrongTgt/arming/wait/seg/n, `stats` rollup carries snap/slide/softWalk/order/wrongTgt/armed/maxPersist) | Test-PlayerCombat / Test-AssaultTown / Test-CombatOrder / Test-CombatCrowd / Test-CombatSnapRate / Test-CombatBattle / Test-CombatWin (Combat.ps1) |
 | `[snap]`, `[interp]`, `[pose]`, `[ai]`, `[gate]`, `[trust]`, `[oi]` | Drive | Test-Smoothness / Test-SnapRate / Test-AntiZombie (Motion.ps1); gate diagnostics |
 | `[census]`, `[audit]`, `[authority]`, `[ck]` | Authority (+Publish send half) | Test-NpcCensus / Test-ExistenceParity / Test-SuppressChurn (Npc.ps1, Motion.ps1) |
 | `[spawn]`, `[limb]`, `[event]`, `[med]` (apply half) | Spawn | Test-SpawnProbe/SpawnSync (Npc.ps1) / Test-LimbLoss (Medical.ps1) / Test-DeathOrder (Npc.ps1) |
@@ -137,7 +137,7 @@ classification (`tabRankOf`/`tabLeaderIdx`/`handFromEntity`) live in
 | `ScenarioSupport.cpp` | (helpers only - no scenarios) |
 | `ScenarioMovement.cpp` | leader_move, fast_march, coop_presence, travel_parity, split_interest |
 | `ScenarioNpc.cpp` | npc_sync, craft_order, down_order, death_order, spawn_probe, spawn_sync, npc_census, spawn_far |
-| `ScenarioCombat.cpp` | combat_probe, combat_order, combat_kill, player_combat, assault_town, player_ko, combat_crowd |
+| `ScenarioCombat.cpp` | combat_probe, combat_order, combat_kill, player_combat, assault_town, player_ko, combat_crowd, combat_battle, combat_win |
 | `ScenarioMedical.cpp` | medic_order, limb_loss, stats_sync |
 | `ScenarioInventory.cpp` | inv_order, inv_bidir, trade_probe, trade_peer, inv_equip, inv_reequip, inv_wpnseq, inv_addequip, wpn_relocate |
 | `ScenarioWorldItems.cpp` | drop_probe, world_item_sync, world_item_join, world_weapon_drop, world_armor_drop, weapon_loot |
@@ -156,7 +156,7 @@ oracle fragments (`scripts/oracles/*.ps1`, Stage 4).
 |---|---|---|
 | `MEMBER` / `RECV` (via logScenarioLine/Entity) | every domain TU | Test-Crosscheck, Measure-NpcSync, Test-CoopPresence, Test-NpcPose* (Npc.ps1) |
 | `VITALS` (via logVitalsLine) | Combat, Medical, Session | Get-VitalsSeries family (Medical.ps1) |
-| `PCOMBAT`, `ASSAULT`, `PKO`, `CROWD` | Combat | Test-PlayerCombat / Test-AssaultTown / Test-PlayerKo / Test-CombatCrowd (Combat.ps1) |
+| `PCOMBAT`, `ASSAULT`, `PKO`, `CROWD`, `BATTLE`, `WIN` | Combat | Test-PlayerCombat / Test-AssaultTown / Test-PlayerKo / Test-CombatCrowd / Test-CombatBattle / Test-CombatWin (Combat.ps1) |
 | `CARRY`, `FURN`, `SNEAK*`, `SPEED` | CharState | Get-CarrySeries/Test-CarryOrder, Get-FurnSeries/Test-FurnPut, Test-Sneak*, Test-Speed* (Npc.ps1) |
 | `INV`, `TINV`, `TRADE`, `EQUIP` | Inventory | Test-Inventory*/Test-Trade* (Inventory.ps1) |
 | `DROP`, `GEAR`, `WITEM` | WorldItems | Test-DropProbe / Test-WorldItemSync / Test-WeaponDrop / Test-WeaponLoot (Inventory.ps1) |

@@ -1073,6 +1073,13 @@ bool writeStats(Character* c, const StatsRead& in);
 // recalculate. Runs on the body's OWNER; the peer asserts the crossing.
 bool raiseSubjectStat(GameWorld* gw, const unsigned int subjHand[5],
                       int statId, float value);
+// Raise EVERY stat (STAT_STRENGTH..STAT_END-1) on the body at subjHand to at least
+// 'value' (raise-only) and recalc once. Returns the count raised. Runs on the
+// body's OWNER (combat_win buffs each side's own PC squad to a winning stat line).
+unsigned int raiseAllStats(GameWorld* gw, const unsigned int subjHand[5], float value);
+// Raise EVERY player-squad member (all tabs) to 'value' in every stat; returns the
+// count of members buffed. The "buffpc" setup scene uses it to bake a maxed save.
+unsigned int buffAllPlayerStats(GameWorld* gw, float value);
 
 // ---- Protocol 18: carried-body sync --------------------------------------
 // Snapshot of a body's LOCAL carry relationship: is it carrying someone

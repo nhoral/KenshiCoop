@@ -16,6 +16,9 @@ namespace coop {
 
 Replicator::Replicator()
     : catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), snapSeconds_(SNAP_SECONDS),
+      combatSoftDist_(COMBAT_SOFT_DIST), combatSnapDist_(COMBAT_SNAP_DIST),
+      combatBigSnapDist_(COMBAT_BIG_SNAP_DIST), combatSlideMax_(COMBAT_SLIDE_MAX),
+      combatConvergeMs_(COMBAT_CONVERGE_MS),
       sendStamp_(true),
       starveHoldMs_(10000), starveHeldNow_(0),
       leaderOnly_(true), streamNpcs_(false),
@@ -24,6 +27,8 @@ Replicator::Replicator()
       interpExtrap_(0), interpSegSnap_(0),
       hardSnapSquad_(0), hardSnapNpc_(0), hardSnapMid_(0),
       walkReissueSquad_(0), walkReissueNpc_(0), restFlipNpc_(0), restFlipMid_(0),
+      combatSnapTotal_(0), combatSoftWalk_(0), combatSlide_(0), combatOrder_(0),
+      combatWrongTgt_(0), combatLogTick_(0),
       interpLogTick_(0),
       translateFrames_(0), walkTruthFrames_(0),
       restSampleFrames_(0), marchFrames_(0),

@@ -5,6 +5,7 @@
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
 #include "ScenarioSupport.h"
+#include <cstdlib>  // getenv/atoi - combat_battle size (KENSHICOOP_BATTLE_N)
 
 namespace coop {
 namespace {
@@ -1051,6 +1052,371 @@ private:
     EntityState   seen_[MAX_REMEMBER]; // JOIN: hands ever captured (resolve fallback)
 };
 
+// combat_battle (many-NPC combat warp validation, 2026-07-16): the HOST runtime-
+// spawns a BATTLE of N fighters near the leader and index-pairs them into MUTUAL
+// melee (battler 2k vs battler 2k+1), so N/2 duels run at once inside the interest
+// bubble. Where combat_crowd stresses ~5 WAITING strikers on ONE victim, this
+// stresses the join's combat DRIVE under many simultaneously-ACTIVE combatants -
+// the "NPCs warp around on the join when many are fighting" field report. The join
+// mints a proxy for each runtime spawn (protocol 21), detaches it, and drives it
+// via the interp + graded-snap combat path; Test-CombatSnapRate gates the [combat]
+// snap teleport buckets (churn rate / persistence / wrong-target), and the enriched
+// [combat] stats rollup records the aggregate. N is env-tunable
+// (KENSHICOOP_BATTLE_N, default 16, clamp 4..MAX_BATTLERS) so ONE build runs the
+// 10v10 / 20v20 / 40v40 ladder. Both sides log SCENARIO MEMBER/RECV like crowd.
+class CombatBattleScenario : public Scenario {
+public:
+    CombatBattleScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
+          nBattlers_(0), nSeen_(0), spawned_(false), issuedLogged_(false) {}
+
+    virtual const char* name() const { return "combat_battle"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // HOST: spawn the battle once the window opens, then keep every pair armed
+        // (orderAttackByHand no-ops while a body is already fighting, so re-arming
+        // only re-engages the ones the AttackSlotManager rotated out).
+        if (ctx.isHost && ctx.elapsedMs >= COMBAT_AT_MS) {
+            if (!spawned_) spawnBattle(ctx);
+            if (nBattlers_ >= 2 &&
+                (ctx.elapsedMs - lastOrderMs_ >= 2500 || lastOrderMs_ == 0)) {
+                lastOrderMs_ = ctx.elapsedMs;
+                for (unsigned int k = 0; k + 1 < nBattlers_; k += 2) {
+                    engine::orderAttackByHand(ctx.gw, battler_[k],     battler_[k + 1]);
+                    engine::orderAttackByHand(ctx.gw, battler_[k + 1], battler_[k]);
+                }
+                if (!issuedLogged_ && nBattlers_ >= 2) {
+                    issuedLogged_ = true;
+                    char b[96];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO BATTLE issued n=%u pairs=%u",
+                              nBattlers_, nBattlers_ / 2);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+
+        // Both sides: the NPC position/task series the oracle compares (same shape
+        // combat_crowd uses).
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+            // JOIN: a driven combat copy leaves the interest capture when the
+            // replicator detaches it into its own platoon; remember every NPC hand
+            // ever captured and keep logging the missing ones by direct resolve
+            // (the exact combat_crowd tracking-continuity fix).
+            if (!ctx.isHost) {
+                for (unsigned int i = 0; i < n; ++i) rememberSeen(npcs[i]);
+                for (unsigned int s = 0; s < nSeen_; ++s) {
+                    bool inCap = false;
+                    for (unsigned int i = 0; i < n; ++i)
+                        if (npcs[i].hIndex == seen_[s].hIndex &&
+                            npcs[i].hSerial == seen_[s].hSerial) { inCap = true; break; }
+                    if (inCap) continue;
+                    Character* c = engine::resolve(seen_[s]);
+                    if (!c) continue;
+                    EntityState e = seen_[s];
+                    float x, y, z;
+                    if (!engine::readPos(c, &x, &y, &z)) continue;
+                    e.x = x; e.y = y; e.z = z;
+                    e.task = TASK_NONE;
+                    e.bodyState = engine::readBodyState(c);
+                    logScenarioEntity("RECV", e);
+                }
+            }
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (nBattlers_ >= MIN_BATTLERS) : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Shared (peer-ready-armed) timeline; the battle window runs 10 s -> end.
+    static const unsigned long COMBAT_AT_MS     = 10000;
+    static const unsigned long HOST_DURATION_MS = 75000;
+    static const unsigned long JOIN_DURATION_MS = 68000;
+    static const unsigned int  MAX_LOG      = 64;
+    static const unsigned int  MAX_BATTLERS = 40;
+    static const unsigned int  MIN_BATTLERS = 4;
+    static const unsigned int  MAX_REMEMBER = 80;
+
+    unsigned int battleN() const {
+        const char* e = ::getenv("KENSHICOOP_BATTLE_N");
+        unsigned int n = e ? (unsigned int)::atoi(e) : 16u;
+        if (n < MIN_BATTLERS)  n = MIN_BATTLERS;
+        if (n > MAX_BATTLERS)  n = MAX_BATTLERS;
+        return n;
+    }
+
+    void spawnBattle(const ScenarioContext& ctx) {
+        spawned_ = true;
+        unsigned int want = battleN();
+        static unsigned int hands[MAX_BATTLERS][5];
+        unsigned int got = engine::spawnRuntimeSquad(ctx.gw, want, hands);
+        for (unsigned int i = 0; i < got && nBattlers_ < MAX_BATTLERS; ++i) {
+            for (int j = 0; j < 5; ++j) battler_[nBattlers_][j] = hands[i][j];
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO BATTLE striker=%u,%u",
+                      battler_[nBattlers_][3], battler_[nBattlers_][4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            ++nBattlers_;
+        }
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO BATTLE spawned=%u/%u", nBattlers_, want);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (nBattlers_ < MIN_BATTLERS)
+            coop::logLine("SCENARIO BATTLE spawn FAILED (too few battlers)");
+    }
+
+    void rememberSeen(const EntityState& e) {
+        for (unsigned int s = 0; s < nSeen_; ++s)
+            if (seen_[s].hIndex == e.hIndex && seen_[s].hSerial == e.hSerial) return;
+        if (nSeen_ < MAX_REMEMBER) seen_[nSeen_++] = e;
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastOrderMs_;
+    unsigned int  nBattlers_;
+    unsigned int  nSeen_;
+    bool          spawned_;
+    bool          issuedLogged_;
+    unsigned int  battler_[MAX_BATTLERS][5];
+    EntityState   seen_[MAX_REMEMBER];
+};
+
+// ---- combat_win: buffed PCs WIN a real fight --------------------------------
+// A second warp shape distinct from the NPC-vs-NPC posturing of combat_battle:
+// here each side buffs its OWN player-squad to 120 in EVERY stat, and the host
+// runtime-spawns N unbuffed enemies (KENSHICOOP_WIN_N, default 8) ordered onto
+// the PC leader. The buffed PCs cut them down, so the join-side stress shifts to
+// dying / fleeing / KO churn and rapid target loss - a different driver of the
+// combat snap/warp path than sustained melee. Both sides log SCENARIO MEMBER/RECV
+// (the enemy copies) for the warp measurement + Test-CombatSnapRate, plus
+// SCENARIO WIN buff/spawned/down for the outcome oracle.
+class CombatWinScenario : public Scenario {
+public:
+    CombatWinScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
+          nEnemies_(0), nSeen_(0), nBuffed_(0), nOwn_(0), maxDown_(0),
+          spawned_(false), buffed_(false), issuedLogged_(false), haveOwn_(false) {
+        for (int j = 0; j < 5; ++j) ownHand_[j] = 0;
+    }
+
+    virtual const char* name() const { return "combat_win"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned int ownRank = ctx.isHost ? 0u : 1u;
+
+        // Both sides: buff their OWN squad to a winning stat line once the window
+        // opens (each side owns its own PCs; statsSync streams the raise to the peer).
+        if (ctx.elapsedMs >= COMBAT_AT_MS && !buffed_) buffOwnSquad(ctx, ownRank);
+
+        // HOST: spawn the enemies once, then keep them ordered onto the PC squad,
+        // SPREAD round-robin across every buffed member so the whole squad fights
+        // (orderAttackByHand no-ops while already fighting, so re-issue only re-arms
+        // the ones the slot manager rotated out or that lost their target to a kill).
+        if (ctx.isHost && ctx.elapsedMs >= COMBAT_AT_MS) {
+            if (!spawned_) spawnEnemies(ctx);
+            if (nOwn_ >= 1 && nEnemies_ >= 1 &&
+                (ctx.elapsedMs - lastOrderMs_ >= 2500 || lastOrderMs_ == 0)) {
+                lastOrderMs_ = ctx.elapsedMs;
+                for (unsigned int i = 0; i < nEnemies_; ++i)
+                    engine::orderAttackByHand(ctx.gw, enemy_[i], ownMembers_[i % nOwn_]);
+                if (!issuedLogged_) {
+                    issuedLogged_ = true;
+                    char b[96];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO WIN issued n=%u vic=spread across %u PC(s)",
+                              nEnemies_, nOwn_);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+        }
+
+        // Both sides: the enemy position/task series the oracle compares (same shape
+        // combat_battle/combat_crowd use), plus the running downed-enemy outcome.
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+            if (!ctx.isHost && n > 0) ++recvCount_;
+            if (!ctx.isHost) {
+                for (unsigned int i = 0; i < n; ++i) rememberSeen(npcs[i]);
+                for (unsigned int s = 0; s < nSeen_; ++s) {
+                    bool inCap = false;
+                    for (unsigned int i = 0; i < n; ++i)
+                        if (npcs[i].hIndex == seen_[s].hIndex &&
+                            npcs[i].hSerial == seen_[s].hSerial) { inCap = true; break; }
+                    if (inCap) continue;
+                    Character* c = engine::resolve(seen_[s]);
+                    if (!c) continue;
+                    EntityState e = seen_[s];
+                    float x, y, z;
+                    if (!engine::readPos(c, &x, &y, &z)) continue;
+                    e.x = x; e.y = y; e.z = z;
+                    e.task = TASK_NONE;
+                    e.bodyState = engine::readBodyState(c);
+                    logScenarioEntity("RECV", e);
+                }
+            }
+            // Outcome: how many spawned enemies are down/dead (bodyState != 0), as
+            // resolved on THIS side. The buffed PCs winning drives this toward N.
+            if (spawned_ || !ctx.isHost) countDowned(ctx);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost
+                ? (nBuffed_ >= 1 && nEnemies_ >= MIN_ENEMIES && maxDown_ >= 1)
+                : (nBuffed_ >= 1 && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Shared (peer-ready-armed) timeline; the win window runs 10 s -> end.
+    static const unsigned long COMBAT_AT_MS     = 10000;
+    static const unsigned long HOST_DURATION_MS = 75000;
+    static const unsigned long JOIN_DURATION_MS = 68000;
+    static const unsigned int  MAX_LOG      = 48;
+    static const unsigned int  MAX_ENEMIES  = 16;
+    static const unsigned int  MIN_ENEMIES  = 4;
+    static const unsigned int  MAX_SQUAD    = 32;
+    static const unsigned int  MAX_OWN      = 16;
+    static const unsigned int  MAX_REMEMBER = 64;
+
+    unsigned int winN() const {
+        const char* e = ::getenv("KENSHICOOP_WIN_N");
+        unsigned int n = e ? (unsigned int)::atoi(e) : 8u;
+        if (n < MIN_ENEMIES) n = MIN_ENEMIES;
+        if (n > MAX_ENEMIES) n = MAX_ENEMIES;
+        return n;
+    }
+
+    // Buff every member of the OWN tab (same container as the own leader) to 120
+    // in all stats. Latches the own leader hand as the enemies' attack target too.
+    void buffOwnSquad(const ScenarioContext& ctx, unsigned int ownRank) {
+        buffed_ = true;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, ownRank);
+        if (idx < 0) {
+            coop::logLine("SCENARIO WIN buff FAILED (no own leader)");
+            return;
+        }
+        handFromEntity(sq[idx], ownHand_);
+        haveOwn_ = true;
+        unsigned int leadC  = sq[idx].hContainer;
+        unsigned int leadCs = sq[idx].hContainerSerial;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (sq[i].hContainer != leadC || sq[i].hContainerSerial != leadCs) continue;
+            unsigned int h[5]; handFromEntity(sq[i], h);
+            unsigned int raised = engine::raiseAllStats(ctx.gw, h, 120.0f);
+            if (raised == 0) continue;
+            ++nBuffed_;
+            // Remember each buffed member so the host can spread the enemies across
+            // the whole squad (not just gank the leader).
+            if (nOwn_ < MAX_OWN) {
+                for (int j = 0; j < 5; ++j) ownMembers_[nOwn_][j] = h[j];
+                ++nOwn_;
+            }
+            char b[112];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO WIN buff rank=%u hand=%u,%u stats=120 raised=%u",
+                      ownRank, h[3], h[4], raised);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        if (nBuffed_ == 0)
+            coop::logLine("SCENARIO WIN buff FAILED (no member stats raised)");
+    }
+
+    void spawnEnemies(const ScenarioContext& ctx) {
+        spawned_ = true;
+        unsigned int want = winN();
+        static unsigned int hands[MAX_ENEMIES][5];
+        unsigned int got = engine::spawnRuntimeSquad(ctx.gw, want, hands);
+        for (unsigned int i = 0; i < got && nEnemies_ < MAX_ENEMIES; ++i) {
+            for (int j = 0; j < 5; ++j) enemy_[nEnemies_][j] = hands[i][j];
+            ++nEnemies_;
+        }
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO WIN spawned=%u/%u", nEnemies_, want);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (nEnemies_ < MIN_ENEMIES)
+            coop::logLine("SCENARIO WIN spawn FAILED (too few enemies)");
+    }
+
+    // Count spawned enemies currently down/dead on this side; log the running peak.
+    void countDowned(const ScenarioContext& ctx) {
+        unsigned int down = 0;
+        if (ctx.isHost) {
+            for (unsigned int i = 0; i < nEnemies_; ++i) {
+                Character* c = engine::resolveCharByHand(enemy_[i][3], enemy_[i][4],
+                                                         enemy_[i][0], enemy_[i][1],
+                                                         enemy_[i][2]);
+                if (c && engine::readBodyState(c) != 0) ++down;
+            }
+        } else {
+            for (unsigned int s = 0; s < nSeen_; ++s) {
+                Character* c = engine::resolve(seen_[s]);
+                if (c && engine::readBodyState(c) != 0) ++down;
+            }
+        }
+        if (down > maxDown_) {
+            maxDown_ = down;
+            char b[80];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WIN down=%u/%u",
+                      maxDown_, ctx.isHost ? nEnemies_ : nSeen_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    void rememberSeen(const EntityState& e) {
+        for (unsigned int s = 0; s < nSeen_; ++s)
+            if (seen_[s].hIndex == e.hIndex && seen_[s].hSerial == e.hSerial) return;
+        if (nSeen_ < MAX_REMEMBER) seen_[nSeen_++] = e;
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    unsigned long lastOrderMs_;
+    unsigned int  nEnemies_;
+    unsigned int  nSeen_;
+    unsigned int  nBuffed_;
+    unsigned int  nOwn_;
+    unsigned int  maxDown_;
+    bool          spawned_;
+    bool          buffed_;
+    bool          issuedLogged_;
+    bool          haveOwn_;
+    unsigned int  ownHand_[5];
+    unsigned int  ownMembers_[MAX_OWN][5];
+    unsigned int  enemy_[MAX_ENEMIES][5];
+    EntityState   seen_[MAX_REMEMBER];
+};
+
 } // namespace
 
 Scenario* makeCombatScenario(const std::string& name) {
@@ -1061,6 +1427,8 @@ Scenario* makeCombatScenario(const std::string& name) {
     if (name == "assault_town") return new AssaultTownScenario();
     if (name == "player_ko")    return new PlayerKoScenario();
     if (name == "combat_crowd") return new CombatCrowdScenario();
+    if (name == "combat_battle") return new CombatBattleScenario();
+    if (name == "combat_win")    return new CombatWinScenario();
     return 0;
 }
 

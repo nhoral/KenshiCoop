@@ -113,12 +113,28 @@ const float TRANSLATE_EPS = 0.02f; // per-frame actual movement counted as "tran
 // a WAITING (slot-queued) copy, and with exponential backoff (1.5 s -> 6 s cap) so
 // a copy that legitimately cannot engage is not clearGoals-reset forever.
 const float COMBAT_SOFT_DIST = 6.0f;       // walk-converge combat drift beyond this
-const float COMBAT_SNAP_DIST = 20.0f;      // teleport-correct combat drift beyond this
-                                           // (measured: a driven brawl legitimately churns
-                                           // 12-18 u against the walk band - snapping there
-                                           // is visible teleporting for no fidelity gain;
-                                           // past 20 u the host body has genuinely LEFT -
-                                           // sprint-chases measured 45-110 u)
+const float COMBAT_SNAP_DIST = 20.0f;      // churn ceiling: a correctly-engaged fight owns its
+                                           // footwork up to here (measured: a driven brawl
+                                           // legitimately churns 12-18 u); a NON-fighting copy
+                                           // (arming / idle / waiting / wrong-target) converges
+                                           // above the soft band instead. Past this a drifted
+                                           // body FAST-SLIDES to the host pose - no teleport
+// Convergence-first correction (2026-07-16 smoothness pass). The old gate teleported the
+// instant a copy passed COMBAT_SNAP_DIST, which was the visible warp during dense fights.
+// Now the copy fast-SLIDES (a quick walk, gait preserved) and only INSTANT-teleports on a
+// genuine LEAVE: drift past COMBAT_BIG_SNAP_DIST, a source teleport (SM_SEG_SNAP), or a drift
+// that SAT over the snap band for COMBAT_CONVERGE_MS on a source actually moving
+// (>= COMBAT_SNAP_VEL). A WAITING stance never "leaves" - it only ever converges, at the
+// tighter COMBAT_WAIT_DIST band (a queued body should not wander).
+const float COMBAT_BIG_SNAP_DIST = 60.0f;  // true-leave distance: only past this (or a source
+                                           // teleport) is an INSTANT warp ever allowed
+const float COMBAT_WAIT_DIST     = 3.0f;   // waiting-stance converge band (they shouldn't move)
+const float COMBAT_SLIDE_MAX     = 60.0f;  // cap on the fast catch-up walk speed (u/s); a large
+                                           // gap glides quickly without a teleport
+const float COMBAT_SNAP_VEL      = 8.0f;   // source speed (u/s) below which a big drift is churn
+                                           // / wrong-place, not a chase - converge, never warp
+const unsigned long COMBAT_CONVERGE_MS = 400; // drift must persist over the snap band this long
+                                              // (on a moving source) before an instant teleport
 const unsigned long COMBAT_REISSUE_MS     = 1500; // base re-issue throttle
 const unsigned long COMBAT_REISSUE_MAX_MS = 6000; // backoff cap
 const unsigned int  COMBAT_REISSUE_CAP    = 5;    // max timer re-issues per episode: a copy

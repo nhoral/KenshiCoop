@@ -202,7 +202,7 @@
             # npc_vitals: the streamed victim vitals must CONVERGE (Phase B) -
             # the join's copy shows the host's true blood, not pristine health.
             Gating   = @('combat_kill', 'damage_guard', 'npc_vitals', 'clock_sync')
-            Advisory = @('smoothness', 'anim_truth', 'march')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'combat_snap_rate')
             Tier = 'smoke'; WanVariant = $true
         }
 
@@ -219,7 +219,7 @@
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'player_combat'
             Gating   = @('player_combat', 'clock_sync')
-            Advisory = @('smoothness', 'anim_truth', 'march')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'combat_snap_rate')
             Tier = 'full'; WanVariant = $true
         }
         # assault_town: the JOIN's player character starts an UNPROVOKED fight
@@ -1072,9 +1072,44 @@
         combat_crowd = @{
             Save = 'sync'; Setup = ''; Tolerance = 20.0
             PrimaryGate = 'combat_crowd'
+            # combat_snap_rate: advisory here (crowd is ~5 WAITING strikers, low
+            # active-melee churn) - it surfaces the enriched [combat] snap buckets
+            # for diagnosis. The many-NPC active-melee case is HARD-gated on
+            # combat_battle. See resources/combat_warp_debug plan.
             Gating   = @('combat_crowd', 'clock_sync')
-            Advisory = @('smoothness', 'anim_truth', 'march')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'combat_snap_rate')
             Tier = 'full'; WanVariant = $true
+        }
+        # combat_battle: many-NPC combat warp validation (the "NPCs warp on the join
+        # when many are fighting" field report). The host runtime-spawns N fighters
+        # (KENSHICOOP_BATTLE_N, default 16; the 10v10/20v20/40v40 ladder) near the
+        # leader and index-pairs them into mutual melee, so the join must DRIVE many
+        # simultaneously-active combat copies via the interp + graded-snap path.
+        # combat_battle gates that the fight happened + crossed; combat_snap_rate
+        # HARD-gates the [combat] snap teleport buckets (churn rate / persistence /
+        # wrong-target) - the actual warp measurement. Tolerance 20u matches the
+        # combat drift bands (COMBAT_SNAP_DIST).
+        combat_battle = @{
+            Save = 'sync'; Setup = ''; Tolerance = 20.0
+            PrimaryGate = 'combat_battle'
+            Gating   = @('combat_battle', 'combat_snap_rate', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # combat_win: the SECOND warp shape (2026-07-16 smoothness pass). Each side
+        # buffs its OWN player-squad to 120 in every stat and the host runtime-spawns
+        # N unbuffed enemies (KENSHICOOP_WIN_N, default 8) onto the PC leader; the
+        # buffed PCs cut them down, so the join stress shifts to dying/fleeing/KO
+        # churn and rapid target loss (distinct from combat_battle's sustained melee).
+        # combat_win gates that the PCs were buffed both sides + the fight was won and
+        # crossed; combat_snap_rate HARD-gates the warp buckets. death/existence parity
+        # advisory (dying enemies). Tolerance 20u matches the combat drift bands.
+        combat_win = @{
+            Save = 'sync'; Setup = ''; Tolerance = 20.0
+            PrimaryGate = 'combat_win'
+            Gating   = @('combat_win', 'combat_snap_rate', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'existence_parity')
+            Tier = 'full'; WanVariant = $false
         }
 
         # ---- inventory ---------------------------------------------------------------

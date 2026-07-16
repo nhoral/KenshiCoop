@@ -468,7 +468,9 @@ function Test-CombatCrowd {
     # host body that sprint-chases 40-110 u NEEDS the teleport).
     $joff = Get-LogClockOffsetMs -File $JoinFile
     $snaps = 0; $waitSnaps = 0
-    foreach ($sm in (Select-String -Path $JoinFile -Pattern '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] snap hand=(\d+),(\d+) drift=[\d\.]+ wait=(\d)' -ErrorAction SilentlyContinue)) {
+    # (Phase 1 warp diagnosis enriched the line with srcVel/localFight/wrongTgt/
+    # arming/seg/n between drift and wait; the .* keeps this tolerant of them.)
+    foreach ($sm in (Select-String -Path $JoinFile -Pattern '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] snap hand=(\d+),(\d+) drift=[\d\.]+.* wait=(\d)' -ErrorAction SilentlyContinue)) {
         $sg = $sm.Matches[0].Groups
         $sh = $sg[5].Value + "," + $sg[6].Value
         if ($crowd -notcontains $sh) { continue }
@@ -544,6 +546,197 @@ function Test-CombatCrowd {
     Write-Host ("  COMBAT-CROWD PASS - $($crowd.Count) strikers (active/waiting samples $nActive/$nWaiting), " +
                 "maxOrders $maxOrders, snaps $snaps (wait $waitSnaps), tracked $tracked/$judged (worstMedian $($m.worstMedian)u)")
     return (Add-GateResult -Name "combat_crowd" -Status PASS -Metrics $m)
+}
+
+# combat_snap_rate (2026-07-15 many-NPC combat warp): the JOIN warp during fights
+# is combat-drive hard TELEPORTS ([combat] snap = engine::applyRaw), not locomotion
+# starvation (Test-SnapRate covers that, keyed off [interp]). This oracle keys off
+# the Phase 1-enriched [combat] snap line and classifies each teleport by root
+# cause so a high rate of the AVOIDABLE kind fails while a legitimate sprint-chase
+# does not:
+#   * CHURN  - localFight=1 on a near-STATIONARY source (srcVel < ChurnVel) at a
+#              moderate drift (< ChaseDrift): both sims fight the right body but the
+#              local footwork diverged - convergence should absorb this, a teleport
+#              is the visible warp. THIS is what the fix targets.
+#   * CHASE  - high srcVel or drift >= ChaseDrift: the host body genuinely left
+#              (sprint-chase measured 45-110 u); a teleport IS the right tool. Not
+#              gated (counted for context only).
+#   * WRONGT - wrongTgt=1: the local copy fights the WRONG body, so it stands in
+#              the wrong place and snaps repeatedly - an order/target problem.
+# Gates (all after an engagement SETTLE window):
+#   1. CHURN RATE   - avoidable teleports/min <= MaxChurnPerMin.
+#   2. PERSISTENCE  - no single hand snaps more than MaxPersistPerHand times (a
+#                     body that keeps snapping is PERSISTENTLY divergent, not
+#                     occasionally churning - the [combat] snap n= / stats
+#                     maxPersist signal).
+#   3. WRONG TARGET - wrongTgt snaps <= MaxWrongTgt.
+# SKIP when no combat happened (no [combat] order) so a peaceful run never falses.
+function Test-CombatSnapRate {
+    param([string]$JoinFile, [string]$Label = "join",
+          [double]$MaxChurnPerMin = 12.0, [int]$MaxPersistPerHand = 6,
+          [int]$MaxWrongTgt = 8,
+          [double]$ChurnVel = 8.0, [double]$ChaseDrift = 45.0,
+          [int]$SettleMs = 8000, [int]$MinWindowSec = 15)
+    if (-not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "combat_snap_rate" -Status SKIP -Detail "no join log")
+    }
+    $joff = Get-LogClockOffsetMs -File $JoinFile
+    # Engagement start = first [combat] order on the join (a fight was reproduced).
+    $tOrder = Get-MarkerTimeMs -File $JoinFile -Pattern '\[combat\] order hand='
+    if ($null -eq $tOrder) {
+        Write-Host "  [$Label] combat-snap-rate SKIP - no [combat] order (no fight reproduced)"
+        return (Add-GateResult -Name "combat_snap_rate" -Status SKIP -Detail "no combat")
+    }
+    $settleEnd = [double]$tOrder + $SettleMs
+    # Window end = last combat-drive activity (order/snap/stats) on the join.
+    $lastT = $tOrder
+    foreach ($lm in (Select-String -Path $JoinFile -Pattern '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] (?:order|snap|stats)' -ErrorAction SilentlyContinue)) {
+        $lt = Convert-StampToMs -Groups $lm.Matches[0].Groups -OffsetMs $joff
+        if ([double]$lt -gt [double]$lastT) { $lastT = $lt }
+    }
+    $winSec = ([double]$lastT - $settleEnd) / 1000.0
+    if ($winSec -lt $MinWindowSec) {
+        Write-Host "  [$Label] combat-snap-rate SKIP - scored window $([math]::Round($winSec,0))s (< ${MinWindowSec}s past settle)"
+        return (Add-GateResult -Name "combat_snap_rate" -Status SKIP `
+                    -Metrics @{ windowSec = [math]::Round($winSec, 1) } -Detail "window too short")
+    }
+    # Enriched [combat] snap line: hand, drift, srcVel, localFight, wrongTgt,
+    # arming, wait, seg, n (the .* tolerates future field additions).
+    $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[combat\] snap hand=(\d+),(\d+) drift=([\d\.]+) srcVel=([\d\.]+) localFight=(\d) wrongTgt=(\d) arming=(\d) wait=(\d) seg=\d+ n=(\d+)'
+    $churn = 0; $chase = 0; $wrongT = 0; $total = 0
+    $persist = @{}; $drifts = @()
+    foreach ($sm in (Select-String -Path $JoinFile -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $sm.Matches[0].Groups
+        $t = Convert-StampToMs -Groups $g -OffsetMs $joff
+        if ([double]$t -lt $settleEnd) { continue }
+        $hand      = $g[5].Value + "," + $g[6].Value
+        $drift     = [double]$g[7].Value
+        $srcVel    = [double]$g[8].Value
+        $localFight= ($g[9].Value -eq "1")
+        $wrong     = ($g[10].Value -eq "1")
+        $n         = [int]$g[13].Value
+        $total++
+        $drifts += $drift
+        if ($persist[$hand] -lt $n) { $persist[$hand] = $n }
+        if ($wrong) { $wrongT++ }
+        if (($srcVel -ge $ChurnVel) -or ($drift -ge $ChaseDrift)) { $chase++ }
+        elseif ($localFight) { $churn++ }
+        else { $churn++ }  # stationary source, mid drift, not actively fighting = still avoidable
+    }
+    $maxPersist = 0
+    foreach ($k in $persist.Keys) { if ($persist[$k] -gt $maxPersist) { $maxPersist = $persist[$k] } }
+    $churnRate = [math]::Round($churn / ($winSec / 60.0), 2)
+    $totalRate = [math]::Round($total / ($winSec / 60.0), 2)
+    $medDrift = 0.0
+    if ($drifts.Count -gt 0) {
+        $sorted = @($drifts | Sort-Object)
+        $medDrift = [math]::Round($sorted[[int]([math]::Floor($sorted.Count / 2))], 1)
+    }
+    $m = @{ total = $total; churn = $churn; chase = $chase; wrongTgt = $wrongT
+            churnRatePerMin = $churnRate; totalRatePerMin = $totalRate
+            maxPersistPerHand = $maxPersist; medianDrift = $medDrift
+            windowSec = [math]::Round($winSec, 1) }
+    $bad = @()
+    if ($churnRate -gt $MaxChurnPerMin) { $bad += "churn snaps $churnRate/min (> $MaxChurnPerMin)" }
+    if ($maxPersist -gt $MaxPersistPerHand) { $bad += "a hand snapped ${maxPersist}x (> $MaxPersistPerHand - persistent divergence)" }
+    if ($wrongT -gt $MaxWrongTgt) { $bad += "$wrongT wrong-target snap(s) (> $MaxWrongTgt)" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  [$Label] combat-snap-rate FAIL - " + ($bad -join "; ") +
+                    " [total $total = churn $churn + chase $chase; medDrift ${medDrift}u; window $([math]::Round($winSec,0))s]")
+        return (Add-GateResult -Name "combat_snap_rate" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  [$Label] combat-snap-rate PASS - churn $churnRate/min (<= $MaxChurnPerMin), maxPersist $maxPersist (<= $MaxPersistPerHand), " +
+                "wrongTgt $wrongT (<= $MaxWrongTgt); total $total = churn $churn + chase $chase, medDrift ${medDrift}u over $([math]::Round($winSec,0))s")
+    return (Add-GateResult -Name "combat_snap_rate" -Status PASS -Metrics $m)
+}
+
+# combat_battle (2026-07-16 many-NPC combat warp): PRESENCE/engagement gate for the
+# combat_battle scenario (the actual snap quality is judged by combat_snap_rate,
+# gated alongside this). Proves the many-NPC fight actually happened so a spawn/
+# engage failure fails LOUDLY instead of letting combat_snap_rate SKIP:
+#   1. HOST spawned the battle - "SCENARIO BATTLE spawned=N/..." with N >= MinBattlers
+#      and a "SCENARIO BATTLE issued" marker (the pairs were ordered into melee).
+#   2. JOIN reproduced it - the join issued combat orders for the streamed fighters
+#      ("[combat] order") for at least MinJoinOrders distinct hands (the fights
+#      crossed and the join drove them - the precondition for any snap measurement).
+function Test-CombatBattle {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinBattlers = 4, [int]$MinJoinOrders = 3)
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "combat_battle" -Status FAIL -Detail "missing log")
+    }
+    $sp = Select-String -Path $HostFile -Pattern 'SCENARIO BATTLE spawned=(\d+)/(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $sp) {
+        Write-Host "  COMBAT-BATTLE FAIL - host never spawned the battle"
+        return (Add-GateResult -Name "combat_battle" -Status FAIL -Detail "no spawn marker")
+    }
+    $spawned = [int]$sp.Matches[0].Groups[1].Value
+    $want    = [int]$sp.Matches[0].Groups[2].Value
+    $issued  = @(Select-String -Path $HostFile -Pattern 'SCENARIO BATTLE issued n=(\d+)' -ErrorAction SilentlyContinue).Count
+    # Distinct join-side combat hands ordered (the fights the join reproduced).
+    $joinHands = @{}
+    foreach ($jm in (Select-String -Path $JoinFile -Pattern '\[combat\] order hand=(\d+),(\d+)' -ErrorAction SilentlyContinue)) {
+        $joinHands[$jm.Matches[0].Groups[1].Value + ',' + $jm.Matches[0].Groups[2].Value] = $true
+    }
+    $m = @{ spawned = $spawned; want = $want; joinOrderedHands = $joinHands.Count }
+    $bad = @()
+    if ($spawned -lt $MinBattlers) { $bad += "only $spawned/$want battlers spawned (< $MinBattlers)" }
+    if ($issued -lt 1) { $bad += "host never issued the battle orders" }
+    if ($joinHands.Count -lt $MinJoinOrders) { $bad += "join reproduced only $($joinHands.Count) fighter(s) (< $MinJoinOrders)" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  COMBAT-BATTLE FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "combat_battle" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host "  COMBAT-BATTLE PASS - $spawned/$want battlers spawned, join drove $($joinHands.Count) fighter(s)"
+    return (Add-GateResult -Name "combat_battle" -Status PASS -Metrics $m)
+}
+
+# combat_win (2026-07-16 smoothness pass, second warp shape): each side buffs its
+# OWN player-squad to 120 in every stat and the host runtime-spawns N enemies onto
+# the PC leader; the buffed PCs win, so the join stress is dying/fleeing/KO churn.
+# Presence/outcome oracle (the warp itself is gated by combat_snap_rate):
+#   1. BOTH sides buffed their own PCs (SCENARIO WIN buff rank=0 on host, rank=1 on join)
+#   2. host spawned >= MinEnemies and issued the attack orders
+#   3. the fight was WON (SCENARIO WIN down >= 1 on the host) and CROSSED (the join
+#      reproduced the enemy copies - SCENARIO RECV present)
+function Test-CombatWin {
+    param([string]$HostFile, [string]$JoinFile, [int]$MinEnemies = 4)
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        return (Add-GateResult -Name "combat_win" -Status FAIL -Detail "missing log")
+    }
+    $hostBuff = @(Select-String -Path $HostFile -Pattern 'SCENARIO WIN buff rank=0' -ErrorAction SilentlyContinue).Count
+    $joinBuff = @(Select-String -Path $JoinFile -Pattern 'SCENARIO WIN buff rank=1' -ErrorAction SilentlyContinue).Count
+    $sp = Select-String -Path $HostFile -Pattern 'SCENARIO WIN spawned=(\d+)/(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $spawned = if ($sp) { [int]$sp.Matches[0].Groups[1].Value } else { 0 }
+    $want    = if ($sp) { [int]$sp.Matches[0].Groups[2].Value } else { 0 }
+    $issued  = @(Select-String -Path $HostFile -Pattern 'SCENARIO WIN issued n=(\d+)' -ErrorAction SilentlyContinue).Count
+    $peak = {
+        param($file)
+        $mx = 0
+        foreach ($mm in (Select-String -Path $file -Pattern 'SCENARIO WIN down=(\d+)/' -ErrorAction SilentlyContinue)) {
+            $v = [int]$mm.Matches[0].Groups[1].Value
+            if ($v -gt $mx) { $mx = $v }
+        }
+        return $mx
+    }
+    $hostDown = & $peak $HostFile
+    $joinDown = & $peak $JoinFile
+    $joinRecv = @(Select-String -Path $JoinFile -Pattern 'SCENARIO RECV ' -ErrorAction SilentlyContinue).Count
+    $m = @{ hostBuff=$hostBuff; joinBuff=$joinBuff; spawned=$spawned; want=$want;
+            issued=$issued; hostDown=$hostDown; joinDown=$joinDown; joinRecv=$joinRecv }
+    $bad = @()
+    if ($hostBuff -lt 1) { $bad += "host never buffed its PCs (no rank=0 buff)" }
+    if ($joinBuff -lt 1) { $bad += "join never buffed its PCs (no rank=1 buff)" }
+    if ($spawned -lt $MinEnemies) { $bad += "only $spawned/$want enemies spawned (< $MinEnemies)" }
+    if ($issued -lt 1) { $bad += "host never issued the attack orders" }
+    if ($hostDown -lt 1) { $bad += "no enemy went down (the PCs did not win)" }
+    if ($joinRecv -lt 1) { $bad += "join never reproduced the enemy copies" }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  COMBAT-WIN FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "combat_win" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host "  COMBAT-WIN PASS - buffed host=$hostBuff join=$joinBuff PC(s); $spawned/$want enemies, down host=$hostDown join=$joinDown"
+    return (Add-GateResult -Name "combat_win" -Status PASS -Metrics $m)
 }
 
 # death_parity (2026-07-15 owner-authoritative death fix): cross-checks a MANUAL

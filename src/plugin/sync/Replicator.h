@@ -53,6 +53,16 @@ public:
         if (snapDist > 0.0f) snapDist_ = snapDist;
         if (snapSeconds > 0.0f) snapSeconds_ = snapSeconds;
     }
+    // Combat-drive convergence bands (2026-07-16 smoothness pass). 0 keeps the
+    // ReplicatorUtil constant default; > 0 overrides for a sweep without a rebuild.
+    void setCombatTuning(float softDist, float snapDist, float bigSnapDist,
+                         float slideMax, unsigned long convergeMs) {
+        if (softDist > 0.0f)    combatSoftDist_    = softDist;
+        if (snapDist > 0.0f)    combatSnapDist_    = snapDist;
+        if (bigSnapDist > 0.0f) combatBigSnapDist_ = bigSnapDist;
+        if (slideMax > 0.0f)    combatSlideMax_    = slideMax;
+        if (convergeMs > 0)     combatConvergeMs_  = convergeMs;
+    }
     // KENSHICOOP_SEND_STAMP=0: ignore the batch sendMs and index interp rings
     // on arrival time (the legacy scheme) - a receiver-local A/B lever.
     void setSendStamp(bool v) { sendStamp_ = v; }
@@ -614,6 +624,17 @@ private:
                                       //   disarm DEBOUNCE: a 1-batch gap must not reset the AI)
         unsigned long combatSnapTick; // last hard snap (cooldown; a failed teleport must not
                                       //   re-fire every frame - walk-converge between snaps)
+        unsigned long combatSnapCount;// cumulative combat hard-snaps on this hand (Phase 1 warp
+                                      //   diagnosis): a body that keeps snapping is PERSISTENTLY
+                                      //   divergent (wrong target / wrong place), not occasionally
+                                      //   churning - surfaced as n= in the [combat] snap line and
+                                      //   as maxPersist in the [combat] stats rollup
+        unsigned long combatOverTick; // Phase 1 hysteresis (2026-07-16 smoothness pass): first
+                                      //   tick the drift went OVER the snap band this spell
+                                      //   (0 = under). A copy only INSTANT-teleports after the
+                                      //   drift PERSISTS COMBAT_CONVERGE_MS on a moving source;
+                                      //   a momentary interp/footwork spike fast-slides back
+                                      //   instead of warping
         unsigned long npcSnapTick;    // locomotion-path hard snap cooldown (Phase 2): a far
                                       //   NPC whose teleport can't stick (seat AI, unloaded
                                       //   terrain) walk-converges between snaps instead of
@@ -669,7 +690,8 @@ private:
                    koLatched(false), deathLatched(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
-                   combatSeenTick(0), combatSnapTick(0), npcSnapTick(0),
+                   combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
+                   combatOverTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
@@ -832,6 +854,11 @@ private:
                                         // by more than this much TRAVEL TIME (the
                                         // fixed distance gate false-fired on
                                         // sprinters and any game speed > 2x)
+    float                 combatSoftDist_;    // combat converge soft band (u)
+    float                 combatSnapDist_;    // combat churn ceiling / slide trigger (u)
+    float                 combatBigSnapDist_; // combat true-leave instant-teleport dist (u)
+    float                 combatSlideMax_;    // combat fast-slide speed cap floor (u/s)
+    unsigned long         combatConvergeMs_;  // combat snap hysteresis window (ms)
     bool                  sendStamp_; // index interp rings on sender stamps (v35)
     unsigned long         starveHoldMs_;  // guard-hold window past staleness
     unsigned int          starveHeldNow_; // bodies in the hold this tick (stat line)
@@ -1002,6 +1029,20 @@ private:
     unsigned long walkReissueNpc_;
     unsigned long restFlipNpc_;     // walk->rest classifier transitions (flap telemetry)
     unsigned long restFlipMid_;     // same, mid-tier bodies (kept out of the near gate)
+    // Combat warp diagnosis (Phase 1): cumulative combat-drive corrections, surfaced
+    // on the ~5 s "[combat] stats" line and diffed by the combat_snap_rate oracle.
+    // A driven combatant is engine-driven locally (its own footwork), so position is
+    // corrected in graded bands; these count each band so a session log tells warp
+    // (snap) from smooth convergence (softWalk) and names WHY (wrongTgt).
+    unsigned long combatSnapTotal_; // combat hard teleports (applyRaw) - the visible warp
+    unsigned long combatSoftWalk_;  // combat soft walk-converge corrections (no teleport)
+    unsigned long combatSlide_;     // combat FAST-SLIDE corrections: drift past the old snap
+                                    //   band (COMBAT_SNAP_DIST) converged with a quick walk
+                                    //   instead of a teleport (the smoothness-pass win - these
+                                    //   used to all be visible warps)
+    unsigned long combatOrder_;     // combat attack (re-)issues (order/target reconcile)
+    unsigned long combatWrongTgt_;  // hard snaps fired while fighting the WRONG local target
+    unsigned long combatLogTick_;
     unsigned long interpLogTick_;
 
     // Protocol 36 (wire v35): per-sender clock mapping for the batch send

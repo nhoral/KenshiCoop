@@ -464,6 +464,14 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // 014713: the pre-seated striker re-ordered 15x, localFight=0 all
                 // window). Flush the order via the order-path attack, once.
                 bool breakSeat = d.taskApplied || d.issuedTask != TASK_NONE;
+                // Wrong-target divergence (Phase 3, 2026-07-16): the local brawl
+                // grabbed a DIFFERENT body than the host reports. Drop the wrong
+                // lock before re-ordering so the engine re-acquires the host's
+                // target instead of re-diverging every episode (the maxPersist /
+                // wrongTgt driver - a snap back doesn't fix the cause, the local
+                // AI just re-locks the wrong enemy). Throttled by the same re-issue
+                // backoff, so this is not a per-frame clearGoals thrash.
+                if (wrongLocalTgt) engine::clearGoals(c);
                 int r = engine::applyCombat(c, out, breakSeat);
                 if (breakSeat && r == 2) {
                     d.taskApplied = false; d.taskBad = false;
@@ -471,6 +479,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 }
                 d.combatArmed = true; d.combatTick = now;
                 if (d.combatOrders < 1000000u) ++d.combatOrders;
+                ++combatOrder_;
                 d.combatTgtIdx = out.sIndex; d.combatTgtSer = out.sSerial;
                 { char b[192]; _snprintf(b, sizeof(b) - 1,
                     "[combat] order hand=%u,%u tgt=%u,%u localFight=%d r=%d wait=%d n=%u%s",
@@ -497,19 +506,92 @@ void Replicator::applyTargets(GameWorld* gw) {
                 bool arming = !hostWaiting && !localFighting &&
                               d.combatOrders <= COMBAT_REISSUE_CAP;
                 float drift = dist3(ax, ay, az, out.x, out.y, out.z);
-                if (drift > COMBAT_SNAP_DIST &&
+                // Source (host) speed estimate: a leave on a FAST source is a real
+                // chase (a teleport is correct there); a big drift on a STATIONARY
+                // source (srcVel~0) is melee churn or a wrong-place body - converge,
+                // never warp. Same 2-sample estimate the locomotion gate uses.
+                float srcVel = 0.0f;
+                { EntityState nn; float cvx = 0.0f, cvy = 0.0f, cvz = 0.0f;
+                  if (d.interp.latest(&nn, &cvx, &cvy, &cvz))
+                      srcVel = std::sqrt(cvx * cvx + cvy * cvy + cvz * cvz); }
+                // Convergence-first correction (2026-07-16 smoothness pass). A
+                // correctly-engaged fight owns its footwork up to the churn ceiling
+                // (COMBAT_SNAP_DIST); every other copy (arming / idle / WAITING /
+                // wrong-target) converges above a soft band - tighter for a waiting
+                // stance that should not wander. Above the leave band the body
+                // FAST-SLIDES to the host pose (a quick walk, gait preserved); an
+                // INSTANT teleport is reserved for a true LEAVE only (very far, a
+                // source teleport, or a drift that SAT over the band for
+                // COMBAT_CONVERGE_MS on a moving source). Momentary interp/footwork
+                // spikes converge - they never warp.
+                bool correctFight = localFighting && !wrongLocalTgt;
+                float softBand  = hostWaiting ? COMBAT_WAIT_DIST : combatSoftDist_;
+                float leaveBand = correctFight ? combatSnapDist_ : softBand;
+                if (drift > combatSnapDist_) {
+                    if (d.combatOverTick == 0) d.combatOverTick = now;
+                } else {
+                    d.combatOverTick = 0;
+                }
+                bool sustained = d.combatOverTick != 0 &&
+                                 (now - d.combatOverTick) >= combatConvergeMs_;
+                bool srcTeleport = (d.interp.lastMode() == EntityInterp::SM_SEG_SNAP);
+                // A WAITING stance has no chase to justify a warp - it only converges.
+                bool trueLeave = !hostWaiting &&
+                                 (drift > combatBigSnapDist_ || srcTeleport ||
+                                  (sustained && srcVel >= COMBAT_SNAP_VEL));
+                if (trueLeave &&
                     (now - d.combatSnapTick) >= COMBAT_SNAP_COOL_MS) {
                     engine::applyRaw(c, out);
                     d.combatSnapTick = now;
-                    { char b[144]; _snprintf(b, sizeof(b) - 1,
-                        "[combat] snap hand=%u,%u drift=%.1f wait=%d",
-                        out.hIndex, out.hSerial, drift, hostWaiting ? 1 : 0);
+                    d.combatOverTick = 0;
+                    d.haveDest = false; // position jumped: force a fresh slide dest
+                    ++d.combatSnapCount; ++combatSnapTotal_;
+                    if (wrongLocalTgt) ++combatWrongTgt_;
+                    { char b[224]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] snap hand=%u,%u drift=%.1f srcVel=%.1f "
+                        "localFight=%d wrongTgt=%d arming=%d wait=%d seg=%lu n=%lu",
+                        out.hIndex, out.hSerial, drift, srcVel,
+                        localFighting ? 1 : 0, wrongLocalTgt ? 1 : 0,
+                        arming ? 1 : 0, hostWaiting ? 1 : 0,
+                        d.interp.lastSegMs(), d.combatSnapCount);
                       b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-                } else if (drift > COMBAT_SOFT_DIST && !localFighting && !arming) {
-                    engine::walkTo(c, out.x, out.y, out.z, 0.0f);
+                } else if (drift > leaveBand) {
+                    // Fast catch-up slide: speed scales with drift (~1 s to close),
+                    // clamped so a big gap glides quickly without a teleport. walkTo
+                    // floors sub-1 speeds to RUN, so small converges stay a walk.
+                    // Re-issue ONLY when the host pose moved past REISSUE_DIST since
+                    // the last slide dest: a per-frame walkTo restarts the path and
+                    // renders as stutter (the locomotion-drive lesson) - the exact
+                    // smoothness regression this throttle removes.
+                    float moved = d.haveDest
+                        ? dist3(out.x, out.y, out.z, d.dx, d.dy, d.dz)
+                        : (REISSUE_DIST + 1.0f);
+                    if (moved > REISSUE_DIST) {
+                        // Speed must EXCEED the source's own pace or a chase never
+                        // closes: the copy would trail at a fixed gap, stay over the
+                        // band, and eventually teleport (the maxPersist=9 driver at
+                        // N=40). Match the streamed locomotion speed and ADD a drift-
+                        // proportional catch-up, capped at 2.5x the source pace (the
+                        // locomotion-drive envelope), with COMBAT_SLIDE_MAX as a
+                        // floor so a stationary-source gap still closes quickly.
+                        float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
+                        float spd = base + drift;
+                        float cap = base * 2.5f;
+                        if (cap < combatSlideMax_) cap = combatSlideMax_;
+                        if (spd > cap) spd = cap;
+                        engine::walkTo(c, out.x, out.y, out.z, spd);
+                        ++combatSoftWalk_;
+                        if (drift > combatSnapDist_) ++combatSlide_;
+                        d.haveDest = true; d.dx = out.x; d.dy = out.y; d.dz = out.z;
+                    }
+                } else {
+                    // Converged inside the leave band: release the slide dest so the
+                    // next genuine drift re-issues a fresh walk (and so a body that
+                    // exits combat doesn't inherit a stale combat destination).
+                    d.haveDest = false;
                 }
             }
-            d.parked = false; d.haveDest = false;
+            d.parked = false;
             if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
             continue;
         }
@@ -1134,6 +1216,28 @@ void Replicator::applyTargets(GameWorld* gw) {
                 z[sizeof(z) - 1] = '\0'; coop::logLine(z);
             }
         }
+    }
+    // Combat warp-diagnosis rollup (~5 s, Phase 1). Quiet until combat has
+    // happened this session (combatOrder_ > 0), so a peaceful run stays clean.
+    // Cumulative counters diff into rates (the combat_snap_rate oracle); armed
+    // counts + maxPersist are LIVE (a body persistently snapping is diverging in
+    // a directed way - wrong target / wrong place - not occasionally churning).
+    if (combatOrder_ > 0 && (now - combatLogTick_) > 5000) {
+        combatLogTick_ = now;
+        unsigned int armed = 0; unsigned long maxPersist = 0;
+        for (std::map<Key, Driven>::iterator it = targets_.begin();
+             it != targets_.end(); ++it) {
+            if (it->second.combatArmed) ++armed;
+            if (it->second.combatSnapCount > maxPersist)
+                maxPersist = it->second.combatSnapCount;
+        }
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+            "[combat] stats snap=%lu slide=%lu softWalk=%lu order=%lu wrongTgt=%lu "
+            "armed=%u maxPersist=%lu",
+            combatSnapTotal_, combatSlide_, combatSoftWalk_, combatOrder_,
+            combatWrongTgt_, armed, maxPersist);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     if (gateAuthority_ && (now - trustLogTick_) > 3000) {
         trustLogTick_ = now;
