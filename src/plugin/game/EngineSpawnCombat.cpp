@@ -1199,6 +1199,22 @@ static bool isWorkFixtureTask(int task) {
     }
 }
 
+// True if a reproduced task is a medic/first-aid action (2026-07-15 medic sync).
+// The subject is the PATIENT (a character), not a building: its hand resolves
+// cross-client so it is identity-trusted (not distance-gated), and it is ordered
+// with dest=NULL (a patient is not a destination building - see applyTaskOrder).
+static bool isMedicTask(int task) {
+    switch (task) {
+        case FIRST_AID_ORDER:
+        case JOB_MEDIC:
+        case FIRST_AID_ROBOT:
+        case JOB_REPAIR_ROBOT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int applyTask(Character* c, const EntityState& e) {
     if (e.task == TASK_NONE) return 0;
     if (!c || !g_handGetRootFn || !g_handCtorFn) return 0;
@@ -1227,9 +1243,11 @@ int applyTask(Character* c, const EntityState& e) {
         {
             Ogre::Vector3 sp = target->getPosition(); // virtual: safe direct call
             float dx = sp.x - e.x, dz = sp.z - e.z;
-            // Seats: reject a far (mis-resolved) prop. Work fixtures: trusted by
-            // identity - a large mine's origin sits far from its operate spot.
-            if (!coop::poseFixtureAcceptedSq(isWorkFixtureTask((int)e.task), dx * dx + dz * dz))
+            // Seats: reject a far (mis-resolved) prop. Work fixtures + medic (patient)
+            // subjects: trusted by identity - a large mine's origin sits far from its
+            // operate spot, and a patient's driven copy may be mid-motion.
+            bool identityTrusted = isWorkFixtureTask((int)e.task) || isMedicTask((int)e.task);
+            if (!coop::poseFixtureAcceptedSq(identityTrusted, dx * dx + dz * dz))
                 return 3; // fixture resolved but it's the WRONG (far) one -> park
         }
         // Clear any local intent first, then issue a PERSISTENT AI goal to perform
@@ -1296,18 +1314,24 @@ int applyTaskOrder(Character* c, const EntityState& e) {
         RootObject* target = g_handGetRootFn(h);
         if (!target) return 1; // fixture not loaded here -> caller idle-parks
         Ogre::Vector3 loc = target->getPosition(); // virtual: safe direct call
+        bool medic = isMedicTask((int)e.task);
         {
             float dx = loc.x - e.x, dz = loc.z - e.z;
-            // Seats: reject a far (mis-resolved) prop. Work fixtures: trusted by
-            // identity - a large mine's origin sits far from its operate spot.
-            if (!coop::poseFixtureAcceptedSq(isWorkFixtureTask((int)e.task), dx * dx + dz * dz))
+            // Seats: reject a far (mis-resolved) prop. Work fixtures + medic (patient)
+            // subjects: trusted by identity - a large mine's origin sits far from its
+            // operate spot, and a patient's driven copy may be mid-motion.
+            if (!coop::poseFixtureAcceptedSq(isWorkFixtureTask((int)e.task) || medic,
+                                             dx * dx + dz * dz))
                 return 3; // resolved the WRONG (far) fixture -> caller parks in place
         }
         if (g_clearGoalsFn) g_clearGoalsFn(c);
-        // Player-order to the EXACT seat fixture + location. A stool is a Building,
-        // so it doubles as the order destination. clear=true drops prior orders.
+        // Player-order to the EXACT fixture + location. A seat/machine IS a Building,
+        // so it doubles as the order destination. A medic subject is the PATIENT (a
+        // character, not a building), so order it with dest=NULL - the same form a
+        // player's right-click First Aid issues (mirrors orderMeleeAttackViaOrder).
+        // clear=true drops prior orders.
         if (g_addOrderFn) {
-            Building* dest = reinterpret_cast<Building*>(target);
+            Building* dest = medic ? 0 : reinterpret_cast<Building*>(target);
             g_addOrderFn(c, dest, (int)e.task, target, /*shift*/false,
                          /*clear*/true, &loc);
         } else if (g_addJobFn) {

@@ -21,6 +21,13 @@
 //     once the hand resolves we trust it and issue the operate order; the engine
 //     paths the body to the machine's own operate point.
 //
+//   * MEDIC (first-aid) subjects (2026-07-15 medic sync) are the PATIENT CHARACTER,
+//     not a fixture. A squad member's hand resolves cross-client (both clients loaded
+//     the same squad), so - like a work fixture - the subject is identity-trusted and
+//     NOT distance-gated (the patient's driven copy may be mid-motion when the heal is
+//     ordered). The caller passes such a task as "identity-trusted" (the boolean arg
+//     below), so the same ungated accept path applies.
+//
 // Shared by:
 //   * EngineSpawnCombat.cpp - the applyTask / applyTaskOrder acceptance gate
 //   * prototest             - the no-game unit layer that guards the mining fix
@@ -42,8 +49,10 @@ namespace coop {
 static const float SEAT_MATCH_DIST = 6.0f;
 
 // Whether a pose's resolved fixture must pass the distance gate. Seats are gated
-// (they mis-resolve to a wrong nearby prop); work fixtures are unique buildings with
-// reliable cross-client hands, so they are trusted regardless of the origin offset.
+// (they mis-resolve to a wrong nearby prop); work fixtures (unique buildings) and
+// medic patient subjects (squad characters) have reliable cross-client hands, so
+// they are identity-trusted regardless of the origin offset. The boolean means
+// "identity-trusted" - the caller ORs the work-fixture and medic predicates.
 inline bool poseIsDistanceGated(bool isWorkFixture) { return !isWorkFixture; }
 
 // True if a fixture resolved 'distMeters' from the streamed transform is accepted.

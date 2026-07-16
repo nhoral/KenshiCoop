@@ -347,7 +347,7 @@ Export-ModuleMember -Function @(
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",
     "Test-CombatProbe", "Test-CombatOrder", "Test-CombatKill", "Test-DamageGuard",
     "Get-VitalsSeries", "Test-PlayerCombat", "Test-AssaultTown", "Test-PlayerKo", "Test-MedicOrder",
-    "Test-LimbLoss", "Test-NpcVitals",
+    "Test-MedicPose", "Test-LimbLoss", "Test-NpcVitals",
     "Get-StatsSeries", "Test-StatsSync",
     "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry",
     "Get-FurnSeries", "Test-FurnPut", "Test-CagePeer",

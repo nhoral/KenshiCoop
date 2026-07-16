@@ -320,3 +320,74 @@ function Test-MedicOrder {
     return (Add-GateResult -Name "medic_order" -Status PASS -Metrics $m)
 }
 
+# medic_pose (2026-07-15 medic-animation sync): the ANIMATION counterpart to
+# medic_order. medic_order proves the medical STATE crosses (owner-authoritative
+# vitals); this proves the first-aid ACTION is reproduced on the peer so the
+# bandaging animation plays. Reproduction is a REPLICATION path (any live heal
+# exercises it), not a scenario, so this judges a manual/host+join session log
+# pair rather than a SCENARIO marker - mirroring how the mining fix is validated
+# by prototest + a manual pass.
+#
+# Two log signals (C++ log contract; see EngineEntity.cpp logTaskKeyOnce and
+# ReplicatorDrive.cpp applyOrder):
+#   HOST recognised it   - "[taskkey] key=K desc='..' repro=1 subject=1" where
+#                          desc reads as first-aid/medic (the host STREAMS such a
+#                          task; repro=1 means it is in isReproduciblePose).
+#   JOIN reproduced it   - "[pose] applyOrder .. task=K .. r=2" for that same K
+#                          (r=2 = the driven copy took the pose = animation ordered).
+# TaskType ids are DISCOVERED from the host desc (never hardcoded); -MedicTaskIds
+# is only a fallback for older logs whose desc doesn't read as medic. SKIP when no
+# medic task appears in the window (nobody healed) so it never falses on a run
+# without a heal.
+function Test-MedicPose {
+    param([string]$HostFile, [string]$JoinFile,
+          [int[]]$MedicTaskIds = @(25, 57, 58, 60))
+    if (-not (Test-Path $HostFile) -or -not (Test-Path $JoinFile)) {
+        Write-Host "  MEDIC-POSE SKIP - missing log(s)"
+        return (Add-GateResult -Name "medic_pose" -Status SKIP -Detail "missing logs")
+    }
+    # 1. Discover the medic TaskType id(s) the HOST recognised as reproducible.
+    $tkPat = "\[taskkey\] key=(\d+) desc='([^']*)' repro=(\d) subject=(\d)"
+    $medicKw = 'first ?aid|medic|bandag|heal|doctor|treat'
+    $recognised = @{}; $seenMedicButNotRepro = @()
+    foreach ($mm in (Select-String -Path $HostFile -Pattern $tkPat -ErrorAction SilentlyContinue)) {
+        $g = $mm.Matches[0].Groups
+        $key = [int]$g[1].Value; $desc = $g[2].Value
+        $repro = [int]$g[3].Value
+        $isMedic = ($desc -match $medicKw) -or ($MedicTaskIds -contains $key)
+        if (-not $isMedic) { continue }
+        if ($repro -eq 1) { $recognised[$key] = $desc }
+        else { $seenMedicButNotRepro += "$key('$desc')" }
+    }
+    # 2. Did the JOIN reproduce a medic task (pose ordered, r=2)?
+    $posePat = "\[pose\] applyOrder hand=\d+,\d+ task=(\d+) subj=\d+,\d+,\d+ det=-?\d+ r=(\d+)"
+    $reproduced = @{}; $poseFar = @{}
+    $medicIds = @($recognised.Keys) + $MedicTaskIds | Select-Object -Unique
+    foreach ($pm in (Select-String -Path $JoinFile -Pattern $posePat -ErrorAction SilentlyContinue)) {
+        $g = $pm.Matches[0].Groups
+        $task = [int]$g[1].Value; $r = [int]$g[2].Value
+        if ($medicIds -notcontains $task) { continue }
+        if ($r -eq 2) { $reproduced[$task] = $true }
+        elseif ($r -eq 3) { $poseFar[$task] = $true }   # resolved WRONG (far) fixture
+    }
+    if ($recognised.Count -eq 0 -and $reproduced.Count -eq 0) {
+        $extra = if ($seenMedicButNotRepro.Count -gt 0) { " (host saw medic task(s) $($seenMedicButNotRepro -join ',') but repro=0 - NOT in isReproduciblePose)" } else { " (no medic task in the session - nobody healed?)" }
+        Write-Host "  MEDIC-POSE SKIP - no reproducible medic task observed$extra"
+        return (Add-GateResult -Name "medic_pose" -Status SKIP -Detail "no medic task$extra")
+    }
+    $bad = @()
+    if ($recognised.Count -eq 0) { $bad += "host never marked a medic task repro=1 (isReproduciblePose gap)" }
+    if ($reproduced.Count -eq 0) {
+        $why = if ($poseFar.Count -gt 0) { "join saw the medic task but the patient fixture resolved far (r=3) - identity-trust gate?" } else { "join never issued the medic pose order (r=2 missing)" }
+        $bad += $why
+    }
+    $mtr = @{ hostRepro = $recognised.Count; joinRepro = $reproduced.Count
+             ids = (@($reproduced.Keys) -join ',') }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  MEDIC-POSE FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "medic_pose" -Status FAIL -Metrics $mtr -Detail ($bad -join "; "))
+    }
+    Write-Host "  MEDIC-POSE PASS - host streamed + join reproduced medic task id(s) $($mtr.ids) (bandaging animation ordered on the peer)"
+    return (Add-GateResult -Name "medic_pose" -Status PASS -Metrics $mtr)
+}
+

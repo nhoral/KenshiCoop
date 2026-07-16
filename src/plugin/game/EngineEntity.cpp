@@ -55,6 +55,18 @@ bool isReproduciblePose(int t) {
         case OPERATE_AUTOMATIC_MACHINERY:
         case USE_TRAINING_DUMMY:
         case PRETEND_TO_OPERATE_MACHINERY:
+        // Medic / first-aid poses (2026-07-15 medic sync). A player treating a
+        // wounded ally runs one of these; unlike a seat/machine the SUBJECT is the
+        // PATIENT (a character), not a building. Its hand resolves cross-client (both
+        // clients loaded the same squad), so the player-order path reproduces the
+        // bandaging animation on the peer. The healing EFFECT already replicates via
+        // the owner-authoritative PKT_MEDICAL snapshot; this is animation parity only.
+        // FIRST_AID_ORDER = right-click First Aid; JOB_MEDIC = the medic job;
+        // FIRST_AID_ROBOT / JOB_REPAIR_ROBOT = the skeleton-repair equivalents.
+        case FIRST_AID_ORDER:
+        case JOB_MEDIC:
+        case FIRST_AID_ROBOT:
+        case JOB_REPAIR_ROBOT:
             return true;
         default:
             return false;
