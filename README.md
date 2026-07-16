@@ -1,5 +1,7 @@
 # KenshiCoop
 
+Setup + Demo: [https://www.youtube.com/watch?v=OqwVRRZEYGM](https://www.youtube.com/watch?v=OqwVRRZEYGM)
+
 Experimental **co-op multiplayer for [Kenshi](https://lofigames.com/)**, built as an
 [RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi) /
 [KenshiLib](https://github.com/BFrizzleFoShizzle/KenshiLib) plugin.
