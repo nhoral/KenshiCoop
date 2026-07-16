@@ -41,3 +41,6 @@ resources/Kenshi_Coop.mp4
 
 # Stray shell artifact
 nul
+
+# Local-only maintainer notes (release process, etc.) - not for the public repo
+*.local.md
