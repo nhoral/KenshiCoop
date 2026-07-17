@@ -29,10 +29,12 @@ struct Config {
     bool          probeRecruit;    // KENSHICOOP_PROBE_RECRUIT == "1" (join only):
                                    // recruit diverged NPCs into the player squad
                                    // to validate the AI-gating "inhabit" lever.
-    bool          aiSuspend;      // KENSHICOOP_AI_SUSPEND != "0" (join only; DEFAULT ON):
+    bool          aiSuspend;      // KENSHICOOP_AI_SUSPEND != "0" (BOTH roles; DEFAULT ON):
                                    // detour Character::periodicUpdate to suspend the
-                                   // AI decision layer for host-driven NPCs (keeps
+                                   // AI decision layer for any peer-DRIVEN body (keeps
                                    // animation; stops self-tasking) - faction-safe.
+                                   // Phase 1b: host too, for units transferred into
+                                   // the join's tab (host then drives them).
                                    // Promoted from probe to the default quieting layer
                                    // (2026-07-05 review: pose_state 0.972 vs 0.962 with
                                    // it on). "0" is the escape hatch; the legacy
@@ -231,6 +233,15 @@ struct Config {
     // executed engine-native (setBedMode/setPrisonMode) between each machine's
     // local pair. "0" is the A/B escape hatch.
     bool          furnSync;
+
+    // KENSHICOOP_CHAIN_SYNC (default ON): chained/pole prisoner sync
+    // (protocol 41) - a captive shackled to a prisoner POLE is chained
+    // (Character::isChained + setChainedMode), a different engine system from a
+    // cage (inSomething==IN_PRISON). Rides the furniture pipeline as kind=3.
+    // Without it a poled unit never crosses the wire (the join leaves it at the
+    // last carried/KO stage). "0" is the A/B escape hatch (beds/cages keep
+    // working) if it ever freezes a walking slave.
+    bool          chainSync;
 
     // KENSHICOOP_STEALTH_SYNC (default ON): stealth sync (protocol 20) -
     // continuous BODY_SNEAK posture apply on driven copies (engine-native

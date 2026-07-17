@@ -153,6 +153,17 @@ static void testSizes() {
     CHECK("bodyInFurniture(BODY_IN_CAGE)",   bodyInFurniture(BODY_IN_CAGE));
     CHECK("!bodyInFurniture(down|carried)",  !bodyInFurniture(BODY_DOWN | BODY_CARRIED));
     CHECK("occupant+down still reads down",  bodyIsDown(BODY_IN_CAGE | BODY_DOWN));
+    // Chained/pole prisoner (protocol 41): distinct bit, rides the furniture
+    // carve-out (bodyInFurniture true) but still reads down when KO'd.
+    CHECK("BODY_CHAINED distinct bit",
+          BODY_CHAINED != BODY_IN_BED && BODY_CHAINED != BODY_IN_CAGE &&
+          BODY_CHAINED != BODY_DOWN && BODY_CHAINED != BODY_RAGDOLL &&
+          BODY_CHAINED != BODY_DEAD && BODY_CHAINED != BODY_CRAWL &&
+          BODY_CHAINED != BODY_CARRIED && BODY_CHAINED != BODY_SNEAK);
+    CHECK("bodyChained(BODY_CHAINED)",       bodyChained(BODY_CHAINED));
+    CHECK("bodyInFurniture(BODY_CHAINED)",   bodyInFurniture(BODY_CHAINED));
+    CHECK("!bodyChained(down|carried)",      !bodyChained(BODY_DOWN | BODY_CARRIED));
+    CHECK("chained+down still reads down",   bodyIsDown(BODY_CHAINED | BODY_DOWN));
     // The new reliable events are distinct from the whole existing set.
     CHECK("EVT_ENTER_FURNITURE distinct",
           EVT_ENTER_FURNITURE != EVT_NONE && EVT_ENTER_FURNITURE != EVT_KNOCKOUT &&
@@ -189,7 +200,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v40: cross-squad trade + hardened drops)", (int)PROTOCOL_VERSION, 40);
+    CHECK_EQ("PROTOCOL_VERSION (v41: chained/pole prisoner sync)", (int)PROTOCOL_VERSION, 41);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------

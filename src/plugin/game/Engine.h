@@ -32,6 +32,12 @@ bool gameplayLive(GameWorld* gw);
 // subsystem isn't ready yet (caller retries next frame) or the call faulted.
 bool loadSave(const std::string& name);
 
+// SEH-guarded: overwrite SaveManager::currentGame in place. The engine's
+// load(name) path does NOT refresh currentGame, so loadSave() calls this to keep
+// getCurrentGame()/saveInfo() truthful - otherwise the host connect-push saves
+// the loaded world over a STALE save name (the fixture-clobber bug).
+bool setCurrentGameName(const std::string& name);
+
 // SEH-guarded readiness probe: does the save subsystem report it is up? Returns
 // true when the probe symbol is unavailable (so it never blocks auto-load).
 bool savesReady();
@@ -185,6 +191,11 @@ bool suppressNpc(GameWorld* gw, Character* c);
 // (when the host stops streaming it), so the world keeps living rather than
 // leaving a frozen body behind. Also makes the body visible again.
 void restoreNpc(GameWorld* gw, Character* c);
+
+// True if 'obj' is one of THIS client's player-squad members. Caller holds the
+// SEH frame. Exposed to the sync layer for the recruit membership audit (a
+// re-keyed recruit binds + drives as a proxy but is NOT in the join's squad).
+bool isPlayerSquad(GameWorld* gw, RootObject* obj);
 
 // SEH-guarded: enumerate nearby world NPCs (excluding the local player squad),
 // writing each live Character* into outChars and its hand-bearing snapshot into
@@ -526,6 +537,13 @@ bool setupInventoryScene(GameWorld* gw, unsigned int outHand[5]);
 // Templates are found by keyword over the BUILDING GameData set (camp bed /
 // prisoner cage preferred). Returns true when both spawned; hands logged.
 bool setupBedCageScene(GameWorld* gw);
+
+// Prisoner-pole scene (protocol 19 kind=4 / engine IN_PRISON): spawn one standing
+// prisoner POLE in front of the leader so both clients load a save-stable pole
+// hand. A pole is the SAME containment system as a cage (setPrisonMode), just a
+// different model - the pole_put controlled test uses it to visibly show a body
+// tied to a pole. Auto-baked into 'pole1'. Returns true when the pole spawned.
+bool setupPoleScene(GameWorld* gw);
 
 // Resolve the baked inventory container again after load (host + join): v1 anchors on
 // the leader's own inventory (a save-stable container that accepts arbitrary items).
@@ -949,6 +967,18 @@ bool isNodeAnchoredPose(int taskKey);
 // Join-side only. Returns the engine's recruit() result (false if unresolved).
 bool recruitNpc(GameWorld* gw, Character* c);
 
+// Phase 1b (cross-game recruit membership): make 'c' a real member of THIS
+// client's player squad, assigned to the tab named by newHand's container (the
+// recruiter-reported target). The PEER calls this on a recruit/move edge so a
+// recruited unit appears in the squad panel in BOTH games. Uses
+// Character::setFaction into the resolved platoon (the header-documented
+// re-platoon path) - NOT recruitNpc, whose PlayerInterface::recruit detour would
+// echo a spurious recruit edge back. Control stays with the OWNER: the caller
+// keeps the hand pinned peer-owned, so this side never streams/controls it and
+// the host's kinematic drive wins. Idempotent; SEH-guarded. Returns true if the
+// body is a player-squad member afterwards.
+bool joinPlayerSquadAt(GameWorld* gw, Character* c, const unsigned int newHand[5]);
+
 // AI decision-layer suspension (the faction-safe alternative to recruit): detour
 // Character::periodicUpdate so that, for NPCs in the suspended set, the AI "think"
 // tick is skipped (no autonomous re-tasking) while the body keeps animating and
@@ -1111,10 +1141,12 @@ bool dropSubject(GameWorld* gw, const unsigned int carrierHand[5], bool ragdoll)
 // ---- Protocol 19: furniture occupancy (beds + prison cages) ---------------
 // Snapshot of a body's LOCAL furniture relationship: Character::inSomething
 // (IN_NOTHING/IN_BED/IN_PRISON) + the furniture's save-stable hand (inWhat).
+// Protocol 41 adds kind 3 (chained/pole): Character::isChained; for it the
+// `furn` hand carries the OWNER (Character::slaveOwner), not a building.
 struct FurnitureRead {
     bool valid;
-    int  kind;             // 0 = none, 1 = bed, 2 = prison cage
-    unsigned int furn[5];  // inWhat hand (readObjectHand layout; zeroed if none)
+    int  kind;             // 0 = none, 1 = bed, 2 = prison cage, 3 = chained/pole
+    unsigned int furn[5];  // kind 1/2: inWhat hand; kind 3: slaveOwner hand
 };
 bool readFurniture(Character* c, FurnitureRead* out);
 // Place the local occupant into / remove it from the furniture at furnHand via
@@ -1136,6 +1168,8 @@ bool taskIsBedPose(int t);
 // Self-heal helper (lost/late ENTER edge): find the nearest matching fixture
 // (kind: 1 bed, 2 cage) within 'radius' of the streamed position and place
 // the occupant in it (the continuous bodyState bit carries no furniture hand).
+// Not used for kind 3 (chained/pole): a chain has no searchable building and
+// needs the OWNER hand, so its self-heal re-applies via a remembered owner.
 bool enterFurnitureNearPos(GameWorld* gw, Character* occupant, int kind,
                            float x, float y, float z, float radius);
 
@@ -1618,7 +1652,8 @@ int probeMoveSquadMember(GameWorld* gw, const unsigned int mHand[5],
 // the finding that gates the protocol-23 design.
 // Returns 1 recruited, 0 refused / no subject, -1 fault.
 int probeRecruit(GameWorld* gw, bool runtimeSubject,
-                 unsigned int outHandBefore[5], unsigned int outHandAfter[5]);
+                 unsigned int outHandBefore[5], unsigned int outHandAfter[5],
+                 float radius = 60.0f);
 
 // SEH-guarded: force the vendor at vHand to BUILD its stock. A ShopTrader's
 // Inventory is created lazily (null until the trade UI first opens - shop_probe

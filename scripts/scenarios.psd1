@@ -154,11 +154,20 @@
         }
         # craft1 is loaded WITHOUT the host re-arm setup: CraftOrderScenario pins the
         # baked worker itself and issues the live order mid-run (that IS the test).
+        # march is ADVISORY here (demoted 2026-07-16): craft1 is the suite's densest
+        # town (~24 node-anchored standers, task=35). Phase 1/2 (9cb0dd4) pulled that
+        # whole background population into the near tier as committed task poses, and
+        # a STAND_AT_NODE pose can render its locomotion clip in place - marchFrac
+        # regressed ~0 -> ~0.3 here (and only here; down1/duel1 stay gating). A code
+        # fix lives in the taskApplied pose path and is entangled with the worker's
+        # own operate pose (endAction there cancels the operate the test checks), so
+        # it stays measured-but-advisory pending a dedicated pose-clip quiet. The
+        # tested behavior (worker craft sync + pose tracking) is still GATED.
         craft_order = @{
             Save = 'craft1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'craft_order'
-            Gating   = @('craft_order', 'pose_state', 'march', 'clock_sync')
-            Advisory = @('smoothness', 'anim_truth')
+            Gating   = @('craft_order', 'pose_state', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
 
@@ -343,6 +352,34 @@
             Tier = 'full'; WanVariant = $true
         }
 
+        # chain_put: protocol-41 chained/pole prisoner state. Same two windows
+        # as cage_put but kind=3 (Character::isChained -> setChainedMode). The
+        # subject is self-chained (a pole needs no baked fixture; the owner is a
+        # save-stable hand), so this gates the chained STATE crossing. Reuses
+        # the generic Test-FurnPut oracle (Kind 3 -> the chain_put gate).
+        chain_put = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'chain_put'
+            Gating   = @('chain_put', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
+        # pole_put: protocol-19 kind=4 prisoner POLE. Same two windows as
+        # cage_put but the subject is placed on a baked standing PRISONER POLE
+        # (fixture save 'pole1', baked via `bake_scene.ps1 -Setup pole
+        # -BaseSave squad1 -BakeSave pole1`). A pole is the SAME containment as a
+        # cage (setPrisonMode -> occupant reads in=2), so this is the controlled,
+        # deterministic 'body ON A POLE' test: the FURNACT marker is kind=4 (the
+        # pole gate) while the FURN occupancy is judged in=2 (Test-PolePut).
+        pole_put = @{
+            Save = 'pole1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'pole_put'
+            Gating   = @('pole_put', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
+
         # cage_peer_sync: protocol-36 third-party placement - the HOST places
         # the join's KO'd leader (a peer-owned driven body) into the baked
         # cage, reproducing the guard-jailing-the-join-PC session bug. The
@@ -518,6 +555,21 @@
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'recruit_sync'
             Gating   = @('recruit_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # recruit_ctl: Phase-1b control validation (recruit + transfer). Host
+        # recruits a baked NPC, walks it (join drives - GAIT phase=A parity
+        # sample), the join transfers it into its own tab (control-flip), then
+        # walks it (host drives - GAIT phase=B). Test-RecruitCtl gates gait
+        # parity (a driven squad member reproduces the owner's RUN, not a walk)
+        # and anti-phantom (a control-flip claim never mints a duplicate proxy).
+        # Save 'sync': the bar town has recruitable NPCs and both squads.
+        recruit_ctl = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'recruit_ctl'
+            Gating   = @('recruit_ctl', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }

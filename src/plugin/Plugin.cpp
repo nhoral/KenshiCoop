@@ -745,6 +745,37 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             armConnectPush();
     }
 
+    // Manual-validation helper (host only): KENSHICOOP_AUTORECRUIT=N seconds -
+    // ONCE, N s after gameplay settles, programmatically recruit the nearest
+    // non-player world NPC. probeRecruit -> recruitNpc -> g_recruitFn is the
+    // SAME PlayerInterface::recruit the dialog "join me" outcome hits, so
+    // recruit_hook authors the edge and the whole recruit-sync path runs. Lets
+    // us exercise recruit on any populated save (camp/squad1) with no dialog-
+    // hireable NPC. OFF by default (0 = no-op, zero cost).
+    if (g_cfg.isHost && g_gameStarted) {
+        static int  autoRecruitS    = -1;
+        static bool autoRecruitDone = false;
+        if (autoRecruitS < 0) {
+            const char* e = std::getenv("KENSHICOOP_AUTORECRUIT");
+            autoRecruitS = e ? std::atoi(e) : 0;
+        }
+        if (autoRecruitS > 0 && !autoRecruitDone &&
+            (GetTickCount() - g_gameStartTick) >= (DWORD)autoRecruitS * 1000u) {
+            autoRecruitDone = true;
+            unsigned int hb[5], ha[5];
+            // Wide reach (600u): a caged/imprisoned player squad (the camp save)
+            // sits well beyond the scenario's 60u nearest-NPC probe from the
+            // guards/prisoners it should recruit.
+            int res = coop::engine::probeRecruit(gw, false, hb, ha, 600.0f);
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                "[recruit] AUTORECRUIT res=%d before=%u,%u,%u,%u,%u "
+                "after=%u,%u,%u,%u,%u", res, hb[0], hb[1], hb[2], hb[3], hb[4],
+                ha[0], ha[1], ha[2], ha[3], ha[4]);
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+        }
+    }
+
     // Test-runner self-exit: quit cleanly after the configured duration so
     // unattended runs terminate on their own and flush their logs. Also a hard
     // backstop for a scenario that never reports completion.
@@ -816,6 +847,17 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             bool ok = coop::engine::setupBedCageScene(gw);
             coopLog(ok ? "SETUP(bedcage): bed + cage spawned - SAVE 'bedcage1' now"
                        : "SETUP(bedcage): spawn FAILED");
+            if (ok && !g_cfg.bakeSave.empty())
+                g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
+        } else if (g_cfg.setupScene == "pole") {
+            // Prisoner-pole occupancy (protocol 19 kind=4) BAKE: spawn one
+            // standing prisoner POLE in front of the leader so both clients load
+            // a save-stable pole hand. The pole_put controlled test then KOs a PC
+            // and setPrisonMode's it onto the pole (visibly a body ON A POLE, not
+            // in a cage). With KENSHICOOP_BAKESAVE the save writes automatically.
+            bool ok = coop::engine::setupPoleScene(gw);
+            coopLog(ok ? "SETUP(pole): prisoner pole spawned - SAVE 'pole1' now"
+                       : "SETUP(pole): spawn FAILED (no pole template? see candidates)");
             if (ok && !g_cfg.bakeSave.empty())
                 g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
         } else if (g_cfg.setupScene == "buffpc") {
@@ -1586,6 +1628,7 @@ __declspec(dllexport) void startPlugin() {
     // enter/exit edges + self-healing occupancy state. KENSHICOOP_FURN_SYNC=0
     // is the A/B escape hatch.
     g_repl.setFurnSync(g_cfg.furnSync);
+    g_repl.setChainSync(g_cfg.chainSync);
     g_repl.setStealthSync(g_cfg.stealthSync);
 
     // Per-tab wallet sync (protocol 22, default ON): owner-authoritative money
@@ -1601,13 +1644,22 @@ __declspec(dllexport) void startPlugin() {
     // AI-gating probe (join side): recruit diverged NPCs to test the inhabit lever.
     if (!g_cfg.isHost && g_cfg.probeRecruit) g_repl.setProbeRecruit(true);
 
-    // AI-suspend (join side, DEFAULT ON): detour Character::periodicUpdate so
-    // host-driven NPCs stop self-tasking (decision layer off) while still
-    // animating. Faction is untouched - we hold the body's current action instead
-    // of letting the AI re-decide and wander/thrash. This is the universal
-    // QUIETING layer (doctrine 15 amendment); per-class APPLY levers sit on top.
-    // KENSHICOOP_AI_SUSPEND=0 disables (A/B escape hatch).
-    if (!g_cfg.isHost && g_cfg.aiSuspend) {
+    // AI-suspend (BOTH roles, DEFAULT ON): detour Character::periodicUpdate so
+    // any body a client DRIVES from the peer's stream stops self-tasking (decision
+    // layer off) while still animating. Faction is untouched - we hold the body's
+    // current action instead of letting the AI re-decide and wander/thrash. This
+    // is the universal QUIETING layer (doctrine 15 amendment); per-class APPLY
+    // levers sit on top. KENSHICOOP_AI_SUSPEND=0 disables (A/B escape hatch).
+    //
+    // Phase 1b: enabled on the HOST too (was join-only). The host drives nothing
+    // in the classic host-authoritative single-direction case (it owns every
+    // NPC), so this is a no-op there. But once a recruit is TRANSFERRED into the
+    // join's tab, control flips to the join and the HOST must now drive that
+    // peer-owned squad member - without suspend it self-follows the host's leader
+    // and shows the same slow-walk/snap artifact the join had. applyTargets only
+    // ever suspends bodies we drive (peer-owned), so a host-owned NPC/leader is
+    // never quieted by this.
+    if (g_cfg.aiSuspend) {
         if (coop::engine::installAiSuspendHook()) {
             g_repl.setAiSuspend(true);
             coopLog("[ai] periodicUpdate detour installed; AI-suspend ON (default)");

@@ -135,7 +135,8 @@ bool writeWalletByHand(const unsigned int mHand[5], int money) {
 // ---- Protocol 23 phase 0: recruitment probe ---------------------------------
 
 int probeRecruit(GameWorld* gw, bool runtimeSubject,
-                 unsigned int outHandBefore[5], unsigned int outHandAfter[5]) {
+                 unsigned int outHandBefore[5], unsigned int outHandAfter[5],
+                 float radius) {
     if (outHandBefore) memset(outHandBefore, 0, 5 * sizeof(unsigned int));
     if (outHandAfter)  memset(outHandAfter,  0, 5 * sizeof(unsigned int));
     if (!gw || !gw->player) return -1;
@@ -154,7 +155,7 @@ int probeRecruit(GameWorld* gw, bool runtimeSubject,
             if (!ld) return -1;
             Ogre::Vector3 center = ld->getPosition();
             g_npcQuery.clear();
-            g_getCharsFn(gw, &g_npcQuery, &center, 60.0f, 60.0f, 30.0f, 32, 32, 0);
+            g_getCharsFn(gw, &g_npcQuery, &center, radius, radius, 30.0f, 32, 32, 0);
             unsigned int total = g_npcQuery.size();
             for (unsigned int i = 0; i < total; ++i) {
                 RootObject* o = g_npcQuery[i];
@@ -173,8 +174,13 @@ int probeRecruit(GameWorld* gw, bool runtimeSubject,
         } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
     }
     if (!subject) {
-        coop::logLine(runtimeSubject ? "[recruit] probe no-subject (spawn failed)"
-                                     : "[recruit] probe no-subject (no world NPC in 60u)");
+        if (runtimeSubject) {
+            coop::logLine("[recruit] probe no-subject (spawn failed)");
+        } else {
+            char b[80]; _snprintf(b, sizeof(b) - 1,
+                "[recruit] probe no-subject (no world NPC in %.0fu)", radius);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
         return 0;
     }
     __try {
@@ -188,6 +194,59 @@ int probeRecruit(GameWorld* gw, bool runtimeSubject,
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         coop::logLine("[recruit] probe SEH-except");
         return -1;
+    }
+}
+
+bool joinPlayerSquadAt(GameWorld* gw, Character* c, const unsigned int newHand[5]) {
+    if (!gw || !gw->player || !c || !newHand ||
+        !g_playerFactionFn || !g_getPlatoonFn)
+        return false;
+    __try {
+        // Idempotent, but tab-aware: skip only when the body is ALREADY a member
+        // AND already sits in the target tab (echoed edge / already inserted). A
+        // transfer moves an existing member to a DIFFERENT tab, so a bare
+        // "already a member" guard would wrongly skip the re-container.
+        unsigned int ch[5];
+        if (readObjectHand(static_cast<RootObject*>(c), ch) &&
+            ch[1] == newHand[1] && ch[2] == newHand[2] &&
+            isPlayerSquad(gw, static_cast<RootObject*>(c)))
+            return true;
+        Faction* f = g_playerFactionFn(gw->player);
+        if (!f) return false;
+        // Case A (the norm - recruit_sync showed tabKnown=1): resolve the target
+        // platoon by the reported container serial among existing squad members,
+        // so the inserted body lands in the SAME tab the recruiter used and its
+        // hand container matches the streamed key.
+        ActivePlatoon* target = 0;
+        unsigned int pc = gw->player->playerCharacters.size();
+        for (unsigned int i = 0; i < pc; ++i) {
+            Character* m = gw->player->playerCharacters[i];
+            if (!m) continue;
+            unsigned int mh[5];
+            if (!readObjectHand(static_cast<RootObject*>(m), mh)) continue;
+            if (mh[1] == newHand[1] && mh[2] == newHand[2]) {
+                target = g_getPlatoonFn(m);
+                break;
+            }
+        }
+        // Case B fallback: the reported tab is a runtime-minted platoon not
+        // present locally - drop into the leader's default tab so the body is
+        // still a panel member (control still follows the peer-owned pin).
+        if (!target && pc > 0 && gw->player->playerCharacters[0])
+            target = g_getPlatoonFn(gw->player->playerCharacters[0]);
+        if (!target) return false;
+        // setFaction (probe lever 1, the header-documented re-platoon path):
+        // moves 'c' into the player faction + target platoon WITHOUT touching
+        // PlayerInterface::recruit, so the recruit detour never fires and no
+        // spurious edge echoes back to the author. PlayerInterface::
+        // playerCharacters refreshes on a later engine tick, so DON'T re-check
+        // isPlayerSquad here (it reads false the same frame - a misleading
+        // false negative); reaching setFaction with a resolved platoon IS the
+        // success signal.
+        c->setFaction(f, target);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 

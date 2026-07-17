@@ -98,6 +98,8 @@ function Invoke-OneOracle {
         "bed_pose"      { return (Test-BedPose         -HostFile $HostLog -JoinFile $JoinLog) }
         "bed_put"       { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 1) }
         "cage_put"      { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 2) }
+        "chain_put"     { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 3) }
+        "pole_put"      { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 4 -InKind 2) }
         "cage_peer"     { return (Test-CagePeer        -HostFile $HostLog -JoinFile $JoinLog) }
         "sneak_probe"   { return (Test-SneakProbe      -HostFile $HostLog) }
         "spawn_probe"   { return (Test-SpawnProbe      -HostFile $HostLog -JoinFile $JoinLog) }
@@ -106,6 +108,7 @@ function Invoke-OneOracle {
         "vendor_trade"  { return (Test-VendorTrade     -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_probe" { return (Test-RecruitProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_sync"  { return (Test-RecruitSync     -HostFile $HostLog -JoinFile $JoinLog) }
+        "recruit_ctl"   { return (Test-RecruitCtl      -HostFile $HostLog -JoinFile $JoinLog) }
         "faction_probe" { return (Test-FactionProbe    -HostFile $HostLog -JoinFile $JoinLog) }
         "faction_sync"  { return (Test-FactionSync     -HostFile $HostLog -JoinFile $JoinLog) }
         "time_probe"    { return (Test-TimeProbe       -HostFile $HostLog -JoinFile $JoinLog) }
@@ -354,12 +357,12 @@ Export-ModuleMember -Function @(
     "Test-MedicPose", "Test-LimbLoss", "Test-NpcVitals",
     "Get-StatsSeries", "Test-StatsSync",
     "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry",
-    "Get-FurnSeries", "Test-FurnPut", "Test-CagePeer",
+    "Get-FurnSeries", "Test-FurnPut", "Test-ChainPut", "Test-PolePut", "Test-CagePeer",
     "Test-SneakProbe",
     "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync", "Test-SpawnFarBind",
     "Test-NpcCensus",
     "Get-WalletSeries", "Test-ShopProbe", "Test-MoneySync", "Test-VendorTrade",
-    "Test-RecruitProbe", "Test-RecruitSync",
+    "Test-RecruitProbe", "Test-RecruitSync", "Test-RecruitCtl",
     "Get-FacRelSeries", "Test-FactionProbe", "Test-FactionSync",
     "Get-GTimeSeries", "Test-TimeProbe", "Test-TimeSync", "Get-SlewSummary",
     "Get-SneakSeries", "Test-SneakPose", "Test-SneakDetect",

@@ -68,6 +68,14 @@ void Replicator::applyTargets(GameWorld* gw) {
         // our own hand shouldn't appear in targets_, but guard regardless (a stray
         // self-owned sample would otherwise fight our own control every frame).
         if (ownHands_.find(it->first) != ownHands_.end()) continue;
+        // Phase 1b (phantom "Squint" fix): also never drive/seed a hand we PIN
+        // owned. ownHands_ is rebuilt each publish from the LOCAL captured hand;
+        // a control-flip claim pins the OWNER's streamed hand (newK) owned too,
+        // and the host's last in-flight batches for newK arrive after the flip.
+        // Without this veto they seed unresolved (newK no longer resolves - the
+        // body moved to a new local index), REQ, and mint a phantom proxy that
+        // chases the real body (manual 2026-07-17: Squint following Adi).
+        if (pinOwned_.find(it->first) != pinOwned_.end()) continue;
         Driven& d = it->second;
         EntityState out;
         if (!d.interp.sample(now, cfg_, &out)) {
@@ -136,9 +144,10 @@ void Replicator::applyTargets(GameWorld* gw) {
         // down/death latches).
         // (Protocol 23 reuses the same translation point for RE-KEYED recruit
         // bodies, so the lookup also runs when only recruit sync is on.)
+        bool viaProxy = false;
         if (!c && (spawnSync_ || recruitSync_)) {
             std::map<Key, Character*>::iterator pit = proxyByKey_.find(it->first);
-            if (pit != proxyByKey_.end()) c = pit->second;
+            if (pit != proxyByKey_.end()) { c = pit->second; viaProxy = true; }
         }
         if (!c) {
             // Unresolved-hand telemetry (Phase 0 diagnostics; logged even with
@@ -157,6 +166,26 @@ void Replicator::applyTargets(GameWorld* gw) {
                 u.x = out.x; u.y = out.y; u.z = out.z;
             }
             continue;
+        }
+        // Phase 0 crash breadcrumb (KENSHICOOP_DEBUG_DRIVE_TRAIL=1, OFF by
+        // default = zero cost): name the PROXY-driven body just before we drive
+        // it. CoopLog flushes every line, so the last flushed [drive] proxy line
+        // before a hard crash identifies the body we touched - the UAF-on-stale-
+        // proxy hypothesis (approach-town/camp mint churn). Native resolves are
+        // save-stable and excluded to keep the trail focused on minted bodies.
+        if (viaProxy) {
+            static int driveTrail = -1;
+            if (driveTrail < 0) {
+                const char* e = getenv("KENSHICOOP_DEBUG_DRIVE_TRAIL");
+                driveTrail = (e && e[0] == '1') ? 1 : 0;
+            }
+            if (driveTrail) {
+                char tb[160]; _snprintf(tb, sizeof(tb) - 1,
+                    "[drive] proxy hand=%u,%u,%u,%u,%u c=%p",
+                    it->first.t, it->first.c, it->first.cs, it->first.i,
+                    it->first.s, (void*)c);
+                tb[sizeof(tb) - 1] = '\0'; coop::logLine(tb);
+            }
         }
         drivenChars_.insert(c);
         drivenSeen_[c] = now; // recently-driven grace for the authority passes
@@ -251,11 +280,23 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     debounced local exit (a 1-batch blip must not eject a valid
         //     occupant - the carry-drop lesson).
         if (furnSync_ && !engine::taskIsBedPose((int)out.task)) {
+            // Chained/pole prisoner (protocol 41) rides this carve-out as
+            // kind=3 (Character::isChained). Gated by chainSync_ so it can be
+            // turned off without disabling bed/cage occupancy.
             int streamKind = (out.bodyState & BODY_IN_BED) ? 1
-                           : ((out.bodyState & BODY_IN_CAGE) ? 2 : 0);
+                           : ((out.bodyState & BODY_IN_CAGE) ? 2
+                           : ((chainSync_ && (out.bodyState & BODY_CHAINED)) ? 3 : 0));
             engine::FurnitureRead lfr;
             bool haveFr = engine::readFurniture(c, &lfr);
             int localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
+            if (localKind == 3 && !chainSync_) localKind = 0;
+            // Remember the owner hand while locally chained, so a lost/late
+            // reliable ENTER (or an AI break-out) can be re-applied below (the
+            // continuous BODY_CHAINED bit carries no owner).
+            if (localKind == 3) {
+                for (int fi = 0; fi < 5; ++fi) d.chainOwner[fi] = lfr.furn[fi];
+                d.haveChainOwner = (lfr.furn[3] != 0 || lfr.furn[4] != 0);
+            }
             if (streamKind != 0) {
                 d.furnNoSeeTick = 0;
                 // A jailed/bedded DRIVEN body must not run its own decision layer.
@@ -272,8 +313,14 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (haveFr && localKind != streamKind &&
                     (now - d.furnHealTick) >= FURN_HEAL_MS) {
                     d.furnHealTick = now;
-                    bool ok = engine::enterFurnitureNearPos(
-                        gw, c, streamKind, out.x, out.y, out.z, FURN_MATCH_DIST);
+                    // Chain (kind 3) has no searchable building and needs the
+                    // OWNER: re-apply setChainedMode with the remembered owner.
+                    // Cages/beds re-find the nearest matching fixture by name.
+                    bool ok = (streamKind == 3)
+                        ? (d.haveChainOwner &&
+                           engine::applyFurniture(gw, c, d.chainOwner, 3, true))
+                        : engine::enterFurnitureNearPos(
+                            gw, c, streamKind, out.x, out.y, out.z, FURN_MATCH_DIST);
                     // Drop the in-progress escape/attack action so the body doesn't
                     // finish breaking out before the suspend takes hold. endAction is
                     // SEH-guarded (same call the rest-park path uses).
@@ -926,14 +973,28 @@ void Replicator::applyTargets(GameWorld* gw) {
             debugMark(c, st == LIFE_MID ? 3 : 0, lifeName(st));
         }
 
-        // AI-suspend probe: for a host-driven world NPC, suspend its AI decision
-        // layer (faction-safe) so it stops self-tasking but keeps animating. The
-        // host stream is the sole task authority; the body holds + animates its
-        // current/injected action instead of the AI re-deciding every tick.
-        // (Releasing node-anchored sitters to local AI was tried - Idea I4 - and
-        // regressed: the freed AI wandered them off-host, CROSSCHECK 0.5, and it
-        // still did not reliably sit them. So we suspend uniformly.)
-        if (aiSuspend_ && !isSquad) engine::addAiSuspend(c);
+        // AI-suspend: for any body we DRIVE from the peer's stream, suspend its
+        // AI decision layer (faction-safe) so it stops self-tasking but keeps
+        // animating. The peer's stream is the sole task authority; the body holds
+        // + animates its current/injected action instead of the AI re-deciding
+        // every tick. (Releasing node-anchored sitters to local AI was tried -
+        // Idea I4 - and regressed: the freed AI wandered them off-host,
+        // CROSSCHECK 0.5, and it still did not reliably sit them. So we suspend
+        // uniformly.)
+        //
+        // Phase 1b: this now covers driven SQUAD members too (dropped the old
+        // !isSquad gate). A peer-owned squad FOLLOWER (e.g. a recruit, or a unit
+        // transferred into the peer's tab) otherwise self-tasks "follow my local
+        // leader" at walk speed while the walk-drive simultaneously issues the
+        // owner's run-speed move order - the two fight, giving the slow-follow +
+        // periodic-snap artifact (manual 2026-07-17: Dust Bandit). Suspending it
+        // lets the walk-drive alone own the motion, so it reproduces the owner's
+        // run cleanly. A driven squad LEADER has nothing to follow, so the
+        // suspend is a no-op for it (leaders already rendered correctly). All
+        // bodies here are peer-owned (applyTargets only drives what we do NOT
+        // own), so this never quiets a locally-controlled character; the set is
+        // rebuilt every tick, so it self-clears the instant ownership flips back.
+        if (aiSuspend_) engine::addAiSuspend(c);
 
         // Re-arm rest-pose reproduction whenever the body is genuinely moving, so
         // the next time it stops we re-evaluate the host's (possibly new) task.
@@ -1067,8 +1128,20 @@ void Replicator::applyTargets(GameWorld* gw) {
                 d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
             }
             d.parked = false;
-            // No motion mirror while genuinely moving: the engine selects the
-            // grounded walk clip itself from the locomotion it is performing.
+            // Locomotion mirror for a DRIVEN SQUAD member (Phase 1b gait fix):
+            // player-squad bodies take their gait from the player move-order path
+            // (Character::setDestination, shift=false) and effectively IGNORE
+            // CharMovement::setDesiredSpeed - so walkTo alone renders a WALK clip
+            // no matter how fast the host ran (manual 2026-07-17: Adi walks while
+            // the host runs). Mirror the host's exact locomotion (currentSpeed +
+            // world-space currentMotion, as streamed) so the anim controller
+            // blends to the RUN clip from a run-magnitude state. World NPCs obey
+            // setDesiredSpeed on the CharMovement path, so they keep the
+            // no-mirror behavior (the engine picks their clip from the locomotion
+            // it actually performs); mirroring an NPC here would fight that.
+            if (isSquad)
+                engine::applyMotion(c, true, out.cSpeed,
+                                    out.cMotionX, out.cMotionY, out.cMotionZ);
         } else {
             // At rest, task-authoritative: reproduce the host's sit/idle pose
             // at the same fixture, else quiet + park. Bar patrons sit

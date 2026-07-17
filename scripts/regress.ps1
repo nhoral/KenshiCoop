@@ -168,8 +168,25 @@ function Invoke-OneRun {
     if ($Lan) { $args += "-SkipBuild" }   # regress already built+deployed; the DLL push still happens per run
     if ($Variant -eq "wan"     -or $Variant -eq "wanskew") { $args += @("-Wan", $WanProfile) }
     if ($Variant -eq "skew"    -or $Variant -eq "wanskew") { $args += @("-FakeClockSkewMs", "$SkewMs") }
-    $out = & powershell @args 2>&1
-    $exit = $LASTEXITCODE
+    # Resilience: a child run_test.ps1 can emit to stderr (e.g. a transient
+    # "No visible window found" from the screenshot/arrange helpers when a game
+    # window is mid-launch). Under the suite's -ErrorActionPreference Stop that
+    # NativeCommandError would ABORT the entire matrix. Isolate the native call
+    # to Continue + try/catch so one flaky run fails ITSELF (and gets the retry
+    # policy) instead of killing the whole regression.
+    $out = @()
+    $exit = 1
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & powershell @args 2>&1
+        $exit = $LASTEXITCODE
+    } catch {
+        $out = @("run_test invocation threw: $($_.Exception.Message)")
+        $exit = 1
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
     $out | ForEach-Object { Write-Host $_ }
     $outDir = ""
     foreach ($line in $out) {

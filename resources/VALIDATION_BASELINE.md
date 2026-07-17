@@ -883,6 +883,9 @@ the copy locally and re-partition ownership); recruits are session-state (save
 /load coordination is gap 8); two players recruiting the SAME NPC in the same
 instant keeps one body per machine but ownership resolves to whoever's EVT
 lands second on each side (benign for position sync, unmeasured for control).
+See also the Squad management sync 2026-07-17 addendum: transferring a
+recruited unit across tabs shares the same author-side control-release edge,
+and a save + reload reconciles any residual desync.
 
 ## Faction-relation sync (2026-07-08, addendum)
 
@@ -1526,6 +1529,14 @@ the shared-save workflow); dismissal (roster-exit) edges are wired but
 have no programmatic lever to validate; wallets/inventories of appended
 mid-session tabs are not rank-keyed (the pins own their members, but the
 per-tab money channel only streams latched session-start ranks).
+
+Accepted limitations (2026-07-17, Phase 1b addendum): cross-tab unit
+transfer is imperfect - after a host-authored move INTO a peer-owned tab
+the author-side does not fully release control, so a just-transferred unit
+can drive slowly (walk gait) on the new owner until it is re-anchored
+(this is why `recruit_ctl` Phase B gait parity is ADVISORY, not a hard
+gate). A save + reload reliably reconciles any residual squad-membership
+/ ownership desync from mid-session transfers.
 
 ## Play-session bug fixes (2026-07-10, addendum)
 

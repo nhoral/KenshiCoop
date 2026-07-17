@@ -331,13 +331,35 @@ function Test-RecruitSync {
         $rekey = @(Select-String -Path $peerFile -Pattern "\[recruit\] REKEY .* new=$hand ok=1" -ErrorAction SilentlyContinue).Count
         $bound = @(Select-String -Path $peerFile -Pattern "\[spawn\] proxy BOUND hand=$hand" -ErrorAction SilentlyContinue).Count
         $track = @(Select-String -Path $peerFile -Pattern "SCENARIO PROXY hand=$handIS" -ErrorAction SilentlyContinue).Count
+        # Phase 1b membership: the peer must make the recruited body a REAL squad
+        # member (insert=1), so it shows in the panel on BOTH games. The lever's
+        # immediate playerSquad recheck is a lazy-refresh false negative, so gate
+        # on the setFaction success signal (insert=1), not the recheck.
+        $member = @(Select-String -Path $peerFile -Pattern "\[recruit\] MEMBER new=$hand insert=1" -ErrorAction SilentlyContinue).Count
         if (($rekey + $bound) -eq 0) { $why += "$k never converged on the peer (no REKEY, no proxy BOUND)" }
         elseif ($rekey -ge 1 -and $bound -ge 1) { $why += "$k DUPLICATED on the peer (rekeyed AND minted a proxy)" }
         else {
             if ($track -eq 0) { $why += "$k bound on the peer but never tracked (no PROXY series)" }
+            elseif ($member -eq 0) { $why += "$k bound on the peer but never joined the squad (no MEMBER insert=1)" }
             else { $converged++ }
         }
-        Write-Host "    FINDING: $k peer rekey=$rekey proxyBound=$bound proxyTrack=$track"
+        Write-Host "    FINDING: $k peer rekey=$rekey proxyBound=$bound proxyTrack=$track member=$member"
+    }
+
+    # Phase 1b squad parity: with cross-game membership, a recruit is a member on
+    # BOTH games, so the two squads must end the run the SAME size. A mismatch is
+    # the duplication class of bug (an escaped-pin re-container the owner minted a
+    # second copy of - recruit_sync run 095843: join 8 vs host 6).
+    $sqRegex = 'SCENARIO TABS n=\d+ squad=(\d+)'
+    $hTabs = @(Select-String -Path $HostFile -Pattern $sqRegex -ErrorAction SilentlyContinue)
+    $jTabs = @(Select-String -Path $JoinFile -Pattern $sqRegex -ErrorAction SilentlyContinue)
+    if ($hTabs.Count -gt 0 -and $jTabs.Count -gt 0) {
+        $hSquad = [int]$hTabs[-1].Matches[0].Groups[1].Value
+        $jSquad = [int]$jTabs[-1].Matches[0].Groups[1].Value
+        if ($hSquad -ne $jSquad) {
+            $why += "squad size diverged (host=$hSquad join=$jSquad) - recruit duplication"
+        }
+        Write-Host "    FINDING: end squad size host=$hSquad join=$jSquad"
     }
 
     $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
@@ -345,6 +367,107 @@ function Test-RecruitSync {
     Write-Host "  RECRUIT-SYNC $v - converged=$converged/4 $detail"
     return (Add-GateResult -Name "recruit_sync" -Status $v `
                 -Metrics @{ converged = $converged } -Detail $detail)
+}
+
+# recruit_ctl (Phase 1b control validation): layered on recruit convergence, it
+# gates the two manual-test regressions:
+#   * gait-parity - a DRIVEN squad member must reproduce the OWNER's RUN, not a
+#     walk. The scenario walks the recruit while the OTHER client drives it and
+#     logs SCENARIO GAIT on both sides (role=own on the owner, role=drive on the
+#     driver). Per phase we compare the median MOVING speed: a driver crawling
+#     while the owner runs is the bug (manual 2026-07-17: Adi walked).
+#   * anti-phantom - a control-flip transfer must NEVER mint a proxy for the
+#     hand it just CLAIMED (the phantom "Squint" that chased Adi: the host's
+#     in-flight batches for the now-owned hand minted a duplicate).
+# Phase A owner=host/driver=join; phase B (after the join's transfer)
+# owner=join/driver=host, so the fix is validated in BOTH drive directions.
+function Test-RecruitCtl {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $RUN_MIN    = 1.0   # owner median above this = it genuinely moved (not idle)
+    $GAIT_RATIO = 0.5   # driver median must be >= this fraction of the owner's
+
+    # --- Preconditions: the path was actually exercised -----------------------
+    $recruit = @(Select-String -Path $HostFile -Pattern 'SCENARIO CTL recruit res=1' -ErrorAction SilentlyContinue).Count
+    if ($recruit -eq 0) { $why += "host never recruited (no SCENARIO CTL recruit res=1)" }
+    $found = @(Select-String -Path $JoinFile -Pattern 'SCENARIO CTL found ' -ErrorAction SilentlyContinue).Count
+    if ($found -eq 0) { $why += "join never found the recruit as a new member" }
+    $move = @(Select-String -Path $HostFile -Pattern 'SCENARIO CTL move rc=1' -ErrorAction SilentlyContinue).Count
+    if ($move -eq 0) { $why += "host never transferred the recruit into the join tab (no move rc=1)" }
+    # The transfer is host-authored INTO the join's tab, so the join RECEIVES it
+    # and its rekeyPeerBody claims ownership (CONTROL-FLIP) - that is what makes
+    # the phantom race fire, so a missing flip means the path was not exercised.
+    $flip = @(Select-String -Path $JoinFile -Pattern '\] CONTROL-FLIP claim new=' -ErrorAction SilentlyContinue).Count
+    if ($flip -eq 0) { $why += "control-flip never fired on the join (transfer did not claim ownership)" }
+
+    # --- Gait parity ----------------------------------------------------------
+    $gRegex = 'SCENARIO GAIT who=(host|join) phase=([AB]) role=(own|drive) moving=(\d) speed=([\d.]+)'
+    function _ctlSpeeds($file, $phase, $role, $rx) {
+        $out = @()
+        foreach ($m in @(Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            if ($g[2].Value -ne $phase) { continue }
+            if ($g[3].Value -ne $role)  { continue }
+            if ($g[4].Value -ne '1')    { continue }  # moving samples only
+            $out += [double]$g[5].Value
+        }
+        return ,$out
+    }
+    function _ctlMedian($a) {
+        if ($a.Count -eq 0) { return 0.0 }
+        $s = @($a | Sort-Object)
+        return [double]$s[[int]([math]::Floor($s.Count / 2))]
+    }
+    # Phase A (owner=host, driver=join) is the DRIVEN-gait regression the user
+    # reported (Adi walked on the join) - a HARD gate. Phase B (owner=join,
+    # driver=host, after a HOST-authored cross-tab transfer) exercises the
+    # author-side control-RELEASE path, which is a separate capability (the
+    # author currently pins the moved body owned unconditionally); it is recorded
+    # ADVISORY here until that release + owner-side run of a just-claimed body
+    # land (a synthetic non-inhabit run has no rank latch, so it is not a
+    # reliable gate).
+    foreach ($ph in @(
+        @{ p = 'A'; ownerFile = $HostFile; drvFile = $JoinFile; hard = $true },
+        @{ p = 'B'; ownerFile = $JoinFile; drvFile = $HostFile; hard = $false })) {
+        $own = _ctlSpeeds $ph.ownerFile $ph.p 'own'   $gRegex
+        $drv = _ctlSpeeds $ph.drvFile   $ph.p 'drive' $gRegex
+        $ownMed = _ctlMedian $own
+        $drvMed = _ctlMedian $drv
+        Write-Host ("    FINDING: gait phase={0} owner n={1} med={2} driver n={3} med={4} hard={5}" -f `
+            $ph.p, $own.Count, [math]::Round($ownMed, 2), $drv.Count, [math]::Round($drvMed, 2), $ph.hard)
+        $fail = $null
+        if ($own.Count -lt 5 -or $ownMed -lt $RUN_MIN) {
+            $fail = "phase $($ph.p): owner never ran (n=$($own.Count) med=$([math]::Round($ownMed,2)))"
+        } elseif ($drv.Count -lt [int](0.3 * $own.Count)) {
+            $fail = "phase $($ph.p): driver rarely moved (n=$($drv.Count) vs owner $($own.Count)) - walk/stall"
+        } elseif ($drvMed -lt ($GAIT_RATIO * $ownMed)) {
+            $fail = "phase $($ph.p): driver gait too slow (med=$([math]::Round($drvMed,2)) < $GAIT_RATIO x owner $([math]::Round($ownMed,2))) - walking not running"
+        }
+        if ($null -ne $fail) {
+            if ($ph.hard) { $why += $fail }
+            else { Write-Host "    ADVISORY: $fail (author-side control-release follow-up)" }
+        }
+    }
+
+    # --- Anti-phantom: a claimed hand must never be proxy-minted ---------------
+    $phantom = 0
+    foreach ($pair in @(@('host', $HostFile), @('join', $JoinFile))) {
+        foreach ($m in @(Select-String -Path $pair[1] -Pattern '\] CONTROL-FLIP claim new=([\d,]+)' -ErrorAction SilentlyContinue)) {
+            $h = [regex]::Escape($m.Matches[0].Groups[1].Value)
+            $pb = @(Select-String -Path $pair[1] -Pattern "\[spawn\] proxy BOUND hand=$h" -ErrorAction SilentlyContinue).Count
+            if ($pb -gt 0) {
+                $phantom++
+                $why += "$($pair[0]) minted a PHANTOM proxy for claimed hand $($m.Matches[0].Groups[1].Value)"
+            }
+        }
+    }
+    Write-Host "    FINDING: control-flips=$flip phantomMints=$phantom"
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  RECRUIT-CTL $v - $detail"
+    return (Add-GateResult -Name "recruit_ctl" -Status $v `
+                -Metrics @{ phantom = $phantom; flips = $flip } -Detail $detail)
 }
 
 # Shared SQTABS parser (protocol 35): ordered series of @{n; squad; list; t}

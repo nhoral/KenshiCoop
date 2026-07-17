@@ -136,6 +136,13 @@ public:
     // KENSHICOOP_FURN_SYNC=0 disables.
     void setFurnSync(bool v) { furnSync_ = v; }
 
+    // Chained/pole prisoner sync (protocol 41, default ON): rides the furniture
+    // pipeline as kind=3 (Character::isChained -> setChainedMode). A captive on
+    // a prisoner pole is shackled, not caged, so the cage path never saw it.
+    // KENSHICOOP_CHAIN_SYNC=0 disables JUST the chain kind (beds/cages keep
+    // working) - the A/B escape hatch if it ever freezes a walking slave.
+    void setChainSync(bool v) { chainSync_ = v; }
+
     // Stealth sync (protocol 20, default ON): continuous BODY_SNEAK posture
     // apply on driven copies (engine-native setStealthMode) + the detection-
     // indicator feedback stream. KENSHICOOP_STEALTH_SYNC=0 disables.
@@ -657,6 +664,13 @@ private:
         // Third-party placement (protocol 36): last time the host authored a
         // PEER-ENTER for this peer-owned driven body (re-author throttle).
         unsigned long furnPeerTick;
+        // Chained/pole prisoner (protocol 41): the OWNER hand last seen for this
+        // body while it was locally chained, so a lost/late reliable ENTER (or
+        // an AI break-out) can be self-healed by re-applying setChainedMode -
+        // the continuous BODY_CHAINED bit carries no owner (unlike a cage, whose
+        // building the self-heal re-finds by name near the streamed position).
+        unsigned int  chainOwner[5];
+        bool          haveChainOwner;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
         // Velocity-aware snap gate (2026-07-11): slow-decaying peak of the
@@ -696,8 +710,11 @@ private:
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
+                   haveChainOwner(false),
                    sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
-                   zeroF(0), activeF(0), midSeenMs(0) {}
+                   zeroF(0), activeF(0), midSeenMs(0) {
+            chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
+        }
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
@@ -1105,6 +1122,9 @@ private:
     // Carried-body sync (protocol 18): master enable (KENSHICOOP_CARRY_SYNC).
     bool                 carrySync_;
     bool                 furnSync_;
+    // Chained/pole prisoner sync (protocol 41): master enable
+    // (KENSHICOOP_CHAIN_SYNC). Sub-gate within the furniture pipeline.
+    bool                 chainSync_;
     // Stealth sync (protocol 20): master enable (KENSHICOOP_STEALTH_SYNC).
     bool                 stealthSync_;
     // Host-side detection-feedback publish state per DRIVEN sneaker: last sent
@@ -1319,6 +1339,17 @@ private:
     // tag selects the log prefix ("recruit" / "squad").
     void rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
                        const char* tag);
+    // Phase 1b (cross-game recruit membership): insert the re-keyed body 'c'
+    // into THIS client's player squad at the tab named by newK's container, so a
+    // recruit/transfer shows in the panel on the PEER too. ownIt selects the
+    // ownership pin for the body's ACTUAL local hand: false (default) pins it
+    // PEER-owned so control stays with the author (fresh recruit / move into the
+    // peer's tab); true pins it OWNED so THIS client controls + streams it (a
+    // transfer INTO a tab we own - the control hand-off). Idempotent + tab-aware
+    // (a squad-move re-containers an existing member). Shared by the recruit ok=1
+    // path, the ok=0 post-mint drain, and the control-flip transfer.
+    void insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
+                          const char* tag, bool ownIt = false);
     // Hard-snap attribution diagnostics (rubber-banding investigation): one
     // throttled [snap] line per applyRaw teleport with everything needed to
     // classify the cause (gap, source speed+velocity, game speed, slew,
@@ -1474,8 +1505,15 @@ private:
         // 20260712_092921: 8/12 far mints DUPE-HEALed within 3 s). Runtime
         // spawns never resolve locally, so they pass the dwell unharmed.
         unsigned long firstMissMs;
+        // Phase 1b: this REQ fulfills a force-REQ recruit/move (rekeyPeerBody
+        // ok=0). It rides the fromCensus proximity bypass, but a reliable
+        // EVT_RECRUIT PROVES it is a distinct host body, so it must SKIP the
+        // census same-template dupe guard (which is for UNcorrelated census
+        // hands). Without this the runtime recruit defers forever behind a
+        // same-template twin (recruit_sync run 094401).
+        bool forceReq;
         SpawnReqState() : lastSendMs(0), sends(0), deniedMs(0), farMs(0),
-                          fromCensus(false), firstMissMs(0) {}
+                          fromCensus(false), firstMissMs(0), forceReq(false) {}
     };
     std::map<Key, SpawnReqState> spawnReq_;
     // JOIN: hands applyTargets failed to resolve this tick, with the streamed
@@ -1487,9 +1525,20 @@ private:
     // (which carries the host's authoritative position).
     struct UnresolvedHand {
         float x, y, z; bool fromCensus;
-        UnresolvedHand() : x(0), y(0), z(0), fromCensus(false) {}
+        // Phase 1b: force-REQ recruit/move hand (reliable-edge correlated) -
+        // skips the mint-side same-template dupe guard.
+        bool forceReq;
+        UnresolvedHand() : x(0), y(0), z(0), fromCensus(false), forceReq(false) {}
     };
     std::map<Key, UnresolvedHand> unresolvedHands_;
+    // JOIN: recruited/re-keyed hands whose rekeyPeerBody landed ok=0 (no local
+    // body to bind - the recruit fired while this hand was outside our interest,
+    // the interest-split "join never saw Ruka" report). A reliable EVT_RECRUIT
+    // PROVES the hand is a legit host body that must appear, so these force a
+    // spawn REQ regardless of the send-side proximity gate (a far recruit is
+    // still streamed as a host-owned member, so it must resolve). Entries clear
+    // once the hand binds a proxy or resolves to a real local body.
+    std::set<Key> forceReqHands_;
     // JOIN: census-mint reach (see setSpawnMintRadius) + the census-missing
     // scan throttle (the resolve sweep over censusHands_ runs at ~0.5 Hz, not
     // per tick).

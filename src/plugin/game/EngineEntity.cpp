@@ -921,6 +921,46 @@ GameData* findCageTemplate(GameWorld* gw) {
     return 0;
 }
 
+// Find a BUILDING template that is a PRISONER POLE (the standing shackle post a
+// captive is tied to). A pole is still IN_PRISON containment (setPrisonMode), a
+// DIFFERENT model from the boxed cage - the pole_put fixture wants that model so
+// the controlled test visibly shows a body ON A POLE, not in a cage. Caller
+// holds SEH. Ordered keyword preference; the bare "pole"/"beam" fallbacks are
+// last so a named "prisoner pole" always wins first. Excludes the cage box so a
+// world with both a cage and a pole picks the pole. Logs every prison-ish
+// candidate so a bake run reveals the exact base-game names.
+GameData* findPoleTemplate(GameWorld* gw) {
+    if (!gw || !g_getDataOfTypeFn) return 0;
+    g_dataScratch.clear();
+    g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
+    unsigned int n = g_dataScratch.size();
+    // Diagnostic: dump prison/cage/pole-ish template names (bake-time discovery).
+    for (unsigned int i = 0; i < n; ++i) {
+        GameData* gd = g_dataScratch[i];
+        if (!gd) continue;
+        const char* nm = gd->name.c_str();
+        if (ciContains(nm, "pole") || ciContains(nm, "cage") ||
+            ciContains(nm, "prison") || ciContains(nm, "shackle") ||
+            ciContains(nm, "beam")) {
+            char d[160];
+            _snprintf(d, sizeof(d) - 1, "SETUP(pole): candidate building '%s'", nm);
+            d[sizeof(d) - 1] = '\0';
+            coop::logLine(d);
+        }
+    }
+    // A pole/shackle keyword (never a bare "cage") is what marks the standing
+    // post; "cage pole" still qualifies because it contains "pole".
+    const char* prefs[] = { "prisoner pole", "cage pole", "shackle", "pole" };
+    const unsigned int nprefs = sizeof(prefs) / sizeof(prefs[0]);
+    for (unsigned int k = 0; k < nprefs; ++k) {
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (gd && ciContains(gd->name.c_str(), prefs[k])) return gd;
+        }
+    }
+    return 0;
+}
+
 // Find a furniture BUILDING template that is an OPERABLE work fixture an NPC can
 // stand at and work (crafting/gathering class). Caller holds SEH. Ordered keyword
 // preference: a training dummy is the most deterministic (no inputs/power/recipe -

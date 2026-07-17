@@ -37,6 +37,12 @@ param(
     # hands and fully render each other - including the player-controlled leaders.
     [string]$JoinSave = "",
     [int]$AutoSpawn = 3,
+    # Host-only recruit helper (KENSHICOOP_AUTORECRUIT=N seconds): N s after
+    # gameplay settles, the host ONCE programmatically recruits the nearest
+    # non-player world NPC via the same PlayerInterface::recruit the dialog
+    # "join me" hits. Use to validate recruit sync on a populated save that has
+    # no dialog-hireable NPC (camp/squad1). 0 = off.
+    [int]$AutoRecruit = 0,
     # Inhabit mode: both clients load the SAME save (so NPC sync works) but each
     # OWNS a different subset of the shared squad. Default split: host owns the
     # leader (index 0), join inhabits everyone else (~0). Overridable via
@@ -256,6 +262,8 @@ function Set-CoopEnv {
     $env:KENSHICOOP_OWN_INDICES  = $Own    # inhabit partition ("" = own all)
     # Host-only one-shot world spawn for baking a deterministic test scene.
     $env:KENSHICOOP_SETUP        = if ($Mode -eq "join") { "" } else { $SetupScene }
+    # Host-only auto-recruit (N s after gameplay): recruit nearest world NPC.
+    $env:KENSHICOOP_AUTORECRUIT  = if ($Mode -eq "join") { "" } else { "$AutoRecruit" }
     $env:KENSHICOOP_PROBE_RECRUIT = if ($Mode -eq "join" -and $ProbeRecruit) { "1" } else { "" }
     $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
     # Inventory sync is bidirectional, so enable it on BOTH clients.

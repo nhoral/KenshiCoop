@@ -159,6 +159,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             const Key& k = *it;
             if (proxyByKey_.find(k) != proxyByKey_.end()) continue;
             if (ownHands_.find(k) != ownHands_.end()) continue;
+            // Phase 1b (phantom fix): a hand we PIN owned is ours - a census
+            // vouch for it is our own echo or a stale tail after a control-flip
+            // claim, never a mintable peer body.
+            if (pinOwned_.find(k) != pinOwned_.end()) continue;
             {
                 // Already recorded unresolved by applyTargets. Phase 2 mid-band
                 // regression (run 113712): the mid tier now STREAMS a distant
@@ -239,6 +243,9 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             continue;
         }
         if (proxyByKey_.find(k) != proxyByKey_.end()) continue; // duplicate reply
+        // Phase 1b (phantom fix): a hand we PIN owned must never be minted - it
+        // is ours (a control-flip claim), and a reply for it is a stale tail.
+        if (pinOwned_.find(k) != pinOwned_.end()) continue;
         // A hand re-keyed away (recruit/squad move) between our REQ and this
         // reply is DEAD - minting it would resurrect the duplicate the re-key
         // just cleaned up (protocol 35 run 192211).
@@ -292,6 +299,15 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         if (mintedThisTick >= MINT_BUDGET_PER_TICK) {
             rq.farMs = (now > FAR_RETRY_MS) ? (now - FAR_RETRY_MS + 1000) : now;
             rq.sends = 0;
+            // Phase 0 crash breadcrumb: town/camp approach can answer a burst of
+            // REQs and defer many mints per tick. The overflow was SILENT; log it
+            // (throttled ~1 Hz/hand by the farMs re-judge above) so a pre-crash
+            // mint storm is visible in the flushed trail.
+            char bd[176]; _snprintf(bd, sizeof(bd) - 1,
+                "[spawn] INFO deferred (budget) hand=%u,%u,%u,%u,%u minted=%u/%u",
+                k.t, k.c, k.cs, k.i, k.s, (unsigned)mintedThisTick,
+                (unsigned)MINT_BUDGET_PER_TICK);
+            bd[sizeof(bd) - 1] = '\0'; coop::logLine(bd);
             continue;
         }
         // Mint duplicate guard (2026-07-11): a VISIBLE body of the same
@@ -303,7 +319,18 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         // often the very copy whose old hand got culled) are excluded, so a
         // legit mint only defers while a visible uncorrelated twin stands
         // there; the far-retry cadence re-judges in 5 s.
-        {
+        //
+        // CENSUS-ONLY scope (2026-07-16 spawn_sync fix): the guard is for an
+        // UNCORRELATED census hand (its exact identity is unknown, so a nearby
+        // same-template body is likely it). A direct STREAM REQ (rq.fromCensus
+        // == false) is fully correlated - the host explicitly streamed THIS hand
+        // at THIS position - so it must mint even where same-template world NPCs
+        // stand nearby. Applying the guard to stream REQs regressed spawn_sync:
+        // near spawns into a POPULATED area (common modded template, twins within
+        // 20u) deferred forever (near 0/4), while far spawns into empty terrain
+        // bound fine (far 4/4). Restores pre-guard stream-REQ minting; the census
+        // path keeps the dupe protection it was built for.
+        if (rq.fromCensus && !rq.forceReq) {
             static Character* excl[NPC_CENSUS_MAX]; // main-thread only
             unsigned int ne = 0;
             for (std::map<Key, Character*>::iterator pi = proxyByKey_.begin();
@@ -319,10 +346,11 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             if (twin) {
                 rq.farMs = now;
                 rq.sends = 0;
-                char b[176]; _snprintf(b, sizeof(b) - 1,
+                char b[200]; _snprintf(b, sizeof(b) - 1,
                     "[spawn] INFO deferred (dupe) hand=%u,%u,%u,%u,%u sid='%s' "
-                    "twin within %.0fu",
-                    k.t, k.c, k.cs, k.i, k.s, p.charSid, MINT_DUPE_RADIUS);
+                    "twin within %.0fu cen=%d force=%d",
+                    k.t, k.c, k.cs, k.i, k.s, p.charSid, MINT_DUPE_RADIUS,
+                    rq.fromCensus ? 1 : 0, rq.forceReq ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 continue;
             }
@@ -355,6 +383,34 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             p.age, p.x, p.y, p.z, mintDist, rq.fromCensus ? 1 : 0,
             (unsigned)proxyByKey_.size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // Phase 1b: a recruit/move whose ok=0 rekey enrolled a force-REQ (the
+        // interest-split recruit) now has its proxy body - make it a real squad
+        // member on this client too (same as the ok=1 path) and retire the
+        // force-REQ. Only force-REQ hands become members: an ordinary world-NPC
+        // census mint must NOT be dropped into the player squad.
+        if (forceReqHands_.erase(k))
+            insertPeerMember(gw, proxy, k, "recruit");
+    }
+
+    // Force-REQ injection (protocol 23 interest-split recruit fix): a recruit/
+    // move whose rekey landed ok=0 has no local body and would be proximity-
+    // gated out of the REQ path when it sits far from OUR squad. Re-seed those
+    // hands into unresolvedHands_ as fromCensus (position-less, proximity-
+    // bypassed) every pass until they bind a proxy or resolve locally, so the
+    // recruited body appears regardless of distance.
+    if (!forceReqHands_.empty()) {
+        for (std::set<Key>::iterator it = forceReqHands_.begin();
+             it != forceReqHands_.end(); ) {
+            const Key& k = *it;
+            bool bound = proxyByKey_.find(k) != proxyByKey_.end();
+            Character* local = bound ? 0
+                : engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            if (bound || local) { forceReqHands_.erase(it++); continue; }
+            UnresolvedHand& uh = unresolvedHands_[k];
+            uh.fromCensus = true; // bypass send-side proximity
+            uh.forceReq   = true; // correlated by the reliable edge: skip dupe guard
+            ++it;
+        }
     }
 
     // Author requests for the hands applyTargets recorded unresolved last
@@ -365,6 +421,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
              it != unresolvedHands_.end(); ++it) {
             const Key& k = it->first;
             if (proxyByKey_.find(k) != proxyByKey_.end()) continue;
+            // Phase 1b (phantom fix): never REQ a hand we PIN owned - a
+            // control-flip claimed it, so asking the peer about it would only
+            // re-open the phantom-mint window it exists to close.
+            if (pinOwned_.find(k) != pinOwned_.end()) continue;
             // Never ask about a hand a re-key just retired (protocol 35): a
             // stale batch of the OLD key may still be in flight, and a REQ
             // for it would mint the duplicate the re-key exists to prevent.
@@ -376,6 +436,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             // far-mint privilege follows the EXISTENCE authority, not the
             // path a later stream sample happened to arrive by).
             if (it->second.fromCensus) rq.fromCensus = true;
+            if (it->second.forceReq)   rq.forceReq   = true;
             if (rq.deniedMs != 0) {
                 if ((now - rq.deniedMs) < DENIED_RETRY_MS) continue;
                 rq.deniedMs = 0; rq.sends = 0; // cooldown over: ask again
@@ -629,12 +690,36 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // which lands on the SAME new hand (run 120738) - would otherwise
     // silence our own edge's stream.
     if (pinOwned_.count(newK) || ownHands_.count(newK)) return;
-    // Never ours to drive again: the author owns this hand even if a local
-    // tab census would rank it into a tab we own.
-    pinPeer_.insert(newK);
+    // Phase 1b (control follows the squad transfer): does newK's destination tab
+    // resolve to a rank THIS client owns? Uses the SAME predicate publishOwned
+    // partitions on (ownRanks_ over the latched tabRank_). When true, the move
+    // handed the body to US - we must CONTROL it (own + stream), not drive it.
+    //
+    // TRANSFERS ONLY (tag "squad" = EVT_SQUAD_MOVE). A fresh RECRUIT is
+    // author-owned regardless of which tab it lands in: both sides recruit into
+    // the shared rank-0 player tab, so a rank-owned claim here would make the
+    // peer seize the OTHER side's recruit and mint a duplicate (recruit_sync run
+    // 110524: join/baked rekeyed AND proxy-minted on the host). A squad-move is
+    // the only edge that legitimately re-homes an existing unit across the
+    // ownership partition. Only meaningful with squadSync_ (tabRank_ is latched
+    // only then); a move into a tab not yet ranked locally reads destOwned=false
+    // and self-corrects on a later edge.
+    bool destOwned = false;
+    if (squadSync_ && tag && tag[0] == 's') {
+        std::map<std::pair<u32, u32>, unsigned int>::const_iterator rit =
+            tabRank_.find(std::make_pair((u32)newK.c, (u32)newK.cs));
+        if (rit != tabRank_.end())
+            destOwned = ownRanks_.empty() ? (rit->second == 0u)
+                                          : (ownRanks_.count(rit->second) != 0);
+    }
+    // The author owns a peer-tab hand even if a local tab census would rank it
+    // into a tab we own; but a transfer INTO a tab we own is exactly the control
+    // hand-off, so we claim it instead of pinning it peer.
+    if (!destOwned) pinPeer_.insert(newK);
     // A chained edge (recruit then move, move then move) leaves the OLD key's
     // pin dead - drop it so the pin sets track only live hands.
     pinPeer_.erase(oldK);
+    if (destOwned) pinPeer_.erase(newK);
     // Carry the down/death LATCH across the re-key. A body that dies (or is
     // KO'd) and then re-containers (host un-squads a corpse, tab move) streams
     // its EVT_DEATH/EVT_KNOCKOUT under the OLD hand, so deathLatched/koLatched
@@ -712,13 +797,109 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // Host-authority suppression may have already hidden the old copy
         // (its hand left the peer's stream the moment the edge re-containered
         // it) - bring the body back first.
+        bool wasSuppressed = false;
         std::map<Key, Character*>::iterator sit = suppressed_.find(oldK);
         if (sit != suppressed_.end()) {
             engine::restoreNpc(gw, c);
             suppressed_.erase(sit);
+            wasSuppressed = true;
         }
-        proxyByKey_[newK] = c;
-        lifeSet(newK, LIFE_RESOLVED, "rekey");
+        // A body transferred into a tab WE own is ours to control now, not
+        // drive - do NOT bind it as a proxy (that would make applyTargets drive
+        // our own owned body). insertPeerMember below re-containers it into the
+        // destination tab and pins the actual local hand OWNED so publishOwned
+        // streams it; the drive teardown after that clears any residual stream
+        // state for an immediate control hand-off.
+        if (!destOwned) proxyByKey_[newK] = c;
+        forceReqHands_.erase(newK); // bound - no force-REQ needed
+        if (!destOwned) lifeSet(newK, LIFE_RESOLVED, "rekey");
+        // Recruit audit (Ruka diagnosis): the body is now bound + host-driven,
+        // but the two field symptoms ("join didn't see the new member" /
+        // "transferring did nothing") are about SQUAD MEMBERSHIP, not the body.
+        // Log whether the re-bound copy is actually in THIS client's player
+        // squad and whether authority had it hidden - the decisive evidence for
+        // whether the gap is membership/ownership (a follow-up feature) vs a
+        // body-visibility bug. Recruit edges only (squad-move poll would spam).
+        if (tag && tag[0] == 'r') {
+            int inSquad = -1;
+            __try {
+                inSquad = engine::isPlayerSquad(gw,
+                            reinterpret_cast<RootObject*>(c)) ? 1 : 0;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { inSquad = -1; }
+            // Tab identity de-risk (Phase 1b step 1): is the recruiter-reported
+            // target tab a container this client already knows as a player tab
+            // (Case A, shared save-stable platoon - rank resolvable) or a NEW
+            // one (Case B, runtime-minted platoon this client can't rank)? The
+            // latch map is refreshed each publishOwned from OUR own squad, so a
+            // hit means the target platoon exists locally and membership
+            // insertion can target it by serial.
+            std::pair<u32, u32> tk((u32)newK.c, (u32)newK.cs);
+            std::map<std::pair<u32, u32>, unsigned int>::const_iterator tit =
+                tabRank_.find(tk);
+            int tabKnown = (tit != tabRank_.end()) ? 1 : 0;
+            long tabRank  = (tit != tabRank_.end()) ? (long)tit->second : -1;
+            char ab[208]; _snprintf(ab, sizeof(ab) - 1,
+                "[recruit] REKEY-BIND new=%u,%u,%u,%u,%u playerSquad=%d "
+                "wasSuppressed=%d tabKnown=%d rank=%ld c=%p",
+                newK.t, newK.c, newK.cs, newK.i, newK.s, inSquad,
+                wasSuppressed ? 1 : 0, tabKnown, tabRank, (void*)c);
+            ab[sizeof(ab) - 1] = '\0'; coop::logLine(ab);
+        }
+        // Phase 1b membership: make the re-keyed body a REAL member of THIS
+        // client's squad, in the tab the author reported, so a recruit/transfer
+        // shows in the panel on BOTH games. For a PEER-owned tab, pinPeer_ (set
+        // above) keeps it peer-owned so publishOwned never streams it and
+        // applyTargets drives it via the isSquad walk-drive regime; a peer-owned
+        // squad FOLLOWER is AI-suspended while driven (see applyTargets) so it
+        // stops self-following its local leader and the walk-drive alone
+        // reproduces the owner's run. For a tab WE own (destOwned - a transfer
+        // into our squad), insertPeerMember pins the actual local hand OWNED so
+        // publishOwned streams it and the local player controls it. Idempotent +
+        // tab-aware, so a squad-move re-containers an existing member too.
+        insertPeerMember(gw, c, newK, tag, destOwned);
+        if (destOwned) {
+            // Control hand-off: drop every residual DRIVE artifact so publishOwned
+            // streams the body immediately and applyTargets never fights our own
+            // now-owned copy. canonicalOf_ is keyed by Character* (the stamp that
+            // otherwise keeps the drive-exclusion guard active for a full
+            // drivenSeen_ horizon); targets_/spawnReq_ hold the peer stream state.
+            canonicalOf_.erase(c);
+            targets_.erase(oldK);  targets_.erase(newK);
+            spawnReq_.erase(oldK); spawnReq_.erase(newK);
+            // Phantom-mint suppression: stamp the CLAIMED hand into the re-keyed
+            // grace so any batch/INFO reply for newK already in flight (the host
+            // was streaming it until this instant) neither REQs nor mints. The
+            // pinOwned_ vetoes above are the primary guard; this covers the
+            // window before the pin is first consulted next tick.
+            rekeyedOld_[newK] = nowMs();
+            // Heal an already-minted phantom: a prior flip (or a lost race) may
+            // have bound a proxy under newK. We own the hand now, so despawn the
+            // stray proxy and drop its binding (manual 2026-07-17: Squint).
+            std::map<Key, Character*>::iterator px = proxyByKey_.find(newK);
+            if (px != proxyByKey_.end()) {
+                if (px->second && px->second != c)
+                    engine::despawnProxyNpc(gw, px->second);
+                proxyByKey_.erase(px);
+            }
+            char cf[176]; _snprintf(cf, sizeof(cf) - 1,
+                "[%s] CONTROL-FLIP claim new=%u,%u,%u,%u,%u (now owned)",
+                (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
+            cf[sizeof(cf) - 1] = '\0'; coop::logLine(cf);
+        }
+    } else {
+        // ok=0: no local body at the OLD hand and no proxy to migrate. The
+        // recruit/move fired while this hand was OUTSIDE our interest (the
+        // interest-split "join never saw Ruka" report). The host still streams
+        // the NEW hand as an owned member, but the ordinary spawn-REQ path
+        // proximity-gates it to OUR squad, so a recruit far from the join's
+        // squad never REQs and the body never mints. Enroll the new hand in the
+        // force-REQ set: the reliable edge PROVES it is a legit host body, so we
+        // REQ it regardless of distance (the reply-side mint gate still judges).
+        forceReqHands_.insert(newK);
+        char fb[176]; _snprintf(fb, sizeof(fb) - 1,
+            "[%s] REKEY-FALLBACK new=%u,%u,%u,%u,%u force-REQ (no local body)",
+            tag, newK.t, newK.c, newK.cs, newK.i, newK.s);
+        fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
     }
     life_.erase(oldK); // the old hand's journey ends with the re-key
     char rb[224]; _snprintf(rb, sizeof(rb) - 1,
@@ -726,6 +907,52 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         tag, oldK.t, oldK.c, oldK.cs, oldK.i, oldK.s,
         newK.t, newK.c, newK.cs, newK.i, newK.s, c ? 1 : 0, repaired, culled);
     rb[sizeof(rb) - 1] = '\0'; coop::logLine(rb);
+}
+
+void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
+                                  const char* tag, bool ownIt) {
+    if (!c) return;
+    unsigned int nh[5] = { newK.t, newK.c, newK.cs, newK.i, newK.s };
+    bool ok = engine::joinPlayerSquadAt(gw, c, nh);
+    // Pin the body's ACTUAL local hand. setFaction assigns a local platoon index
+    // that usually DIFFERS from the owner's streamed hand (each engine numbers
+    // its platoon independently), and publishOwned keys ownership by the captured
+    // LOCAL hand - so we must pin THAT hand, not just newK. ownIt selects the
+    // side of the partition:
+    //   * ownIt=false (recruit / move into the PEER's tab): pin PEER-owned. Without
+    //     it the re-containered body escapes the owner-hand pin (newK), streams as
+    //     owned, and the owner mints a DUPLICATE proxy of its own recruit
+    //     (recruit_sync run 095843: join squad 8 vs host 6).
+    //   * ownIt=true (transfer INTO a tab we own - the control hand-off): pin
+    //     OWNED so publishOwned streams the body and the local player controls it.
+    // readObjectHand re-reads post-move in Key order [type,container,
+    // containerSerial,index,serial].
+    if (ownIt) { pinOwned_.insert(newK); pinPeer_.erase(newK); }
+    unsigned int lh[5] = { 0, 0, 0, 0, 0 };
+    bool haveLh = false;
+    __try {
+        haveLh = engine::readObjectHand(reinterpret_cast<RootObject*>(c), lh);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { haveLh = false; }
+    Key lk; lk.t = lh[0]; lk.c = lh[1]; lk.cs = lh[2]; lk.i = lh[3]; lk.s = lh[4];
+    bool sameAsNew = (lk.t == newK.t && lk.c == newK.c && lk.cs == newK.cs &&
+                      lk.i == newK.i && lk.s == newK.s);
+    bool pinnedLocal = false;
+    if (haveLh && (lh[0] | lh[1] | lh[2] | lh[3] | lh[4]) && !sameAsNew) {
+        if (ownIt) { pinPeer_.erase(lk); pinOwned_.insert(lk); }
+        else       { pinOwned_.erase(lk); pinPeer_.insert(lk); }
+        pinnedLocal = true;
+    }
+    int inSquad = -1;
+    __try {
+        inSquad = engine::isPlayerSquad(gw, reinterpret_cast<RootObject*>(c)) ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { inSquad = -1; }
+    char b[240]; _snprintf(b, sizeof(b) - 1,
+        "[%s] MEMBER new=%u,%u,%u,%u,%u insert=%d playerSquad=%d "
+        "localHand=%u,%u,%u,%u,%u pinnedLocal=%d ownIt=%d",
+        (tag ? tag : "recruit"), newK.t, newK.c, newK.cs, newK.i, newK.s,
+        ok ? 1 : 0, inSquad, lk.t, lk.c, lk.cs, lk.i, lk.s,
+        pinnedLocal ? 1 : 0, ownIt ? 1 : 0);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
 

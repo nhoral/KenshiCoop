@@ -280,6 +280,14 @@ typedef void      (__fastcall* DropCarriedFn)(Character* self, bool ragdollHim,
 // inSomething/inWhat bookkeeping). Same signature for both.
 typedef void      (__fastcall* SetFurnModeFn)(Character* self, bool on,
                                               UseableStuff* h);
+// Chained/pole prisoner (protocol 41): setChainedMode runs the engine's full
+// shackle chain on the OCCUPANT (isChained/slaveOwner bookkeeping + shackle
+// item + slave AI job). It is a Kenshi member `void setChainedMode(bool on,
+// const hand& owner)`, so the x64 ABI passes the owner hand by hidden
+// reference - the raw binding takes a `const hand*`. Reproduces a captive on
+// a prisoner POLE (a different engine system from the cage's setPrisonMode).
+typedef void      (__fastcall* SetChainedModeFn)(Character* self, bool on,
+                                                 const hand* owner);
 // Stealth (protocol 20): setStealthMode runs the engine's full sneak chain on
 // the LOCAL body (sneak-walk pose, stealthUpdate scanning, stealth skill use).
 // notifyICanSeeYouSneaking updates the sneaker's whoSeesMeSneaking map + the
@@ -312,6 +320,7 @@ PickupObjectFn    g_pickupObjectFn    = 0;
 DropCarriedFn     g_dropCarriedFn     = 0;
 SetFurnModeFn     g_setBedModeFn      = 0;
 SetFurnModeFn     g_setPrisonModeFn   = 0;
+SetChainedModeFn  g_setChainedModeFn  = 0;
 SetStealthModeFn  g_setStealthModeFn  = 0;
 NotifySeeSneakFn  g_notifySeeSneakFn  = 0;
 
@@ -1294,6 +1303,11 @@ void resolve() {
     if (!g_setBedModeFn || !g_setPrisonModeFn)
         coop::logErrLine("engine: could not resolve bed/prison setters (occupancy sync off)");
 
+    // Chained/pole prisoner (protocol 41; non-fatal: unresolved -> chain sync off).
+    g_setChainedModeFn = (SetChainedModeFn)KenshiLib::GetRealAddress(&Character::setChainedMode);
+    if (!g_setChainedModeFn)
+        coop::logErrLine("engine: could not resolve setChainedMode (chain/pole sync off)");
+
     // Stealth sync (protocol 20; non-fatal: unresolved -> stealth sync off).
     g_setStealthModeFn = (SetStealthModeFn)KenshiLib::GetRealAddress(&Character::setStealthMode);
     g_notifySeeSneakFn = (NotifySeeSneakFn)KenshiLib::GetRealAddress(&Character::notifyICanSeeYouSneaking);
@@ -1619,12 +1633,40 @@ int probeNativeSnapshot(GameWorld* gw) {
            loadedRecordCount == recordCount ? 1 : 0;
 }
 
+// Overwrite SaveManager::currentGame in place. getCurrentGame() returns a
+// reference to the member (modelled as a pointer via g_saveMgrCurGameFn), so we
+// write straight through it. Field evidence: SaveManager::load(name) does NOT
+// update currentGame, so after a programmatic load getCurrentGame()/saveInfo()
+// keep reporting the STALE name (whatever the in-game menu / persisted config
+// left there). Left unfixed, the host connect-push (armConnectPush ->
+// saveGameAs(saveInfo)) writes the freshly-loaded world over an UNRELATED save
+// folder - the fixture-clobber that corrupted pole1 mid-regression. Caller
+// (loadSave) sets it to the name we just asked the engine to load so the
+// connect-push and any coordinated save target the correct slot.
+bool setCurrentGameName(const std::string& name) {
+    if (!g_getFn || !g_saveMgrCurGameFn) return false;
+    __try {
+        SaveManager* mgr = g_getFn();
+        if (!mgr) return false;
+        const std::string* cur = g_saveMgrCurGameFn(mgr);
+        if (!cur) return false;
+        *const_cast<std::string*>(cur) = name;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool loadSave(const std::string& name) {
     if (!g_getFn || !g_loadFn) return false;
     __try {
         SaveManager* mgr = g_getFn();
         if (!mgr) return false;
         g_loadFn(mgr, &name); // deferred: sets LOADGAME, engine loads a few frames later
+        // The engine's own load does NOT refresh currentGame, so set it here to
+        // the save we just issued. Keeps getCurrentGame()/saveInfo() truthful so
+        // the connect-push (armConnectPush) targets THIS save, never a stale one.
+        setCurrentGameName(name);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;

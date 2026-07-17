@@ -531,6 +531,13 @@ P2P transport. See the doctrine list (14-35) for the mechanism of each.
   its squad UI); a late joiner misses pre-connect move edges (bounded by
   the shared-save workflow, rides gap 8); dismissal (roster exit) edges are
   wired but untested (no programmatic dismiss lever).
+- **Remaining edge (2026-07-17, Phase 1b):** author-side control-release on
+  a cross-tab transfer is incomplete - when a unit is moved INTO a
+  peer-owned tab, the author keeps its ownership pin and never stops
+  streaming its (stationary) copy, so the new owner's move orders fight the
+  author's stream and the unit renders a walk gait / slow drive until
+  re-anchored. `recruit_ctl` Phase B gait parity is ADVISORY for this
+  reason. Workaround: a save + reload reconciles the membership/ownership.
 - **Spikes:** squad_probe/squad_sync findings (runs 185825, 191911, 192211,
   193304).
 

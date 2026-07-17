@@ -335,7 +335,18 @@ typedef double         f64;
 // front-of-queue copy - the WRONG instance. The picker now correlates the
 // exact Item* that re-entered its bag to the drop it tracked and names that
 // instance; the peer re-homes precisely that (owner,id)-keyed copy.
-const u16 PROTOCOL_VERSION = 40;
+//
+// v41 (chained/pole prisoner sync, 2026-07-16): a NEW bodyState bit
+// BODY_CHAINED (Character::isChained) rides the furniture-occupancy pipeline
+// as kind=3. Kenshi puts a captive on a prisoner POLE via the chained/slave
+// mechanism (isChained + slaveOwner + setChainedMode/slaveAttachToBoneMode),
+// which is a DIFFERENT engine system from a cage (inSomething==IN_PRISON /
+// setPrisonMode). Cages were the only prison state synced, so a unit shackled
+// to a pole never crossed the wire - the join left it at the last carried/KO
+// stage. The furniture reliable enter/exit edges reuse the SAME shape for
+// chain: arg=3, and the actor hand carries the OWNER (setChainedMode needs an
+// owner, and the pole position rides the continuous transform).
+const u16 PROTOCOL_VERSION = 41;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -402,7 +413,11 @@ enum EventType {
     // Furniture occupancy (protocol 19). subject = the OCCUPANT, actor slots =
     // the FURNITURE's save-stable hand (a building, not a character - both
     // clients loaded the same save, so it resolves locally on each machine).
-    // arg: 1 = bed, 2 = prison cage.
+    // arg: 1 = bed, 2 = prison cage, 3 = chained/pole (protocol 41). For a
+    // chain the actor slots carry the OWNER's hand (Character::slaveOwner)
+    // instead of a furniture building: the receiver reproduces it with
+    // setChainedMode(occupant, on, owner) and the pole position rides the
+    // continuous transform stream (no rigid fixture attach needed).
     EVT_ENTER_FURNITURE = 8, // occupant was placed in / climbed into the furniture
     EVT_EXIT_FURNITURE  = 9, // occupant left / was removed from the furniture
     // Recruitment sync (protocol 23). subject = the recruited body's OLD hand
@@ -561,13 +576,21 @@ const u16 BODY_IN_CAGE = 1 << 6;
 // player toggles). Distinct from BODY_CRAWL (isStealthModeOrCrawling), which
 // also covers injured crawl - a crawler must never get setStealthMode applied.
 const u16 BODY_SNEAK   = 1 << 7;
+// Chained/pole prisoner (protocol 41): Character::isChained. A captive on a
+// prisoner POLE is shackled via the chained/slave system, NOT the cage's
+// inSomething==IN_PRISON. Like the occupancy bits it may also read down (a
+// KO'd body just placed on the pole) but is EXEMPT from the down enforcement
+// and all position driving - the chained attach + streamed transform own it.
+// Rides the furniture pipeline as kind=3 (the actor hand carries the OWNER).
+const u16 BODY_CHAINED = 1 << 8;
 
 // True if the body should be treated as lying down (suppress walk-drive / parking).
 // Deliberately ignores BODY_CARRIED (and the occupancy bits): the receiver checks
 // bodyIsCarried/bodyInFurniture FIRST and skips the down path entirely for them.
 inline bool bodyIsDown(u16 s)    { return (s & (BODY_DOWN | BODY_RAGDOLL | BODY_DEAD)) != 0; }
 inline bool bodyIsCarried(u16 s) { return (s & BODY_CARRIED) != 0; }
-inline bool bodyInFurniture(u16 s) { return (s & (BODY_IN_BED | BODY_IN_CAGE)) != 0; }
+inline bool bodyInFurniture(u16 s) { return (s & (BODY_IN_BED | BODY_IN_CAGE | BODY_CHAINED)) != 0; }
+inline bool bodyChained(u16 s)   { return (s & BODY_CHAINED) != 0; }
 inline bool bodySneaking(u16 s)  { return (s & BODY_SNEAK) != 0; }
 
 // An entity batch is: [EntityBatchHeader][EntityState * count]. ownerId tags the

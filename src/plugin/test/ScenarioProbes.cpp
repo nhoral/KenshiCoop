@@ -810,6 +810,273 @@ private:
     unsigned int  tabsLogged_;
 };
 
+// recruit_ctl (Phase 1b gait + phantom VALIDATION, full tier): the recruit
+// family's CONTROL scenario. recruit_sync proves a recruit CONVERGES + joins
+// the squad on the peer; recruit_ctl proves the two Phase-1b behaviors layered
+// on top - (1) a DRIVEN squad member reproduces the owner's RUN gait (not a
+// walk), and (2) a control-flip TRANSFER does not mint a phantom duplicate.
+// Timeline (save 'sync', both squads present; clock from ARM = peer-ready):
+//   t=8s   HOST recruits the nearest baked NPC. The join re-keys its copy onto
+//          the host hand (Case A) + inserts it as a peer-owned member, so the
+//          join finds it as the NEW squad member (set-diff vs the onStart base).
+//   t=12-20s  HOST walks the recruit (owner). Both sides log SCENARIO GAIT
+//          phase=A: host=owner (streams a run), join=driver (its reproduced
+//          readMotion speed is the gait-parity sample - a WALK here is the bug).
+//   t=24s  JOIN moves the recruit INTO its own tab (lever 1) -> control-flip:
+//          the join CLAIMS ownership, the host re-keys + becomes the driver.
+//          The host's last in-flight batches for the now-owned hand must NOT
+//          mint a proxy (the phantom "Squint").
+//   t=28-36s  JOIN walks the recruit (owner now). Both sides log GAIT phase=B:
+//          join=owner, host=driver (validates the host-side drive mirror too).
+//   t=40s  end.
+// Each side reads its OWN stored Character* for the gait sample (stable across
+// recruit/move - setFaction re-containers but never recreates the object), so
+// no cross-hand correlation is needed. Test-RecruitCtl gates gait-parity
+// (driver median speed vs owner median per phase) + anti-phantom (no proxy
+// BOUND for a CONTROL-FLIP-claimed hand; end squad-size parity).
+class RecruitCtlScenario : public Scenario {
+public:
+    RecruitCtlScenario()
+        : passed_(false), lastGaitMs_(0), lastWalkMs_(0), altDir_(0),
+          recruitDone_(false), recruitRes_(-9), subject_(0),
+          moveDone_(false), moveRes_(-9), baseN_(0), haveHome_(false) {
+        memset(recruitHand_, 0, sizeof(recruitHand_));
+        memset(homeHand_, 0, sizeof(homeHand_));
+        for (int i = 0; i < MAX_BASE; ++i)
+            for (int j = 0; j < 5; ++j) baseHands_[i][j] = 0;
+    }
+
+    virtual const char* name() const { return "recruit_ctl"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        // Baseline squad hands: the join identifies the NEW member (the recruit)
+        // by set difference, and the HOST uses them to find the JOIN's tab (the
+        // transfer target - the baseline member whose container differs from the
+        // recruit's, i.e. the OTHER squad's tab) at transfer time.
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        baseN_ = 0;
+        for (unsigned int i = 0; i < n && baseN_ < MAX_BASE; ++i)
+            handFromEntity(sq[i], baseHands_[baseN_++]);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CTL start host=%d base=%u",
+                  ctx.isHost ? 1 : 0, baseN_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // 1) Recruit (host t=8s).
+        if (ctx.isHost && !recruitDone_ && ctx.elapsedMs >= RECRUIT_AT_MS) {
+            recruitDone_ = true;
+            unsigned int hb[5], ha[5];
+            recruitRes_ = engine::probeRecruit(ctx.gw, /*runtime=*/false, hb, ha);
+            if (recruitRes_ == 1) {
+                memcpy(recruitHand_, ha, sizeof(recruitHand_));
+                subject_ = engine::resolveCharByHand(ha[3], ha[4], ha[0],
+                                                     ha[1], ha[2]);
+            }
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO CTL recruit res=%d hand=%u,%u,%u,%u,%u t=%lu",
+                      recruitRes_, ha[0], ha[1], ha[2], ha[3], ha[4],
+                      ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Join: discover the recruit as the NEW squad member (poll until found).
+        if (!ctx.isHost && !subject_) findNewMember(ctx);
+
+        // 2) Gait sampling (both sides, ~4 Hz inside a walk window).
+        if (subject_ && (ctx.elapsedMs - lastGaitMs_ >= 250)) {
+            int phase = phaseAt(ctx.elapsedMs);
+            if (phase >= 0) { lastGaitMs_ = ctx.elapsedMs; logGait(ctx, phase); }
+        }
+
+        // 3) Owner walk-drive: the phase's OWNER re-issues a far run every 1s.
+        //    Phase A owner = host; phase B owner = join.
+        if (subject_) {
+            int phase = phaseAt(ctx.elapsedMs);
+            bool owner = (phase == 0 && ctx.isHost) || (phase == 1 && !ctx.isHost);
+            if (owner && (ctx.elapsedMs - lastWalkMs_ >= 1000)) {
+                lastWalkMs_ = ctx.elapsedMs;
+                driveWalk(ctx);
+            }
+        }
+
+        // 4) Transfer (HOST t=24s): the host moves the recruit INTO the JOIN's
+        //    tab. This is the direction that flips control TO the join - the
+        //    join RECEIVES the move into a tab it owns, so its rekeyPeerBody
+        //    claims ownership (CONTROL-FLIP) and the phantom-mint race fires on
+        //    the join (the reproduction of manual 2026-07-17: Squint). A
+        //    join-authored move into its own tab does NOT flip (the author does
+        //    not run rekeyPeerBody; the host receiver does not own the dest).
+        if (ctx.isHost && subject_ && !moveDone_ && ctx.elapsedMs >= MOVE_AT_MS) {
+            moveDone_ = true;
+            doTransfer(ctx);
+        }
+
+        if (ctx.elapsedMs >= DURATION_MS) {
+            // Host: the recruit landed AND the transfer was authored (rc=1).
+            // Join: it found the recruit (and, post-flip, owns + walks it in
+            // phase B). The cross-machine gait + phantom verdict is
+            // Test-RecruitCtl's job (reads the GAIT/spawn logs on both files).
+            if (ctx.isHost) passed_ = (recruitRes_ == 1) && moveDone_ &&
+                                      (moveRes_ == 1);
+            else            passed_ = (subject_ != 0);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static bool sameHand(const unsigned int a[5], const unsigned int b[5]) {
+        return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] &&
+               a[3] == b[3] && a[4] == b[4];
+    }
+
+    // -1 outside a walk window, 0 = phase A, 1 = phase B.
+    int phaseAt(unsigned long t) const {
+        if (t >= PHASE_A_FROM && t < PHASE_A_TO) return 0;
+        if (t >= PHASE_B_FROM && t < PHASE_B_TO) return 1;
+        return -1;
+    }
+
+    void findNewMember(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        for (unsigned int i = 0; i < n; ++i) {
+            unsigned int h[5]; handFromEntity(sq[i], h);
+            bool baseline = false;
+            for (unsigned int b = 0; b < baseN_; ++b)
+                if (sameHand(h, baseHands_[b])) { baseline = true; break; }
+            if (baseline) continue;
+            Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+            if (!c) continue;
+            memcpy(recruitHand_, h, sizeof(recruitHand_));
+            subject_ = c;
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO CTL found hand=%u,%u,%u,%u,%u t=%lu",
+                      h[0], h[1], h[2], h[3], h[4], ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return;
+        }
+    }
+
+    // Live hand of the subject (re-read every call so it tracks a re-key /
+    // control-flip re-container). readObjectHand + handFromEntity share the same
+    // [t,c,cs,i,s] layout, so the result compares directly against a squad
+    // capture.
+    bool subjectHand(unsigned int out[5]) {
+        if (!subject_) return false;
+        return engine::readObjectHand(reinterpret_cast<RootObject*>(subject_), out);
+    }
+
+    // Current position of the subject via a squad capture matched on its LIVE
+    // hand (tracks the post-transfer re-container).
+    bool subjectPos(const ScenarioContext& ctx, float* x, float* y, float* z) {
+        unsigned int cur[5];
+        if (!subjectHand(cur)) return false;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        for (unsigned int i = 0; i < n; ++i) {
+            unsigned int h[5]; handFromEntity(sq[i], h);
+            if (sameHand(h, cur)) {
+                *x = sq[i].x; *y = sq[i].y; *z = sq[i].z; return true;
+            }
+        }
+        return false;
+    }
+
+    void logGait(const ScenarioContext& ctx, int phase) {
+        bool moving = false; float speed = 0.0f;
+        int ok = engine::readMotion(subject_, &moving, &speed) ? 1 : 0;
+        bool owner = (phase == 0) ? ctx.isHost : (!ctx.isHost);
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO GAIT who=%s phase=%c role=%s moving=%d speed=%.2f "
+                  "ok=%d t=%lu",
+                  ctx.isHost ? "host" : "join", (phase == 0) ? 'A' : 'B',
+                  owner ? "own" : "drive", moving ? 1 : 0, speed, ok,
+                  ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void driveWalk(const ScenarioContext& ctx) {
+        float x, y, z;
+        if (!subjectPos(ctx, &x, &y, &z)) return;
+        // Order a FAR run so the engine picks the run gait; alternate the
+        // direction so the body bounces in-region for the whole window.
+        float d = (altDir_ & 1) ? -180.0f : 180.0f;
+        ++altDir_;
+        engine::walkTo(subject_, x + d, y, z, 30.0f);
+    }
+
+    // The host moves the recruit INTO the join's tab. Target = the baseline
+    // member whose container differs from the recruit's current container (on
+    // the 2-tab 'sync' save that is the join's own squad tab - robust to which
+    // rank number each side owns). memberHand is the subject's LIVE hand.
+    void doTransfer(const ScenarioContext& ctx) {
+        unsigned int mh[5];
+        if (!subjectHand(mh)) { moveRes_ = -8; homeLog(ctx, 0); return; }
+        // Pick the join's tab leader: a baseline hand with a different (c,cs).
+        int home = -1;
+        for (unsigned int i = 0; i < baseN_; ++i) {
+            if (baseHands_[i][1] != mh[1] || baseHands_[i][2] != mh[2]) {
+                home = (int)i; break;
+            }
+        }
+        if (home < 0) { moveRes_ = -7; homeLog(ctx, 0); return; }
+        memcpy(homeHand_, baseHands_[home], sizeof(homeHand_)); haveHome_ = true;
+        unsigned int hb[5], ha[5];
+        moveRes_ = engine::probeMoveSquadMember(ctx.gw, mh, homeHand_,
+                                                /*lever=*/1, hb, ha);
+        if (moveRes_ == 1) memcpy(recruitHand_, ha, sizeof(recruitHand_));
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CTL move rc=%d target=%u,%u before=%u,%u,%u,%u,%u "
+                  "after=%u,%u,%u,%u,%u t=%lu",
+                  moveRes_, homeHand_[1], homeHand_[2],
+                  hb[0], hb[1], hb[2], hb[3], hb[4],
+                  ha[0], ha[1], ha[2], ha[3], ha[4], ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void homeLog(const ScenarioContext& ctx, int) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CTL move rc=%d (no target) t=%lu",
+                  moveRes_, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const unsigned long RECRUIT_AT_MS = 8000;
+    static const unsigned long PHASE_A_FROM  = 12000;
+    static const unsigned long PHASE_A_TO    = 20000;
+    static const unsigned long MOVE_AT_MS    = 24000;
+    static const unsigned long PHASE_B_FROM  = 28000;
+    static const unsigned long PHASE_B_TO    = 36000;
+    static const unsigned long DURATION_MS   = 40000;
+    static const unsigned int  MAX_SQUAD     = 48;
+    static const unsigned int  MAX_BASE      = 48;
+
+    bool          passed_;
+    unsigned long lastGaitMs_;
+    unsigned long lastWalkMs_;
+    unsigned int  altDir_;
+    bool          recruitDone_;
+    int           recruitRes_;
+    Character*    subject_;
+    bool          moveDone_;
+    int           moveRes_;
+    unsigned int  baseN_;
+    unsigned int  baseHands_[MAX_BASE][5];
+    unsigned int  recruitHand_[5];
+    unsigned int  homeHand_[5];
+    bool          haveHome_;
+};
+
 // squad_probe (protocol 35 phase 0, probe tier; squadSync forced OFF) /
 // squad_sync (probe=false, full tier; squadSync ON). Moving a unit between
 // squad tabs RE-CONTAINERS it - the hand changes like a recruit's - but no
@@ -1441,6 +1708,7 @@ Scenario* makeProbeScenario(const std::string& name) {
     if (name == "vendor_trade") return new VendorTradeScenario();
     if (name == "recruit_probe") return new RecruitProbeScenario(true);
     if (name == "recruit_sync")  return new RecruitProbeScenario(false);
+    if (name == "recruit_ctl")   return new RecruitCtlScenario();
     if (name == "squad_probe")   return new SquadProbeScenario(true);
     if (name == "squad_sync")    return new SquadProbeScenario(false);
     if (name == "faction_probe") return new FactionProbeScenario(true);

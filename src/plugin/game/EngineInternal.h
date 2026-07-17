@@ -146,6 +146,10 @@ typedef void      (__fastcall* DropCarriedFn)(Character* self, bool ragdollHim,
                                               bool removeOnly);
 typedef void      (__fastcall* SetFurnModeFn)(Character* self, bool on,
                                               UseableStuff* h);
+// Chained/pole prisoner (protocol 41): Character::setChainedMode(bool on,
+// const hand& owner) - owner passed by hidden reference (const hand*).
+typedef void      (__fastcall* SetChainedModeFn)(Character* self, bool on,
+                                                 const hand* owner);
 typedef void      (__fastcall* SetStealthModeFn)(Character* self, bool on);
 typedef void      (__fastcall* NotifySeeSneakFn)(Character* self, Character* who,
                                                  const int* seeingYnm, float prog01);
@@ -329,6 +333,7 @@ extern PickupObjectFn    g_pickupObjectFn;
 extern DropCarriedFn     g_dropCarriedFn;
 extern SetFurnModeFn     g_setBedModeFn;
 extern SetFurnModeFn     g_setPrisonModeFn;
+extern SetChainedModeFn  g_setChainedModeFn;
 extern SetStealthModeFn  g_setStealthModeFn;
 extern NotifySeeSneakFn  g_notifySeeSneakFn;
 
@@ -505,6 +510,7 @@ bool ciContains(const char* hay, const char* needle);
 GameData* findSeatTemplate(GameWorld* gw);
 GameData* findBedTemplate(GameWorld* gw);
 GameData* findCageTemplate(GameWorld* gw);
+GameData* findPoleTemplate(GameWorld* gw);
 GameData* findMachineTemplate(GameWorld* gw);
 // Position/yaw anchor in front of the local leader.
 bool leaderAnchor(GameWorld* gw, float fwd, float side,

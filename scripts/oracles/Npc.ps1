@@ -645,8 +645,13 @@ function Get-FurnSeries {
 #                   of the author's out marker
 function Test-FurnPut {
     param([string]$HostFile, [string]$JoinFile, [int]$Kind = 1,
+          [int]$InKind = 0,
           [int]$MaxLatencyMs = 12000, [double]$PosTol = 3.0)
-    $gate = if ($Kind -eq 2) { "cage_put" } else { "bed_put" }
+    # $Kind identifies the scenario/gate + the FURNACT 'kind=' marker; $InKind is
+    # the occupancy value the FURN series must read. They differ for pole_put
+    # (Kind 4 = the pole gate, but a pole is IN_PRISON so the occupant reads in=2).
+    if ($InKind -eq 0) { $InKind = $Kind }
+    $gate = if ($Kind -eq 4) { "pole_put" } elseif ($Kind -eq 3) { "chain_put" } elseif ($Kind -eq 2) { "cage_put" } else { "bed_put" }
     $tagU = $gate.ToUpper()
     # Subject hands from the latch lines (each side latches both subjects; take
     # each window's subject from its AUTHOR's log).
@@ -675,12 +680,12 @@ function Test-FurnPut {
         $Td = Get-MarkerTimeMs -File $d.authorLog -Pattern ('SCENARIO FURNACT ' + $t + ' out ')
         # Author ground truth: its own local subject really entered the furniture.
         $Aall = Get-FurnSeries -File $d.authorLog -HandIS $d.subject
-        $aIn = @($Aall | Where-Object { $_.t -ge $Tp -and $_.t -le ($Td + 1500) -and $_.in -eq $Kind })
-        if ($aIn.Count -lt 1) { $bad += "${t}: subject never read in=$Kind on the AUTHOR (engine put failed?)"; continue }
+        $aIn = @($Aall | Where-Object { $_.t -ge $Tp -and $_.t -le ($Td + 1500) -and $_.in -eq $InKind })
+        if ($aIn.Count -lt 1) { $bad += "${t}: subject never read in=$InKind on the AUTHOR (engine put failed?)"; continue }
         # 1. Enter crossed: the peer's local copy reads the occupancy.
         $Pall = Get-FurnSeries -File $d.peerLog -HandIS $d.subject
         if ($Pall.Count -lt 3) { $bad += "${t}: peer furn series too short ($($Pall.Count))"; continue }
-        $pIn = @($Pall | Where-Object { $_.t -ge $Tp -and $_.in -eq $Kind })
+        $pIn = @($Pall | Where-Object { $_.t -ge $Tp -and $_.in -eq $InKind })
         if ($pIn.Count -lt 1) { $bad += "${t}: enter never crossed to the peer"; continue }
         $enterLat = [int]($pIn[0].t - $Tp)
         $m["${t}EnterLatMs"] = $enterLat
@@ -716,6 +721,34 @@ function Test-FurnPut {
     Write-Host ("  $tagU PASS - A: enter $($m.AEnterLatMs)ms exit $($m.AExitLatMs)ms gap $($m.AFurnGapMed); " +
                 "B: enter $($m.BEnterLatMs)ms exit $($m.BExitLatMs)ms gap $($m.BFurnGapMed)")
     return (Add-GateResult -Name $gate -Status PASS -Metrics $m)
+}
+
+# chain_put (protocol 41, chained/pole prisoner): identical shape to bed_put/
+# cage_put but kind=3 (Character::isChained -> setChainedMode). The scenario
+# self-chains each subject (no baked fixture), so this gates that the chained
+# STATE crosses: author reads in=3 locally, the peer's driven copy reads in=3
+# within MaxLatencyMs, the copies hold together while chained, and both read
+# in=0 after release. Confirms the wire/apply path; the real pole visual is
+# validated by the manual 'pole' save re-test.
+function Test-ChainPut {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MaxLatencyMs = 12000, [double]$PosTol = 3.0)
+    return (Test-FurnPut -HostFile $HostFile -JoinFile $JoinFile -Kind 3 `
+                         -MaxLatencyMs $MaxLatencyMs -PosTol $PosTol)
+}
+
+# pole_put (protocol 19 kind=4, prisoner POLE): identical shape to cage_put but
+# the subject is placed on a baked standing PRISONER POLE instead of a cage box.
+# A pole is the SAME containment as a cage (setPrisonMode -> occupant reads
+# in=2), so the FURNACT marker is kind=4 (the pole gate) while the FURN
+# occupancy is checked as in=2. Gates that the pole placement crosses to the
+# peer (enter within budget), the copies hold together on the pole, and both
+# read in=0 after release - the controlled, deterministic 'body on a pole' test.
+function Test-PolePut {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MaxLatencyMs = 12000, [double]$PosTol = 3.0)
+    return (Test-FurnPut -HostFile $HostFile -JoinFile $JoinFile -Kind 4 -InKind 2 `
+                         -MaxLatencyMs $MaxLatencyMs -PosTol $PosTol)
 }
 
 # cage_peer_sync (protocol 36, third-party placement): the HOST places the

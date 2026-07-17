@@ -62,6 +62,24 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         Key hk = keyOf(raw[i]);
         if (pinOwned_.count(hk))     owned = true;
         else if (pinPeer_.count(hk)) owned = false;
+        // Drive-exclusion (Phase 1b recruit membership): a body we are DRIVING
+        // from the peer's stream is peer-owned regardless of the local tab
+        // rank/hand it sits in. insertPeerMember re-containers a recruit into
+        // OUR squad, giving it a NEW local index the owner's hand-pin (keyed on
+        // the OWNER's reported hand) does not cover - without this it escapes the
+        // pin, publishes as owned, and the owner mints a DUPLICATE proxy of its
+        // own recruit (recruit_sync run 093032: host squad 6 vs join 8).
+        // canonicalOf_ is stamped every drive tick by Character*, so it tracks
+        // the body across index drift; the body was already driven as a
+        // proxy/re-keyed copy BEFORE it became a member, so there is no lag. Our
+        // OWN recruits are pinOwned_ (never driven) and keep publishing.
+        if (owned && !pinOwned_.count(hk)) {
+            Character* bc = engine::resolveCharByHand(
+                raw[i].hIndex, raw[i].hSerial, raw[i].hType,
+                raw[i].hContainer, raw[i].hContainerSerial);
+            if (bc && canonicalOf_.find(bc) != canonicalOf_.end())
+                owned = false;
+        }
         if (!owned) continue;
         buf[n++] = raw[i];
         ownHands_.insert(hk);
@@ -362,7 +380,12 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         // TASK and the peer's copy walks in via the validated L3 fixture-pose
         // path (bed_pose) - an ENTER event would teleport it in and fight that.
         if (furnSync_ && carryAuthor && !engine::taskIsBedPose((int)e.task)) {
-            int curKind = (cur & BODY_IN_BED) ? 1 : ((cur & BODY_IN_CAGE) ? 2 : 0);
+            // Chained/pole prisoner (protocol 41) rides this pipeline as kind=3
+            // (readFurniture puts the OWNER hand in fr.furn). Gated by chainSync_
+            // so it can be disabled without losing bed/cage sync.
+            int curKind = (cur & BODY_IN_BED) ? 1 :
+                          ((cur & BODY_IN_CAGE) ? 2 :
+                          ((chainSync_ && (cur & BODY_CHAINED)) ? 3 : 0));
             if (curKind != hb.furnKind) {
                 if (hb.furnKind != 0) {
                     // Exit edge: subject = occupant, actor = the remembered furniture.

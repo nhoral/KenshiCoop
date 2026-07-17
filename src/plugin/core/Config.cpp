@@ -232,6 +232,10 @@ void loadConfig(Config& c) {
     // native (setBedMode/setPrisonMode) between each machine's local pair.
     // "0" is the A/B escape hatch.
     c.furnSync = envOr("KENSHICOOP_FURN_SYNC", "1") != "0";
+    // Chained/pole prisoner sync (protocol 41, DEFAULT ON): rides the furniture
+    // pipeline as kind=3 (Character::isChained -> setChainedMode). "0" disables
+    // just the chain kind (beds/cages keep working).
+    c.chainSync = envOr("KENSHICOOP_CHAIN_SYNC", "1") != "0";
     c.stealthSync = envOr("KENSHICOOP_STEALTH_SYNC", "1") != "0";
     c.moneySync   = envOr("KENSHICOOP_MONEY_SYNC", "1") != "0";
     // Forced OFF for the shop_probe diagnostic - that scenario exists to

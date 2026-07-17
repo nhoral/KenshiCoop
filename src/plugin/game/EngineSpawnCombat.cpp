@@ -328,6 +328,35 @@ bool setupBedCageScene(GameWorld* gw) {
     return bed != 0 && cage != 0;
 }
 
+// Prisoner-pole occupancy fixture (protocol 19 kind=4 / engine IN_PRISON): spawn
+// a single standing prisoner POLE in front of the leader so both clients load a
+// save-stable pole hand. A pole is the same containment SYSTEM as a cage
+// (setPrisonMode), just a different model - the pole_put controlled test wants
+// this model so the sync is visibly a body ON A POLE. Auto-baked into 'pole1'.
+bool setupPoleScene(GameWorld* gw) {
+    GameData* poleTmpl = 0;
+    __try {
+        poleTmpl = findPoleTemplate(gw);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("SETUP(pole): template lookup FAULTED");
+        return false;
+    }
+    {
+        char d[224];
+        _snprintf(d, sizeof(d) - 1, "SETUP(pole): poleTemplate='%s'",
+                  poleTmpl ? poleTmpl->name.c_str() : "(none)");
+        d[sizeof(d) - 1] = '\0';
+        coop::logLine(d);
+    }
+    if (!poleTmpl) {
+        coop::logLine("SETUP(pole): no prisoner-pole template found (see candidates above)");
+        return false;
+    }
+    // Directly in front of the leader, framed by the default camera.
+    RootObject* pole = spawnTemplateInFront(gw, poleTmpl, 7.0f, 0.0f, "pole");
+    return pole != 0;
+}
+
 bool orderWorkAt(Character* c, RootObject* fixture, int task) {
     if (!c || !fixture) return false;
     if (!g_addOrderFn && !g_addJobFn) return false;
@@ -362,8 +391,13 @@ RootObject* findFurnitureNear(GameWorld* gw, int kind) {
         unsigned int total = g_npcQuery.size();
         const char* bedPrefs[]  = { "camp bed", "bedroll", "bed" };
         const char* cagePrefs[] = { "prisoner cage", "cage" };
-        const char** prefs = (kind == 2) ? cagePrefs : bedPrefs;
-        const unsigned int nprefs = (kind == 2) ? 2u : 3u;
+        // kind==4: a PRISONER POLE. Same engine containment as a cage (kind=2 /
+        // setPrisonMode) but a distinct model - prefer pole/shackle names so a
+        // world holding both a cage and a pole picks the pole.
+        const char* polePrefs[] = { "prisoner pole", "cage pole", "shackle", "pole" };
+        const char** prefs = (kind == 4) ? polePrefs
+                                          : ((kind == 2) ? cagePrefs : bedPrefs);
+        const unsigned int nprefs = (kind == 4) ? 4u : ((kind == 2) ? 2u : 3u);
         for (unsigned int k = 0; k < nprefs; ++k) {
             for (unsigned int i = 0; i < total; ++i) {
                 RootObject* o = g_npcQuery[i];
@@ -1146,6 +1180,9 @@ unsigned short readBodyState(Character* c) {
         // Furniture occupancy (protocol 19): direct member read (0x2F8).
         if (c->inSomething == IN_BED)         s |= BODY_IN_BED;
         else if (c->inSomething == IN_PRISON) s |= BODY_IN_CAGE;
+        // Chained/pole prisoner (protocol 41): direct member read (0x320). A
+        // captive shackled to a prisoner pole is chained, not caged.
+        if (c->isChained) s |= BODY_CHAINED;
         // Stealth (protocol 20): the mode bool exactly (0xD4), NOT the
         // crawl-inclusive isStealthModeOrCrawling that feeds BODY_CRAWL.
         if (c->stealthMode) s |= BODY_SNEAK;

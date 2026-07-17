@@ -23,7 +23,7 @@ declarations of cross-TU helpers.
 | `EngineEntity.cpp` | EntityState capture (`captureOne`/`captureSquad`/`captureNpcs`), hand resolve (`resolve`/`resolveCharByHand`/`readObjectHand`), motion apply/orders, NPC suppression, interest centers, debug marker HUD, seat/bed/cage/machine template + work-fixture finders | `g_npcQuery`, `g_dataScratch`, hand/locomotion `g_*Fn` |
 | `EngineInventory.cpp` | Phase 4a container capture/reconcile (`readInvItems`, `createItemAndAdd`, equip levers), Phase W0/W1 world items, spike-451 weapon-mint trace (`[mkspy]`), spike-401 research store probe (r401) | `g_dataScratch`, inventory/factory `g_*Fn` |
 | `EngineSpawnCombat.cpp` | Protocol 21 runtime-spawn proxies (`spawnProxyNpc`/`describeCharacter`), scenario scene setup (seat/bed/cage/machine/duel/down), combat reads + melee orders, limb-loss/revive/bandage medical primitives | `g_npcQuery`, `g_dataScratch`, spawn/combat/medical `g_*Fn`; owns duel/down anchor statics |
-| `EngineCharState.cpp` | Protocol 17 stats, 18 carry, 19 furniture, 20 stealth; consensus game-speed plane (read/write/quiet write, intent consume, vote buttons) | stats/carry/furniture/stealth/speed `g_*Fn`, speed-intent flags |
+| `EngineCharState.cpp` | Protocol 17 stats, 18 carry, 19 furniture, 20 stealth, 41 chained/pole (kind=3, setChainedMode); consensus game-speed plane (read/write/quiet write, intent consume, vote buttons) | stats/carry/furniture/chain/stealth/speed `g_*Fn`, speed-intent flags |
 | `EngineWorld.cpp` | Protocol 22 money/vendors, 23 recruit probe, 24 faction relations, 26 doors, 27/28 placed buildings, 33 machines, 34 containers | wallet/door/build/machine/faction `g_*Fn`, `g_facDeltas` (read via drain) |
 | `ZoneQuery.cpp` | Zone-loaded query, quarantined TU (ZoneManager.h vs CombatClass.h `ParticlePool` clash) | none (private `g_zone*Fn`) |
 
@@ -115,7 +115,7 @@ Consumer column = oracle function + its `scripts/oracles/*.ps1` fragment.
 | `[spawn]`, `[limb]`, `[event]`, `[med]` (apply half) | Spawn | Test-SpawnProbe/SpawnSync (Npc.ps1) / Test-LimbLoss (Medical.ps1) / Test-DeathOrder (Npc.ps1) |
 | `[inv]`, `[wi]`, `[wd]`, `[dk]`/`[pk]`/`[sk]`, `[xfer]`, `[key]` | Items | Test-InventorySync / Test-WorldItemSync / Test-WeaponDrop / Test-WeaponLoot / Test-TradePeer (Inventory.ps1) |
 | `[stats]`, `[money]`, `[fac]`, `[door]`, `[bdoor]`, `[build]`, `[prod]`, `[research]`, `[recruit]`, `[squad]`, `[sneak]`, `[speed]`, `[time]`, `[latejoin]`, `[rank]` | Channels | matching per-channel oracles: Test-StatsSync (Medical.ps1); Test-Sneak*/Test-Speed* (Npc.ps1); Test-Money*/Faction*/Door*/Bdoor*/Build*/Prod*/Research*/Recruit*/Squad*/Time* (World.ps1); Test-Latejoin* (Session.ps1) |
-| `[carry]`, `[furn]` | Publish (SEND) + Drive (drive/sweep) + Spawn (RECV edges) | Test-CarryOrder / Test-NpcCarry / Test-FurnPut / Test-CagePeer (Npc.ps1) |
+| `[carry]`, `[furn]` | Publish (SEND) + Drive (drive/sweep) + Spawn (RECV edges); `[furn]` kind=3 = chained/pole (protocol 41, actor hand = owner); kind=4 (pole_put) = prisoner POLE via prison mode (occupant reads in=2) | Test-CarryOrder / Test-NpcCarry / Test-FurnPut / Test-ChainPut / Test-PolePut / Test-CagePeer (Npc.ps1) |
 | `[coop-ui]` | EngineEntity (panel intent) + Plugin (`coopUiConnect` resolved) | Test-PanelConfig (Panel.ps1) - hand-driven, run via `check_panel_log.ps1` |
 
 ## Scenario plane (`src/plugin/test/`)
@@ -141,7 +141,7 @@ classification (`tabRankOf`/`tabLeaderIdx`/`handFromEntity`) live in
 | `ScenarioMedical.cpp` | medic_order, limb_loss, stats_sync |
 | `ScenarioInventory.cpp` | inv_order, inv_bidir, trade_probe, trade_peer, inv_equip, inv_reequip, inv_wpnseq, inv_addequip, wpn_relocate |
 | `ScenarioWorldItems.cpp` | drop_probe, world_item_sync, world_item_join, world_weapon_drop, world_armor_drop, weapon_loot |
-| `ScenarioCharState.cpp` | carry_order, npc_carry, bed_pose, bed_put, cage_put, cage_peer_sync, sneak_probe, sneak_pose, sneak_detect, speed_sync, speed_probe |
+| `ScenarioCharState.cpp` | carry_order, npc_carry, bed_pose, bed_put, cage_put, chain_put, pole_put, cage_peer_sync, sneak_probe, sneak_pose, sneak_detect, speed_sync, speed_probe |
 | `ScenarioProbes.cpp` | spike (numbered-probe dispatcher), shop_probe, money_sync, vendor_trade, recruit_probe/sync, squad_probe/sync, faction_probe/sync, time_probe/sync, hunger_probe/sync |
 | `ScenarioBuildings.cpp` | door_probe/sync, build_probe/sync, bdoor_probe/sync, prod_probe/sync, research_probe/sync, store_probe/sync |
 | `ScenarioSession.cpp` | latejoin_probe/sync, save_probe, save_sync, save_stage1, resume_check, load_probe, load_sync |
@@ -184,7 +184,7 @@ shared exactly as before the split. Importers (`run_test.ps1`,
 |---|---|
 | `oracles/Parsing.ps1` | clock offset + series parsers: Get-LogClockOffsetMs, Get-ClockSyncStats, Convert-StampToMs, Get-ScenarioLines, Get-ScenarioSeries, Get-MarkerTimeMs |
 | `oracles/CoreChecks.ps1` | every-scenario gates: Test-LogHealth, Test-NoCheckFail, Test-ScenarioResultPass, Test-ClockSync |
-| `oracles/Npc.ps1` | Test-Crosscheck, Measure-NpcSync, Test-NpcTrack, Test-CoopPresence, pose/body-state, craft/down/death orders, carry/furniture/cage, sneak, speed, split_interest, spawn probes, Test-SpawnSync, Test-NpcCensus |
+| `oracles/Npc.ps1` | Test-Crosscheck, Measure-NpcSync, Test-NpcTrack, Test-CoopPresence, pose/body-state, craft/down/death orders, carry/furniture/cage/chain, sneak, speed, split_interest, spawn probes, Test-SpawnSync, Test-NpcCensus |
 | `oracles/Combat.ps1` | Test-CombatProbe/Order/Kill, Test-DamageGuard, Test-PlayerCombat, Test-AssaultTown, Test-PlayerKo, Test-CombatCrowd |
 | `oracles/Medical.ps1` | Get-VitalsSeries, Test-NpcVitals, Test-LimbLoss, Get-StatsSeries, Test-StatsSync, Test-MedicOrder |
 | `oracles/Inventory.ps1` | Test-Inventory*/Trade*, Test-DropProbe, Test-WorldItemSync, Test-WpnRelocate, Test-WeaponDrop, Test-WeaponLoot |

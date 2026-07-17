@@ -216,8 +216,19 @@ bool readFurniture(Character* c, FurnitureRead* out) {
     __try {
         if (c->inSomething == IN_BED)         out->kind = 1;
         else if (c->inSomething == IN_PRISON) out->kind = 2;
+        else if (c->isChained)                out->kind = 3;  // protocol 41: pole/shackle
         else                                  out->kind = 0;
-        if (out->kind != 0) {
+        if (out->kind == 3) {
+            // Chained/pole: the reproduction needs the OWNER hand
+            // (setChainedMode), not a furniture building. Carry slaveOwner in
+            // the same 5-field slot the cage path uses for inWhat.
+            const hand& o = c->slaveOwner;
+            out->furn[0] = (unsigned int)o.type;
+            out->furn[1] = o.container;
+            out->furn[2] = o.containerSerial;
+            out->furn[3] = o.index;
+            out->furn[4] = o.serial;
+        } else if (out->kind != 0) {
             const hand& h = c->inWhat;
             out->furn[0] = (unsigned int)h.type;
             out->furn[1] = h.container;
@@ -235,7 +246,38 @@ bool readFurniture(Character* c, FurnitureRead* out) {
 bool applyFurniture(GameWorld* gw, Character* occupant,
                     const unsigned int furnHand[5], int kind, bool on) {
     (void)gw;
-    if (!occupant || (kind != 1 && kind != 2)) return false;
+    if (!occupant || (kind != 1 && kind != 2 && kind != 3)) return false;
+    // Chained/pole prisoner (protocol 41): a separate engine system from cages
+    // (setChainedMode, not setPrisonMode). furnHand carries the OWNER's hand.
+    // The pole position rides the continuous transform stream, so no rigid
+    // fixture attach is reproduced here - just the shackle/slave state, which
+    // (with the furniture carve-out + AI-suspend) keeps the body on the pole.
+    if (kind == 3) {
+        if (!g_setChainedModeFn || !g_handCtorFn) return false;
+        __try {
+            const bool cur = occupant->isChained;
+            const bool desired = on;
+            if (cur == desired) return true;           // idempotent no-op
+            char buf[sizeof(hand) + 16];
+            memset(buf, 0, sizeof(buf));
+            hand* owner = reinterpret_cast<hand*>(buf);
+            if (furnHand) {
+                g_handCtorFn(owner, furnHand[3], furnHand[4], (itemType)furnHand[0],
+                             furnHand[1], furnHand[2]);
+            } else {
+                // Exit without a supplied owner: reuse the body's own slaveOwner.
+                const hand& so = occupant->slaveOwner;
+                g_handCtorFn(owner, so.index, so.serial, so.type, so.container,
+                             so.containerSerial);
+            }
+            if (on && owner->index == 0 && owner->serial == 0)
+                return false;                          // enter needs a real owner
+            g_setChainedModeFn(occupant, on, owner);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
     SetFurnModeFn fn = (kind == 1) ? g_setBedModeFn : g_setPrisonModeFn;
     if (!fn) return false;
     // Resolve the furniture OUTSIDE the SEH frame (resolveObjectByHand guards
@@ -272,11 +314,26 @@ bool putSubjectInFurniture(GameWorld* gw, const unsigned int subjHand[5], int ki
     Character* c = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
                                      subjHand[1], subjHand[2]);
     if (!c) return false;
-    RootObject* furn = findFurnitureNear(gw, kind);
+    if (kind == 3) {
+        // Chain scaffold (chain_put): a pole has no searchable building and the
+        // reproduction is owner-based, so chain the subject to ITSELF as a
+        // stand-in owner (a valid save-stable hand). This exercises just the
+        // state crossing (isChained -> BODY_CHAINED -> peer setChainedMode);
+        // real captures set the enemy faction as owner via slaveOwner.
+        return applyFurniture(gw, c, subjHand, 3, on);
+    }
+    // kind==4 (pole_put): a PRISONER POLE is IN_PRISON containment, the SAME
+    // engine system as a cage (setPrisonMode) - the only difference is the
+    // fixture model. Resolve the baked pole (findFurnitureNear kind=4) but drive
+    // it through the prison path (engine kind 2), so the occupant reads in=2 and
+    // the peer reproduces it exactly as it does a cage - just on a pole.
+    const int findKind   = kind;
+    const int engineKind = (kind == 4) ? 2 : kind;
+    RootObject* furn = findFurnitureNear(gw, findKind);
     if (!furn) return false;
     unsigned int fh[5] = { 0, 0, 0, 0, 0 };
     if (!readObjectHand(furn, fh)) return false;
-    return applyFurniture(gw, c, fh, kind, on);
+    return applyFurniture(gw, c, fh, engineKind, on);
 }
 
 bool taskIsBedPose(int t) {

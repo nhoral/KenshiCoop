@@ -1,6 +1,6 @@
 // ScenarioCharState.cpp - carry/furniture/stealth/speed scenarios (monolith
 // split from Scenario.cpp, 2026-07-12): carry_order, npc_carry, bed_pose,
-// bed_put, cage_put, cage_peer_sync, sneak_probe, sneak_pose, sneak_detect,
+// bed_put, cage_put, chain_put, cage_peer_sync, sneak_probe, sneak_pose, sneak_detect,
 // speed_sync, speed_probe. Classes are TU-private (anonymous namespace);
 // only makeCharStateScenario (ScenarioSupport.h) is exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
@@ -600,9 +600,14 @@ private:
     unsigned int  l0Hand_[5];
 };
 
-// bed_put / cage_put (protocol 19 phase 3, unconscious placement): save
-// 'bedcage1' again. Two sequential owner-side windows against the SAME baked
-// fixture (one occupant at a time):
+// bed_put / cage_put / chain_put / pole_put (protocol 19 phase 3, unconscious
+// placement): save 'bedcage1' (bed/cage) or 'pole1' (pole). chain_put (protocol
+// 41 chained/pole STATE) needs no baked fixture - it self-chains the subject
+// (setChainedMode) to exercise the isChained -> BODY_CHAINED crossing. pole_put
+// (kind=4) places the subject on a baked PRISONER POLE via the engine's prison
+// path (setPrisonMode -> occupant reads in=2), the SAME containment as a cage
+// but on a pole model, so it's the controlled visual of a body ON A POLE. Two
+// sequential owner-side windows against the SAME subject slot (one at a time):
 //   Window A (host own-tab):  KO M2 (host tab's second member), place it in
 //     the fixture via the putSubjectInFurniture scaffold, hold it there, then
 //     take it back out. The JOIN's driven M2 copy must mirror enter + exit.
@@ -623,7 +628,11 @@ public:
           bDown_(false), bPut_(false), bOut_(false),
           aPutOk_(false), bPutOk_(false), lastPutMs_(0) {}
 
-    virtual const char* name() const { return kind_ == 2 ? "cage_put" : "bed_put"; }
+    virtual const char* name() const {
+        return kind_ == 4 ? "pole_put"
+             : (kind_ == 3 ? "chain_put"
+             : (kind_ == 2 ? "cage_put" : "bed_put"));
+    }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1638,6 +1647,8 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "bed_pose")     return new BedPoseScenario();
     if (name == "bed_put")      return new FurnPutScenario(1);
     if (name == "cage_put")     return new FurnPutScenario(2);
+    if (name == "chain_put")    return new FurnPutScenario(3);
+    if (name == "pole_put")     return new FurnPutScenario(4);
     if (name == "cage_peer_sync") return new CagePeerScenario();
     if (name == "sneak_probe")  return new SneakProbeScenario();
     if (name == "sneak_pose")   return new SneakPoseScenario();
