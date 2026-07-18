@@ -83,6 +83,10 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
             out[n].equipped = 0;
             out[n].slot     = (unsigned char)((unsigned int)it->slotType & 0xFFu);
             out[n].section  = 0; // loose: no equip section
+            // Phase 6b: locked shackle bit (LockedArmour with a live lock). Direct
+            // virtual dispatch (like getGameData above) discriminates the item; the
+            // outer __try covers a fault.
+            { LockedArmour* la = it->isLockedArmour(); out[n].locked = (la && la->lock) ? 1 : 0; }
             fillItemProvenance(it, out[n]); // weapon manufacturer/material (empty otherwise)
             if (outItems) outItems[n] = it;
             ++n;
@@ -120,6 +124,8 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                     out[n].quality = (unsigned short)(ql * 100.0f);
                     out[n].equipped = 1;
                     out[n].slot     = (unsigned char)((unsigned int)sec->limitedSlot & 0xFFu);
+                    // Phase 6b: locked shackle bit on the equipped LockedArmour.
+                    { LockedArmour* la = it->isLockedArmour(); out[n].locked = (la && la->lock) ? 1 : 0; }
                     // Carry the SECTION identity so the two weapon slots ('hip' vs
                     // 'back', both ATTACH_WEAPON) replicate to the SAME slot on the peer.
                     out[n].section  = sectionNameHash(sec->name.c_str());

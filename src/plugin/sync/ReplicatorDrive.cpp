@@ -149,6 +149,30 @@ void Replicator::applyTargets(GameWorld* gw) {
             std::map<Key, Character*>::iterator pit = proxyByKey_.find(it->first);
             if (pit != proxyByKey_.end()) { c = pit->second; viaProxy = true; }
         }
+        // Phase 2 crash hardening: a minted proxy pointer can be freed by the
+        // engine in the window between the ~1 Hz syncSpawns liveness sweep and
+        // this 20 Hz drive (mint/zone churn on town/camp approach). Prove the
+        // pointer is still live with a cheap SEH-guarded hand read BEFORE we
+        // dereference it below; a dead read means the body was reaped, so unbind
+        // and let the census/REQ machinery re-mint if the host still streams it.
+        // Only minted proxies need this - engine::resolve() returns bodies from
+        // the engine's own live lookup. targets_ is being iterated here, so we
+        // only touch the OTHER maps and let the 30 s targets_ prune (or a clean
+        // next-tick re-resolve) handle this key.
+        if (viaProxy) {
+            unsigned int lh[5];
+            if (!engine::readHand(c, lh)) {
+                char sb[160]; _snprintf(sb, sizeof(sb) - 1,
+                    "[drive] STALE unbind hand=%u,%u,%u,%u,%u c=%p",
+                    it->first.t, it->first.c, it->first.cs, it->first.i,
+                    it->first.s, (void*)c);
+                sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+                proxyByKey_.erase(it->first);
+                spawnReq_.erase(it->first);   // allow a fresh REQ/mint cycle
+                lifeSet(it->first, LIFE_UNKNOWN, "drive-stale");
+                continue;
+            }
+        }
         if (!c) {
             // Unresolved-hand telemetry (Phase 0 diagnostics; logged even with
             // spawnSync off - spawn_probe baselines this failure mode). Once
@@ -216,6 +240,16 @@ void Replicator::applyTargets(GameWorld* gw) {
         float ax, ay, az;
         bool haveActual = engine::readPos(c, &ax, &ay, &az);
         bool hostMoving = (out.cMoving != 0) || (out.cSpeed > MOVE_EPS);
+        // A conscious bed pose (USE_BED / USE_BED_ORDER / SLEEP_ON_FLOOR) is a
+        // STATIONARY anchored pose, but a sleeper streams currentlyMoving=1 (the
+        // climb-in / in-bed idle sets the movement flag while cSpeed stays 0).
+        // For a DRIVEN SQUAD member genuinelyMoving == hostMoving, so that flag
+        // routes the sleeper down the walk/snap path - it gets position-snapped
+        // to the streamed transform instead of reproducing the bed pose via
+        // applyRest, so it STANDS on the bed instead of lying in it (manual
+        // 2026-07-17, ~4/5 tries; the 1/5 that worked caught cMoving==0). A
+        // bedded body is never walking: anchor it so the rest/pose path runs.
+        if (engine::taskIsBedPose((int)out.task)) hostMoving = false;
 
         // Two drive regimes (see Engine::isLocalPlayerChar):
         //   * SQUAD member - a player-controlled body, inert when uncontrolled, so
@@ -279,6 +313,42 @@ void Replicator::applyTargets(GameWorld* gw) {
         //   * locally occupied after the stream stopped reporting the bit ->
         //     debounced local exit (a 1-batch blip must not eject a valid
         //     occupant - the carry-drop lesson).
+        // Non-owner unlock guard (protocol 42): a shackled prisoner (isChained ->
+        // BODY_CHAINED) can ALSO be in a cage/bed (IN_PRISON/IN_BED). readFurniture's
+        // kind priority reports the cage (kind=2), so the occupancy self-heal below
+        // only ever re-asserts the CAGE - never the shackle. A peer PC's local
+        // lockpick (or AI break-out) then leaves the owner's prisoner UNLOCKED on
+        // this peer while the owner still streams BODY_CHAINED (the reported "the
+        // other client's PC unlocked the shackle" desync, cage2). Re-assert
+        // setChainedMode INDEPENDENTLY of the furniture kind: remember the owner
+        // (slaveOwner) while the driven copy is locally chained, and re-apply if it
+        // has lost the chain. Scoped to the masked case (chained AND in a cage/bed);
+        // a pole-only chained body is handled by the kind=3 self-heal below.
+        if (chainSync_ && (out.bodyState & BODY_CHAINED) &&
+            (out.bodyState & (BODY_IN_CAGE | BODY_IN_BED))) {
+            engine::ShackleRead lsr;
+            bool haveSr = engine::readShackle(c, &lsr) && lsr.valid;
+            if (haveSr && lsr.chained &&
+                (lsr.owner[3] != 0 || lsr.owner[4] != 0)) {
+                for (int fi = 0; fi < 5; ++fi) d.chainOwner[fi] = lsr.owner[fi];
+                d.haveChainOwner = true;
+            }
+            if (haveSr && !lsr.chained &&
+                (now - d.chainHealTick) >= FURN_HEAL_MS) {
+                d.chainHealTick = now;
+                // Remembered owner if we have one, else the body's own slaveOwner
+                // (furnHand=0) - covers a caged slave that activated unshackled.
+                bool ok = d.haveChainOwner
+                    ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
+                    : engine::applyFurniture(gw, c, 0, 3, true);
+                engine::endAction(c);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[furn] SHACKLE RELOCK occ=%u,%u owner=%u,%u src=%s ok=%d",
+                    out.hIndex, out.hSerial, d.chainOwner[3], d.chainOwner[4],
+                    d.haveChainOwner ? "remembered" : "slaveOwner", ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
         if (furnSync_ && !engine::taskIsBedPose((int)out.task)) {
             // Chained/pole prisoner (protocol 41) rides this carve-out as
             // kind=3 (Character::isChained). Gated by chainSync_ so it can be
@@ -297,7 +367,44 @@ void Replicator::applyTargets(GameWorld* gw) {
                 for (int fi = 0; fi < 5; ++fi) d.chainOwner[fi] = lfr.furn[fi];
                 d.haveChainOwner = (lfr.furn[3] != 0 || lfr.furn[4] != 0);
             }
-            if (streamKind != 0) {
+            // Chained fall-through (world_parity 2026-07-17): kind=3 (chained)
+            // is an EQUIP state, not a transform anchor - a working slave
+            // walks its mining round while shackled, and the camp save starts
+            // the PCs chained, so the hold below froze every chained body at
+            // its entry position (the host's PC rendered 1600 u away on the
+            // join) and - at rest - left the local copy's own queued job
+            // running (the join's Leaf walked its local mining round while
+            // the host mined in place: the hold skips applyRest, so the
+            // host's task was never reproduced and the stale local task never
+            // cleared). Keep only the CHAINED-STATE heal here (re-chain a
+            // locally-unchained copy, throttled) and fall through: the
+            // unified drive owns transform AND task for chained bodies (it
+            // AI-suspends driven bodies itself; applyRest reproduces the
+            // host's work pose at rest). Cage/bed (kinds 1-2) remain true
+            // transform anchors below.
+            if (streamKind == 3) {
+                if (haveFr && localKind != 3 &&
+                    (now - d.furnHealTick) >= FURN_HEAL_MS) {
+                    d.furnHealTick = now;
+                    // A local bed/cage the stream does NOT vouch for is a
+                    // transform anchor at the wrong spot (the host's guard
+                    // jailed its copy locally / a stale attach) - the drive's
+                    // parks and walks all no-op against it (Flashbox held a
+                    // 33 u offset for 60 s). Break it before re-chaining.
+                    if (localKind == 1 || localKind == 2) {
+                        engine::applyFurniture(gw, c, lfr.furn, localKind, false);
+                        engine::endAction(c);
+                    }
+                    bool ok = d.haveChainOwner
+                        ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
+                        : engine::applyFurniture(gw, c, 0, 3, true);
+                    engine::endAction(c);
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "[furn] HEAL ENTER occ=%u,%u kind=3 was=%d ok=%d (fallthrough)",
+                        out.hIndex, out.hSerial, localKind, ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            } else if (streamKind != 0) {
                 d.furnNoSeeTick = 0;
                 // A jailed/bedded DRIVEN body must not run its own decision layer.
                 // A CONSCIOUS caged squad member (an arrested player) otherwise
@@ -314,11 +421,19 @@ void Replicator::applyTargets(GameWorld* gw) {
                     (now - d.furnHealTick) >= FURN_HEAL_MS) {
                     d.furnHealTick = now;
                     // Chain (kind 3) has no searchable building and needs the
-                    // OWNER: re-apply setChainedMode with the remembered owner.
+                    // OWNER: re-apply setChainedMode with the remembered owner,
+                    // or - for a prisoner that spawned into interest already
+                    // UNCHAINED (no owner ever remembered) - via its OWN
+                    // slaveOwner (furnHand=0, set from the shared save). Without
+                    // this fallback an obedient working slave that activated
+                    // unshackled+jobless on the join was never re-locked and its
+                    // local AI fled, drawing the join guards into a chase the host
+                    // never saw (manual 2026-07-17, camp working prisoners).
                     // Cages/beds re-find the nearest matching fixture by name.
                     bool ok = (streamKind == 3)
-                        ? (d.haveChainOwner &&
-                           engine::applyFurniture(gw, c, d.chainOwner, 3, true))
+                        ? (d.haveChainOwner
+                           ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
+                           : engine::applyFurniture(gw, c, 0, 3, true))
                         : engine::enterFurnitureNearPos(
                             gw, c, streamKind, out.x, out.y, out.z, FURN_MATCH_DIST);
                     // Drop the in-progress escape/attack action so the body doesn't
@@ -337,6 +452,28 @@ void Replicator::applyTargets(GameWorld* gw) {
                 d.parked = false; d.haveDest = false;
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
                 continue;
+            } else if (localKind == 1 && hostMoving) {
+                // Bed fast-exit (conscious sleep wake): a bed pose has NO
+                // reliable EXIT edge (publishOwned suppresses furniture edges
+                // while taskIsBedPose), so a host that wakes and WALKS would
+                // otherwise leave the join copy frozen in bed until the
+                // FURN_EXIT_MS debounce - and a conscious bed sleeper is never
+                // AI-suspended, so its local AI can re-sleep it in the gap
+                // ("stays sleeping" desync, pole save 2026-07-17). The host
+                // genuinely moving is an unambiguous "left the bed" signal (a
+                // caged/chained body - kind 2/3 - never moves, so this can't
+                // false-trigger there and they stay on the debounce): eject NOW,
+                // drop the in-progress sleep action, release the held pose, and
+                // FALL THROUGH (no continue) so the unified drive follows the
+                // host this same tick.
+                bool ok = engine::applyFurniture(gw, c, lfr.furn, 1, false);
+                engine::endAction(c);
+                d.furnNoSeeTick = 0;
+                d.taskApplied = false; d.issuedTask = TASK_NONE; d.taskNoneTick = 0;
+                char bfe[160]; _snprintf(bfe, sizeof(bfe) - 1,
+                    "[furn] BED FAST-EXIT occ=%u,%u ok=%d hostMoving=1",
+                    out.hIndex, out.hSerial, ok ? 1 : 0);
+                bfe[sizeof(bfe) - 1] = '\0'; coop::logLine(bfe);
             } else if (localKind != 0) {
                 // Third-party placement authority (protocol 36): a HOST-sim
                 // actor (a guard jailing an arrested player) put this PEER-
@@ -511,6 +648,17 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // 014713: the pre-seated striker re-ordered 15x, localFight=0 all
                 // window). Flush the order via the order-path attack, once.
                 bool breakSeat = d.taskApplied || d.issuedTask != TASK_NONE;
+                // Engagement escalation (world_parity camp, run 005538): a
+                // driven guard beating a locally PLAYER-OWNED body (escaped
+                // prisoner PC) accepted the goal-path attack (r=2) every
+                // reissue but never engaged - its running local AI re-decides
+                // against fighting the player squad and drops the goal. After
+                // a failed goal-path episode, flush via the ORDER path too
+                // (player orders outrank AI goals - the seat-injection
+                // precedent). Backoff-throttled like every reissue.
+                if (!breakSeat && !hostWaiting && !localFighting &&
+                    d.combatOrders >= 1)
+                    breakSeat = true;
                 // Wrong-target divergence (Phase 3, 2026-07-16): the local brawl
                 // grabbed a DIFFERENT body than the host reports. Drop the wrong
                 // lock before re-ordering so the engine re-acquires the host's
@@ -524,15 +672,30 @@ void Replicator::applyTargets(GameWorld* gw) {
                     d.taskApplied = false; d.taskBad = false;
                     d.issuedTask  = TASK_NONE;
                 }
+                // Final escalation (world_parity camp, run 011417): the copy
+                // accepted BOTH the goal and order attacks yet still never
+                // engaged (localFight=0, task 65535 all window) - its running
+                // AI validates the victim (locally player-owned, non-hostile
+                // faction: the escaped-prisoner recapture) and drops the
+                // committed goal. attackTarget is that AI's own commit entry,
+                // past the validation. Only after two failed ordered episodes
+                // so ordinary NPC-vs-NPC fights never hit this path.
+                int fr = -2; // -2 = not attempted
+                if (r == 2 && !hostWaiting && !localFighting &&
+                    d.combatOrders >= 2) {
+                    fr = engine::forceAttack(c, out);
+                }
                 d.combatArmed = true; d.combatTick = now;
                 if (d.combatOrders < 1000000u) ++d.combatOrders;
                 ++combatOrder_;
                 d.combatTgtIdx = out.sIndex; d.combatTgtSer = out.sSerial;
                 { char b[192]; _snprintf(b, sizeof(b) - 1,
-                    "[combat] order hand=%u,%u tgt=%u,%u localFight=%d r=%d wait=%d n=%u%s",
+                    "[combat] order hand=%u,%u tgt=%u,%u localFight=%d r=%d wait=%d n=%u%s%s",
                     out.hIndex, out.hSerial, out.sIndex, out.sSerial,
                     localFighting ? 1 : 0, r, hostWaiting ? 1 : 0, d.combatOrders,
-                    breakSeat ? " seatbrk=1" : "");
+                    breakSeat ? " seatbrk=1" : "", fr == -2 ? "" :
+                    (fr == 2 ? " forced=1" : (fr == 1 ? " forced=notgt" :
+                     (fr == 0 ? " forced=nofn" : " forced=fault"))));
                   b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             }
             // Graded position correction (don't kill the gait): under the soft band
@@ -1443,7 +1606,15 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
         // the body into a NEW platoon (a new hand), destroying the save-stable
         // identity every hand-keyed protocol relies on. Squad members have no
         // town-AI re-tasker anyway (they are player-controlled + peer-driven).
-        if (!d.detached && !noDetach_ && !isSquad) {
+        // NEVER detach a CHAINED body either (world_parity 2026-07-17): the
+        // chained fall-through routes working slaves here, and the detach
+        // re-containered each one (Pao 1,42 -> 1,53 etc.) - the old hand
+        // stopped resolving (drive dropped it, census couldn't match) and the
+        // new-hand body was census-absent, so suppression HID it: the "many
+        // units on the host missing on the join" manual finding. AI-suspend
+        // (default-on) already quiets the town-AI re-tasker for them.
+        bool chained = (out.bodyState & BODY_CHAINED) != 0;
+        if (!d.detached && !noDetach_ && !isSquad && !chained) {
             d.detached = engine::detachFromTownAI(c);
             if (d.detached) ++detachUses_;
         }
@@ -1480,6 +1651,12 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
     }
     if (d.taskApplied) {
         d.parked = false; // the engine holds the seated/idle pose; don't fight it
+        // NOTE: do NOT AI-suspend a held bed pose. The engine's decision layer
+        // (Character::periodicUpdate) is what plays/maintains the lie-down sleep
+        // clip; suspending it leaves the body placed in the bed but STANDING on
+        // it (manual test 2026-07-17). The wake-and-move desync is handled by the
+        // bed fast-exit in applyTargets (Fix A), so no re-sleep guard is needed
+        // here - the driven copy follows the host the instant it moves.
         return;
     }
     // Fallback (no task / fixture missing / drifted): quiet the AI and hold the

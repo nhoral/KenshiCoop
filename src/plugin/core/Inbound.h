@@ -290,6 +290,13 @@ struct InboundLoadNack {
     LoadNackPacket pkt;
 };
 
+// One received camera hint (protocol 43, host side): the join's camera world
+// center, folded into interestCenters as an extra anchor. Latest wins.
+struct InboundCamHint {
+    u32           ownerId;
+    CamHintPacket pkt;
+};
+
 class Inbound {
 public:
     Inbound()  { InitializeCriticalSection(&cs_); sawRemote_ = false; }
@@ -497,6 +504,11 @@ public:
         InboundLoadNack ln; ln.ownerId = ownerId; ln.pkt = pkt;
         EnterCriticalSection(&cs_); loadNack_.push_back(ln); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received camera hint (protocol 43), owner-tagged.
+    void pushCamHint(u32 ownerId, const CamHintPacket& pkt) {
+        InboundCamHint ch; ch.ownerId = ownerId; ch.pkt = pkt;
+        EnterCriticalSection(&cs_); camHint_.push_back(ch); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
     void drainConnects(std::deque<u32>& out) {
@@ -607,6 +619,9 @@ public:
     void drainLoadNacks(std::deque<InboundLoadNack>& out) {
         EnterCriticalSection(&cs_); out.swap(loadNack_); LeaveCriticalSection(&cs_);
     }
+    void drainCamHints(std::deque<InboundCamHint>& out) {
+        EnterCriticalSection(&cs_); out.swap(camHint_); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread, session reset (protocol 32): drop every queued packet that
     // describes the OLD world after a reload edge. Presence (connect/leave
@@ -623,7 +638,7 @@ public:
         buildPlace_.clear(); buildState_.clear(); buildDoor_.clear();
         buildRemove_.clear(); stealth_.clear();   spawnReq_.clear();
         spawnInfo_.clear(); prod_.clear();       npcCensus_.clear();
-        research_.clear();
+        research_.clear();  camHint_.clear();
         LeaveCriticalSection(&cs_);
     }
 
@@ -666,6 +681,7 @@ private:
     std::deque<InboundLoadGo>      loadGo_;
     std::deque<InboundLoadReq>     loadReq_;
     std::deque<InboundLoadNack>    loadNack_;
+    std::deque<InboundCamHint>     camHint_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);

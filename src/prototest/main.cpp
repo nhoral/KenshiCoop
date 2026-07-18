@@ -59,7 +59,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             54);
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       10); // v35: +sendMs
-    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            156);
+    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            158); // v42: +locked+lockReserved
     CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       27); // v33: +keyKind
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
@@ -95,6 +95,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(ProdPacket)",              sizeof(ProdPacket),              109);
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
+    CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -200,7 +201,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v41: chained/pole prisoner sync)", (int)PROTOCOL_VERSION, 41);
+    CHECK_EQ("PROTOCOL_VERSION (v43: camera hint / PKT_CAM_HINT)", (int)PROTOCOL_VERSION, 43);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -525,6 +526,8 @@ static void testContentHash() {
     CHECK("equipped perturbs hash",     invEntryHash(b) != base);
     b = makeEntry(); b.slot = 5;
     CHECK("slot perturbs hash",         invEntryHash(b) != base);
+    b = makeEntry(); b.locked = 1;
+    CHECK("locked perturbs hash",       invEntryHash(b) != base);
     b = makeEntry(); b.section = 1234;
     CHECK("section perturbs hash",      invEntryHash(b) != base);
     b = makeEntry(); std::strcpy(b.manufacturer, "cross");

@@ -618,6 +618,92 @@ function Test-WorldItemSync {
         hostCulled = $hostCulled; joinCulled = $joinCulled })
 }
 
+# rejoin_items (Phase 3 item-dup fix): a reload must not duplicate save-native
+# ground items. The HOST drops K items (both clients reach n0+K), coordinated-
+# saves so the drops bake into the shared save, then loads it mid-session. The
+# first-scan baseline must record the now-native drops as never-emit; WITHOUT it
+# the host re-streams them and the join layers a duplicate proxy per reload. The
+# gate: POST-reload ground-item count must NOT grow past the PRE-reload count on
+# EITHER side (equal is the fixed behavior), a reload edge actually happened, and
+# the host authored the drop + coordinated save + mid-session load.
+function Test-RejoinItems {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    $parse = {
+        param($file)
+        $o = [pscustomobject]@{ base = -1; pre = -1; post = -1; postSeen = $false
+                                swapDone = $false; reload = $false; verdictPass = $null }
+        if (Test-Path $file) {
+            foreach ($ln in Get-Content $file) {
+                if ($ln -match 'SCENARIO RI BASELINE n=(-?\d+)') { $o.base = [int]$matches[1] }
+                if ($ln -match 'SCENARIO RI PRERELOAD n=(-?\d+)') { $o.pre = [int]$matches[1] }
+                if ($ln -match 'SCENARIO RI POSTRELOAD n=(-?\d+) pre=(-?\d+)') {
+                    $o.post = [int]$matches[1]
+                    if ($o.pre -lt 0) { $o.pre = [int]$matches[2] }
+                    $o.postSeen = $true
+                }
+                if ($ln -match 'SCENARIO RI SWAPDONE')     { $o.swapDone = $true }
+                if ($ln -match '\[load\] WORLD-RELOAD')    { $o.reload = $true }
+                if ($ln -match 'SCENARIO RI verdict .*pass=(\d+)') { $o.verdictPass = ([int]$matches[1] -eq 1) }
+            }
+        }
+        return $o
+    }
+    $H = & $parse $HostFile
+    $J = & $parse $JoinFile
+
+    # Host authoring legs.
+    $drop = [bool](Select-String -Path $HostFile -Pattern 'SCENARIO RI DROP .*dropped=[1-9]' -Quiet -ErrorAction SilentlyContinue)
+    $save = [bool](Select-String -Path $HostFile -Pattern 'SCENARIO RI SAVE .*ok=1' -Quiet -ErrorAction SilentlyContinue)
+    $load = [bool](Select-String -Path $HostFile -Pattern 'SCENARIO RI LOAD .*ok=1' -Quiet -ErrorAction SilentlyContinue)
+    if (-not $drop) { $why += "host never dropped test items (no 'SCENARIO RI DROP dropped>=1')" }
+    if (-not $save) { $why += "host coordinated save failed (no 'SCENARIO RI SAVE ok=1')" }
+    if (-not $load) { $why += "host mid-session load failed (no 'SCENARIO RI LOAD ok=1')" }
+
+    # The drops must have actually entered the world+save (host grew over its own
+    # baseline), otherwise the test never exercised the item-dup path.
+    if ($H.base -ge 0 -and $H.pre -ge 0 -and $H.pre -le $H.base) {
+        $why += "host drops never registered (baseline=$($H.base) >= preReload=$($H.pre) - nothing to duplicate)"
+    }
+
+    # A reload edge must have happened on BOTH sides (the coordinated load must
+    # drive the join, not just the host).
+    if (-not ($H.reload -or $H.swapDone)) { $why += "host saw no reload edge (no WORLD-RELOAD / RI SWAPDONE)" }
+    if (-not ($J.reload -or $J.swapDone)) { $why += "join saw no reload edge (coordinated load did not drive the join)" }
+
+    if (-not $H.postSeen) { $why += "host missing POSTRELOAD census" }
+    if (-not $J.postSeen) { $why += "join missing POSTRELOAD census" }
+
+    # THE gate (cross-client parity): both clients loaded the byte-identical save,
+    # so once co-located after the swap they must converge to the SAME native
+    # count. A join that mints a proxy on top of each save-native (the reload dup
+    # bug) shows a count that EXCEEDS the host's authoritative native count. So a
+    # join-post GREATER than host-post = duplication. (join-pre is NOT a valid
+    # baseline: the drops land near the host leader, often outside the join's 60u
+    # interest sphere pre-reload, so the join legitimately reaches the full count
+    # only after the reload co-locates it with the saved items.)
+    if ($H.postSeen -and $J.postSeen -and $H.post -ge 0 -and $J.post -gt $H.post) {
+        $why += "join DUPLICATED items on reload (join post=$($J.post) EXCEEDS host post=$($H.post) - a proxy minted on top of each save-native)"
+    }
+    # Host must not balloon against its own pre-reload count either.
+    if ($H.postSeen -and $H.pre -ge 0 -and $H.post -gt $H.pre) {
+        $why += "host DUPLICATED items on reload (pre=$($H.pre) -> post=$($H.post))"
+    }
+
+    Write-Host ("    FINDING: host base={0} pre={1} post={2} reload={3} | join pre={4} post={5} reload={6} | parity(join<=host)={7} | drop={8} save={9} load={10}" -f `
+        $H.base, $H.pre, $H.post, ($H.reload -or $H.swapDone), $J.pre, $J.post, ($J.reload -or $J.swapDone), `
+        ($J.post -le $H.post), $drop, $save, $load)
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  REJOIN-ITEMS $v - $detail"
+    return (Add-GateResult -Name "rejoin_items" -Status $v -Metrics @{
+        hostBase = $H.base; hostPre = $H.pre; hostPost = $H.post
+        joinPre = $J.pre; joinPost = $J.post
+        drop = $drop; save = $save; load = $load } -Detail $detail)
+}
+
 # wpn_relocate (conservation spike): LOCAL single-client bag->ground->bag move of a
 # real weapon. Gated on the host; the join result is advisory cross-client evidence.
 function Test-WpnRelocate {

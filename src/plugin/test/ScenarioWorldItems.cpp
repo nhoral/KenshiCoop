@@ -564,6 +564,235 @@ private:
     char          sid_[48];
 };
 
+// rejoin_items (Phase 3 item-dup fix): a reload must NOT duplicate save-native
+// ground items. The HOST drops K test items (both clients reach n0+K), issues a
+// coordinated saveGameAs (the saveSync half streams the join a byte-identical
+// copy; its PKT_SAVE_ACK is the "join holds my copy" gate) so the drops bake
+// into the shared save, then loads it MID-SESSION. After the swap those drops
+// are save-natives on BOTH clients: the first-scan baseline (worldSeeded_) must
+// record them as never-emit so the host does NOT re-stream them and the join
+// does NOT mint a duplicate proxy on top of its own native. WITHOUT the fix the
+// re-scan re-streams all n0+K and the join layers n0+K proxies -> ~2*(n0+K).
+// Both clients census the interest sphere every 500 ms (SCENARIO RI rows); the
+// oracle gates that the POST-reload count did not grow past the PRE-reload count
+// on either side (no +K layer) and that a WORLD-RELOAD edge actually occurred.
+// Reuses the load_sync save/ACK/load coordination + world-swap detection.
+class RejoinItemsScenario : public Scenario {
+public:
+    RejoinItemsScenario()
+        : passed_(false), have_(false), lastLogMs_(0), step_(0),
+          baselineN_(-1), preReloadN_(-1), postReloadN_(-1), lastN_(0),
+          dropped_(0), saveIssued_(false), saveOk_(false), ackSeen_(false),
+          ackOk_(false), loadIssued_(false), loadOk_(false),
+          dropStartMs_(0), swapSeen_(false), swapDone_(false), censusAtMs_(0),
+          postCensused_(false), sigWas2_(false), sigClearedMs_(0), lastStatusMs_(0) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        sid_[0] = '\0';
+    }
+
+    virtual const char* name() const { return "rejoin_items"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        have_ = engine::pickInventoryContainer(ctx.gw, hand_);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO RI anchor host=%d have=%d hand=%u,%u,%u,%u,%u",
+            ctx.isHost ? 1 : 0, have_ ? 1 : 0,
+            hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        bool live = engine::gameplayLive(ctx.gw);
+
+        // Census the interest sphere on BOTH clients every 500 ms (when live).
+        if (live && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            engine::WorldItemRaw raw[MAXW];
+            unsigned int n = engine::captureWorldItems(ctx.gw, raw, MAXW, 60.0f);
+            lastN_ = (int)n;
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO RI %s t=%lu n=%u step=%d swapDone=%d",
+                ctx.isHost ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, n,
+                step_, swapDone_ ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // ---- Host script: baseline -> drop K -> coordinated save -> load ----
+        if (ctx.isHost && have_) {
+            if (step_ == 0 && live && ctx.elapsedMs >= 4000) {
+                step_ = 1;
+                baselineN_ = lastN_;
+                char b[96]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RI BASELINE n=%d t=%lu", baselineN_, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (step_ == 1 && ctx.elapsedMs >= 6000) {
+                step_ = 2;
+                for (int k = 0; k < DROP_K; ++k) {
+                    char s[48]; s[0] = '\0';
+                    int added = engine::addTestItemsToContainer(ctx.gw, hand_, 1, s, sizeof(s));
+                    if (added <= 0 || !s[0]) continue;
+                    unsigned int dtype = 0;
+                    InvItemEntry items[INV_ITEMS_MAX];
+                    unsigned int n = engine::captureContainerContents(ctx.gw, hand_, items, INV_ITEMS_MAX, 0);
+                    for (unsigned int i = 0; i < n; ++i)
+                        if (!items[i].equipped && strcmp(items[i].stringID, s) == 0) { dtype = items[i].itemType; break; }
+                    if (engine::dropItemFromInventory(ctx.gw, hand_, s, dtype, 1) > 0) ++dropped_;
+                }
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RI DROP k=%d dropped=%d t=%lu", DROP_K, dropped_, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // @14s: the drops have replicated to the join; issue the coordinated save.
+            if (step_ == 2 && ctx.elapsedMs >= 14000) {
+                step_ = 3;
+                saveIssued_ = true;
+                saveOk_ = engine::saveGameAs(SAVE_NAME);
+                char b[112]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RI SAVE name='%s' ok=%d t=%lu", SAVE_NAME, saveOk_ ? 1 : 0, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (step_ == 3 && saveIssued_ && !ackSeen_ && savexfer::lastAckXferId() != 0) {
+                ackSeen_ = true; ackOk_ = (savexfer::lastAckOk() == 1);
+                char b[96]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RI ACK ok=%d t=%lu", ackOk_ ? 1 : 0, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (step_ == 3 && ackSeen_ && ackOk_ && !loadIssued_ && live) {
+                step_ = 4;
+                loadIssued_ = true;
+                loadOk_ = engine::loadSave(SAVE_NAME);
+                char b[96]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RI LOAD ok=%d t=%lu", loadOk_ ? 1 : 0, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        // The JOIN is reactive: the Plugin's coordinated-load GO handler issues
+        // its own bypass-once load; the scenario just watches for the swap.
+
+        // ---- Both sides: world-swap tracking (mirrors LoadSyncScenario) -------
+        if (!live && dropStartMs_ == 0) {
+            dropStartMs_ = ctx.elapsedMs;
+            if (!swapSeen_) {
+                swapSeen_ = true;
+                preReloadN_ = lastN_; // last count seen while live = the pre-reload total
+                char b[112]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RI PRERELOAD n=%d t=%lu", preReloadN_, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        } else if (live && dropStartMs_ != 0) {
+            unsigned long ms = ctx.elapsedMs - dropStartMs_;
+            dropStartMs_ = 0;
+            if (ms >= SWAP_MIN_MS && !swapDone_) {
+                swapDone_ = true;
+                censusAtMs_ = ctx.elapsedMs + CENSUS_SETTLE_MS;
+                char b[112]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RI SWAPDONE swapMs=%lu t=%lu", ms, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        // Synchronous swap path: execute() rebuilds inside one call (no visible
+        // live drop) - latch off the LOADGAME signal being consumed.
+        {
+            int sig = engine::saveMgrSignal(0);
+            if (sig == 2) { sigWas2_ = true; sigClearedMs_ = 0; }
+            else if (sigWas2_ && sigClearedMs_ == 0) sigClearedMs_ = ctx.elapsedMs;
+            if (!swapDone_ && sigWas2_ && sigClearedMs_ != 0 && live &&
+                dropStartMs_ == 0 && ctx.elapsedMs >= sigClearedMs_ + SYNC_CONFIRM_MS) {
+                if (preReloadN_ < 0) preReloadN_ = lastN_;
+                swapDone_ = true;
+                censusAtMs_ = ctx.elapsedMs + CENSUS_SETTLE_MS;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO RI SWAPDONE t=%lu (synchronous inside execute)", ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Both sides: post-reload census ---------------------------------
+        if (swapDone_ && !postCensused_ && live && ctx.elapsedMs >= censusAtMs_) {
+            postCensused_ = true;
+            engine::WorldItemRaw raw[MAXW];
+            unsigned int n = engine::captureWorldItems(ctx.gw, raw, MAXW, 60.0f);
+            postReloadN_ = (int)n;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO RI POSTRELOAD n=%d pre=%d delta=%d t=%lu",
+                postReloadN_, preReloadN_, postReloadN_ - preReloadN_, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.elapsedMs - lastStatusMs_ >= 5000) {
+            lastStatusMs_ = ctx.elapsedMs;
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO RI STATE host=%d dropped=%d save=%d ack=%d load=%d "
+                "swapDone=%d post=%d base=%d pre=%d postN=%d live=%d t=%lu",
+                ctx.isHost ? 1 : 0, dropped_, saveOk_ ? 1 : 0, ackOk_ ? 1 : 0,
+                loadOk_ ? 1 : 0, swapDone_ ? 1 : 0, postCensused_ ? 1 : 0,
+                baselineN_, preReloadN_, postReloadN_, live ? 1 : 0, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        bool localDone = ctx.isHost
+            ? (dropped_ > 0 && saveOk_ && ackOk_ && loadOk_ && swapDone_ && postCensused_)
+            : (swapDone_ && postCensused_);
+        if ((localDone && ctx.elapsedMs >= censusAtMs_ + TAIL_HOLD_MS) ||
+            ctx.elapsedMs >= DURATION_MS) {
+            // The cross-client no-duplication verdict (join count must not EXCEED
+            // the host's authoritative native count post-reload) needs BOTH logs,
+            // so the runner's Test-RejoinItems oracle owns it. Locally each side
+            // only proves it drove its own legs: the HOST authored drop+save+load
+            // and did not balloon its OWN count (host mints no proxy for its own
+            // stream, so host post == pre is the fixed behavior); the JOIN merely
+            // survived the reload and censused (the join CANNOT see the host count
+            // to judge parity). The join count legitimately grows past its pre-
+            // reload value when the drops were outside its interest sphere until
+            // the reload co-located it - which is why parity, not pre-vs-post, is
+            // the gate.
+            bool hostNoDup = (postReloadN_ >= 0 && preReloadN_ >= 0 && postReloadN_ <= preReloadN_);
+            passed_ = ctx.isHost
+                ? (dropped_ > 0 && saveOk_ && ackOk_ && loadOk_ && swapDone_ && postCensused_ && hostNoDup)
+                : (swapDone_ && postCensused_);
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO RI verdict host=%d pass=%d base=%d pre=%d post=%d hostNoDup=%d "
+                "dropped=%d save=%d ack=%d load=%d",
+                ctx.isHost ? 1 : 0, passed_ ? 1 : 0, baselineN_, preReloadN_, postReloadN_,
+                hostNoDup ? 1 : 0, dropped_, saveOk_ ? 1 : 0, ackOk_ ? 1 : 0, loadOk_ ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned int  MAXW            = 64;
+    static const int           DROP_K          = 3;
+    static const unsigned long SWAP_MIN_MS     = 400;    // Plugin's flicker floor
+    static const unsigned long SYNC_CONFIRM_MS = 3000;   // no-drop window after sig clear
+    static const unsigned long CENSUS_SETTLE_MS= 6000;   // let the reloaded world settle
+    static const unsigned long TAIL_HOLD_MS    = 8000;
+    static const unsigned long DURATION_MS     = 150000;
+
+    bool          passed_, have_;
+    unsigned long lastLogMs_;
+    int           step_;
+    int           baselineN_, preReloadN_, postReloadN_, lastN_;
+    int           dropped_;
+    bool          saveIssued_, saveOk_, ackSeen_, ackOk_, loadIssued_, loadOk_;
+    unsigned long dropStartMs_;
+    bool          swapSeen_, swapDone_;
+    unsigned long censusAtMs_;
+    bool          postCensused_, sigWas2_;
+    unsigned long sigClearedMs_, lastStatusMs_;
+    unsigned int  hand_[5];
+    char          sid_[48];
+
+    static const char* const SAVE_NAME;
+};
+const char* const RejoinItemsScenario::SAVE_NAME = "coopresume";
+
 } // namespace
 
 Scenario* makeWorldItemScenario(const std::string& name) {
@@ -574,6 +803,7 @@ Scenario* makeWorldItemScenario(const std::string& name) {
     if (name == "world_weapon_drop") return new WorldGearDropScenario("world_weapon_drop", 2);
     if (name == "world_armor_drop")  return new WorldGearDropScenario("world_armor_drop", 3);
     if (name == "weapon_loot")  return new WeaponLootScenario();
+    if (name == "rejoin_items") return new RejoinItemsScenario();
     return 0;
 }
 

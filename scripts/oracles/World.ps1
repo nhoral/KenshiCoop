@@ -470,6 +470,67 @@ function Test-RecruitCtl {
                 -Metrics @{ phantom = $phantom; flips = $flip } -Detail $detail)
 }
 
+# Test-CampApproach (Phase 2 crash-hardening SOAK): validate the fix MECHANISMS
+# from the flushed plugin logs of a camp_approach run. There is no deterministic
+# repro of the original approach crash, so this proves: (1) both clients reach
+# scenario completion (no crash / no truncated log); (2) the surviving join saw
+# the host drop and (3) ran clearPeerReplicationState (B1); (4) the join did NOT
+# crash AFTER the drop (its SCENARIO RESULT follows the peer-left). Stale-unbind
+# (B2 guard firing) and mint volume are reported as findings, not failures - a
+# STALE unbind is the guard WORKING.
+function Test-CampApproach {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    # 1) Both processes reached scenario completion = they did not crash. The
+    #    join is the survivor that churns through the drop - its RESULT is the
+    #    core "did the hardening hold" signal.
+    $hostResult = @(Select-String -Path $HostFile -Pattern 'SCENARIO RESULT ' -ErrorAction SilentlyContinue).Count
+    $joinResults = @(Select-String -Path $JoinFile -Pattern 'SCENARIO RESULT ' -ErrorAction SilentlyContinue | ForEach-Object { $_.LineNumber })
+    if ($hostResult -eq 0) { $why += "host never reached SCENARIO RESULT (crash/truncated log before its self-exit)" }
+    if ($joinResults.Count -eq 0) { $why += "join never reached SCENARIO RESULT (crash during churn or on the peer drop - the failure this hardening targets)" }
+
+    # 2) The peer-drop leg actually exercised: the join must have observed the
+    #    host leave (asymmetric self-exit closes the socket -> transport leave).
+    $leftLines = @(Select-String -Path $JoinFile -Pattern 'handshake: peer left' -ErrorAction SilentlyContinue | ForEach-Object { $_.LineNumber })
+    if ($leftLines.Count -eq 0) { $why += "join never saw the host drop (no 'handshake: peer left' - peer-drop leg did not exercise)" }
+
+    # 3) B1 fired on the survivor. Report the MAX cleared count across all leave
+    #    lines (a teardown-time second leave logs cleared=0 after the maps were
+    #    already emptied by the real drop's clear).
+    $cleared = -1
+    $cm = @(Select-String -Path $JoinFile -Pattern '\[leave\] cleared proxies=(\d+)' -ErrorAction SilentlyContinue)
+    if ($cm.Count -eq 0) { $why += "join never ran clearPeerReplicationState (no '[leave] cleared proxies=' after the drop)" }
+    else { $cleared = ($cm | ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Maximum).Maximum }
+
+    # 4) Survivor did not crash AFTER the drop: a SCENARIO RESULT must appear
+    #    LATER in the join log than the FIRST peer-left (the real host drop). The
+    #    join self-exits at its scheduled window ~30 s after the drop, and only a
+    #    surviving process reaches SCENARIO RESULT at all (a crash never logs it).
+    #    NB: a teardown-time SECOND peer-left can follow the RESULT during the 4 s
+    #    exit hold - so we anchor on the FIRST leave, not the last.
+    if ($leftLines.Count -gt 0 -and $joinResults.Count -gt 0) {
+        $firstLeft = ($leftLines | Measure-Object -Minimum).Minimum
+        $afterLeave = @($joinResults | Where-Object { $_ -gt $firstLeft }).Count
+        if ($afterLeave -eq 0) {
+            $why += "join's SCENARIO RESULT precedes every peer-left - it did not survive the drop window"
+        }
+    }
+
+    # Findings (not gates): B2 guard activity + mint churn volume.
+    $stale = @(Select-String -Path $JoinFile -Pattern '\[drive\] STALE unbind' -ErrorAction SilentlyContinue).Count
+    $bound = @(Select-String -Path $JoinFile -Pattern '\[spawn\] proxy BOUND ' -ErrorAction SilentlyContinue).Count
+    Write-Host ("    FINDING: join proxyBOUND={0} staleUnbind={1} clearedOnLeave={2} peerLeftLines={3} hostResult={4}" -f `
+        $bound, $stale, $cleared, $leftLines.Count, $hostResult)
+    if ($bound -eq 0) { Write-Host "    ADVISORY: join minted no proxies (little mint churn this run - camp NPCs may be baked-resolved)" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  CAMP-APPROACH $v - $detail"
+    return (Add-GateResult -Name "camp_approach" -Status $v `
+                -Metrics @{ bound = $bound; stale = $stale; cleared = $cleared } -Detail $detail)
+}
+
 # Shared SQTABS parser (protocol 35): ordered series of @{n; squad; list; t}
 # where list = "container:serial:count|..." sorted ascending (the same order
 # the Replicator ranks the ownership partition on).

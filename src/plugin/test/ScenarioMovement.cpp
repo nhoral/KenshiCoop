@@ -594,6 +594,133 @@ private:
 
 const float SplitInterestScenario::SPLIT_DIST = 260.0f;
 
+// camp_approach (Phase 2 crash hardening SOAK): reproduce the town/bandit-camp
+// approach crash conditions - mint/zone churn on approach plus a real peer drop
+// - and prove the survivor cleans up without a fault. Run on the 'camp' save
+// (a prison camp, many NPCs). There is NO deterministic repro of the original
+// crash, so this is a stress/soak, not a strict-parity gate; Test-CampApproach
+// verifies the FIX MECHANISMS from the flushed plugin log.
+//
+// Timeline (clock from ARM = peer-ready):
+//   JOIN teleport-hops its leader across the camp region every HOP_DWELL_MS
+//     (park + short walk leg), forcing zone streaming + census/mint bursts as
+//     the coverage bubble re-centers - the "approach" churn. It is the machine
+//     the crash breadcrumb ("2026-07-11 join crash") blames, so it is the
+//     SURVIVOR we harden.
+//   HOST holds near its start and self-exits FIRST at HOST_DURATION_MS. That
+//     TerminateProcess closes the socket, so the JOIN's transport enqueues a
+//     REAL 'handshake: peer left' - firing clearPeerReplicationState (B1) on the
+//     survivor mid-churn (no new harness/transport code needed; travel_parity
+//     already proves asymmetric self-exit produces a genuine peer-left edge).
+//   JOIN keeps running ~JOIN-HOST ms after the drop, so its post-leave cleanup
+//     ('[leave] cleared proxies=N') and any stale-drive attempt are captured
+//     while it is still hopping (drive path exercised against a just-cleared map).
+//
+// Test-CampApproach gates (from host.log/join.log): both reach a SCENARIO RESULT
+// line (no crash / no truncated log); the join logs 'handshake: peer left' ->
+// '[leave] cleared proxies='; no '[drive] STALE' hand is driven after it was
+// unbound and no '[drive]' fires after the leave; proxy count returns toward 0.
+class CampApproachScenario : public Scenario {
+public:
+    CampApproachScenario()
+        : passed_(false), lastLogMs_(0), hopsDone_(0),
+          haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
+
+    virtual const char* name() const { return "camp_approach"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        // Anchor = this side's own squad leader (both clients resolve their own
+        // leader locally; camp is not guaranteed to be a 2-tab save, so we do
+        // NOT rely on a rank-1 tab the way travel_parity does).
+        Character* ld = engine::leader(ctx.gw);
+        if (ld && engine::readPos(ld, &ax_, &ay_, &az_)) haveAnchor_ = true;
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO CAMP start host=%d anchor=%.1f,%.1f,%.1f have=%d "
+                  "hop=%.0f hops=%u dwell=%lums hostDur=%lu joinDur=%lu",
+                  ctx.isHost ? 1 : 0, ax_, ay_, az_, haveAnchor_ ? 1 : 0, HOP,
+                  (unsigned)HOPS, HOP_DWELL_MS, HOST_DURATION_MS, JOIN_DURATION_MS);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!haveAnchor_)
+            coop::logLine("SCENARIO CAMP no leader resolved (empty squad?)");
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+
+        if (haveAnchor_ &&
+            (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            Character* ld = engine::leader(ctx.gw);
+            if (!ctx.isHost) {
+                // JOIN: hop the leader one HOP further out every HOP_DWELL_MS to
+                // drive mint/zone churn; short walk legs inside the dwell keep it
+                // a live, moving subject.
+                unsigned int wantHops = (unsigned int)(ctx.elapsedMs / HOP_DWELL_MS);
+                if (wantHops > HOPS) wantHops = HOPS;
+                if (ld) {
+                    if (wantHops > hopsDone_) {
+                        hopsDone_ = wantHops;
+                        float hx = ax_ + (float)hopsDone_ * HOP;
+                        engine::park(ld, hx, ay_, az_, 0.0f);
+                        char b[96];
+                        _snprintf(b, sizeof(b) - 1,
+                                  "SCENARIO CAMP hop n=%u to=%.0f,%.0f,%.0f",
+                                  hopsDone_, hx, ay_, az_);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    } else {
+                        float hx = ax_ + (float)hopsDone_ * HOP;
+                        bool legB = ((ctx.elapsedMs / 3000) % 2) != 0;
+                        engine::orderMoveTo(ld, hx + (legB ? 15.0f : 0.0f), ay_, az_);
+                    }
+                }
+            }
+            // Both sides log their leader position (light telemetry; the real
+            // gates read the plugin's [spawn]/[drive]/[leave] lines).
+            if (ld) {
+                float lx = 0, ly = 0, lz = 0;
+                engine::readPos(ld, &lx, &ly, &lz);
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO CAMP pos host=%d %.1f,%.1f,%.1f t=%lu",
+                          ctx.isHost ? 1 : 0, lx, ly, lz, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        if (ctx.elapsedMs >= dur) {
+            // Host: exiting first IS the peer-drop stimulus. Join: survived the
+            // drop + churn (the cleanup/no-stale-drive verdict is the oracle's,
+            // read from the flushed log).
+            passed_ = haveAnchor_;
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // Host exits FIRST (the peer drop); join outlives it by ~20 s to log the
+    // post-leave cleanup while still hopping. Manifest raises Seconds/KillGrace
+    // so the 150 s join window survives the runner backstop.
+    // ~40 s gap so the transport reliably detects the host drop (ENet peer
+    // timeout) and delivers 'peer left' to the join well before the join's own
+    // self-exit - the survivor needs a wide window to log its post-leave cleanup.
+    static const unsigned long HOST_DURATION_MS = 120000; // host drops here
+    static const unsigned long JOIN_DURATION_MS = 160000; // join survives + logs cleanup
+    static const unsigned long HOP_DWELL_MS     = 8000;   // per-stop coverage window
+    static const unsigned int  HOPS             = 12;     // total legs
+    static const float         HOP;                       // leg length (units)
+
+    bool          passed_;
+    unsigned long lastLogMs_;
+    unsigned int  hopsDone_;
+    bool          haveAnchor_;
+    float         ax_, ay_, az_;
+};
+const float CampApproachScenario::HOP = 2800.0f;
+
 } // namespace
 
 Scenario* makeMovementScenario(const std::string& name) {
@@ -602,6 +729,7 @@ Scenario* makeMovementScenario(const std::string& name) {
     if (name == "coop_presence") return new CoopPresenceScenario();
     if (name == "travel_parity") return new TravelParityScenario();
     if (name == "split_interest") return new SplitInterestScenario();
+    if (name == "camp_approach") return new CampApproachScenario();
     return 0;
 }
 

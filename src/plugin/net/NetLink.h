@@ -122,6 +122,10 @@ public:
     // the caller, so loss just delays an arrow update one snapshot.
     void queueStealth(const StealthPacket& pkt);
 
+    // MAIN thread: queue an UNRELIABLE camera hint (protocol 43, join -> host,
+    // ~1 Hz). Latest wins; loss just delays the anchor one hint.
+    void queueCamHint(const CamHintPacket& pkt);
+
     // MAIN thread: queue a reliable runtime-spawn query (protocol 21, join ->
     // host). Debounced per hand by the caller.
     void queueSpawnReq(const SpawnReqPacket& pkt);
@@ -240,6 +244,8 @@ private:
     std::vector<BuildRemovePacket> outBuildRemove_;
     // Unreliable stealth detection-map snapshots (protocol 20). Guarded by outCs_.
     std::vector<StealthPacket>   outStealth_;
+    // Unreliable camera hints (protocol 43, ~1 Hz latest-wins). Guarded by outCs_.
+    std::vector<CamHintPacket>   outCamHint_;
     // Reliable runtime-spawn query/description packets (protocol 21). Guarded by outCs_.
     std::vector<SpawnReqPacket>  outSpawnReq_;
     std::vector<SpawnInfoPacket> outSpawnInfo_;

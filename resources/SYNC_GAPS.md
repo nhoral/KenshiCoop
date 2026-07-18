@@ -875,3 +875,20 @@ being attacked in one world only.
 - Cross-rendering the other player's detection arrows (engine limitation).
 - Wall clocks are ms-since-midnight (sessions spanning midnight confuse log
   alignment only).
+- World-item first-scan baseline (Phase 3, 2026-07-17): on a SHARED save both
+  clients hold every save-native ground item identically, so the FIRST post-load
+  publish pass records the in-range natives as `baseline` tracks that never
+  stream (streaming one would mint a proxy on top of the peer's own native - the
+  "rejoin/reload duplicated all items" report). Only items appearing AFTER the
+  baseline (session drops via the hook, runtime spawns) stream; `resetSession()`
+  clears `worldSeeded_` so every reload re-baselines the now-native items instead
+  of re-layering. Residual: a save-native OUTSIDE the first-scan radius that a
+  player later walks up to is not baselined, so the peer's stream can mint a
+  proxy beside the local native. Not closed here because the only native-check
+  primitive (`captureWorldItems`) is leader-centered and cannot see an item far
+  from the local leader; a reliable apply-side guard would need a new
+  position-centered engine scan (deferred - the reported reload/rejoin vector is
+  fully covered by the baseline + orphan-despawn fixes). Trade-off: picking up a
+  save-native on one client is not mirrored on the other (each keeps its own
+  native copy); world-item pickup conservation is the W2 gear channel's job, not
+  W1's template stream.

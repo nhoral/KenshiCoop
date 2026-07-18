@@ -46,6 +46,13 @@ coop::Inbound    g_inbound;
 coop::Replicator g_repl;
 coop::u32        g_tick = 0;
 
+// Last GameWorld seen by the main-loop hook. The F2-panel UI callbacks
+// (coopUiConnect/coopUiDisconnect) run without a GameWorld argument, but the
+// world is live when the user hits Connect/Disconnect, so we despawn our
+// minted proxies (NPC + world-item, Phase 3) through this cached pointer to
+// avoid leaking duplicate bodies into the save. Only touched on the main thread.
+GameWorld*       g_lastGw = 0;
+
 // Cross-owner trade veto owner classifier (engine InvOwnerClassFn): forwards a
 // save-stable owner hand to the Replicator's squad-ownership sets. Free function
 // so the engine layer (which must not know about the Replicator) can call it.
@@ -216,6 +223,16 @@ void processNetEvents(GameWorld* gw) {
             coop::engine::setSaveSuppress(false);
             coopLog("[save] JOIN save suppression OFF (peer left)");
         }
+    }
+    // Phase 2 crash hardening: a peer drop leaves this side's minted proxies
+    // standing AND its drive maps pointing at bodies with no fresh authority
+    // (the engine will eventually reap them, and the next drive touches a freed
+    // pointer - the "join crash -> host follow-on crash" chain). Despawn the
+    // minted proxies and clear the peer maps, mirroring coopUiDisconnect(). Runs
+    // once per leave batch (we support a single peer).
+    if (!leaves.empty()) {
+        g_repl.clearPeerReplicationState(gw);
+        g_inbound.flushWorldState();
     }
 }
 
@@ -669,6 +686,7 @@ void coopPanelDrive(GameWorld* gw) {
 // Main-thread tick hook: the one safe point where we touch game state.
 void mainLoop_hook(GameWorld* gw, float dt) {
     ++g_tick;
+    g_lastGw = gw; // cache for the argument-less F2 UI callbacks
 
     coopPanelDrive(gw);
 
@@ -1137,6 +1155,10 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         // after publishOwned (the combat flag samples the ownHands_ set).
         if (g_cfg.speedSync)
             g_repl.syncSpeed(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+        // Phase 6 (6a evidence spike): env-gated ([shackledbg]) per-character
+        // shackle/lock trace. No-op unless KENSHICOOP_DEBUG_SHACKLE=1, so it is
+        // free to leave in the tick for manual-session characterization.
+        coop::engine::shackleDbgTick(gw, g_cfg.isHost);
         // Game-clock sync (protocol 25): the host broadcasts its absolute
         // in-game clock ~1 Hz; the join measures the offset and SLEWS - a
         // multiplier the speed layer's quiet writes fold in on top of the
@@ -1264,6 +1286,13 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         } else {
             g_repl.publishNpcCensus(gw, g_net, g_net.localId());
         }
+        // Camera-anchored interest (protocol 43): both sides publish their
+        // LOCAL camera to the engine's anchor store; the join additionally
+        // ships its center to the host at ~1 Hz, and the host folds a fresh
+        // peer hint into interestCenters. Runs even with CAM_INTEREST off
+        // (the engine-side knob makes interestCenters ignore the anchors)
+        // so an A/B toggle needs no session restart logic.
+        g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
     }
 
     // Coordinated load (protocol 32): deferred-signal backstop. The engine
@@ -1458,7 +1487,12 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     if (g_net.isRunning()) g_net.stop();
     coop::steamp2p::shutdown();
     g_peerPresent = false;
-    g_repl.resetSession();
+    // World is live here (reconnect from within a running game): despawn minted
+    // NPC + world-item proxies before clearing the maps so a re-connect doesn't
+    // leave orphaned duplicates (and doesn't bake them into a save). Falls back
+    // to a plain map reset if no world has ticked yet.
+    if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
+    else          g_repl.resetSession();
     g_inbound.flushWorldState();
 
     g_cfg.isHost    = isHost;
@@ -1504,7 +1538,11 @@ void coopUiDisconnect() {
     coop::steaminvite::reset(); // leave any Steam lobby
     coop::steamp2p::shutdown();
     g_peerPresent = false;
-    g_repl.resetSession();
+    // World stays live on a manual disconnect: despawn minted NPC + world-item
+    // proxies before clearing maps so nothing lingers as a duplicate or gets
+    // baked into the next save.
+    if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
+    else          g_repl.resetSession();
     g_inbound.flushWorldState();
 }
 
@@ -1597,14 +1635,19 @@ __declspec(dllexport) void startPlugin() {
         g_repl.setCensusRadius(g_cfg.censusRadius);
         g_repl.setSpawnMintRadius(g_cfg.spawnMintRadius);
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
+        g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
+        // Camera-anchored interest (protocol 43): engine-side master enable
+        // for the camera anchors in interestCenters.
+        coop::engine::setCamInterest(g_cfg.camInterest);
         // travel_parity needs the 5 s SCENARIO WORLD/WNPC worldstate rows on
         // both sides; npc_sync feeds the same rows to the anti-zombie oracle
         // (Phase 2 mid-band tier: a populated town run has moving census-band
         // NPCs, which the hop corridor mostly lacks). Every other scenario
         // stays quiet (log volume).
         g_repl.setAuditRows(g_cfg.scenario == "travel_parity" ||
-                            g_cfg.scenario == "npc_sync");
+                            g_cfg.scenario == "npc_sync" ||
+                            g_cfg.scenario == "world_parity");
         char b[260];
         _snprintf(b, sizeof(b) - 1,
                   "KenshiCoop: interp delay=%u-%ums extrap=%ums stale=%ums snap=%.0fu "

@@ -35,7 +35,8 @@ Replicator::Replicator()
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
       probeRecruit_(false), probedCount_(0),
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
-      nextWorldNetId_(1), nextDropId_(1), nextPickupId_(1), nextXferId_(1),
+      nextWorldNetId_(1), worldSeeded_(false),
+      nextDropId_(1), nextPickupId_(1), nextXferId_(1),
       xferScanMs_(0), nextTreatId_(1),
       quietRelapse_(0), sitOrders_(0), detachUses_(0), noDetach_(false),
       dmgGuard_(false), carrySync_(true), furnSync_(true), chainSync_(true),
@@ -44,12 +45,14 @@ Replicator::Replicator()
       trustGrants_(0), trustRevokes_(0),
       authSuppresses_(0), authRestores_(0), authReassertMs_(0), authPruned_(0),
       censusRadius_(0.0f), censusSendMs_(0), censusRecvMs_(0), censusCulls_(0),
+      camHintSendMs_(0), peerCamMs_(0),
       midCursor_(0), midSliceMs_(0),
-      censusParkDist_(0.0f), censusParks_(0), auditRows_(false),
+      censusParkDist_(0.0f), censusParks_(0), censusFreezeAi_(true),
+      auditRows_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
-      speedLastSendMs_(0), speedCombatSampleMs_(0),
+      speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), censusScanMs_(0),
       moneySync_(true), recruitSync_(true),
@@ -64,7 +67,9 @@ Replicator::Replicator()
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
-      lifeSweepMs_(0) {}
+      lifeSweepMs_(0) {
+    peerCam_[0] = peerCam_[1] = peerCam_[2] = 0.0f;
+}
 
 // ---- Phase 3: unified entity lifecycle ---------------------------------------
 // The AUDIT layer over the authority/mint/drive machinery: every decision
@@ -178,6 +183,9 @@ void Replicator::resetSession() {
     parkMs_.clear();
     censusRecvMs_ = 0;
     censusSendMs_ = 0;
+    // Protocol 43: the camera hint describes the OLD world's coordinates.
+    camHintSendMs_ = 0;
+    peerCamMs_ = 0;
     furnPeerPend_.clear();
     ownFurnExit_.clear();
     // Session maps + change-gate baselines (they describe the OLD world; the
@@ -196,6 +204,7 @@ void Replicator::resetSession() {
     censusContainers_.clear(); // protocol 34: re-censused in the new world
     worldTrack_.clear();
     worldProxies_.clear();
+    worldSeeded_ = false; // re-baseline the reloaded world's save-native items
     weaponCensus_.clear();
     appliedDrops_.clear();
     appliedPickups_.clear();
@@ -241,6 +250,7 @@ void Replicator::resetSession() {
     speedSeqSeen_     = 0;
     speedLastSendMs_  = 0;
     speedCombatSampleMs_ = 0;
+    speedCombatHoldMs_ = 0;
     timeSlew_         = 1.0f;
     timeSeqSeen_      = 0;
     timeLastSendMs_   = 0;
@@ -254,6 +264,42 @@ void Replicator::resetSession() {
     // Config gates, ownRanks_ and every OUTBOUND seq counter are deliberately
     // preserved (see the header comment).
     coop::logLine("[load] session reset: pointer caches, session maps, change gates cleared");
+}
+
+void Replicator::clearPeerReplicationState(GameWorld* gw) {
+    // Destroy every minted proxy body before resetSession() drops the map that
+    // owns the pointers. The engine owns the bodies; a proxy left standing after
+    // the peer that authored it is gone is a permanent ghost, and any map still
+    // pointing at it (targets_, drivenChars_) would drive a body with no fresh
+    // authority - or a freed pointer once the engine reaps it. SEH-guarded via
+    // despawnProxyNpc so a single bad pointer can't take down the leave path.
+    unsigned int cleared = 0;
+    for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
+         it != proxyByKey_.end(); ++it) {
+        if (gw && it->second && engine::despawnProxyNpc(gw, it->second))
+            ++cleared;
+    }
+    char b[96];
+    _snprintf(b, sizeof(b) - 1, "[leave] cleared proxies=%u", cleared);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+    // World-item proxies (Phase 3): the world stays LIVE across a peer leave /
+    // reconnect (no engine world swap), so the proxy RootObjects we minted for the
+    // departed peer's ground items are valid pointers that must be destroyed here -
+    // otherwise they linger as duplicate items and, worse, get baked into the save
+    // on the next write (becoming natives that re-stream on reload). resetSession()
+    // below only clears the map, not the bodies, so despawn first.
+    unsigned int wcleared = 0;
+    for (std::map<std::pair<u32, u32>, WorldProxy>::iterator wi = worldProxies_.begin();
+         wi != worldProxies_.end(); ++wi) {
+        if (gw && wi->second.obj && engine::removeWorldItemProxy(gw, wi->second.obj))
+            ++wcleared;
+    }
+    _snprintf(b, sizeof(b) - 1, "[leave] cleared worldProxies=%u", wcleared);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+    // Now drop every map (proxyByKey_ included) back to freshly-launched state.
+    resetSession();
 }
 
 void Replicator::ingest(Inbound& in) {

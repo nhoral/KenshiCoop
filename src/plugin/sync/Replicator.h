@@ -523,6 +523,17 @@ public:
     // counter would make every new row look stale to it.
     void resetSession();
 
+    // Peer-leave cleanup (Phase 2 crash hardening): called from the transport
+    // leave edge when the OTHER player disconnects mid-session (distinct from a
+    // world-reload). resetSession() clears proxyByKey_ but never DESTROYS the
+    // minted bodies, and the leave handler previously did neither - so after a
+    // peer drop the survivor kept its minted proxies standing AND kept driving
+    // them off stale maps (the "join crash -> host follow-on crash" chain). This
+    // despawns every minted proxy body FIRST (SEH-guarded), then resetSession()
+    // to clear the maps that referenced them. Safe if reconnect follows: the new
+    // session re-censuses and re-mints from scratch.
+    void clearPeerReplicationState(GameWorld* gw);
+
     // AFTER engine: sample + apply the interpolated pose for every tracked entity.
     void applyTargets(GameWorld* gw);
 
@@ -546,6 +557,15 @@ public:
     // (censusHands_) consumed by enforceHostAuthority's wide-radius pass.
     void applyNpcCensus(Inbound& in);
 
+    // Camera hint channel (protocol 43, camera-anchored interest):
+    //  * join: read the local camera center (engine::cameraCenter) and send
+    //    it to the host at ~1 Hz (PKT_CAM_HINT, unreliable latest-wins);
+    //  * host: drain received hints into peerCam_/peerCamMs_ and publish the
+    //    fresh hint to the engine layer (engine::setPeerCamHint) so
+    //    interestCenters can anchor an extra sphere on it. Both sides also
+    //    publish their LOCAL camera as an anchor (never crosses the wire).
+    void syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
+
     // KENSHICOOP_CENSUS_RADIUS: wide-radius existence culling reach (units);
     // <= 0 disables the census channel on both sides.
     void setCensusRadius(float r) { censusRadius_ = r; }
@@ -565,6 +585,14 @@ public:
     // parks it back onto the host's spot. <= 0 disables parking (existence-
     // only census, the v37 behavior).
     void setCensusParkDist(float d) { censusParkDist_ = d; }
+
+    // KENSHICOOP_CENSUS_FREEZE_AI (default ON): the join freezes the local AI
+    // of a census-band body (census-present, unstreamed) that DIVERGES past
+    // censusParkDist_ - the position park teleports it back, but its local AI
+    // kept re-deciding to flee/fight, so a captive/working slave ran and
+    // aggroed the join's guards while the host had it working. Divergence-
+    // gated: well-tracking census NPCs never trip it and keep their local AI.
+    void setCensusFreezeAi(bool v) { censusFreezeAi_ = v; }
 
     // travel_parity worldstate rows: when enabled, both sides dump one
     // "SCENARIO WNPC hand=.. pos=.. cls=.. name=.." row per enumerated world
@@ -671,6 +699,12 @@ private:
         // building the self-heal re-finds by name near the streamed position).
         unsigned int  chainOwner[5];
         bool          haveChainOwner;
+        // Phase 6b (protocol 42): last non-owner unlock-guard re-assert attempt
+        // (throttle). A caged prisoner (streamKind=2) is also shackled, but the
+        // furniture kind priority hides the chained state from the occupancy
+        // self-heal; this guard re-asserts setChainedMode independently so a peer
+        // PC's local lockpick can't leave the owner's prisoner unlocked on the peer.
+        unsigned long chainHealTick;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
         // Velocity-aware snap gate (2026-07-11): slow-decaying peak of the
@@ -710,7 +744,7 @@ private:
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
-                   haveChainOwner(false),
+                   haveChainOwner(false), chainHealTick(0),
                    sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
                    zeroF(0), activeF(0), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
@@ -821,6 +855,12 @@ private:
     float                     censusRadius_;  // 0 = census disabled
     unsigned long             censusSendMs_;  // host: last census publish
     unsigned long             censusRecvMs_;  // join: last census arrival
+    // Camera hint channel (protocol 43): join sends its camera center at
+    // ~1 Hz; the host keeps the latest hint + arrival stamp (stale hints are
+    // dropped from the anchor set rather than pinning interest forever).
+    unsigned long             camHintSendMs_; // join: last hint send
+    float                     peerCam_[3];    // host: latest peer camera center
+    unsigned long             peerCamMs_;     // host: its arrival time (0 = none)
     std::set<Key>             censusHands_;   // join: latest existence set
     unsigned long             censusCulls_;   // join: wide-radius suppress count
     // Phase 2 mid-band streaming tier (HOST): census-walk NPCs OUTSIDE the
@@ -851,6 +891,13 @@ private:
     float                     censusParkDist_;
     unsigned long             censusParks_;   // join: divergence-park count
     std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
+    // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI): join-side flag +
+    // per-key last-diverge tick. A census-band body that drifts past
+    // censusParkDist_ is added here and AI-suspended; the hold (~5 s) keeps it
+    // quiesced after the park zeroes its drift, then re-checks (release if it
+    // settled, re-freeze if it diverges again).
+    bool                      censusFreezeAi_;
+    std::map<Key, unsigned long> censusFrozen_; // join: per-key freeze-hold tick
     bool                      auditRows_;     // travel_parity worldstate rows
     // Third-party furniture placement (protocol 36): ENTER edges detected on
     // peer-owned driven bodies in applyTargets (a guard jailing an arrested
@@ -937,9 +984,16 @@ private:
     // row or a query-free drop-hook edge) so the item can be streamed and refreshed
     // by HANDLE resolution alone - no rescan needed. `seen` is retained only for the
     // legacy scan path; culling is now handle-based (engine::groundItemLiveness).
+    // `baseline` (Phase 3 item-dup fix): a ground item present at the FIRST
+    // post-load spatial scan is a SHARED save-native - both clients already hold
+    // it identically, so it must never be streamed (authoring it mints a proxy
+    // on top of the peer's own native = the rejoin/reload duplication). Baseline
+    // tracks are recorded for identity/liveness but skipped in the emit path;
+    // only items appearing AFTER the baseline (session drops, runtime spawns)
+    // stream. Re-seeded after every reload via worldSeeded_ in resetSession().
     struct WorldTrack {
         u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen;
-        char stringID[48]; u32 itemType; u16 quantity; u16 quality;
+        char stringID[48]; u32 itemType; u16 quantity; u16 quality; bool baseline;
     };
     struct WorldProxy { RootObject* obj; float x, y, z; u32 hash; };
     std::map<Key, WorldTrack> worldTrack_;
@@ -948,6 +1002,12 @@ private:
     // so netId spaces are per-sender and culls are scoped to their owner.
     std::map<std::pair<u32, u32>, WorldProxy> worldProxies_;
     u32                        nextWorldNetId_;
+    // First-scan-baseline latch (Phase 3): false after launch/reload; the first
+    // publishWorldItems pass seeds every in-range save-native as a baseline track
+    // (never-emit) and sets this true. resetSession() clears it so the reloaded
+    // world (which may now contain previously-dropped-then-baked items) re-baselines
+    // rather than re-streaming - closing the per-reload duplicate layering.
+    bool                       worldSeeded_;
 
     // Phase W2 conservation-drop state.
     // weaponCensus_: per OWNED character hand, the last-tick set of WEAPON copies it held,
@@ -1417,11 +1477,30 @@ private:
     // pointer wasn't vouched live this pass (enumerations / driven / proxy /
     // validated suppressed); the label object is ours to destroy safely.
     void pruneDebugMarkers(const std::set<Character*>& live);
+    // world_parity roster rows: one "SCENARIO WNPC" line for a body, with the
+    // task/pelvis/mv parity fields appended (world_parity oracle) after the
+    // legacy hand/pos/cls/name schema (travel_parity's parser ignores the
+    // extras). cls=pc rows carry the player characters - the class the legacy
+    // dumps EXCLUDED, which is how a diverged host-PC position stayed
+    // invisible to every automated gate. Shared by the host (Publish) and
+    // join (Authority) dump sites.
+    void emitWnpcRow(Character* c, const EntityState& st, const char* cls);
+    // world_parity PC rows: capture every playerCharacter (both tabs) and
+    // emit each as a cls=pc WNPC row. Called inside the auditRows_ dumps on
+    // both sides.
+    void emitPcRows(GameWorld* gw);
     // v38 census position parking: snap a census-present unstreamed local
     // copy back onto the host's census position once it diverges past
     // censusParkDist_. Called from both authority passes with this tick's
-    // live enumeration pointer.
-    void parkDivergedCopy(Character* c, const EntityState& st, const Key& k);
+    // live enumeration pointer. Returns the measured drift (u) from the host's
+    // census position, or -1 if unknown (no census row / parking disabled) -
+    // the census-band AI-freeze uses it to decide when a body is diverging.
+    float parkDivergedCopy(Character* c, const EntityState& st, const Key& k);
+    // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI): suspend the local AI
+    // of a census-band body whose drift crossed censusParkDist_, held ~5 s past
+    // the last over-threshold tick so the position park can't oscillate it back
+    // into fleeing. Divergence-gated: leaves well-tracking census NPCs alone.
+    void censusFreezeDivergedAi(Character* c, const Key& k, float drift);
     // Phase B: combat-scoped world-NPC vitals (host side). Keys of streamed
     // NPCs that are fighting / being fought / down, with last-qualified time;
     // publishMedical streams their vitals at ~1 Hz while fresh. The join's
@@ -1443,6 +1522,7 @@ private:
     u32           speedSeqSeen_;       // newest seq accepted from the peer (stale guard)
     unsigned long speedLastSendMs_;    // last REQ (join) / SET (host) send, safety resend
     unsigned long speedCombatSampleMs_;// last own-combat sample time
+    unsigned long speedCombatHoldMs_;  // last time own-squad combat read TRUE (cap hysteresis)
 
     // Protocol 25 game-clock sync state. timeSlew_ is the join's correction
     // multiplier (1.0 = no correction); the speed layer applies effective *

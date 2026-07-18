@@ -412,6 +412,14 @@ void loadConfig(Config& c) {
         std::string cp = envOr("KENSHICOOP_CENSUS_PARK", "");
         c.censusParkDist = cp.empty() ? 120.0f : (float)std::atof(cp.c_str());
         if (c.censusParkDist < 0.0f) c.censusParkDist = 0.0f;
+        // Census-band AI freeze: quiesce a diverging census-band body's local
+        // AI so it can't flee/aggro the join's guards. DEFAULT ON; the A/B
+        // escape hatch restores the position-park-only behavior.
+        c.censusFreezeAi = envOr("KENSHICOOP_CENSUS_FREEZE_AI", "1") != "0";
+        // Camera-anchored interest (protocol 43): fold the local camera +
+        // peer camera hint into the interest anchors. DEFAULT ON; the A/B
+        // escape hatch restores tab-leader-only anchors.
+        c.camInterest = envOr("KENSHICOOP_CAM_INTEREST", "1") != "0";
         // Starve hold: "0" (explicit) restores legacy release-on-stale;
         // absent = 10 s guard-hold default.
         std::string sh = envOr("KENSHICOOP_STARVE_HOLD_MS", "");

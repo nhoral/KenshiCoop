@@ -96,6 +96,8 @@ function Invoke-OneOracle {
         "pose"          { return (Test-NpcPose         -HostFile $HostLog -JoinFile $JoinLog) }
         "pose_state"    { return (Test-NpcPoseState    -HostFile $HostLog -JoinFile $JoinLog) }
         "bed_pose"      { return (Test-BedPose         -HostFile $HostLog -JoinFile $JoinLog) }
+        "bed_wake"      { return (Test-BedWake         -HostFile $HostLog -JoinFile $JoinLog) }
+        "bed_lay"       { return (Test-BedLay          -HostFile $HostLog -JoinFile $JoinLog) }
         "bed_put"       { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 1) }
         "cage_put"      { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 2) }
         "chain_put"     { return (Test-FurnPut         -HostFile $HostLog -JoinFile $JoinLog -Kind 3) }
@@ -160,6 +162,8 @@ function Invoke-OneOracle {
         "npc_vitals"    { return (Test-NpcVitals       -HostFile $HostLog -JoinFile $JoinLog) }
         "speed_sync"    { return (Test-SpeedSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "speed_probe"   { return (Test-SpeedProbe      -HostFile $HostLog) }
+        "shackle_probe" { return (Test-ShackleProbe    -HostFile $HostLog -JoinFile $JoinLog) }
+        "shackle_sync"  { return (Test-ShackleSync     -HostFile $HostLog -JoinFile $JoinLog) }
         "combat_crowd"  { return (Test-CombatCrowd     -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "combat_battle" { return (Test-CombatBattle    -HostFile $HostLog -JoinFile $JoinLog) }
         "combat_win"    { return (Test-CombatWin       -HostFile $HostLog -JoinFile $JoinLog) }
@@ -179,6 +183,7 @@ function Invoke-OneOracle {
         "weapon_drop"   { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog) }
         "armor_drop"    { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "armor_drop") }
         "weapon_loot"   { return (Test-WeaponLoot      -HostFile $HostLog -JoinFile $JoinLog) }
+        "rejoin_items"  { return (Test-RejoinItems     -HostFile $HostLog -JoinFile $JoinLog) }
         "smoothness"    { return (Test-Smoothness      -File $JoinLog) }
         "anim_truth"    { return (Test-AnimTruth       -File $JoinLog) }
         "march"         { return (Test-MarchInPlace    -File $JoinLog) }
@@ -189,6 +194,8 @@ function Invoke-OneOracle {
         "existence_parity" { return (Test-ExistenceParity -File $JoinLog) }
         "follow_travel" { return (Test-FollowTravel    -HostFile $HostLog -JoinFile $JoinLog) }
         "travel_parity" { return (Test-TravelParity    -HostFile $HostLog -JoinFile $JoinLog) }
+        "world_parity"  { return (Test-WorldParity     -HostFile $HostLog -JoinFile $JoinLog) }
+        "camp_approach" { return (Test-CampApproach    -HostFile $HostLog -JoinFile $JoinLog) }
         "mint_dist"     { return (Test-MintDistance    -JoinFile $JoinLog) }
         "anti_zombie"   { return (Test-AntiZombie      -HostFile $HostLog -JoinFile $JoinLog) }
         "lifecycle"     { return (Test-Lifecycle       -JoinFile $JoinLog) }
@@ -349,7 +356,7 @@ Export-ModuleMember -Function @(
     "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs",
     "Test-LogHealth", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
     "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence",
-    "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose",
+    "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose", "Test-BedWake", "Test-BedLay",
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",
     "Test-CombatProbe", "Test-CombatOrder", "Test-CombatKill", "Test-DamageGuard",
     "Test-CombatSnapRate", "Test-CombatBattle", "Test-CombatWin", "Test-DeathParity",
@@ -366,17 +373,22 @@ Export-ModuleMember -Function @(
     "Get-FacRelSeries", "Test-FactionProbe", "Test-FactionSync",
     "Get-GTimeSeries", "Test-TimeProbe", "Test-TimeSync", "Get-SlewSummary",
     "Get-SneakSeries", "Test-SneakPose", "Test-SneakDetect",
+    "Get-ShackleSeries",
     "Test-SpeedSync",
     "Test-SpeedProbe",
+    "Test-ShackleProbe",
+    "Test-ShackleSync",
     "Test-CombatCrowd",
     "Test-SplitInterest",
     "Test-InventorySync", "Test-InventoryBidir", "Test-InventoryEquip",
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
-    "Test-WorldItemSync", "Test-WpnRelocate", "Test-WeaponDrop",
+    "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",
     "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
+    "Test-WorldParity",
+    "Test-CampApproach",
     "Test-MintDistance", "Test-AntiZombie", "Test-Lifecycle",
     "Get-PanelConnects", "Get-PanelIntents", "Test-PanelConfig",
     "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"

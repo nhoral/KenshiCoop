@@ -550,6 +550,36 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
+// world_parity roster row: legacy WNPC schema (hand/pos/cls/name - the
+// travel_parity parser keys on those) with the parity fields APPENDED:
+//   task=   reproducible pose/combat task enum (same vocabulary as MEMBER/RECV)
+//   pelvis= Bip01 height off the rendered skeleton (seated/downed vs standing)
+//   mv=     locomotion bit (cMoving, or speed > walk threshold)
+// cls=pc rows carry the player characters, which the NPC dumps exclude
+// (isPlayerSquad skip) - the class where a diverged host-PC hid from every gate.
+void Replicator::emitWnpcRow(Character* c, const EntityState& st, const char* cls) {
+    char nm[40]; engine::charName(c, nm, sizeof(nm));
+    float pelvis = -1.0f; int idle = -1, crouch = -1, ptask = (int)st.task;
+    if (c) engine::readPoseState(c, &pelvis, &idle, &crouch, &ptask);
+    int mv = (st.cMoving || st.cSpeed > 0.25f) ? 1 : 0;
+    char r[256];
+    _snprintf(r, sizeof(r) - 1,
+              "SCENARIO WNPC hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f "
+              "cls=%s name='%s' task=%u pelvis=%.2f mv=%d",
+              st.hIndex, st.hSerial, st.hType,
+              st.hContainer, st.hContainerSerial,
+              st.x, st.y, st.z, cls, nm, (unsigned int)st.task, pelvis, mv);
+    r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+}
+
+void Replicator::emitPcRows(GameWorld* gw) {
+    const unsigned int MAX_PC = 32;
+    static EntityState pcs[MAX_PC]; // main-thread only
+    unsigned int nPc = engine::captureSquad(gw, /*leaderOnly*/ false, pcs, MAX_PC);
+    for (unsigned int i = 0; i < nPc; ++i)
+        emitWnpcRow(engine::resolve(pcs[i]), pcs[i], "pc");
+}
+
 void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // Host-only existence broadcast (protocol 36): hands of every world NPC
     // within the census radius, 1 Hz. Position streaming stays at the ~200 u
@@ -584,20 +614,20 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // Phase 2 mid-band tier: rebuild the round-robin list from this census
     // walk. Everything beyond the stream bubble's KEEP band belongs to the
     // mid tier; nearest-first so a MAX_PUBLISH squeeze drops the farthest.
-    // Distance is to the closest own-squad member (the interest centers are
-    // squad-tab leaders; members trail them by meters - close enough for a
-    // priority ordering).
+    // Distance is to the closest interest ANCHOR (protocol 43: tab leaders +
+    // local camera + peer camera hint) - the same anchors the stream bubble
+    // uses, so a camera-watched far NPC gets a mid-band drive slot too.
     {
         const float MID_NEAR_EDGE = 260.0f; // captureNpcs' NPC_CAPTURE_KEEP
-        const unsigned int MAX_SQUAD = 32;
-        static EntityState squad[MAX_SQUAD]; // main-thread only
-        unsigned int nSquad = engine::captureSquad(gw, false, squad, MAX_SQUAD);
+        float anchors[12];
+        unsigned int nAnchor = engine::interestAnchors(gw, anchors);
         midBand_.clear();
         for (unsigned int i = 0; i < n; ++i) {
             float best = -1.0f;
-            for (unsigned int s = 0; s < nSquad; ++s) {
+            for (unsigned int s = 0; s < nAnchor; ++s) {
                 float d = dist3(states[i].x, states[i].y, states[i].z,
-                                squad[s].x, squad[s].y, squad[s].z);
+                                anchors[s * 3 + 0], anchors[s * 3 + 1],
+                                anchors[s * 3 + 2]);
                 if (best < 0.0f || d < best) best = d;
             }
             if (best < 0.0f || best <= MID_NEAR_EDGE) continue; // near tier
@@ -632,18 +662,11 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             char w[64];
             _snprintf(w, sizeof(w) - 1, "SCENARIO WORLD n=%u cls=host", n);
             w[sizeof(w) - 1] = '\0'; coop::logLine(w);
-            for (unsigned int i = 0; i < n; ++i) {
-                char nm[40];
-                engine::charName(chars[i], nm, sizeof(nm));
-                char r[224];
-                _snprintf(r, sizeof(r) - 1,
-                          "SCENARIO WNPC hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f "
-                          "cls=host name='%s'",
-                          states[i].hIndex, states[i].hSerial, states[i].hType,
-                          states[i].hContainer, states[i].hContainerSerial,
-                          states[i].x, states[i].y, states[i].z, nm);
-                r[sizeof(r) - 1] = '\0'; coop::logLine(r);
-            }
+            for (unsigned int i = 0; i < n; ++i)
+                emitWnpcRow(chars[i], states[i], "host");
+            // world_parity: the player characters, excluded from the census
+            // walk, get their own cls=pc rows so PC divergence is judged too.
+            emitPcRows(gw);
         }
     }
     // ~10 s cadence log so free-play sessions show the census breathing
@@ -676,6 +699,54 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
         }
     }
+}
+
+void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
+                             bool isHost) {
+    if (!gw) return;
+    unsigned long now = nowMs();
+
+    // Both sides: publish the LOCAL camera center to the engine's interest
+    // layer (never crosses the wire - each client reads its own camera).
+    float local[3];
+    bool haveLocal = engine::cameraCenter(gw, local);
+    engine::setLocalCamAnchor(haveLocal, local[0], local[1], local[2]);
+
+    if (!isHost) {
+        // JOIN: ship the camera center to the host at ~1 Hz (unreliable,
+        // latest wins - a lost hint is replaced a second later).
+        if (haveLocal && (camHintSendMs_ == 0 || (now - camHintSendMs_) >= 1000)) {
+            camHintSendMs_ = now;
+            CamHintPacket p;
+            p.type = (u8)PKT_CAM_HINT;
+            p.ownerId = ownerId;
+            p.x = local[0]; p.y = local[1]; p.z = local[2];
+            net.queueCamHint(p);
+        }
+        return;
+    }
+
+    // HOST: drain received hints (latest wins) into peerCam_ + staleness
+    // stamp, and publish a FRESH hint to the engine's interest layer. A
+    // stale hint (silent join > 3 s: alt-tabbed, loading, disconnecting)
+    // drops out of the anchor set rather than pinning interest forever.
+    std::deque<InboundCamHint> got;
+    in.drainCamHints(got);
+    if (!got.empty()) {
+        const CamHintPacket& p = got.back().pkt;
+        peerCam_[0] = p.x; peerCam_[1] = p.y; peerCam_[2] = p.z;
+        peerCamMs_ = now;
+        static unsigned long logTick = 0; // main-thread only
+        if (logTick == 0 || (now - logTick) >= 5000) {
+            logTick = now;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "[cam] hint recv=%.1f,%.1f,%.1f",
+                      p.x, p.y, p.z);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    bool fresh = (peerCamMs_ != 0) && (now - peerCamMs_) <= 3000;
+    engine::setPeerCamHint(fresh, peerCam_[0], peerCam_[1], peerCam_[2]);
 }
 
 

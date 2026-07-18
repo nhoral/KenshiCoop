@@ -243,6 +243,68 @@ bool readFurniture(Character* c, FurnitureRead* out) {
     }
 }
 
+// Phase 6 (6a evidence spike): read a character's shackle/lock state.
+// getChainedModeShackles() returns the equipped LockedArmour* (the shackle
+// item) or null; its `lock` member (0x2F0) is the live DoorLock* (null when
+// unlocked/absent). All reads are SEH-guarded and null-safe.
+bool readShackle(Character* c, ShackleRead* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!c) return false;
+    __try {
+        out->chained = c->isChained;
+        LockedArmour* sh = g_getShacklesFn ? g_getShacklesFn(c) : 0;
+        out->hasShackleItem = (sh != 0);
+        out->lockPresent    = (sh != 0 && sh->lock != 0);
+        const hand& o = c->slaveOwner;
+        out->owner[0] = (unsigned int)o.type;
+        out->owner[1] = o.container;
+        out->owner[2] = o.containerSerial;
+        out->owner[3] = o.index;
+        out->owner[4] = o.serial;
+        out->valid = true;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool shackleDbgOn() {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KENSHICOOP_DEBUG_SHACKLE"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on == 1;
+}
+
+void shackleDbgTick(GameWorld* gw, bool isHost) {
+    if (!shackleDbgOn() || !gw) return;
+    static unsigned long lastMs = 0;
+    unsigned long now = GetTickCount();
+    if (lastMs != 0 && (now - lastMs) < 1000) return;
+    lastMs = now;
+
+    // Prisoners/slaves are world NPCs (never the local player squad), so the
+    // census walk enumerates them with a live Character* + hand. Log only the
+    // bodies that matter (chained or carrying a shackle item) to keep the
+    // manual-session trace readable.
+    static const unsigned int MAXN = 64;
+    Character* chars[MAXN];
+    EntityState st[MAXN];
+    unsigned int n = listNpcs(gw, chars, st, MAXN);
+    for (unsigned int i = 0; i < n; ++i) {
+        ShackleRead sr;
+        if (!readShackle(chars[i], &sr) || !sr.valid) continue;
+        if (!sr.chained && !sr.hasShackleItem) continue;
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+                  "[shackledbg] host=%d hand=%u,%u chained=%d shackleItem=%d "
+                  "lock=%d owner=%u,%u",
+                  isHost ? 1 : 0, st[i].hIndex, st[i].hSerial,
+                  sr.chained ? 1 : 0, sr.hasShackleItem ? 1 : 0,
+                  sr.lockPresent ? 1 : 0, sr.owner[3], sr.owner[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 bool applyFurniture(GameWorld* gw, Character* occupant,
                     const unsigned int furnHand[5], int kind, bool on) {
     (void)gw;
@@ -500,6 +562,9 @@ bool writeGameSpeed(GameWorld* gw, float mult, bool paused) {
         g_userPauseFn(gw, paused);
         // Leave the multiplier untouched while paused, so unpausing restores
         // the pre-pause speed (matching the engine's own pause behaviour).
+        // click=false: setGameSpeed does not reselect the tier button on any
+        // click value (spike 2026-07-17 - only the inline UI handler does), so
+        // the loud path stays on the numeric-intent capture like before.
         if (!paused) g_setGameSpeedFn(gw, mult, /*click*/false);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -567,11 +632,29 @@ bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused) {
     bool engineDiff = g_quietHave &&
         (ep != g_quietPaused ||
          (!ep && em > 0.0f && fabsf(em - g_quietMult) > 0.01f));
+    // btnDiff fires ONLY when a tier button turns ON (a real inline click
+    // selects a new speed). A pure DEHIGHLIGHT (buttons went all-0) is NOT a
+    // user action - setGameSpeed dehighlights the tier on every programmatic /
+    // denied write (spike 2026-07-17), and treating that as a click created a
+    // per-tick feedback loop (btnDiff never clears, the reconcile is starved,
+    // 18M log lines / 2.4GB). Only a new selection counts.
     bool btnDiff = false;
     char btn[16]; btn[0] = '\0';
     int nBtn = readSpeedButtons(btn, sizeof(btn));
-    if (nBtn > 0 && g_voteBtnN == nBtn && memcmp(btn, g_voteBtn, nBtn) != 0)
-        btnDiff = true;
+    if (nBtn > 0 && g_voteBtnN == nBtn) {
+        for (int i = 0; i < nBtn; ++i)
+            if (btn[i] == '1' && g_voteBtn[i] != '1') { btnDiff = true; break; }
+    }
+    if (speedDbgOn() && (engineDiff || btnDiff)) {
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+            "[speeddbg] poll engineDiff=%d btnDiff=%d em=%.2f ep=%d "
+            "qMult=%.2f qPaused=%d combat=%d btn=%.*s vote=%.*s",
+            engineDiff ? 1 : 0, btnDiff ? 1 : 0, em, ep ? 1 : 0,
+            g_quietMult, g_quietPaused ? 1 : 0, g_speedCombatHint ? 1 : 0,
+            nBtn, btn, g_voteBtnN, g_voteBtn);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
     if (!engineDiff && !btnDiff) return false;
     if (engineDiff) {
         // Which multiplier is the request? A moved engine mult = the user
@@ -611,7 +694,15 @@ bool consumeSpeedIntent(GameWorld* gw, float* mult, bool* paused) {
     // Explain the state + adopt the clicked highlight as the new vote display.
     g_quietHave = true; g_quietPaused = ep;
     if (!ep && em > 0.0f) g_quietMult = em;
-    if (nBtn > 0) { memcpy(g_voteBtn, btn, nBtn); g_voteBtnN = nBtn; }
+    // Adopt the live highlight ONLY when a tier button is actually selected: a
+    // programmatic setGameSpeed leaves the buttons blank (0000) and btnDiff
+    // fires on that pure dehighlight - adopting it would wipe the vote display.
+    // A real inline UI click always turns a tier button ON, so it is kept.
+    if (nBtn > 0) {
+        bool anySel = false;
+        for (int i = 0; i < nBtn; ++i) if (btn[i] == '1') { anySel = true; break; }
+        if (anySel) { memcpy(g_voteBtn, btn, nBtn); g_voteBtnN = nBtn; }
+    }
     return true;
 }
 

@@ -836,6 +836,40 @@ const float SpawnFarScenario::SPAWN_DIST  = 620.0f;
 const float SpawnFarScenario::WALK_SPEED  = 14.0f;
 const float SpawnFarScenario::ARRIVE_DIST = 30.0f;
 
+// world_parity: full-roster cross-client parity soak on a dense save (camp).
+// Nothing is scripted - both sides run their normal sims while the
+// replicator's auditRows dumps (SCENARIO WORLD/WNPC, 5 s cadence, carrying
+// the task=/pelvis=/mv= parity fields and the cls=pc player rows) feed
+// Test-WorldParity, which tier-judges every host row against the join:
+// PCs hard position gate, near tier existence+pos+task, census band
+// existence+pos. The scenario verdict is script-ran only; parity is the
+// oracle's job. Host outlives the join (stale streams would poison the
+// tail samples, same reasoning as npc_sync).
+class WorldParityScenario : public Scenario {
+public:
+    WorldParityScenario() : passed_(false) {}
+
+    virtual const char* name() const { return "world_parity"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) { passed_ = true; return true; }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    // ~160 s of joined observation: long enough past the join's clock
+    // catch-up (~40 s) that steady-state dominates the 5 s dump series
+    // (~24 aligned samples).
+    static const unsigned long HOST_DURATION_MS = 180000;
+    static const unsigned long JOIN_DURATION_MS = 160000;
+    bool passed_;
+};
+
 } // namespace
 
 Scenario* makeNpcScenario(const std::string& name) {
@@ -847,6 +881,7 @@ Scenario* makeNpcScenario(const std::string& name) {
     if (name == "spawn_sync")   return new SpawnSyncScenario(/*probe=*/false);
     if (name == "npc_census")   return new NpcCensusScenario();
     if (name == "spawn_far")    return new SpawnFarScenario();
+    if (name == "world_parity") return new WorldParityScenario();
     return 0;
 }
 

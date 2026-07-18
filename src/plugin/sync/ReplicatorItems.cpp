@@ -308,6 +308,44 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
          pi != worldProxies_.end(); ++pi)
         proxyObjs.insert(pi->second.obj);
 
+    // ---- First-scan baseline (Phase 3 item-dup fix) ------------------------
+    // Every non-gear ground item present at the FIRST publish pass after a load
+    // is a SHARED save-native: the peer loaded the same save (or the host's
+    // connect-pushed save) and already holds an identical copy. Streaming it
+    // would mint a proxy on top of the peer's own native - the "rejoin/reload
+    // duplicated all items" report, compounding one layer per reload. Seed them
+    // as baseline tracks (identity + liveness only, NEVER emitted). Only items
+    // that appear AFTER this baseline (session drops via the hook, host runtime
+    // spawns) stream. resetSession() clears worldSeeded_ so each reload re-
+    // baselines the (possibly newly-baked) save-natives instead of re-streaming.
+    if (!worldSeeded_) {
+        worldSeeded_ = true;
+        engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
+        unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
+        unsigned int seeded = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (isGearType(raw[i].itemType)) continue;
+            if (!proxyObjs.empty() &&
+                proxyObjs.count(engine::resolveObjectByHand(raw[i].hand)) != 0)
+                continue; // already our proxy (defensive; unlikely at first scan)
+            Key k; k.t = raw[i].hand[0]; k.c = raw[i].hand[1]; k.cs = raw[i].hand[2];
+            k.i = raw[i].hand[3]; k.s = raw[i].hand[4];
+            if (worldTrack_.find(k) != worldTrack_.end()) continue;
+            WorldTrack t; memset(&t, 0, sizeof(t));
+            t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
+            t.x = raw[i].x; t.y = raw[i].y; t.z = raw[i].z; t.seen = true;
+            t.baseline = true; // never emit
+            strncpy(t.stringID, raw[i].stringID, sizeof(t.stringID) - 1);
+            t.stringID[sizeof(t.stringID) - 1] = '\0';
+            t.itemType = raw[i].itemType; t.quantity = raw[i].quantity; t.quality = raw[i].quality;
+            worldTrack_[k] = t;
+            ++seeded;
+        }
+        char b[96]; _snprintf(b, sizeof(b) - 1,
+            "[wi] BASELINE seeded=%u (save-native, never-stream)", seeded);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
     // Gear (itemType WEAPON/ARMOUR) rides the W2 conservation drop/pickup channel
     // (the real shared-save object is relocated bag<->ground on each client), so the
     // W1 template-proxy stream skips it in BOTH discovery sources below.
@@ -379,13 +417,18 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         float pos[3] = { tr.x, tr.y, tr.z };
         // Query-free liveness: is the real item still on the ground (not gone/picked-up)?
         if (!engine::groundItemLiveness(ihand, pos)) {
-            if (nr < 256) removed[nr++] = tr.netId;
+            // Baseline (save-native) tracks were never streamed, so the peer has
+            // no proxy to remove - just drop our track. Streamed tracks emit a
+            // remove so the peer despawns its proxy.
+            if (!tr.baseline) { if (nr < 256) removed[nr++] = tr.netId; }
             if (dumpWi) { char b[112]; _snprintf(b, sizeof(b) - 1,
-                "[wi] CULL netId=%u (gone/picked-up)", tr.netId);
+                "[wi] CULL netId=%u (gone/picked-up) baseline=%d", tr.netId, tr.baseline ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             worldTrack_.erase(it++);
             continue;
         }
+        // Baseline save-natives never stream (both clients hold them identically).
+        if (tr.baseline) { tr.x = pos[0]; tr.y = pos[1]; tr.z = pos[2]; ++it; continue; }
         bool sent = (tr.lastSendMs != 0);
         float dx = pos[0] - tr.x, dy = pos[1] - tr.y, dz = pos[2] - tr.z;
         bool moved = (dx*dx + dy*dy + dz*dz) > (POS_EPS * POS_EPS);

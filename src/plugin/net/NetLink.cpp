@@ -256,6 +256,12 @@ void NetLink::queueStealth(const StealthPacket& pkt) {
     LeaveCriticalSection(&outCs_);
 }
 
+void NetLink::queueCamHint(const CamHintPacket& pkt) {
+    EnterCriticalSection(&outCs_);
+    outCamHint_.push_back(pkt);
+    LeaveCriticalSection(&outCs_);
+}
+
 void NetLink::queueSpawnReq(const SpawnReqPacket& pkt) {
     EnterCriticalSection(&outCs_);
     outSpawnReq_.push_back(pkt);
@@ -887,6 +893,14 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushLoadNack(ln.ownerId, ln);
                         }
+                    } else if (type == PKT_CAM_HINT) {
+                        // Camera hint (protocol 43, join -> host): latest-wins
+                        // interest anchor. Only meaningful on the host.
+                        CamHintPacket chp;
+                        if (isHost_ && readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
+                            && inbound_) {
+                            inbound_->pushCamHint(chp.ownerId, chp);
+                        }
                     } else if (type == PKT_TIME_PING) {
                         // Wall-clock sync probe: echo immediately (host side). Answered
                         // inside the service loop so the response delay stays minimal
@@ -1436,6 +1450,25 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < stealthPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&stealthPkts[i], sizeof(StealthPacket),
+                                                 0 /*unreliable*/);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_UNRELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_UNRELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued camera hints on CH_UNRELIABLE (protocol
+        // 43, join -> host, ~1 Hz). Latest wins; a lost hint is replaced by
+        // the next one a second later.
+        std::vector<CamHintPacket> camHints;
+        EnterCriticalSection(&outCs_);
+        camHints.swap(outCamHint_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < camHints.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&camHints[i], sizeof(CamHintPacket),
                                                  0 /*unreliable*/);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_UNRELIABLE, out);

@@ -346,7 +346,22 @@ typedef double         f64;
 // stage. The furniture reliable enter/exit edges reuse the SAME shape for
 // chain: arg=3, and the actor hand carries the OWNER (setChainedMode needs an
 // owner, and the pole position rides the continuous transform).
-const u16 PROTOCOL_VERSION = 41;
+// Protocol 42 (shackle lock-state sync): InvItemEntry gains a `locked` bit
+// (equipped LockedArmour with a live lock). Cage occupancy (IN_PRISON) masks the
+// chained furniture kind on the drive side, so a caged prisoner's shackle
+// unlock never crossed; the locked bit is an occupancy-independent lock signal
+// (feeds the content hash so a lock toggle triggers a resend), paired with a
+// non-owner unlock guard that re-asserts the owner-authoritative chained state.
+//
+// Protocol 43 (camera-anchored interest, PKT_CAM_HINT): the join sends its
+// CAMERA world center to the host at ~1 Hz (unreliable, latest wins). Interest
+// anchors were squad-tab leaders only, so NPCs where a player is LOOKING (but
+// its PC is not standing) fell outside the stream bubble - the manual camp
+// finding of host-visible units missing on the join near the streamed edge.
+// The host folds a fresh hint into interestCenters (up to 4 anchors: 2 tab
+// leaders + own camera + peer camera); the host camera never crosses the wire
+// (read locally).
+const u16 PROTOCOL_VERSION = 43;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -389,7 +404,8 @@ enum PacketType {
     PKT_PROD             = 37,// RELIABLE host-authoritative machine state row (protocol 33); ProdPacket
     PKT_NPC_CENSUS       = 38,// RELIABLE wide-radius NPC existence list (protocol 36); NpcCensusHeader
     PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
-    PKT_RESEARCH         = 40 // RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
+    PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
+    PKT_CAM_HINT         = 41 // UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -643,6 +659,14 @@ struct InvItemEntry {
     u16  quality;
     u8   equipped;   // 1 if worn in an equipment slot (armour/weapon), else 0 (loose)
     u8   slot;       // AttachSlot the item occupies (advisory; equipItem auto-routes)
+    // Phase 6b (protocol 42): 1 when this item is a LockedArmour (shackle) with a
+    // live lock (Item::isLockedArmour()->lock != null). The owner is authoritative
+    // for the lock state; a peer's local lockpick must not desync it (see the
+    // non-owner unlock guard in ReplicatorDrive). Cage occupancy (IN_PRISON) masks
+    // the chained furniture kind, so this rides the inventory snapshot as an
+    // occupancy-independent lock signal. lockReserved keeps `section` 2-byte aligned.
+    u8   locked;
+    u8   lockReserved; // reserved (0)
     u16  section;    // hash of the equip SECTION name (0 = loose / none). Distinguishes
                      // the two weapon slots ('hip' vs 'back'), which share AttachSlot
                      // ATTACH_WEAPON and so are identical in `slot`; lets the peer place
@@ -1438,6 +1462,16 @@ struct NpcCensusHeader {
 
 // Hard cap on hands per census packet (512 * 20 B = ~10 KB, fragmented fine).
 const unsigned int NPC_CENSUS_MAX = 512;
+
+// Camera hint (protocol 43, join -> host, ~1 Hz UNRELIABLE latest-wins): the
+// join's camera world center, so the host can anchor an interest sphere where
+// the join player is LOOKING (its PC may be elsewhere). Loss is harmless -
+// the next hint lands a second later; a stale hint (> ~3 s) is dropped.
+struct CamHintPacket {
+    u8  type;    // = PKT_CAM_HINT
+    u32 ownerId; // network player id of the sender (the join)
+    f32 x, y, z; // CameraClass::getCenter() world position
+};
 
 struct TimePingPacket {
     u8  type;       // = PKT_TIME_PING

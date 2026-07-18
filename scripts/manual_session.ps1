@@ -103,6 +103,11 @@ param(
     # in the host census. Makes pops and ghosts self-explaining on screen
     # (pair with -Save zoom for long-run wide-camera inspection).
     [switch]$DebugMarkers,
+    # Phase 6 shackle diagnostic (KENSHICOOP_DEBUG_SHACKLE=1 on both clients):
+    # emits the ~1 Hz [shackledbg] per-body chained/lock trace so a manual camp
+    # session captures the exact tick a peer's driven copy diverges from the
+    # owner (the reported "peer PC unlocks the shackles" desync).
+    [switch]$DebugShackle,
     # Manual sessions tile the two game windows side-by-side BY DEFAULT (host left,
     # join right; scripts\arrange_windows.ps1, re-pinned through the load screen) on
     # the ULTRAWIDE (widest monitor, 3440x1440): each client window is sized to half
@@ -274,6 +279,8 @@ function Set-CoopEnv {
     $env:KENSHICOOP_INV_DUMP     = if ($InvDump) { "1" } else { "" }
     # Authority markers render on the DRIVEN side; harmless on both, so set both.
     $env:KENSHICOOP_DEBUG_MARKERS = if ($DebugMarkers) { "1" } else { "" }
+    # Phase 6 shackle trace on both clients (see -DebugShackle).
+    $env:KENSHICOOP_DEBUG_SHACKLE = if ($DebugShackle) { "1" } else { "" }
     # Per-mode log next to the install so host/join don't clobber each other.
     $env:KENSHICOOP_LOG          = if ($Mode -eq "join") { "KenshiCoop_join.log" } else { "KenshiCoop_host.log" }
 }

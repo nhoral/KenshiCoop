@@ -405,7 +405,7 @@ unsigned int enumDoorsNear(GameWorld* gw, float radius, DoorRead* out, unsigned 
     if (!gw || !out || maxOut == 0 || !g_getObjsFn || !g_doorIsOpenFn) return 0;
     unsigned int n = 0;
     __try {
-        Ogre::Vector3 centers[2];
+        Ogre::Vector3 centers[4];
         unsigned int nc = interestCenters(gw, centers);
         if (nc == 0) return 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {
@@ -504,7 +504,7 @@ unsigned int enumSitesNear(GameWorld* gw, float radius, BuildRead* out, unsigned
     if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
     unsigned int n = 0;
     __try {
-        Ogre::Vector3 centers[2];
+        Ogre::Vector3 centers[4];
         unsigned int nc = interestCenters(gw, centers);
         if (nc == 0) return 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {
@@ -819,7 +819,7 @@ unsigned int enumMachinesNear(GameWorld* gw, float radius, ProdRead* out,
     if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
     unsigned int n = 0;
     __try {
-        Ogre::Vector3 centers[2];
+        Ogre::Vector3 centers[4];
         unsigned int nc = interestCenters(gw, centers);
         if (nc == 0) return 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {
@@ -1148,7 +1148,7 @@ unsigned int enumContainersNear(GameWorld* gw, float radius, ContRead* out,
     if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
     unsigned int n = 0;
     __try {
-        Ogre::Vector3 centers[2];
+        Ogre::Vector3 centers[4];
         unsigned int nc = interestCenters(gw, centers);
         if (nc == 0) return 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {

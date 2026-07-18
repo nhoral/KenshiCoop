@@ -328,6 +328,38 @@
             Tier = 'full'; WanVariant = $true
         }
 
+        # bed_wake: conscious bed EXIT (protocol 19). bed_pose only proved ENTER +
+        # HOLD; this drives the wake-and-move arc that was desyncing (host PC
+        # sleeps, then wakes and walks - the join copy stayed stuck sleeping). The
+        # host orders L0 into the baked Camp Bed, waits for the join to commit the
+        # pose, then issues a move ~25u away; the join copy must leave the bed
+        # (BODY_IN_BED clears, [furn] BED FAST-EXIT) and follow the host.
+        bed_wake = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'bed_wake'
+            Gating   = @('bed_wake', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'pose_state')
+            Tier = 'full'; WanVariant = $true
+        }
+
+        # bed_lay: UNCONSCIOUS place-in-bed LAYING pose + wake-and-exit (protocol
+        # 19). bed_pose proved a conscious sleep ORDER lays down and bed_put proved
+        # unconscious OCCUPANCY crosses; this proves a KO'd body DROPPED into a bed
+        # renders the LAYING pose on BOTH clients and can get back OUT when it wakes.
+        # (A conscious placement was ruled out: Kenshi itself nondeterministically
+        # stands a conscious placed body on the mattress and the join mirrors it
+        # faithfully - base-game behavior, not a coop bug, run 2026-07-17.) The owner
+        # KO's M2 (then L1), drops it in the baked Camp Bed, then revives + moves it;
+        # the pelvis + BODY_IN_BED in the MEMBER/RECV series must read LAYING on both
+        # clients, and both must leave the bed after the wake.
+        bed_lay = @{
+            Save = 'bedcage1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'bed_lay'
+            Gating   = @('bed_lay', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'pose_state')
+            Tier = 'full'; WanVariant = $true
+        }
+
         # bed_put: unconscious placement (protocol 19 phase 3). Window A: the
         # host KO's its M2 (holdDown re-topped) and places it in the baked Camp
         # Bed via the putSubjectInFurniture scaffold, then takes it back out;
@@ -1070,6 +1102,25 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # camp_approach: Phase 2 crash-hardening SOAK on the 'camp' prison save
+        # (many NPCs). The JOIN teleport-hops across the camp forcing mint/zone
+        # churn while the HOST self-exits FIRST at ~130s - a real peer drop that
+        # fires clearPeerReplicationState on the surviving join mid-churn. There
+        # is no deterministic crash repro, so this is a stress gate, not parity:
+        # Test-CampApproach checks both sides reach a SCENARIO RESULT (no crash),
+        # the join logs 'peer left' -> '[leave] cleared proxies=', no '[drive]'
+        # touches a stale/unbound hand after the leave, and proxies drain to ~0.
+        # Join window 150s (from arm) -> Seconds/KillGraceSec raised like
+        # travel_parity so the runner backstop outlives it.
+        camp_approach = @{
+            Save = 'camp'; Setup = ''; Tolerance = 18.0
+            Seconds = 230; KillGraceSec = 200
+            PrimaryGate = 'camp_approach'
+            Gating   = @('camp_approach', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # spawn_sync: protocol-21 runtime-spawn proxy replication (spawnSync ON).
         # Same script as spawn_probe; gates that the join minted proxies for the
         # host's runtime spawns (near half + far >= 1), the PROXY position series
@@ -1093,6 +1144,58 @@
             PrimaryGate = 'speed_probe'
             Gating   = @('speed_probe', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # shackle_probe: Phase 6 6a evidence spike (log-only, BOTH clients) on the
+        # 'camp' prison save. Each client enumerates nearby world NPCs and emits a
+        # "SCENARIO SHACKLE" line per chained / shackle-carrying body. The oracle
+        # time-aligns the owner's and peer's view of each shackled prisoner and
+        # flags any chained/lock divergence (the reported "peer PC unlocks the
+        # shackles" desync). No behavior change ships in 6a.
+        shackle_probe = @{
+            Save = 'camp'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'shackle_probe'
+            Gating   = @('shackle_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # shackle_sync: Phase 6 6b validation (BOTH clients) on the 'camp' prison
+        # save. Same "SCENARIO SHACKLE" emission as shackle_probe, but the oracle
+        # is now STRICT: with the protocol-42 locked bit + non-owner unlock guard
+        # shipping, a shared prisoner whose owner reports chained/locked while the
+        # peer's driven copy reports it cleared is a FAIL. Shared-hand parity is
+        # asserted; the no-shared-hand identity caveat defers to the manual gate.
+        shackle_sync = @{
+            Save = 'camp'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'shackle_sync'
+            Gating   = @('shackle_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # world_parity: full-roster cross-client parity on the dense 'camp'
+        # prison save. Nothing scripted - both sides run their sims while the
+        # replicator's 5 s auditRows dumps (SCENARIO WORLD/WNPC with the
+        # task=/pelvis=/mv= parity fields and cls=pc player rows) feed
+        # Test-WorldParity's tiered judgment:
+        #   PC tier     - every player character present on both sides, hard
+        #                 position gate (a diverged host-PC is invisible to
+        #                 every other oracle: the NPC dumps exclude the squad)
+        #   near tier   - host rows within 260 u of a PC anchor: existence,
+        #                 position and task parity on the join
+        #   census tier - 260-2000 u: existence + position within the park
+        #                 threshold; task not judged (local-sim copies)
+        # Seconds/KillGraceSec: the 180 s host window outlives the default
+        # 150 s self-exit + kill grace (same pattern as travel_parity).
+        world_parity = @{
+            Save = 'camp'; Setup = ''; Tolerance = 6.0
+            Seconds = 220; KillGraceSec = 190
+            PrimaryGate = 'world_parity'
+            Gating   = @('world_parity', 'clock_sync')
+            Advisory = @('existence_parity', 'anti_zombie', 'lifecycle',
+                         'suppress_churn', 'smoothness', 'anim_truth', 'march')
             Tier = 'probe'; WanVariant = $false
         }
 
@@ -1263,6 +1366,23 @@
             PrimaryGate = 'wi_join'
             Gating   = @('wi_join', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # rejoin_items (Phase 3 item-dup fix): a reload must not duplicate save-
+        # native ground items. Reuses the load_sync coordinated save+load lever
+        # (loadSync + saveSync ON by default): the HOST drops K test items (both
+        # clients reach n0+K), coordinated-saves 'coopresume' so the drops bake
+        # into the shared save, then loads it mid-session. The first-scan baseline
+        # must record the now-native drops as never-emit so the host does not
+        # re-stream them and the join does not layer a duplicate proxy - the
+        # oracle gates POST-reload count <= PRE-reload count on BOTH sides plus a
+        # WORLD-RELOAD edge. clock_sync is NOT gated (the reload restarts the
+        # in-game clock series, same as load_sync).
+        rejoin_items = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'rejoin_items'
+            Gating   = @('rejoin_items')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'clock_sync')
             Tier = 'full'; WanVariant = $false
         }
         wpn_relocate = @{

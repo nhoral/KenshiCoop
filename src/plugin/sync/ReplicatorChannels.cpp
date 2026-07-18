@@ -1566,12 +1566,20 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
                            bool isHost) {
     const unsigned long RESEND_MS        = 3000; // safety resend (late join / lost state)
     const unsigned long COMBAT_SAMPLE_MS = 1000; // own-squad combat poll cadence
+    const unsigned long COMBAT_HOLD_MS   = 4000; // cap hysteresis: hold past brief gaps
     const float         EPS              = 0.01f;
     unsigned long now = nowMs();
 
     // Own-squad combat flag, ~1 Hz (readCombat per owned member; the cap only
     // needs second-level reactivity). An edge forces a REQ send below so the
     // host's cap reacts faster than the safety resend.
+    //
+    // Hysteresis (Phase 5 spike 2026-07-17): readCombat drops to false in the
+    // gap between an enemy being KO'd and the next attacker engaging, so a raw
+    // per-sample flag makes the consensus cap FLAP (SET bounced 1x<->3x mid
+    // fight, only 0.667 of the combat window sat at 1x). Hold the cap for
+    // COMBAT_HOLD_MS past the last TRUE read so a momentary lull never releases
+    // the speed - the indicator/effective stay steady while fighting continues.
     bool combatEdge = false;
     if (speedCombatSampleMs_ == 0 || (now - speedCombatSampleMs_) >= COMBAT_SAMPLE_MS) {
         speedCombatSampleMs_ = now;
@@ -1582,9 +1590,15 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
             engine::CombatRead cr;
             if (c && engine::readCombat(c, &cr) && cr.inCombat) { fighting = true; break; }
         }
-        combatEdge     = (fighting != speedMyCombat_);
-        speedMyCombat_ = fighting;
+        if (fighting) speedCombatHoldMs_ = now;
+        bool held = (speedCombatHoldMs_ != 0) && ((now - speedCombatHoldMs_) < COMBAT_HOLD_MS);
+        combatEdge     = (held != speedMyCombat_);
+        speedMyCombat_ = held;
     }
+    // Phase 5 spike: expose the combat-cap state so the speed-setter
+    // diagnostics (KENSHICOOP_DEBUG_SPEED) can distinguish an engine-forced
+    // combat cap from a user click by context.
+    engine::setSpeedCombatHint(speedMyCombat_ || speedPeerCombat_);
 
     // Local vote capture: the engine-setter hooks (setGameSpeed / userPause /
     // togglePause) record every REAL user action - UI clicks, keyboard pause,
@@ -1736,6 +1750,14 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
             }
         }
     }
+
+    // Phase 5 continuous indicator reconcile: the buttons show the VOTE, but
+    // engine-forced changes (dialog auto-pause re-highlight, the combat cap, a
+    // denied write's dehighlight) drag the MyGUI highlight off it. Unless the
+    // player acted THIS tick (in which case the new click owns the highlight),
+    // snap the buttons back to the captured vote so the indicator self-heals
+    // within a frame and always reflects the player's request.
+    if (!userActed) engine::reconcileVoteButtons();
 }
 
 void Replicator::syncTime(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,

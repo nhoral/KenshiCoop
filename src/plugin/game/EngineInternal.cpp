@@ -288,6 +288,11 @@ typedef void      (__fastcall* SetFurnModeFn)(Character* self, bool on,
 // a prisoner POLE (a different engine system from the cage's setPrisonMode).
 typedef void      (__fastcall* SetChainedModeFn)(Character* self, bool on,
                                                  const hand* owner);
+// Phase 6 shackle read lever: Character::getChainedModeShackles() (RVA
+// 0x5C8290) returns the equipped LockedArmour* (the shackle item) or null. A
+// non-null return with a non-null LockedArmour::lock (0x2F0) is a locked
+// shackle. Read-only; used by readShackle() for the 6a evidence spike.
+typedef LockedArmour* (__fastcall* GetShacklesFn)(Character* self);
 // Stealth (protocol 20): setStealthMode runs the engine's full sneak chain on
 // the LOCAL body (sneak-walk pose, stealthUpdate scanning, stealth skill use).
 // notifyICanSeeYouSneaking updates the sneaker's whoSeesMeSneaking map + the
@@ -321,8 +326,11 @@ DropCarriedFn     g_dropCarriedFn     = 0;
 SetFurnModeFn     g_setBedModeFn      = 0;
 SetFurnModeFn     g_setPrisonModeFn   = 0;
 SetChainedModeFn  g_setChainedModeFn  = 0;
+GetShacklesFn     g_getShacklesFn     = 0;
 SetStealthModeFn  g_setStealthModeFn  = 0;
 NotifySeeSneakFn  g_notifySeeSneakFn  = 0;
+CamGetCenterFn    g_camGetCenterFn    = 0;
+CamIsInitFn       g_camIsInitFn       = 0;
 
 // Limb state with the engine's null policy: robotLimbs is lazily allocated, and
 // a null robotLimbs means "no limb ever lost/replaced" == ORIGINAL on all four.
@@ -462,22 +470,59 @@ bool  g_quietPaused = false;
 // always show the last thing the USER did, never the arbitrated effective.
 char g_voteBtn[15]; int g_voteBtnN = 0;
 
+// Phase 5 spike state: combat-cap hint (set by syncSpeed) + env gate.
+bool g_speedCombatHint = false;
+
+bool speedDbgOn() {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KENSHICOOP_DEBUG_SPEED"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on == 1;
+}
+
+void setSpeedCombatHint(bool inCombat) { g_speedCombatHint = inCombat; }
+
+// One-liner used by the speed-setter diagnostics: dumps the current button
+// highlight so the log shows whether the engine moved the indicator.
+static void speedDbgLog(const char* what, float f, int i) {
+    char btn[16]; if (readSpeedButtons(btn, sizeof(btn)) <= 0) btn[0] = '\0';
+    char b[160];
+    _snprintf(b, sizeof(b) - 1,
+        "[speeddbg] %s v=%.2f i=%d guard=%d combat=%d btn=%s vote=%.*s",
+        what, f, i, g_speedGuardWrite ? 1 : 0, g_speedCombatHint ? 1 : 0,
+        btn, g_voteBtnN, g_voteBtn);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+// Capture the current speed-button highlight as the vote display. Guard: a
+// BLANK read (no button selected) is never a valid vote - it is the transient
+// dehighlight setGameSpeed leaves behind on a programmatic / denied write
+// (spike 2026-07-17: the tier button is only reselected by the inline UI click
+// handler, never by setGameSpeed). Storing that blank would wipe the indicator,
+// so keep the last real selection instead.
 void snapshotVoteButtons() {
     char buf[16];
     int n = readSpeedButtons(buf, sizeof(buf));
-    if (n > 0) { memcpy(g_voteBtn, buf, n); g_voteBtnN = n; }
+    if (n <= 0) return;
+    bool anySel = false;
+    for (int i = 0; i < n; ++i) if (buf[i] == '1') { anySel = true; break; }
+    if (!anySel) return;
+    memcpy(g_voteBtn, buf, n); g_voteBtnN = n;
 }
 
 void __fastcall setGameSpeed_hook(GameWorld* self, float speed, bool click) {
+    if (speedDbgOn()) speedDbgLog("setGameSpeed", speed, click ? 1 : 0);
     if (!g_speedGuardWrite && speed > 0.0f) {
         g_speedIntentMult  = speed;
         g_speedIntentFresh = true;
     }
     g_setGameSpeedOrig(self, speed, click);
+    // snapshotVoteButtons ignores the blank dehighlight setGameSpeed leaves
+    // behind (spike 2026-07-17), so this keeps the last real tier selection.
     if (!g_speedGuardWrite) snapshotVoteButtons();
 }
 
 void __fastcall userPause_hook(GameWorld* self, bool p) {
+    if (speedDbgOn()) speedDbgLog("userPause", 0.0f, p ? 1 : 0);
     if (!g_speedGuardWrite) {
         g_speedIntentPaused = p;
         g_speedIntentFresh  = true;
@@ -487,6 +532,7 @@ void __fastcall userPause_hook(GameWorld* self, bool p) {
 }
 
 void __fastcall togglePause_hook(GameWorld* self, bool p) {
+    if (speedDbgOn()) speedDbgLog("togglePause", 0.0f, p ? 1 : 0);
     if (!g_speedGuardWrite) {
         g_speedIntentPaused = p;
         g_speedIntentFresh  = true;
@@ -508,6 +554,20 @@ void restoreVoteButtons() {
             if (btns[i]) btns[i]->setStateSelected(g_voteBtn[i] == '1');
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+}
+
+// Phase 5 continuous reconcile: force the MyGUI speed buttons back onto the
+// captured vote whenever the live highlight has drifted off it (an engine
+// dialog auto-pause re-highlight, a combat cap, or a click=false dehighlight).
+// Only restores on a real mismatch so we don't hammer MyGUI every tick. The
+// caller gates this on "no user acted this tick" so a genuine same-frame click
+// is never fought.
+void reconcileVoteButtons() {
+    if (g_voteBtnN <= 0) return;
+    char cur[16];
+    int n = readSpeedButtons(cur, sizeof(cur));
+    if (n <= 0 || n != g_voteBtnN) return;
+    if (memcmp(cur, g_voteBtn, n) != 0) restoreVoteButtons();
 }
 
 // Money + vendor trading (protocol 22 groundwork). Character::getPlatoon gives
@@ -1205,6 +1265,7 @@ typedef CombatClass* (__fastcall* GetCombatClassFn)(Character* self);
 GetAttackTargetFn g_getAttackTargetFn = 0;
 InCombatModeFn    g_inCombatModeFn    = 0;
 GetCombatClassFn  g_getCombatClassFn  = 0;
+AttackTargetFn    g_attackTargetFn    = 0;
 CharBodyBoolFn    g_inRangedModeFn    = 0;
 CharBodyBoolFn    g_underMeleeFn      = 0;
 CharBodyBoolFn    g_fleeingFn         = 0;
@@ -1308,11 +1369,24 @@ void resolve() {
     if (!g_setChainedModeFn)
         coop::logErrLine("engine: could not resolve setChainedMode (chain/pole sync off)");
 
+    // Phase 6 shackle read lever (non-fatal: unresolved -> readShackle reports
+    // only Character::isChained, no shackle-item/lock discrimination).
+    g_getShacklesFn = (GetShacklesFn)KenshiLib::GetRealAddress(&Character::getChainedModeShackles);
+    if (!g_getShacklesFn)
+        coop::logErrLine("engine: could not resolve getChainedModeShackles (shackle read degraded)");
+
     // Stealth sync (protocol 20; non-fatal: unresolved -> stealth sync off).
     g_setStealthModeFn = (SetStealthModeFn)KenshiLib::GetRealAddress(&Character::setStealthMode);
     g_notifySeeSneakFn = (NotifySeeSneakFn)KenshiLib::GetRealAddress(&Character::notifyICanSeeYouSneaking);
     if (!g_setStealthModeFn || !g_notifySeeSneakFn)
         coop::logErrLine("engine: could not resolve stealth functions (stealth sync off)");
+
+    // Camera-anchored interest (spike 35; non-fatal: unresolved -> camera
+    // anchor off, interest falls back to squad-tab leaders only).
+    g_camGetCenterFn = (CamGetCenterFn)KenshiLib::GetRealAddress(&CameraClass::getCenter);
+    g_camIsInitFn    = (CamIsInitFn)KenshiLib::GetRealAddress(&CameraClass::isInitialised);
+    if (!g_camGetCenterFn || !g_camIsInitFn)
+        coop::logErrLine("engine: could not resolve CameraClass accessors (camera interest off)");
 
     // Consensus game-speed sync (non-fatal: unresolved -> speed sync off).
     g_setGameSpeedFn = (SetGameSpeedFn)KenshiLib::GetRealAddress(&GameWorld::setGameSpeed);
@@ -1472,6 +1546,11 @@ void resolve() {
     g_underMeleeFn   = (CharBodyBoolFn)KenshiLib::GetRealAddress(
         &Character::isLiterallyUnderMeleeAttackRightNowForSure);
     g_fleeingFn      = (CharBodyBoolFn)KenshiLib::GetRealAddress(&Character::isFleeing);
+    // Engagement escalation: the AI's own commit-an-attack entry (non-fatal:
+    // unresolved -> escalation degrades to the goal/order paths).
+    g_attackTargetFn = (AttackTargetFn)KenshiLib::GetRealAddress(&Character::attackTarget);
+    if (!g_attackTargetFn)
+        coop::logLine("[engine] WARN Character::attackTarget unresolved - combat force-escalation off");
 
     // Spike 402: prove which executable is actually mapped and record the
     // KenshiLib-remapped entry points for the native save/object-serialisation

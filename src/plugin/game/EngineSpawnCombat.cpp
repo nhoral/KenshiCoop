@@ -1401,6 +1401,26 @@ int applyCombat(Character* c, const EntityState& e, bool breakOrder) {
     return orderMeleeAttack(c, target) ? 2 : -1;
 }
 
+// Escalation past applyCombat: Character::attackTarget is the engine AI's own
+// commit-an-attack entry. The goal/order paths above are ACCEPTED but then
+// dropped by the copy's running AI when the victim is a locally player-owned
+// body of a non-hostile faction (world_parity camp: host Holy Sentinels beat
+// the escaped-prisoner PC, join sentinels idle at task 65535 through every
+// reissue). attackTarget skips that re-decision and starts the fight directly.
+int forceAttack(Character* c, const EntityState& e) {
+    if (!c || !coop::taskIsCombat(e.task)) return 0;
+    if (!g_attackTargetFn) return 0;
+    Character* target = resolveCharByHand(e.sIndex, e.sSerial, e.sType,
+                                          e.sContainer, e.sContainerSerial);
+    if (!target) return 1;
+    __try {
+        g_attackTargetFn(c, target);
+        return 2;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
 // ---- Player-combat / medical validation primitives (spike 21 field map) ----
 
 bool readMedical(Character* c, MedicalRead* out) {

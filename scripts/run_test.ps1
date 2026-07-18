@@ -228,9 +228,16 @@ function Set-CoopEnv {
     $env:KENSHICOOP_LOG          = $Log
     $env:KENSHICOOP_SCENARIO     = $Scenario
     # Reconcile/world-item trace gate (diagnostic scenarios need the [recon]/[wi] traces).
-    $env:KENSHICOOP_INV_DUMP     = if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -eq "world_armor_drop" -or $Scenario -eq "trade_probe" -or $Scenario -eq "trade_peer" -or $Scenario -like "world_item_*") { "1" } else { "" }
+    $env:KENSHICOOP_INV_DUMP     = if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -eq "world_armor_drop" -or $Scenario -eq "trade_probe" -or $Scenario -eq "trade_peer" -or $Scenario -like "world_item_*" -or $Scenario -eq "rejoin_items") { "1" } else { "" }
     # Join-only AI-suspend probe.
     $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
+    # Phase 5 speed-path diagnostics ([speeddbg] setter/poll trace); on for the
+    # speed scenarios so combat-cap / forced-change attribution is captured.
+    $env:KENSHICOOP_DEBUG_SPEED = if ($Scenario -like "speed*") { "1" } else { "" }
+    # Phase 6 shackle diagnostics ([shackledbg] per-body chained/lock trace); on
+    # for the shackle scenarios so the [shackledbg] series is captured alongside
+    # the SCENARIO SHACKLE lines (same trace the manual camp session relies on).
+    $env:KENSHICOOP_DEBUG_SHACKLE = if ($Scenario -like "shackle*") { "1" } else { "" }
     # Host-only setup/re-arm scene.
     $env:KENSHICOOP_SETUP = if ($Mode -eq "host") { $Setup } else { "" }
     # Legacy in-plugin WAN sim (both clients; entities only).

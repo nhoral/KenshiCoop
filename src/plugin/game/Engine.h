@@ -139,6 +139,9 @@ bool walkTo(Character* c, float x, float y, float z, float speed);
 
 // SEH-guarded: halt + teleport to an exact transform (a clean stop at rest).
 bool park(Character* c, float x, float y, float z, float heading);
+// Halt an in-flight movement goal without teleporting (census-freeze upkeep:
+// the AI-suspend hook blocks new decisions, not a committed destination).
+bool haltMovement(Character* c);
 
 // SEH-guarded: mirror the source's locomotion state onto the movement controller
 // (drives the AnimationClass walk/idle/run selection). Written as the last word.
@@ -150,6 +153,29 @@ bool readMotion(Character* c, bool* moving, float* speed);
 
 // SEH-guarded: fetch the local player's squad leader (playerCharacters[0]) or 0.
 Character* leader(GameWorld* gw);
+
+// SEH-guarded: read the LOCAL camera's world center into out[3] (x,y,z).
+// Returns false when the camera is absent or not yet initialised (pre-load).
+// Camera-anchored interest lever (spike 35): purely local read; the join
+// forwards its value to the host at ~1Hz via PKT_CAM_HINT.
+bool cameraCenter(GameWorld* gw, float out[3]);
+
+// Camera-anchored interest anchor stores (protocol 43). The sync layer
+// publishes the LOCAL camera center and the peer's (fresh) camera hint each
+// tick; interestCenters folds them in as extra anchors, deduped against the
+// squad-tab leader spheres. valid=false clears the anchor (camera not up /
+// hint stale). Main-thread only.
+void setLocalCamAnchor(bool valid, float x, float y, float z);
+void setPeerCamHint(bool valid, float x, float y, float z);
+// KENSHICOOP_CAM_INTEREST master enable: when off, interestCenters ignores
+// the camera anchors (squad-tab leaders only - the pre-43 behavior).
+void setCamInterest(bool on);
+
+// SEH-guarded: expose the current interest anchors (up to 4 x,y,z triples
+// into out[12]) to the sync layer - the mid-band nearest-first ordering
+// prioritizes by distance to the closest ANCHOR (tab leaders + cameras), so
+// camera-watched NPCs get mid-band drive slots too. Returns the anchor count.
+unsigned int interestAnchors(GameWorld* gw, float out[12]);
 
 // ---- Stage 4 NPC replication primitives ------------------------------------
 
@@ -451,6 +477,14 @@ bool readCombatByHand(const unsigned int hand[5], CombatRead* out);
 // stool which outranks the AI goal, so the goal alone never starts the fight.
 // Returns 2 ordered / 1 target not loaded / 0 no-op (not a combat intent) / -1 fault.
 int applyCombat(Character* c, const EntityState& e, bool breakOrder);
+
+// Engagement escalation (world_parity camp): both the goal and order attack
+// paths are silently dropped by the running local AI when the target is a
+// locally player-owned body of a non-hostile faction (escaped-prisoner
+// recapture: host guards fight, join guards idle). Character::attackTarget is
+// the AI's own commit-an-attack entry and bypasses that validation. Returns
+// 2 forced / 1 target not loaded / 0 no-op / -1 fault.
+int forceAttack(Character* c, const EntityState& e);
 
 // duel test scene: spawn two mutually-hostile non-squad NPCs in front of the leader
 // from the SAME nearby faction so they are PEACEFUL on spawn (no attack issued here).
@@ -1149,6 +1183,30 @@ struct FurnitureRead {
     unsigned int furn[5];  // kind 1/2: inWhat hand; kind 3: slaveOwner hand
 };
 bool readFurniture(Character* c, FurnitureRead* out);
+// ---- Phase 6: shackle (locked equipped item) read lever --------------------
+// Read-only snapshot of a character's shackle/lock state for the 6a evidence
+// spike. `chained` is Character::isChained (0x320); `hasShackleItem` is
+// getChainedModeShackles() != null (an equipped LockedArmour); `lockPresent`
+// is that LockedArmour's `lock` (0x2F0) != null (a live lock object). A
+// desync fingerprint is when the owner reports chained/locked but the peer's
+// driven copy reports it cleared. SEH-guarded; degrades to `chained` only if
+// getChainedModeShackles is unresolved.
+struct ShackleRead {
+    bool valid;
+    bool chained;          // Character::isChained (0x320)
+    bool hasShackleItem;   // getChainedModeShackles() != null
+    bool lockPresent;      // LockedArmour::lock (0x2F0) != null
+    unsigned int owner[5]; // Character::slaveOwner (0x328) hand, all-zero if none
+};
+bool readShackle(Character* c, ShackleRead* out);
+// Phase 6 (6a spike): env-gated ([shackledbg], KENSHICOOP_DEBUG_SHACKLE)
+// per-character shackle/lock trace, throttled ~1 Hz. Enumerates nearby world
+// NPCs (prisoners are not in the player squad) and logs every body that is
+// chained or carries a shackle item, on BOTH clients, so a manual session
+// captures the tick a peer's driven copy diverges from the owner. No-op when
+// the env var is unset; SEH-guarded per body. `isHost` only tags the line.
+void shackleDbgTick(GameWorld* gw, bool isHost);
+bool shackleDbgOn();
 // Place the local occupant into / remove it from the furniture at furnHand via
 // the engine's own setBedMode/setPrisonMode (kind: 1 bed, 2 cage) - pose,
 // attach and transform are engine-native. Idempotent: already in the desired
@@ -1733,6 +1791,16 @@ bool installSpeedIntentHooks(GameWorld* gw);
 // selected states into out (one char per button, '0'/'1', NUL-terminated;
 // cap n-1 buttons). Returns the button count read, -1 when the GUI isn't up.
 int readSpeedButtons(char* out, int n);
+
+// Phase 5: publish the combat-cap-active state (from syncSpeed) so the
+// speed-path diagnostics can attribute an engine-forced cap vs a user click.
+void setSpeedCombatHint(bool inCombat);
+
+// Phase 5: force the MyGUI speed buttons back onto the captured vote when the
+// live highlight has drifted (engine dialog auto-pause / combat cap / a
+// click=false dehighlight). No-op when already matching. Gate the call on "no
+// user acted this tick" so a genuine same-frame click is not fought.
+void reconcileVoteButtons();
 
 } // namespace engine
 } // namespace coop

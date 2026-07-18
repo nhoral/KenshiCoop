@@ -197,11 +197,25 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                 // fallback regime.
                 lifeSet(k, LIFE_PARKED, "census-local");
                 debugMark(chars[i], 2, lifeName(LIFE_PARKED));
+                // world_parity 2026-07-17: the bubble used to be a park-free
+                // zone outright (run 185524: sub-50 u seat divergence fought
+                // the local seat AI every frame). But a census-present body
+                // inside the JOIN's bubble that the HOST does not stream
+                // (interest sets only partially overlap - the edge class the
+                // manual sessions kept catching, Pao at a steady 451 u) had
+                // NO reconciliation at all. parkDivergedCopy's 120 u
+                // threshold already exempts the seat-schedule class, and the
+                // divergence freeze quiets the AI that used to fight the
+                // teleport - so the park now runs here with the exact same
+                // gates as the wide pass.
+                float drift = parkDivergedCopy(chars[i], states[i], k);
+                if (censusFreezeAi_ && drift >= 0.0f)
+                    censusFreezeDivergedAi(chars[i], k, drift);
             }
-            // NOTE: census position parking deliberately does NOT run inside
-            // the stream bubble (npc_sync regression, run 185524): a bar NPC
-            // whose two schedules seat it ~50 u apart is re-placed by its own
-            // seat AI the same frame, so the park never sticks and the fight
+            // NOTE: census position parking below the 120 u threshold stays
+            // OFF inside the stream bubble (npc_sync regression, run 185524):
+            // a bar NPC whose two schedules seat it ~50 u apart is re-placed
+            // by its own seat AI the same frame, so the park never sticks and the fight
             // wrecked tracking/march. Inside the bubble the stream owns
             // position truth; parking is a WIDE-pass render-range tool.
         } else {
@@ -297,7 +311,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                 // Driven bodies excluded: the mid/near stream owns them.
                 if (s == suppressed_.end() && !driven) {
                     lifeSet(k, LIFE_PARKED, "census-wide");
-                    parkDivergedCopy(wChars[i], wStates[i], k);
+                    float drift = parkDivergedCopy(wChars[i], wStates[i], k);
+                    // Census-band AI freeze: quiesce a diverging body's local AI
+                    // so it can't flee/aggro the join's guards (the mining-slave
+                    // cascade). drift < 0 = no census row / parking off -> skip.
+                    if (censusFreezeAi_ && drift >= 0.0f)
+                        censusFreezeDivergedAi(wChars[i], k, drift);
                 }
             } else if (s == suppressed_.end() && ac.unstreamed >= SUPPRESS_AFTER_FRAMES) {
                 if (engine::suppressNpc(gw, wChars[i])) {
@@ -437,6 +456,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
             dumpGhost = (e && e[0] == '1') ? 1 : 0;
         }
         std::set<Character*> counted;
+        std::set<Key> emittedKeys; // world_parity: hands already dumped
         unsigned int ghostRows = 0;
         for (int pass = 0; pass < 2; ++pass) {
             unsigned int cnt = (pass == 0) ? n : wn;
@@ -471,19 +491,66 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                 // travel_parity worldstate rows (join side): one row per
                 // enumerated NPC with its authority class, same schema as the
                 // host's census dump so the oracle can cross-match by hand.
-                if (auditRows_) {
-                    char nm[40]; engine::charName(cs[i], nm, sizeof(nm));
-                    char r[224]; _snprintf(r, sizeof(r) - 1,
-                        "SCENARIO WNPC hand=%u,%u,%u,%u,%u pos=%.1f,%.1f,%.1f "
-                        "cls=%s name='%s'",
-                        sts[i].hIndex, sts[i].hSerial, sts[i].hType,
-                        sts[i].hContainer, sts[i].hContainerSerial,
-                        sts[i].x, sts[i].y, sts[i].z, cls, nm);
-                    r[sizeof(r) - 1] = '\0'; coop::logLine(r);
-                }
+                if (auditRows_) { emittedKeys.insert(k); emitWnpcRow(cs[i], sts[i], cls); }
             }
         }
         if (auditRows_) {
+            // world_parity third pass: a driven body that is locally IN
+            // FURNITURE (bed/cage/chained at the join's fixture) drops out of
+            // the spatial character query, so the two passes above never list
+            // it and the parity oracle scored it "missing" (guard escorting
+            // the arrested PC: 16/25 samples absent while rendering fine).
+            // The drive targets are keyed by hand; emit any that resolve but
+            // were not enumerated. captureNpcByHand's resolve round-trip is
+            // the liveness proof; player-squad members are covered by
+            // emitPcRows below.
+            for (std::map<Key, Driven>::iterator ti = targets_.begin();
+                 ti != targets_.end(); ++ti) {
+                const Key& tk = ti->first;
+                if (emittedKeys.find(tk) != emittedKeys.end()) continue;
+                EntityState ts;
+                if (!engine::captureNpcByHand(gw, tk.i, tk.s, tk.t, tk.c,
+                                              tk.cs, &ts)) continue;
+                Character* tc = engine::resolveCharByHand(tk.i, tk.s, tk.t,
+                                                          tk.c, tk.cs);
+                if (!tc) continue;
+                // Row keyed by the STREAMED hand (what the host dumps): a
+                // combat-detached body's local handle differs, and captureOne
+                // read that local one - overwrite so the oracle can pair it.
+                ts.hIndex = tk.i; ts.hSerial = tk.s; ts.hType = tk.t;
+                ts.hContainer = tk.c; ts.hContainerSerial = tk.cs;
+                emittedKeys.insert(tk);
+                if (counted.insert(tc).second) ++cDrv;
+                emitWnpcRow(tc, ts, "drv");
+            }
+            // ...and the same for every census-vouched hand (a host-side
+            // barracks of SLEEPING guards is contained in beds on the join
+            // too - resolving fine, rendering fine, invisible to the spatial
+            // query, and not driven so the targets_ pass can't list them
+            // either; a re-containered ex-slave answers to a DIFFERENT local
+            // hand, so its enumerated row can't pair with the host's - emit
+            // it under the census hand too). The resolve round-trip IS the
+            // existence answer the parity oracle wants; a hand that fails it
+            // here is genuinely absent from this client.
+            for (std::set<Key>::iterator ci = censusHands_.begin();
+                 ci != censusHands_.end(); ++ci) {
+                if (emittedKeys.find(*ci) != emittedKeys.end()) continue;
+                EntityState ts;
+                if (!engine::captureNpcByHand(gw, ci->i, ci->s, ci->t, ci->c,
+                                              ci->cs, &ts)) continue;
+                Character* tc = engine::resolveCharByHand(ci->i, ci->s, ci->t,
+                                                          ci->c, ci->cs);
+                if (!tc) continue;
+                ts.hIndex = ci->i; ts.hSerial = ci->s; ts.hType = ci->t;
+                ts.hContainer = ci->c; ts.hContainerSerial = ci->cs;
+                emittedKeys.insert(*ci);
+                bool sup = suppressed_.find(*ci) != suppressed_.end();
+                if (counted.insert(tc).second) { if (sup) ++cHid; else ++cCen; }
+                emitWnpcRow(tc, ts, sup ? "hid" : "cen");
+            }
+            // world_parity: PC rows on the join too (the peer-driven copies) -
+            // the host/join cls=pc pairs are what the PC position gate judges.
+            emitPcRows(gw);
             char w[112]; _snprintf(w, sizeof(w) - 1,
                 "SCENARIO WORLD n=%u cls=join drv=%u cen=%u hid=%u ghost=%u fresh=%d",
                 (unsigned)counted.size(), cDrv, cCen, cHid, cGhost,
@@ -504,7 +571,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     lifeSweep(gw, now);
 }
 
-void Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Key& k) {
+float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Key& k) {
     // v38 pack-hidden fix: existence culling exempts census-present NPCs, but
     // both clients then run INDEPENDENT sims of the same body - the join's
     // copy can stand somewhere the host's copy isn't (the "pack hidden" save:
@@ -514,20 +581,47 @@ void Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Key
     // host's spot. 120 u default: ABOVE town-schedule divergence (two sims
     // seating the same bar NPC ~50 u apart - run 185524), so only genuinely
     // divergent wanderers (measured 500-900 u) trip it.
-    if (censusParkDist_ <= 0.0f) return;
+    if (censusParkDist_ <= 0.0f) return -1.0f;
     std::map<Key, CensusPos>::iterator it = censusPos_.find(k);
-    if (it == censusPos_.end()) return;
+    if (it == censusPos_.end()) return -1.0f;
     float d = dist3(st.x, st.y, st.z, it->second.x, it->second.y, it->second.z);
-    if (d <= censusParkDist_) return;
+    if (d <= censusParkDist_) return d;
     // Per-key cooldown (npc_sync regression, run 185524): the engine's own
     // schedule AI can re-place the body the same frame (a seated copy), so an
     // unthrottled park re-teleported every frame and wrecked tracking. One
     // park per key per cooldown bounds the fight; a free wanderer sticks on
     // the first try.
     unsigned long nowP = nowMs();
+    // A FROZEN body (AI suspended for repeat divergence) reparks on a 1 s
+    // cooldown: run 014948 showed a frozen slave still re-pathed to ~600 u
+    // between 5 s parks (an in-flight movement goal survives the suspend),
+    // so the clamp must out-pace the walk. Unfrozen bodies keep the 5 s
+    // cooldown that protects seat-schedule NPCs from park thrash.
+    unsigned long cool = censusFrozen_.count(k) ? 1000 : 5000;
     std::map<Key, unsigned long>::iterator pm = parkMs_.find(k);
-    if (pm != parkMs_.end() && (nowP - pm->second) < 5000) return;
+    if (pm != parkMs_.end() && (nowP - pm->second) < cool) return d;
     parkMs_[k] = nowP;
+    // Anchor break (world_parity 2026-07-17): a census copy chained/caged at
+    // the WRONG fixture (cross-client furniture identity is unreliable) is
+    // position-anchored - every park teleport snapped straight back (Nutto:
+    // parks=543, local pos constant at d=381 all run). Release the local
+    // furniture first, then park. A chained body is NOT re-chained here:
+    // kind-3 re-entry (setChainedMode with the LOCAL slaveOwner) snapped the
+    // body straight back to that owner's spot ~500 u away (run 012555:
+    // Lungrot re-anchored kind=3 at d~450-520 on EVERY 5 s park, forever).
+    // The divergence freeze below keeps the parked body inert instead; the
+    // lock-state stream still owns the shackle item itself.
+    engine::FurnitureRead lfr;
+    bool anchored = engine::readFurniture(c, &lfr) && lfr.valid && lfr.kind != 0;
+    if (anchored) {
+        engine::applyFurniture(0, c, lfr.furn, lfr.kind, false);
+        engine::endAction(c);
+        char nm[48]; engine::charName(c, nm, sizeof(nm));
+        char b[144]; _snprintf(b, sizeof(b) - 1,
+            "[census] park ANCHOR-BREAK hand=%u,%u name='%s' kind=%d d=%.0f",
+            k.i, k.s, nm, lfr.kind, d);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
     if (engine::park(c, it->second.x, it->second.y, it->second.z, st.heading)) {
         ++censusParks_;
         static unsigned long logTick = 0; // main-thread only, ~4 lines/s
@@ -542,6 +636,58 @@ void Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Key
                 it->second.x, it->second.y, it->second.z, censusParks_);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
+    }
+    return d;
+}
+
+// Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI, join only): the position
+// park above teleports a diverged census-band body back to the host's spot, but
+// its LOCAL AI kept re-deciding to flee/fight (a captive/working slave with no
+// supervisor on the join), so it ran off and aggroed the join's guards while the
+// host had it working. Suspend its AI while it is diverging. Divergence-gated so
+// well-tracking census NPCs (bar-seaters ~50 u apart) keep their local AI: only
+// a body that crossed censusParkDist_ is frozen, HELD ~5 s past the last over-
+// threshold tick (so the park zeroing its drift can't oscillate it back into
+// fleeing), then re-checked (released if it settled, re-frozen if it diverges
+// again). Runs AFTER applyTargets' per-tick clearAiSuspend(), so the suspend
+// added here stands for the tick; addAiSuspend is a no-op if the AI-suspend
+// detour is not installed (KENSHICOOP_AI_SUSPEND=0).
+void Replicator::censusFreezeDivergedAi(Character* c, const Key& k, float drift) {
+    if (!c) return;
+    // 20 s hold (was 5 s): a diverged working slave released after only 5 s
+    // below-threshold walked back toward its local job spot / owner and was
+    // over the 120 u park line again before the next 5 s park cooldown fired
+    // (run 012555: Lungrot oscillated 300-500 u every park, all run). The
+    // longer hold keeps a repeat offender inert across several park cycles;
+    // a genuinely settled body still releases and never re-arms.
+    const unsigned long HOLD_MS = 20000;
+    unsigned long now = nowMs();
+    bool over = (drift > censusParkDist_); // censusParkDist_ > 0 implied (drift >= 0)
+    std::map<Key, unsigned long>::iterator it = censusFrozen_.find(k);
+    bool wasFrozen = (it != censusFrozen_.end());
+    if (over) {
+        censusFrozen_[k] = now;                 // (re)arm / refresh the hold
+        if (!wasFrozen) engine::endAction(c);   // drop the in-progress flee/attack once
+    } else if (wasFrozen) {
+        if ((now - it->second) >= HOLD_MS) {    // settled: release, resume local AI
+            censusFrozen_.erase(it);
+            return;
+        }
+    } else {
+        return;                                 // never diverged: leave local AI alone
+    }
+    engine::addAiSuspend(c);                     // quiesce AI decisions this tick
+    // A destination committed BEFORE the suspend keeps the body running (run
+    // 014948: frozen slave re-pathed ~600 u between parks); kill it per tick.
+    engine::haltMovement(c);
+    static unsigned long logTick = 0;           // main-thread only, ~4 lines/s
+    if ((now - logTick) >= 250) {
+        logTick = now;
+        char nm[48]; engine::charName(c, nm, sizeof(nm));
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[census] FREEZE hand=%u,%u name='%s' d=%.0f (frozen=%u)",
+            k.i, k.s, nm, drift, (unsigned)censusFrozen_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
 

@@ -411,6 +411,22 @@ bool park(Character* c, float x, float y, float z, float heading) {
     }
 }
 
+// Census-freeze support: stop an in-flight movement goal WITHOUT teleporting.
+// The AI-suspend hook only blocks new periodic decisions - a destination the
+// slave AI committed before the freeze keeps the body running (run 014948: a
+// FROZEN slave re-pathed ~600 u between parks). Called per tick while frozen.
+bool haltMovement(Character* c) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        mv->halt();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool applyMotion(Character* c, bool moving, float speed, float mx, float my, float mz) {
     if (!c) return false;
     __try {
@@ -516,15 +532,75 @@ Faction* findNearbyNonPlayerFaction(GameWorld* gw) {
     return 0;
 }
 
+// Camera-anchored interest (spike 35): read the LOCAL camera's world center.
+// gw->player->camera is the live per-client CameraClass; getCenter() returns
+// Ogre::Vector3 by value (hidden-return-pointer ABI, resolved by RVA in
+// engine::resolve). isInitialised() rejects the pre-load camera. Purely local
+// - never touches the wire here (the join's hint crosses via PKT_CAM_HINT).
+// Throttled [cam] debug line (~5s) so manual logs show the anchor moving.
+bool cameraCenter(GameWorld* gw, float out[3]) {
+    if (!gw || !out || !g_camGetCenterFn || !g_camIsInitFn) return false;
+    static unsigned long lastLog = 0;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    __try {
+        PlayerInterface* pl = gw->player;
+        if (!pl) return false;
+        CameraClass* cam = pl->camera;
+        if (!cam || !g_camIsInitFn(cam)) return false;
+        Ogre::Vector3 c;
+        g_camGetCenterFn(cam, &c);
+        x = c.x; y = c.y; z = c.z;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    out[0] = x; out[1] = y; out[2] = z;
+    unsigned long now = GetTickCount();
+    if (now - lastLog >= 5000) {
+        lastLog = now;
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[cam] center=%.1f,%.1f,%.1f", x, y, z);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+    return true;
+}
+
+// Camera anchor stores (protocol 43, camera-anchored interest). Main-thread
+// only: the sync layer publishes these each tick (syncCamHint), and
+// interestCenters reads them in the same tick.
+static bool  s_camInterest    = true;  // KENSHICOOP_CAM_INTEREST master enable
+static bool  s_localCamValid  = false;
+static float s_localCam[3]    = { 0.0f, 0.0f, 0.0f };
+static bool  s_peerCamValid   = false;
+static float s_peerCam[3]     = { 0.0f, 0.0f, 0.0f };
+
+void setCamInterest(bool on) { s_camInterest = on; }
+
+void setLocalCamAnchor(bool valid, float x, float y, float z) {
+    s_localCamValid = valid;
+    if (valid) { s_localCam[0] = x; s_localCam[1] = y; s_localCam[2] = z; }
+}
+
+void setPeerCamHint(bool valid, float x, float y, float z) {
+    s_peerCamValid = valid;
+    if (valid) { s_peerCam[0] = x; s_peerCam[1] = y; s_peerCam[2] = z; }
+}
+
 // DUAL-INTEREST centers (step 5): one interest sphere per squad TAB leader, up
 // to two. Both clients load the same save, so the shared playerCharacters list
 // (and its tab/container partition) is identical on each machine - the first
 // member of each distinct hand-container IS the other player's leader as seen
 // locally. A single host-leader-centered sphere meant the shared world degraded
 // the moment the players split up (spike 16); with one sphere per tab leader,
-// NPCs around EACH player stay streamed (spike 19's validated design). Writes up
-// to two centers; returns the count. Caller holds the SEH frame.
-unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[2]) {
+// NPCs around EACH player stay streamed (spike 19's validated design).
+//
+// Protocol 43 grows the set to up to FOUR anchors: the two tab-leader spheres
+// plus the LOCAL camera center and the peer's fresh CAMERA HINT - so NPCs
+// where a player is LOOKING (but no PC is standing) stay streamed/listed.
+// Camera anchors within ~100u of an existing anchor are dropped (the common
+// camera-follows-leader case adds no reach, only query cost). Writes up to
+// four centers; returns the count. Caller holds the SEH frame.
+unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]) {
     PlayerInterface* pl = gw->player;
     if (!pl || pl->playerCharacters.size() == 0) return 0;
     unsigned int pairs[2][2];
@@ -542,6 +618,45 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[2]) {
         pairs[nc][0] = h[1]; pairs[nc][1] = h[2];
         outC[nc] = m->getPosition();
         ++nc;
+    }
+    if (nc == 0 || !s_camInterest) return nc;
+    // Fold in the camera anchors (local first, then the peer hint), deduped
+    // against everything already in the set. nc==0 stays 0: no players in
+    // gameplay means no streaming at all (the camera alone must not stream).
+    const float DEDUPE_DIST_SQ = 100.0f * 100.0f;
+    const float* cams[2] = { s_localCamValid ? s_localCam : 0,
+                             s_peerCamValid  ? s_peerCam  : 0 };
+    for (unsigned int ci = 0; ci < 2 && nc < 4; ++ci) {
+        if (!cams[ci]) continue;
+        bool dup = false;
+        for (unsigned int k = 0; k < nc && !dup; ++k) {
+            float dx = outC[k].x - cams[ci][0];
+            float dy = outC[k].y - cams[ci][1];
+            float dz = outC[k].z - cams[ci][2];
+            dup = (dx * dx + dy * dy + dz * dz) <= DEDUPE_DIST_SQ;
+        }
+        if (dup) continue;
+        outC[nc] = Ogre::Vector3(cams[ci][0], cams[ci][1], cams[ci][2]);
+        ++nc;
+    }
+    return nc;
+}
+
+// SEH wrapper over interestCenters for callers outside the engine layer
+// (interestCenters itself relies on the caller's SEH frame).
+unsigned int interestAnchors(GameWorld* gw, float out[12]) {
+    if (!gw || !out) return 0;
+    unsigned int nc = 0;
+    __try {
+        Ogre::Vector3 centers[4];
+        nc = interestCenters(gw, centers);
+        for (unsigned int i = 0; i < nc; ++i) {
+            out[i * 3 + 0] = centers[i].x;
+            out[i * 3 + 1] = centers[i].y;
+            out[i * 3 + 2] = centers[i].z;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
     }
     return nc;
 }
@@ -566,7 +681,7 @@ unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {
     __try {
         // Interest: one sphere per squad-tab leader (dual-interest, step 5). The
         // query radii approximate a town-block footprint (~200u far) per sphere.
-        Ogre::Vector3 centers[2];
+        Ogre::Vector3 centers[4];
         unsigned int nc = interestCenters(gw, centers);
         if (nc == 0) { prevN = 0; return 0; }
 
@@ -689,7 +804,7 @@ unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outState
     __try {
         // Same dual-interest spheres as captureNpcs, so the join's suppression
         // view matches what the host is willing to stream.
-        Ogre::Vector3 centers[2];
+        Ogre::Vector3 centers[4];
         unsigned int nc = interestCenters(gw, centers);
         if (nc == 0) return 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {
@@ -723,7 +838,7 @@ unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
         // Same dual-interest centers as the stream bubble, but the query
         // reaches the census radius (uniform in all axes, like the proven
         // findNearbyNonPlayerFaction whole-block scan) with wide limits.
-        Ogre::Vector3 centers[2];
+        Ogre::Vector3 centers[4];
         unsigned int nc = interestCenters(gw, centers);
         if (nc == 0) return 0;
         for (unsigned int ci = 0; ci < nc; ++ci) {

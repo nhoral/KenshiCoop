@@ -292,6 +292,22 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 continue;
             }
+        } else if (mintDist >= 0.0f && !engine::isZoneLoadedAt(gw, p.x, p.y, p.z)) {
+            // Phase 2 crash hardening (near-mint zone guard): a NEAR mint normally
+            // lands in a loaded block (a body this close would have baked-resolved),
+            // but during approach/zone churn the destination block can be mid-load
+            // or not yet streamed - creating a body there is the mint-into-unloaded-
+            // zone crash vector. Defer (re-judge on the far cadence) until the block
+            // is fully loaded. The far branch already requires isZoneLoadedAt; this
+            // extends the same proof to near mints. Near-the-player zones are loaded
+            // in normal play, so this rarely fires; spawn_sync is the regression gate.
+            rq.farMs = now;
+            rq.sends = 0;
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[spawn] INFO deferred (near-unloaded) hand=%u,%u,%u,%u,%u dist=%.0f",
+                k.t, k.c, k.cs, k.i, k.s, mintDist);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
         }
         // Per-tick mint budget: a raid arriving all at once answers a burst
         // of REQs with a burst of INFOs - creating many bodies in one engine
@@ -366,6 +382,27 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 k.t, k.c, k.cs, k.i, k.s, p.charSid);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
+        }
+        // Phase 2 crash hardening (post-mint liveness): prove the just-minted
+        // body is live and engine-registered by round-tripping its OWN hand
+        // BEFORE we bind it into proxyByKey_ and start driving it. A create that
+        // returns a pointer the engine cannot resolve back is a body we would
+        // drive into a UAF. On failure, destroy it and treat as a failed mint.
+        // Mirrors the ~1 Hz syncSpawns sweep, closing the gap at mint time.
+        {
+            unsigned int ph[5];
+            Character* back = 0;
+            if (engine::readHand(proxy, ph))
+                back = engine::resolveCharByHand(ph[0], ph[1], ph[2], ph[3], ph[4]);
+            if (back != proxy) {
+                engine::despawnProxyNpc(gw, proxy);
+                rq.deniedMs = now;
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[spawn] proxy FAILED hand=%u,%u,%u,%u,%u sid='%s' (post-mint liveness)",
+                    k.t, k.c, k.cs, k.i, k.s, p.charSid);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                continue;
+            }
         }
         proxyByKey_[k] = proxy;
         ++mintedThisTick;
@@ -789,8 +826,12 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // rebind the real body below.
         Character* mint = ex->second;
         proxyByKey_.erase(ex);
-        culled = engine::removeWorldItemProxy(
-                     gw, reinterpret_cast<RootObject*>(mint)) ? 1 : 0;
+        // Phase 2 crash hardening: this is an NPC proxy body, not a ground-item
+        // proxy - destroy it with the NPC-correct SEH-guarded despawnProxyNpc
+        // (removeWorldItemProxy is for world Item* proxies and mis-handles a
+        // Character body; the same rekey path already uses despawnProxyNpc for
+        // its control-flip phantom cull below).
+        culled = engine::despawnProxyNpc(gw, mint) ? 1 : 0;
         repaired = 1;
     }
     if (c) {

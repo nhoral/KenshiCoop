@@ -317,6 +317,265 @@ function Test-BedPose {
                             pelvisPairs = $pelvisPairs; pelvisOk = $pelvisOk } -Detail $detail)
 }
 
+# bed_wake (conscious bed EXIT / wake-and-move). bed_pose only proved ENTER +
+# HOLD; this proves the transition OUT. Anchors on the host's "SCENARIO BEDWAKE
+# ORDER/MOVE" markers (the ORDER carries the subject hand) and gates:
+#   1. host entered:  host MEMBER pre-move series holds BODY_IN_BED for >= MinBed
+#      samples (the sleeper actually got into the bed and streamed it),
+#   2. host moved:    after the MOVE marker the host MEMBER series travels >
+#      MoveDist from the bed position (the host really left + walked),
+#   3. join left bed: the join RECV tail (post-move + settle) is OUT of bed for
+#      >= LeaveRatio of samples - the fix's whole point (no stuck sleeping); a
+#      "[furn] BED FAST-EXIT" on the join is reported as corroboration,
+#   4. join followed: median time-aligned host<->join gap over those out-of-bed
+#      join tail samples <= PosTol (the copy tracked the host, not frozen).
+# BODY_IN_BED is 1<<5 = 32 (netproto/Wire.h).
+function Test-BedWake {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$PosTol = 6.0, [double]$MoveDist = 8.0,
+          [int]$MinBed = 6, [int]$MinTail = 4, [double]$LeaveRatio = 0.7,
+          [int]$SettleMs = 4000, [int]$MaxDt = 800)
+    $BED = 32
+    $mo = Select-String -Path $HostFile -Pattern "SCENARIO BEDWAKE ORDER issued hand=(\d+),(\d+) task=(\d+) ok=1" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mo) {
+        Write-Host "  BED-WAKE FAIL - host never issued the bed order (ok=1 marker missing)"
+        return (Add-GateResult -Name "bed_wake" -Status FAIL -Detail "no BEDWAKE ORDER ok=1 marker")
+    }
+    $mm = Select-String -Path $HostFile -Pattern "SCENARIO BEDWAKE MOVE issued" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mm) {
+        Write-Host "  BED-WAKE FAIL - host never issued the wake-move marker"
+        return (Add-GateResult -Name "bed_wake" -Status FAIL -Detail "no BEDWAKE MOVE marker")
+    }
+    $g = $mo.Matches[0].Groups
+    $keyPrefix = "$($g[1].Value),$($g[2].Value),"
+    $tMove = Get-MarkerTimeMs -File $HostFile -Pattern "SCENARIO BEDWAKE MOVE issued"
+
+    $H = Get-ScenarioSeries -File $HostFile -Kind "MEMBER"
+    $J = Get-ScenarioSeries -File $JoinFile -Kind "RECV"
+    $hKey = $H.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
+    $jKey = $J.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
+    if ($null -eq $hKey -or $null -eq $jKey) {
+        Write-Host "  BED-WAKE FAIL - subject series missing (host=$([bool]$hKey) join=$([bool]$jKey))"
+        return (Add-GateResult -Name "bed_wake" -Status FAIL -Detail "subject series missing")
+    }
+
+    # Gate 1 - host entered the bed (pre-move BODY_IN_BED samples).
+    $hPre    = @($H[$hKey] | Where-Object { $_.t -lt $tMove })
+    $hPreBed = @($hPre | Where-Object { ($_.bs -band $BED) -ne 0 })
+    $hostEntered = ($hPreBed.Count -ge $MinBed)
+
+    # Bed position (median of the host in-bed samples) to measure the walk away.
+    $bedPos = $null
+    if ($hPreBed.Count -gt 0) {
+        $xs = @($hPreBed | ForEach-Object { $_.p[0] } | Sort-Object)
+        $ys = @($hPreBed | ForEach-Object { $_.p[1] } | Sort-Object)
+        $zs = @($hPreBed | ForEach-Object { $_.p[2] } | Sort-Object)
+        $mi = [int][Math]::Floor($xs.Count / 2)
+        $bedPos = @($xs[$mi], $ys[$mi], $zs[$mi])
+    }
+
+    # Gate 2 - host walked clear of the bed after the move.
+    $hPost = @($H[$hKey] | Where-Object { $_.t -ge $tMove })
+    $hostMaxAway = -1.0
+    if ($null -ne $bedPos) {
+        foreach ($hs in $hPost) {
+            $dx = $hs.p[0]-$bedPos[0]; $dy = $hs.p[1]-$bedPos[1]; $dz = $hs.p[2]-$bedPos[2]
+            $dd = [Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz)
+            if ($dd -gt $hostMaxAway) { $hostMaxAway = $dd }
+        }
+    }
+    $hostMoved = ($hostMaxAway -gt $MoveDist)
+
+    # Gate 3 - the join copy LEFT the bed on the settled tail.
+    $jTail  = @($J[$jKey] | Where-Object { $_.t -ge ($tMove + $SettleMs) })
+    $jOut   = @($jTail | Where-Object { ($_.bs -band $BED) -eq 0 })
+    $leaveRatioVal = if ($jTail.Count -gt 0) { [Math]::Round($jOut.Count / $jTail.Count, 3) } else { 0.0 }
+    $joinLeft = ($jTail.Count -ge $MinTail -and $leaveRatioVal -ge $LeaveRatio)
+    $fastExit = @(Select-String -Path $JoinFile -Pattern "\[furn\] BED FAST-EXIT" -ErrorAction SilentlyContinue).Count
+
+    # Gate 4 - the join followed the host after waking (co-located over the tail
+    # out-of-bed samples, time-aligned to the host MEMBER series).
+    $gaps = New-Object System.Collections.ArrayList
+    foreach ($js in $jOut) {
+        $best = [double]::MaxValue; $bh = $null
+        foreach ($hs in $hPost) {
+            $dt = [Math]::Abs($hs.t - $js.t)
+            if ($dt -lt $best) { $best = $dt; $bh = $hs }
+        }
+        if ($best -le $MaxDt -and $null -ne $bh) {
+            $dx = $js.p[0]-$bh.p[0]; $dy = $js.p[1]-$bh.p[1]; $dz = $js.p[2]-$bh.p[2]
+            [void]$gaps.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+        }
+    }
+    $medGap = -1.0
+    if ($gaps.Count -gt 0) {
+        $sorted = @($gaps | Sort-Object)
+        $medGap = [Math]::Round($sorted[[int][Math]::Floor($sorted.Count / 2)], 2)
+    }
+    $joinFollowed = ($gaps.Count -gt 0 -and $medGap -le $PosTol)
+
+    $ok = ($hostEntered -and $hostMoved -and $joinLeft -and $joinFollowed)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $why = @()
+    if (-not $hostEntered) { $why += "host in-bed samples $($hPreBed.Count) < $MinBed (never slept)" }
+    if (-not $hostMoved)   { $why += "host max-away $([Math]::Round($hostMaxAway,2)) <= $MoveDist (never walked off the bed)" }
+    if (-not $joinLeft)    { $why += "join out-of-bed ratio $leaveRatioVal < $LeaveRatio over $($jTail.Count) tail samples (STUCK SLEEPING)" }
+    if (-not $joinFollowed){ $why += "join follow medGap $medGap > $PosTol (or no aligned pairs)" }
+    $detail = $why -join "; "
+    Write-Host "  BED-WAKE $v - hostBed=$($hPreBed.Count) hostAway=$([Math]::Round($hostMaxAway,2)) joinLeaveRatio=$leaveRatioVal($($jOut.Count)/$($jTail.Count)) fastExit=$fastExit medGap=$medGap $detail"
+    return (Add-GateResult -Name "bed_wake" -Status $v `
+                -Metrics @{ hostBed = $hPreBed.Count; hostAway = [Math]::Round($hostMaxAway,2);
+                            joinLeaveRatio = $leaveRatioVal; joinTail = $jTail.Count;
+                            fastExit = $fastExit; medGap = $medGap } -Detail $detail)
+}
+
+# bed_lay (UNCONSCIOUS place-in-bed LAYING POSE + wake-and-exit). bed_pose proved
+# a conscious SLEEP ORDER lays down; bed_put proved unconscious OCCUPANCY crosses.
+# This proves the "carry a KO'd squadmate to a bed" case renders the LAYING pose on
+# BOTH clients AND that the body can get back OUT when it wakes. (A CONSCIOUS
+# placement was ruled out first: Kenshi itself nondeterministically stands a
+# conscious placed body on the mattress and the join mirrors that faithfully, so
+# it is base-game behavior, not a coop bug - run 2026-07-17.) Two windows over
+# opposite ownership:
+#   A: host owns M2 (MEMBER host log; join drives -> RECV join log)
+#   B: join owns L1 (MEMBER join log; host drives -> RECV host log)
+# Each window drives KO -> drop in bed -> revive -> take out + move. Per window:
+#   LAY   1. owner IN_BED >= MinBed samples in [put,wake) with a LOW (laying) pelvis,
+#         2. peer  IN_BED >= MinBed samples in [put,wake) with a LOW pelvis (mirrored),
+#         3. co-located while laying (median gap <= PosTol),
+#   EXIT  4. owner OUT of bed for >= LeaveRatio of the settled post-wake tail,
+#         5. peer  OUT of bed for >= LeaveRatio of that tail (it can get up + leave),
+#         6. co-located over the peer's out-of-bed tail (follows the host).
+# "Laying" = in-bed median pelvis dropped >= LayDrop below the pre-KO STANDING
+# baseline (or under the absolute LayMax). BODY_IN_BED = 1<<5 = 32; BODY_DOWN|
+# RAGDOLL|DEAD = 7 (netproto/Wire.h). Absolute pelvis medians are always printed.
+function Test-BedLay {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinBed = 5, [double]$LayDrop = 3.0, [double]$LayMax = 6.0,
+          [double]$PosTol = 5.0, [double]$LeaveRatio = 0.6, [int]$MinExit = 4,
+          [int]$SettleMs = 4000, [int]$MaxDt = 800)
+    $BED = 32
+
+    function _Med($arr) {
+        $a = @($arr | Sort-Object)
+        if ($a.Count -eq 0) { return -1.0 }
+        return [Math]::Round([double]$a[[int][Math]::Floor($a.Count / 2)], 2)
+    }
+    # Median time-aligned distance between a peer sample set and the owner series.
+    function _GapMed($peerSamples, $ownerSamples, $maxDt) {
+        $gaps = New-Object System.Collections.ArrayList
+        foreach ($ps in $peerSamples) {
+            $best = [double]::MaxValue; $bo = $null
+            foreach ($os in $ownerSamples) {
+                $dt = [Math]::Abs($os.t - $ps.t)
+                if ($dt -lt $best) { $best = $dt; $bo = $os }
+            }
+            if ($best -le $maxDt -and $null -ne $bo) {
+                $dx = $ps.p[0]-$bo.p[0]; $dy = $ps.p[1]-$bo.p[1]; $dz = $ps.p[2]-$bo.p[2]
+                [void]$gaps.Add([Math]::Sqrt($dx*$dx + $dy*$dy + $dz*$dz))
+            }
+        }
+        return @{ med = (_Med $gaps); n = $gaps.Count }
+    }
+
+    # Evaluate one KO-place-revive window. $ownerFile carries the OWNER's MEMBER
+    # series + the PUT/wake markers; $peerFile carries the driven RECV copy.
+    function _Win([string]$tag, [string]$ownerFile, [string]$peerFile) {
+        $m = Select-String -Path $ownerFile -Pattern "SCENARIO BEDLAY PUT $tag hand=(\d+),(\d+) kind=1 ok=1" -EA SilentlyContinue | Select-Object -First 1
+        if ($null -eq $m) { return @{ ok = $false; why = "win ${tag}: no PUT ok=1 marker"; hasData = $false } }
+        $g = $m.Matches[0].Groups
+        $keyPrefix = "$($g[1].Value),$($g[2].Value),"
+        $tPut  = Get-MarkerTimeMs -File $ownerFile -Pattern "SCENARIO BEDLAY PUT $tag hand="
+        $tWake = Get-MarkerTimeMs -File $ownerFile -Pattern "SCENARIO BEDLAY $tag wake hand="
+        if ($tWake -le 0) { return @{ ok = $false; why = "win ${tag}: no wake marker"; hasData = $false } }
+
+        $O = Get-ScenarioSeries -File $ownerFile -Kind "MEMBER"
+        $P = Get-ScenarioSeries -File $peerFile  -Kind "RECV"
+        $oKey = $O.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
+        $pKey = $P.Keys | Where-Object { $_.StartsWith($keyPrefix) } | Select-Object -First 1
+        if ($null -eq $oKey -or $null -eq $pKey) {
+            return @{ ok = $false; why = "win ${tag}: subject series missing (owner=$([bool]$oKey) peer=$([bool]$pKey))"; hasData = $false }
+        }
+        $oAll = $O[$oKey]; $pAll = $P[$pKey]
+        $DOWN = 3   # BODY_DOWN | BODY_RAGDOLL (an unconscious body is collapsed)
+
+        # Pre-KO STANDING baseline (owner, upright, not down, not in bed).
+        $stand = @($oAll | Where-Object { $_.t -lt $tPut -and ($_.bs -band $BED) -eq 0 -and ($_.bs -band 7) -eq 0 -and $_.pelvis -gt 0.5 } | ForEach-Object { $_.pelvis })
+        $standMed = _Med $stand
+
+        # ---- LAY phase [tPut, tWake) ----
+        # An UNCONSCIOUS body cannot stand: "laying in the bed" == IN_BED AND
+        # collapsed (DOWN/RAGDOLL). That body-state pair is the reliable signal on
+        # BOTH clients; the pelvis is only corroboration and is UNREADABLE on a
+        # ragdoll (readPoseState returns a -99 sentinel), so it is never required on
+        # the owner. Where the driven copy DOES report a valid pelvis it must be LOW
+        # (the visual pose the player sees is laying, not standing on the mattress).
+        $oLay = @($oAll | Where-Object { $_.t -ge $tPut -and $_.t -lt $tWake -and ($_.bs -band $BED) -ne 0 -and ($_.bs -band $DOWN) -ne 0 })
+        $pLay = @($pAll | Where-Object { $_.t -ge $tPut -and $_.t -lt $tWake -and ($_.bs -band $BED) -ne 0 -and ($_.bs -band $DOWN) -ne 0 })
+        $oLayPel = _Med @($oLay | Where-Object { $_.pelvis -gt 0 } | ForEach-Object { $_.pelvis })
+        $pLayPel = _Med @($pLay | Where-Object { $_.pelvis -gt 0 } | ForEach-Object { $_.pelvis })
+        $layGap = _GapMed $pLay @($oAll | Where-Object { $_.t -ge $tPut -and $_.t -lt $tWake }) $MaxDt
+
+        $LayOf = {
+            param($pel)
+            if ($pel -lt 0) { return $true }   # unreadable (ragdoll -99) -> DOWN bit carries it
+            if ($standMed -gt 0 -and $pel -le ($standMed - $LayDrop)) { return $true }
+            return ($pel -le $LayMax)
+        }
+        $ownerOcc  = ($oLay.Count -ge $MinBed)
+        $peerOcc   = ($pLay.Count -ge $MinBed)
+        $ownerLay  = (& $LayOf $oLayPel)
+        $peerLay   = (& $LayOf $pLayPel)
+        $layColoc  = ($layGap.n -gt 0 -and $layGap.med -le $PosTol)
+
+        # ---- EXIT phase [tWake + settle, end] ----
+        $oTail = @($oAll | Where-Object { $_.t -ge ($tWake + $SettleMs) })
+        $pTail = @($pAll | Where-Object { $_.t -ge ($tWake + $SettleMs) })
+        $oOut  = @($oTail | Where-Object { ($_.bs -band $BED) -eq 0 })
+        $pOut  = @($pTail | Where-Object { ($_.bs -band $BED) -eq 0 })
+        $oOutRatio = if ($oTail.Count -gt 0) { [Math]::Round($oOut.Count / $oTail.Count, 3) } else { 0.0 }
+        $pOutRatio = if ($pTail.Count -gt 0) { [Math]::Round($pOut.Count / $pTail.Count, 3) } else { 0.0 }
+        $exitGap = _GapMed $pOut @($oAll | Where-Object { $_.t -ge $tWake }) $MaxDt
+        $ownerExit = ($oTail.Count -ge $MinExit -and $oOutRatio -ge $LeaveRatio)
+        $peerExit  = ($pTail.Count -ge $MinExit -and $pOutRatio -ge $LeaveRatio)
+        $exitColoc = ($exitGap.n -gt 0 -and $exitGap.med -le $PosTol)
+
+        $why = @()
+        if (-not $ownerOcc) { $why += "win $tag owner collapsed-in-bed samples $($oLay.Count) < $MinBed (KO body never lay in bed)" }
+        if (-not $peerOcc)  { $why += "win $tag peer collapsed-in-bed samples $($pLay.Count) < $MinBed (NOT LAYING on driven copy - standing/not-in-bed)" }
+        if (-not $ownerLay) { $why += "win $tag owner lay-pelvis $oLayPel not low (stand=$standMed need<=stand-$LayDrop or <=$LayMax)" }
+        if (-not $peerLay)  { $why += "win $tag peer lay-pelvis $pLayPel NOT LOW (standing on bed? stand=$standMed need<=stand-$LayDrop or <=$LayMax)" }
+        if (-not $layColoc) { $why += "win $tag lay medGap $($layGap.med) > $PosTol (or no pairs)" }
+        if (-not $ownerExit){ $why += "win $tag owner stayed in bed (outRatio $oOutRatio < $LeaveRatio over $($oTail.Count))" }
+        if (-not $peerExit) { $why += "win $tag peer STUCK IN BED (outRatio $pOutRatio < $LeaveRatio over $($pTail.Count))" }
+        if (-not $exitColoc){ $why += "win $tag exit medGap $($exitGap.med) > $PosTol (or no pairs)" }
+
+        return @{
+            ok = ($ownerOcc -and $peerOcc -and $ownerLay -and $peerLay -and $layColoc -and `
+                  $ownerExit -and $peerExit -and $exitColoc)
+            why = ($why -join "; "); hasData = $true
+            standMed = $standMed; oLayPel = $oLayPel; pLayPel = $pLayPel
+            oLay = $oLay.Count; pLay = $pLay.Count; layGap = $layGap.med
+            oOutRatio = $oOutRatio; pOutRatio = $pOutRatio; exitGap = $exitGap.med
+        }
+    }
+
+    $A = _Win "A" $HostFile $JoinFile   # host owns M2, join drives
+    $B = _Win "B" $JoinFile $HostFile   # join owns L1, host drives
+
+    $ok = $A.ok -and $B.ok
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $detail = @($A.why, $B.why | Where-Object { $_ }) -join "; "
+    $sa = if ($A.hasData) { "A[lay owner=$($A.oLayPel) peer=$($A.pLayPel) stand=$($A.standMed) occ=$($A.oLay)/$($A.pLay) gap=$($A.layGap) | exit out=$($A.oOutRatio)/$($A.pOutRatio) gap=$($A.exitGap)]" } else { "A[$($A.why)]" }
+    $sb = if ($B.hasData) { "B[lay owner=$($B.oLayPel) peer=$($B.pLayPel) stand=$($B.standMed) occ=$($B.oLay)/$($B.pLay) gap=$($B.layGap) | exit out=$($B.oOutRatio)/$($B.pOutRatio) gap=$($B.exitGap)]" } else { "B[$($B.why)]" }
+    Write-Host "  BED-LAY $v - $sa $sb"
+    if (-not $ok -and $detail) { Write-Host "    -> $detail" }
+    return (Add-GateResult -Name "bed_lay" -Status $v `
+                -Metrics @{ aPeerLayPel = $A.pLayPel; aPeerOut = $A.pOutRatio;
+                            bPeerLayPel = $B.pLayPel; bPeerOut = $B.pOutRatio } `
+                -Detail $detail)
+}
+
 # Stage 2 body-state oracle: every host-DOWN sample must be down on the join's
 # time-aligned sample too. Inconclusive (no host-down samples) -> SKIP.
 function Test-NpcBodyState {
@@ -867,6 +1126,136 @@ function Test-SneakProbe {
                 -Metrics @{ modeOn = $modeOn; withSeers = $withSeers; maxMap = $maxMap } -Detail $detail)
 }
 
+# Parse "SCENARIO SHACKLE hand=i,s t=ms chained=.. shackleItem=.. lock=.. owner=i,s"
+# lines into per-hand series. Returns hashtable hand -> list of
+# @{T; Chained; ShackleItem; Lock; Owner}. Used by Test-ShackleProbe (Phase 6 6a).
+function Get-ShackleSeries {
+    param([string]$File)
+    $series = @{}
+    $rx = 'SCENARIO SHACKLE hand=(\d+),(\d+) t=(\d+) chained=(\d) shackleItem=(\d) lock=(\d) owner=(\d+),(\d+)'
+    foreach ($l in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $l.Matches[0].Groups
+        $hand = "$($g[1].Value),$($g[2].Value)"
+        if (-not $series.ContainsKey($hand)) { $series[$hand] = New-Object System.Collections.ArrayList }
+        [void]$series[$hand].Add([pscustomobject]@{
+            T = [long]$g[3].Value; Chained = [int]$g[4].Value
+            ShackleItem = [int]$g[5].Value; Lock = [int]$g[6].Value
+            Owner = "$($g[7].Value),$($g[8].Value)" })
+    }
+    return $series
+}
+
+# Test-ShackleProbe (Phase 6 6a evidence spike, log-only, BOTH clients): confirm
+# each client found the shackled prisoner(s) on the camp save, then compare the
+# owner's and peer's steady chained/lock view per hand to surface the reported
+# "peer PC unlocks the shackles" desync. This is a CHARACTERIZATION gate: it
+# PASSes when both clients produced a usable series with >= 1 shackled sighting;
+# the parity metrics (divergentHands) are the deliverable that informs the
+# 6b GO/NO-GO. It does not FAIL on divergence - divergence IS the evidence.
+function Test-ShackleProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $hs = Get-ShackleSeries -File $HostFile
+    $js = Get-ShackleSeries -File $JoinFile
+    $hostHands = @($hs.Keys)
+    $joinHands = @($js.Keys)
+    $m = @{
+        hostHands   = $hostHands.Count
+        joinHands   = $joinHands.Count
+        hostSamples = (@($hs.Values | ForEach-Object { $_.Count }) | Measure-Object -Sum).Sum
+        joinSamples = (@($js.Values | ForEach-Object { $_.Count }) | Measure-Object -Sum).Sum
+    }
+    $bad = @()
+    if ($hostHands.Count -lt 1) { $bad += "host saw no shackled body (SCENARIO SHACKLE never emitted)" }
+    if ($joinHands.Count -lt 1) { $bad += "join saw no shackled body (SCENARIO SHACKLE never emitted)" }
+
+    # Cross-client parity on shared hands: compare the last steady chained/lock
+    # state. A mismatch is the peer-unlock fingerprint (owner still locked,
+    # peer's driven copy cleared - or vice versa).
+    $shared = @($hostHands | Where-Object { $js.ContainsKey($_) })
+    $m.sharedHands = $shared.Count
+    $divergeHands = @()
+    foreach ($h in $shared) {
+        $hLast = $hs[$h] | Select-Object -Last 1
+        $jLast = $js[$h] | Select-Object -Last 1
+        if ($hLast.Chained -ne $jLast.Chained -or $hLast.Lock -ne $jLast.Lock) {
+            $divergeHands += ("{0} host(ch={1},lk={2}) join(ch={3},lk={4})" -f `
+                $h, $hLast.Chained, $hLast.Lock, $jLast.Chained, $jLast.Lock)
+        }
+    }
+    $m.divergentHands = $divergeHands.Count
+
+    $ok = ($hostHands.Count -ge 1 -and $joinHands.Count -ge 1)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $detail = if ($bad.Count -gt 0) { $bad -join "; " } else { "" }
+    if ($divergeHands.Count -gt 0) {
+        Write-Host ("  SHACKLE-PROBE divergence (characterization): " + ($divergeHands -join " | "))
+        if ($detail) { $detail += "; " }
+        $detail += "divergentHands=$($divergeHands.Count)"
+    }
+    Write-Host ("  SHACKLE-PROBE $v - hostHands=$($hostHands.Count) joinHands=$($joinHands.Count) " +
+                "shared=$($shared.Count) divergent=$($divergeHands.Count) " +
+                "hostSamples=$($m.hostSamples) joinSamples=$($m.joinSamples)")
+    return (Add-GateResult -Name "shackle_probe" -Status $v -Metrics $m -Detail $detail)
+}
+
+# Test-ShackleSync (Phase 6 6b validation, BOTH clients): the STRICT counterpart
+# to Test-ShackleProbe. With the protocol-42 locked bit + the non-owner unlock
+# guard shipping, a shared prisoner whose owner reports chained/locked while the
+# peer's driven copy reports it CLEARED (the "other client's PC unlocked the
+# shackle" desync) is now a FAIL. Requires both clients to have observed >= 1
+# shackled body; then FAILs on any shared-hand steady-state chained/lock
+# divergence. The sharedHands=0 case (the camp hand-identity caveat noted in 6a,
+# where prisoners enumerate under different local hands on each client) cannot be
+# asserted here and PASSes with a note - the manual gate is authoritative there.
+function Test-ShackleSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $hs = Get-ShackleSeries -File $HostFile
+    $js = Get-ShackleSeries -File $JoinFile
+    $hostHands = @($hs.Keys)
+    $joinHands = @($js.Keys)
+    $m = @{
+        hostHands   = $hostHands.Count
+        joinHands   = $joinHands.Count
+        hostSamples = (@($hs.Values | ForEach-Object { $_.Count }) | Measure-Object -Sum).Sum
+        joinSamples = (@($js.Values | ForEach-Object { $_.Count }) | Measure-Object -Sum).Sum
+    }
+    $bad = @()
+    if ($hostHands.Count -lt 1) { $bad += "host saw no shackled body (SCENARIO SHACKLE never emitted)" }
+    if ($joinHands.Count -lt 1) { $bad += "join saw no shackled body (SCENARIO SHACKLE never emitted)" }
+
+    # Steady-state parity on shared hands: last (chained,lock) must agree. A
+    # mismatch is the peer-unlock fingerprint the 6b guard is meant to prevent.
+    $shared = @($hostHands | Where-Object { $js.ContainsKey($_) })
+    $m.sharedHands = $shared.Count
+    $divergeHands = @()
+    foreach ($h in $shared) {
+        $hLast = $hs[$h] | Select-Object -Last 1
+        $jLast = $js[$h] | Select-Object -Last 1
+        if ($hLast.Chained -ne $jLast.Chained -or $hLast.Lock -ne $jLast.Lock) {
+            $divergeHands += ("{0} host(ch={1},lk={2}) join(ch={3},lk={4})" -f `
+                $h, $hLast.Chained, $hLast.Lock, $jLast.Chained, $jLast.Lock)
+        }
+    }
+    $m.divergentHands = $divergeHands.Count
+
+    # STRICT: observed on both clients AND no shared-hand divergence.
+    $observed = ($hostHands.Count -ge 1 -and $joinHands.Count -ge 1)
+    $ok = ($observed -and $divergeHands.Count -eq 0)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $detail = if ($bad.Count -gt 0) { $bad -join "; " } else { "" }
+    if ($divergeHands.Count -gt 0) {
+        if ($detail) { $detail += "; " }
+        $detail += "shackle divergence: " + ($divergeHands -join " | ")
+    } elseif ($observed -and $shared.Count -eq 0) {
+        if ($detail) { $detail += "; " }
+        $detail += "no shared hands (identity caveat) - manual gate authoritative"
+    }
+    Write-Host ("  SHACKLE-SYNC $v - hostHands=$($hostHands.Count) joinHands=$($joinHands.Count) " +
+                "shared=$($shared.Count) divergent=$($divergeHands.Count) " +
+                "hostSamples=$($m.hostSamples) joinSamples=$($m.joinSamples)")
+    return (Add-GateResult -Name "shackle_sync" -Status $v -Metrics $m -Detail $detail)
+}
+
 # Parse "SCENARIO SNEAK hand=i,s t=ms mode=d bs=n" lines into per-hand series
 # (mirrors Get-FurnSeries). Returns hashtable hand -> list of @{T; Mode; Bs}.
 function Get-SneakSeries {
@@ -1202,18 +1591,21 @@ function Test-NpcCarry {
 function Test-SpeedSync {
     param([string]$HostFile, [string]$JoinFile,
           [double]$MinMatch = 0.80, [int]$MaxFollowMs = 2500,
-          [int]$TransitionWinMs = 2000, [int]$MinTransitions = 4)
+          [int]$TransitionWinMs = 2000, [int]$MinTransitions = 4,
+          [double]$MaxBlankFrac = 0.10)
     $series = {
         param($file)
         $off = Get-LogClockOffsetMs -File $file
         $list = New-Object System.Collections.ArrayList
-        $pat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO SPEED t=\d+ mult=([\d\.]+) paused=(\d)'
+        # buttons= (Phase 5) is optional so older logs still parse.
+        $pat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO SPEED t=\d+ mult=([\d\.]+) paused=(\d)(?: nbtn=-?\d+ buttons=([01]*))?'
         foreach ($mi in (Select-String -Path $file -Pattern $pat -ErrorAction SilentlyContinue)) {
             $gg = $mi.Matches[0].Groups
             $tt = Convert-StampToMs -Groups $gg -OffsetMs $off
             $mu = [double]$gg[5].Value
             if ([int]$gg[6].Value -eq 1) { $mu = 0.0 }
-            [void]$list.Add([pscustomobject]@{ t = $tt; mult = $mu })
+            $btn = if ($gg[7].Success) { $gg[7].Value } else { $null }
+            [void]$list.Add([pscustomobject]@{ t = $tt; mult = $mu; btn = $btn })
         }
         return ,$list
     }
@@ -1345,12 +1737,34 @@ function Test-SpeedSync {
         }
     }
 
+    # Indicator (speed-button highlight) gate [Phase 5]: the buttons show the
+    # VOTE tier and must NEVER blank out (all-zero). The pre-fix corruption left
+    # the indicator EMPTY whenever a programmatic / replicated speed change or
+    # the combat cap fired (setGameSpeed dehighlights the tier button and only
+    # the inline UI click reselects it; spike 2026-07-17: buttons=0000). The
+    # blank-guard + continuous reconcile must keep a tier lit at all times.
+    # Skipped for older logs without buttons=.
+    foreach ($side in @(@{ n = "host"; S = $H }, @{ n = "join"; S = $J })) {
+        $withBtn = @($side.S | Where-Object { $null -ne $_.btn -and $_.btn -ne '' })
+        if ($withBtn.Count -lt 10) { continue }
+        $warm = [double]$withBtn[0].t + 3000  # skip the arming/settle window
+        $judged = @($withBtn | Where-Object { [double]$_.t -ge $warm })
+        if ($judged.Count -lt 10) { continue }
+        $blank = @($judged | Where-Object { $_.btn -notmatch '1' })
+        $bf = [Math]::Round($blank.Count / $judged.Count, 3)
+        $m[($side.n + "IndicatorBlank")] = $bf
+        if ($bf -gt $MaxBlankFrac) {
+            $bad += "$($side.n) speed indicator blank for $bf of samples (need <= $MaxBlankFrac - indicator wiped by a programmatic/cap speed change)"
+        }
+    }
+
     if ($bad.Count -gt 0) {
         Write-Host ("  SPEED-SYNC FAIL - " + ($bad -join "; "))
         return (Add-GateResult -Name "speed_sync" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
     }
     Write-Host ("  SPEED-SYNC PASS - $($sets.Count) transitions (max follow $($m.maxFollowMs)ms, lone raise denied), " +
-                "match $frac over $consider samples, combat window 1x host=$($m.hostCombat1x) join=$($m.joinCombat1x)")
+                "match $frac over $consider samples, combat window 1x host=$($m.hostCombat1x) join=$($m.joinCombat1x), " +
+                "indicator blank host=$($m.hostIndicatorBlank) join=$($m.joinIndicatorBlank)")
     return (Add-GateResult -Name "speed_sync" -Status PASS -Metrics $m)
 }
 

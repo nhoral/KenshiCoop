@@ -34,6 +34,7 @@
 #include <core/Functions.h>         // KenshiLib::GetRealAddress
 #include <kenshi/GameWorld.h>       // GameWorld::player
 #include <kenshi/PlayerInterface.h> // PlayerInterface::playerCharacters
+#include <kenshi/CameraClass.h>     // CameraClass (camera-anchored interest, spike 35)
 #include <kenshi/SaveManager.h>     // SaveManager::getSingleton/load/savesExist
 #include <kenshi/SaveInfo.h>        // SaveInfo (the in-game load menu's load(SaveInfo&) overload)
 #include <kenshi/Character.h>       // Character (handle/getPosition/getOrientation/movement)
@@ -150,9 +151,23 @@ typedef void      (__fastcall* SetFurnModeFn)(Character* self, bool on,
 // const hand& owner) - owner passed by hidden reference (const hand*).
 typedef void      (__fastcall* SetChainedModeFn)(Character* self, bool on,
                                                  const hand* owner);
+// Phase 6 shackle read lever: Character::getChainedModeShackles() -> equipped
+// LockedArmour* (shackle item) or null; non-null LockedArmour::lock == locked.
+typedef LockedArmour* (__fastcall* GetShacklesFn)(Character* self);
 typedef void      (__fastcall* SetStealthModeFn)(Character* self, bool on);
 typedef void      (__fastcall* NotifySeeSneakFn)(Character* self, Character* who,
                                                  const int* seeingYnm, float prog01);
+// Engagement escalation (world_parity camp): Character::attackTarget is the
+// engine's own AI commit-an-attack entry - it bypasses the goal/order
+// validation that silently drops an attack on a non-hostile player-squad
+// target (a driven guard beating a locally player-owned escaped prisoner).
+typedef void (__fastcall* AttackTargetFn)(Character* self, Character* who);
+// Camera-anchored interest (spike 35): CameraClass::getCenter() returns
+// Ogre::Vector3 by value (12 bytes -> hidden return pointer on x64, the
+// GetTimeHoursFn precedent). isInitialised guards a camera not yet set up.
+typedef Ogre::Vector3* (__fastcall* CamGetCenterFn)(const CameraClass* self,
+                                                    Ogre::Vector3* ret);
+typedef bool           (__fastcall* CamIsInitFn)(const CameraClass* self);
 
 // game speed / clock
 typedef void (__fastcall* SetGameSpeedFn)(GameWorld* self, float speed, bool click);
@@ -334,8 +349,12 @@ extern DropCarriedFn     g_dropCarriedFn;
 extern SetFurnModeFn     g_setBedModeFn;
 extern SetFurnModeFn     g_setPrisonModeFn;
 extern SetChainedModeFn  g_setChainedModeFn;
+extern GetShacklesFn     g_getShacklesFn;
 extern SetStealthModeFn  g_setStealthModeFn;
 extern NotifySeeSneakFn  g_notifySeeSneakFn;
+extern CamGetCenterFn    g_camGetCenterFn;
+extern CamIsInitFn       g_camIsInitFn;
+extern AttackTargetFn    g_attackTargetFn;
 
 // game speed / clock (+ intent hooks state)
 extern SetGameSpeedFn      g_setGameSpeedFn;
@@ -357,6 +376,12 @@ extern float g_quietMult;
 extern bool  g_quietPaused;
 extern char g_voteBtn[15];
 extern int  g_voteBtnN;
+// Phase 5 spike (KENSHICOOP_DEBUG_SPEED): combat-cap-active hint, set by
+// Replicator::syncSpeed each tick so the speed-setter diagnostics can tell an
+// engine-forced (combat) change from a user click by context.
+extern bool g_speedCombatHint;
+// True when KENSHICOOP_DEBUG_SPEED=1 (cached). Gates the speed-path diagnostics.
+bool speedDbgOn();
 
 // doors
 extern DoorBoolFn g_doorIsOpenFn;
@@ -503,7 +528,7 @@ bool isPlayerSquad(GameWorld* gw, RootObject* obj);
 // Live NON-player Faction* read off a nearby world NPC. Caller holds SEH.
 Faction* findNearbyNonPlayerFaction(GameWorld* gw);
 // Dual-interest centers (one per squad tab leader, up to two). Caller holds SEH.
-unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[2]);
+unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]);
 // Case-insensitive substring test on raw C strings (SEH legal).
 bool ciContains(const char* hay, const char* needle);
 // Template scans (reused g_dataScratch; main thread only).

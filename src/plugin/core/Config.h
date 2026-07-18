@@ -96,6 +96,20 @@ struct Config {
     // culling is untouched. 0 disables parking.
     float        censusParkDist;    // KENSHICOOP_CENSUS_PARK          (120 u)
 
+    // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI, DEFAULT ON): the join
+    // suspends the local AI of a census-band body (census-present, unstreamed)
+    // that diverges past censusParkDist_, so a captive/working slave can't flee
+    // and aggro the join's guards while the host has it working. Divergence-
+    // gated; well-tracking census NPCs keep their local AI. A/B escape hatch.
+    bool         censusFreezeAi;     // KENSHICOOP_CENSUS_FREEZE_AI     (on)
+
+    // Camera-anchored interest (KENSHICOOP_CAM_INTEREST, DEFAULT ON,
+    // protocol 43): interestCenters grows from the two squad-tab-leader
+    // spheres to up to FOUR anchors - + the local camera center + the peer's
+    // ~1 Hz camera hint (PKT_CAM_HINT), deduped within ~100 u. NPCs where a
+    // player is LOOKING (but no PC stands) stay streamed/listed. A/B hatch.
+    bool         camInterest;        // KENSHICOOP_CAM_INTEREST         (on)
+
     // Starved-replica guard hold: how long (ms) a driven body whose stream
     // went stale keeps its AI-suspend + damage-guard before releasing to
     // local simulation - a WAN stall must not become an authority transfer.

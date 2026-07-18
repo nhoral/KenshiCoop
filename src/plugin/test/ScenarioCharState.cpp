@@ -600,6 +600,360 @@ private:
     unsigned int  l0Hand_[5];
 };
 
+// bed_wake (protocol 19, conscious bed EXIT / wake-and-move): bed_pose only
+// validated ENTERING and HOLDING the pose - never the transition OUT. A host
+// PC that sleeps, then wakes and WALKS left the join copy stuck sleeping (no
+// reliable EXIT edge for a bed pose; the join relied on a 3 s self-heal and
+// was never AI-suspended, so its local AI re-slept it - pole save 2026-07-17).
+// This drives the full arc on save 'bedcage1': host orders L0 into the baked
+// bed (USE_BED_ORDER), waits for the JOIN to commit the pose, then issues a
+// MOVE order ~25u away. The join's driven L0 copy must LEAVE the bed (bs loses
+// BODY_IN_BED, the [furn] BED FAST-EXIT fires) and co-locate with the host.
+// Test-BedWake anchors on "SCENARIO BEDWAKE ORDER/MOVE" and gates:
+// host-entered / host-moved-away / join-left-bed / join-co-located.
+class BedWakeScenario : public Scenario {
+public:
+    BedWakeScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0), haveL0_(false),
+          orderLogged_(false), lastOrderMs_(0), orderOk_(false),
+          moveLogged_(false), lastMoveMs_(0), moveOk_(false) {}
+
+    virtual const char* name() const { return "bed_wake"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveL0_) latchLeader(ctx);
+
+        // Phase 1 - host orders L0 to the baked bed (guarded re-issue on failure,
+        // same as bed_pose: orderUseBed is a no-op once L0 is on a bed task).
+        if (ctx.isHost && haveL0_ && ctx.elapsedMs >= ORDER_AT_MS &&
+            ctx.elapsedMs < MOVE_AT_MS &&
+            (!orderLogged_ || (!orderOk_ && ctx.elapsedMs - lastOrderMs_ >= 4000))) {
+            lastOrderMs_ = ctx.elapsedMs;
+            int ordered = 0, useBed = 0;
+            orderOk_ = engine::orderUseBed(ctx.gw, l0Hand_, &ordered, &useBed);
+            if (!orderLogged_) {
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO BEDWAKE ORDER issued hand=%u,%u task=%d ok=%d",
+                          l0Hand_[3], l0Hand_[4], ordered, orderOk_ ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                orderLogged_ = true;
+            }
+        }
+
+        // Phase 2 - after the join has had time to commit the pose, wake L0 and
+        // walk it well clear of the bed. Re-issue while it is still reported
+        // IN_BED (a move order can be absorbed on the first sleeping frame).
+        if (ctx.isHost && haveL0_ && ctx.elapsedMs >= MOVE_AT_MS &&
+            (!moveLogged_ || (ctx.elapsedMs - lastMoveMs_ >= 3000 && stillInBed(ctx)))) {
+            lastMoveMs_ = ctx.elapsedMs;
+            Character* l0 = engine::resolveCharByHand(l0Hand_[3], l0Hand_[4],
+                                                      l0Hand_[0], l0Hand_[1],
+                                                      l0Hand_[2]);
+            float x = 0, y = 0, z = 0;
+            if (l0 && engine::readPos(l0, &x, &y, &z)) {
+                moveOk_ = engine::orderMoveTo(l0, x + 25.0f, y, z);
+            }
+            if (!moveLogged_) {
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO BEDWAKE MOVE issued hand=%u,%u to=%.2f,%.2f,%.2f ok=%d",
+                          l0Hand_[3], l0Hand_[4], x + 25.0f, y, z, moveOk_ ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                moveLogged_ = true;
+            }
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (orderLogged_ && orderOk_ && moveLogged_)
+                                 : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long ORDER_AT_MS      = 14000; // join logs standing baseline first
+    static const unsigned long MOVE_AT_MS       = 34000; // give the join time to commit the pose
+    static const unsigned long HOST_DURATION_MS = 64000; // enter + observe + wake-move + follow
+    static const unsigned long JOIN_DURATION_MS = 60000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    // Host-side: is L0 still reported occupying the bed (drives the move re-issue)?
+    bool stillInBed(const ScenarioContext& ctx) {
+        (void)ctx;
+        Character* l0 = engine::resolveCharByHand(l0Hand_[3], l0Hand_[4],
+                                                  l0Hand_[0], l0Hand_[1],
+                                                  l0Hand_[2]);
+        if (!l0) return false;
+        return (engine::readBodyState(l0) & BODY_IN_BED) != 0;
+    }
+
+    void latchLeader(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, 0); // host tab's leader on BOTH sides
+        if (idx >= 0) {
+            handFromEntity(sq[idx], l0Hand_);
+            haveL0_ = true;
+            char b[96];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO BEDWAKE L0 hand=%u,%u",
+                      l0Hand_[3], l0Hand_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveL0_;
+    bool          orderLogged_;
+    unsigned long lastOrderMs_;
+    bool          orderOk_;
+    bool          moveLogged_;
+    unsigned long lastMoveMs_;
+    bool          moveOk_;
+    unsigned int  l0Hand_[5];
+};
+
+// bed_lay (protocol 19, UNCONSCIOUS place-in-bed LAYING POSE + wake-and-exit):
+// bed_pose validates a CONSCIOUS SLEEP ORDER (task=USE_BED, walk-in + lie down)
+// and bed_put validates UNCONSCIOUS occupancy (BODY_IN_BED bit crossing). Neither
+// checks that a KO'd body DROPPED into a bed - the real "carry an unconscious
+// squadmate to a bed" case - actually renders the LAYING pose on both clients,
+// nor that it can get back OUT when it wakes. (A CONSCIOUS placement was tried
+// first and proved a dead end: Kenshi itself nondeterministically leaves a
+// conscious placed body STANDING on the mattress, and the join mirrors that
+// faithfully - so "standing on the bed" for a conscious body is base-game
+// behavior, not a coop bug: manual + bed_lay-conscious run 2026-07-17.) This
+// drives the deterministic arc on save 'bedcage1', once host-own (M2) and once
+// join-own (L1): KO the subject (held down), DROP it into the baked bed
+// (setBedMode, re-issued until it lands), observe it LAYING, then REVIVE it, take
+// it out and MOVE it clear. Test-BedLay gates from the AUTHORITATIVE pelvis
+// height + BODY_IN_BED in the MEMBER/RECV series: (1) both clients read the KO'd
+// body IN_BED with a LOW (laying) pelvis, and (2) after the wake both clients
+// have it OUT of the bed and co-located (it can get up and leave).
+class BedLayScenario : public Scenario {
+public:
+    BedLayScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          haveM2_(false), haveL1_(false),
+          lastPutMs_(0), lastHoldMs_(0), lastMoveMs_(0),
+          aDown_(false), aPut_(false), aPutOk_(false), aWake_(false), aMoved_(false),
+          bDown_(false), bPut_(false), bPutOk_(false), bWake_(false), bMoved_(false) {}
+
+    virtual const char* name() const { return "bed_lay"; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveM2_ || !haveL1_) latchSubjects(ctx);
+
+        // ---- Window A (host owns M2): KO -> drop in bed -> revive -> move ----
+        if (ctx.isHost && haveM2_) {
+            if (!aDown_ && ctx.elapsedMs >= A_DOWN_AT_MS) {
+                bool ok = engine::orderDownSubject(ctx.gw, m2Hand_);
+                logAct("A down", m2Hand_, ok); aDown_ = true;
+            }
+            // Drop the KO'd body into the bed; re-issue until it occupies it.
+            if (aDown_ && !aWake_ && ctx.elapsedMs >= A_PUT_AT_MS &&
+                ctx.elapsedMs < A_WAKE_AT_MS &&
+                (!aPut_ || (ctx.elapsedMs - lastPutMs_ >= REPUT_MS && !subjectInBed(m2Hand_)))) {
+                lastPutMs_ = ctx.elapsedMs;
+                bool ok = engine::putSubjectInFurniture(ctx.gw, m2Hand_, 1, true);
+                if (ok) aPutOk_ = true;
+                if (!aPut_) { logPut("A", m2Hand_, ok); aPut_ = true; }
+            }
+            // Wake: revive + take out of the bed (deterministic exit trigger).
+            if (!aWake_ && ctx.elapsedMs >= A_WAKE_AT_MS) {
+                bool rok = engine::reviveSubject(ctx.gw, m2Hand_);
+                engine::putSubjectInFurniture(ctx.gw, m2Hand_, 1, false);
+                aWake_ = true; logAct("A wake", m2Hand_, rok);
+            }
+            // Move clear so the copy has to leave + follow (re-issue while in bed).
+            if (aWake_ && (!aMoved_ ||
+                (ctx.elapsedMs - lastMoveMs_ >= 3000 && subjectInBed(m2Hand_)))) {
+                lastMoveMs_ = ctx.elapsedMs;
+                if (issueMove(m2Hand_) && !aMoved_) { logAct("A move", m2Hand_, true); aMoved_ = true; }
+            }
+        }
+
+        // ---- Window B (join owns L1): the same over L1 ----------------------
+        if (!ctx.isHost && haveL1_) {
+            if (!bDown_ && ctx.elapsedMs >= B_DOWN_AT_MS) {
+                bool ok = engine::orderDownSubject(ctx.gw, l1Hand_);
+                logAct("B down", l1Hand_, ok); bDown_ = true;
+            }
+            if (bDown_ && !bWake_ && ctx.elapsedMs >= B_PUT_AT_MS &&
+                ctx.elapsedMs < B_WAKE_AT_MS &&
+                (!bPut_ || (ctx.elapsedMs - lastPutMs_ >= REPUT_MS && !subjectInBed(l1Hand_)))) {
+                lastPutMs_ = ctx.elapsedMs;
+                bool ok = engine::putSubjectInFurniture(ctx.gw, l1Hand_, 1, true);
+                if (ok) bPutOk_ = true;
+                if (!bPut_) { logPut("B", l1Hand_, ok); bPut_ = true; }
+            }
+            if (!bWake_ && ctx.elapsedMs >= B_WAKE_AT_MS) {
+                bool rok = engine::reviveSubject(ctx.gw, l1Hand_);
+                engine::putSubjectInFurniture(ctx.gw, l1Hand_, 1, false);
+                bWake_ = true; logAct("B wake", l1Hand_, rok);
+            }
+            if (bWake_ && (!bMoved_ ||
+                (ctx.elapsedMs - lastMoveMs_ >= 3000 && subjectInBed(l1Hand_)))) {
+                lastMoveMs_ = ctx.elapsedMs;
+                if (issueMove(l1Hand_) && !bMoved_) { logAct("B move", l1Hand_, true); bMoved_ = true; }
+            }
+        }
+
+        // Owner-side KO hold (timer-only re-top) through each subject's lay window.
+        if (ctx.elapsedMs - lastHoldMs_ >= 2000) {
+            lastHoldMs_ = ctx.elapsedMs;
+            if (ctx.isHost && haveM2_ && aDown_ && !aWake_) holdSubject(m2Hand_);
+            if (!ctx.isHost && haveL1_ && bDown_ && !bWake_) holdSubject(l1Hand_);
+        }
+
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+            bool sawPeer = false;
+            for (unsigned int i = 0; i < n; ++i) {
+                int r = tabRankOf(sq, n, i);
+                if (r < 0) continue;
+                logScenarioEntity(((unsigned int)r == ownRank) ? "MEMBER" : "RECV", sq[i]);
+                if ((unsigned int)r != ownRank) sawPeer = true;
+            }
+            if (!ctx.isHost && sawPeer) ++recvCount_;
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            passed_ = ctx.isHost ? (aDown_ && aPut_ && aPutOk_ && aWake_ && aMoved_)
+                                 : (bDown_ && bPut_ && bPutOk_ && bWake_ && bMoved_ && recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long A_DOWN_AT_MS     = 6000;
+    static const unsigned long A_PUT_AT_MS      = 12000;
+    static const unsigned long A_WAKE_AT_MS     = 30000;
+    static const unsigned long B_DOWN_AT_MS     = 46000;
+    static const unsigned long B_PUT_AT_MS      = 52000;
+    static const unsigned long B_WAKE_AT_MS     = 70000;
+    static const unsigned long HOST_DURATION_MS = 88000;
+    static const unsigned long JOIN_DURATION_MS = 84000;
+    static const unsigned long REPUT_MS         = 1500;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    // Is this subject currently occupying a bed (drives the re-put/re-move throttle)?
+    bool subjectInBed(const unsigned int h[5]) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return false;
+        engine::FurnitureRead fr;
+        return engine::readFurniture(c, &fr) && fr.valid && fr.kind == 1;
+    }
+
+    // Order the subject 25u clear of its current position (post-wake exit).
+    bool issueMove(const unsigned int h[5]) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (!c) return false;
+        float x = 0, y = 0, z = 0;
+        if (!engine::readPos(c, &x, &y, &z)) return false;
+        return engine::orderMoveTo(c, x + 25.0f, y, z);
+    }
+
+    void holdSubject(const unsigned int h[5]) {
+        Character* c = engine::resolveCharByHand(h[3], h[4], h[0], h[1], h[2]);
+        if (c) engine::holdDown(c);
+    }
+
+    void logAct(const char* what, const unsigned int h[5], bool ok) {
+        char b[144];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO BEDLAY %s hand=%u,%u ok=%d",
+                  what, h[3], h[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void logPut(const char* what, const unsigned int h[5], bool ok) {
+        char b[144];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO BEDLAY PUT %s hand=%u,%u kind=1 ok=%d",
+                  what, h[3], h[4], ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchSubjects(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        if (!haveM2_) {
+            // Host tab's SECOND member (lowest non-leader hand of rank 0).
+            int lidx = tabLeaderIdx(sq, n, 0);
+            if (lidx >= 0) {
+                unsigned int lh[5]; handFromEntity(sq[lidx], lh);
+                int best = -1;
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (tabRankOf(sq, n, i) != 0) continue;
+                    unsigned int h[5]; handFromEntity(sq[i], h);
+                    if (h[3] == lh[3] && h[4] == lh[4]) continue;
+                    if (best < 0 || tabHandLess(sq[i], sq[best])) best = (int)i;
+                }
+                if (best >= 0) {
+                    handFromEntity(sq[best], m2Hand_);
+                    haveM2_ = true;
+                    logSubject("M2", m2Hand_);
+                }
+            }
+        }
+        if (!haveL1_) {
+            int idx = tabLeaderIdx(sq, n, 1);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], l1Hand_);
+                haveL1_ = true;
+                logSubject("L1", l1Hand_);
+            }
+        }
+    }
+
+    void logSubject(const char* who, const unsigned int h[5]) {
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO BEDLAY %s hand=%u,%u", who, h[3], h[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveM2_, haveL1_;
+    unsigned long lastPutMs_, lastHoldMs_, lastMoveMs_;
+    bool          aDown_, aPut_, aPutOk_, aWake_, aMoved_;
+    bool          bDown_, bPut_, bPutOk_, bWake_, bMoved_;
+    unsigned int  m2Hand_[5];
+    unsigned int  l1Hand_[5];
+};
+
 // bed_put / cage_put / chain_put / pole_put (protocol 19 phase 3, unconscious
 // placement): save 'bedcage1' (bed/cage) or 'pole1' (pole). chain_put (protocol
 // 41 chained/pole STATE) needs no baked fixture - it self-chains the subject
@@ -1443,11 +1797,17 @@ public:
         if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
             lastLogMs_ = ctx.elapsedMs;
             // The SPEED series the oracle compares across the two clients.
+            // buttons= is the MyGUI speed-button highlight (the VOTE indicator);
+            // Phase 5 gates that it tracks the vote and returns to it after the
+            // combat cap clears (mult can be capped to 1x while buttons show 3x).
             float mult = 0.0f; bool paused = false;
             if (engine::readGameSpeed(ctx.gw, &mult, &paused)) {
-                char b[96];
-                _snprintf(b, sizeof(b) - 1, "SCENARIO SPEED t=%lu mult=%.2f paused=%d",
-                          ctx.elapsedMs, mult, paused ? 1 : 0);
+                char btn[16]; btn[0] = '\0';
+                int nBtn = engine::readSpeedButtons(btn, sizeof(btn));
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO SPEED t=%lu mult=%.2f paused=%d nbtn=%d buttons=%s",
+                          ctx.elapsedMs, mult, paused ? 1 : 0, nBtn, btn);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
             // Squad MEMBER/RECV series (harness anchors + advisory transform
@@ -1639,12 +1999,88 @@ private:
     bool          actsOk_;
 };
 
+// shackle_probe (Phase 6 6a evidence spike, log-only, BOTH clients): enumerate
+// nearby world NPCs (a shackled prisoner is a slave, never in the player squad)
+// and emit a "SCENARIO SHACKLE hand=i,s t=ms chained=.. shackleItem=.. lock=..
+// owner=i,s" line at ~2 Hz for every body that is chained or carries a shackle
+// item. The Test-ShackleProbe oracle time-aligns the owner's and peer's view of
+// each shackled prisoner and flags any lock/chained divergence. Reads only - no
+// behavior change ships in 6a.
+// shackle_sync (Phase 6 6b validation, BOTH clients) reuses the SAME emission:
+// with the protocol-42 locked bit + non-owner unlock guard shipping, Test-
+// ShackleSync turns the probe's characterization metrics into a STRICT gate -
+// a shared prisoner whose owner reports chained/locked while the peer's driven
+// copy reports it cleared is now a FAIL (the guard is supposed to prevent it).
+class ShackleProbeScenario : public Scenario {
+public:
+    ShackleProbeScenario(const char* nm)
+        : name_(nm), passed_(false), lastLogMs_(0), sawShackled_(false) {}
+
+    virtual const char* name() const { return name_; }
+
+    virtual void onStart(const ScenarioContext&) {}
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            Character* chars[MAXN];
+            EntityState st[MAXN];
+            unsigned int n = engine::listNpcs(ctx.gw, chars, st, MAXN);
+            unsigned int shackled = 0;
+            for (unsigned int i = 0; i < n; ++i) {
+                engine::ShackleRead sr;
+                if (!engine::readShackle(chars[i], &sr) || !sr.valid) continue;
+                if (!sr.chained && !sr.hasShackleItem) continue;
+                ++shackled;
+                sawShackled_ = true;
+                char b[192];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO SHACKLE hand=%u,%u t=%lu chained=%d "
+                          "shackleItem=%d lock=%d owner=%u,%u",
+                          st[i].hIndex, st[i].hSerial, ctx.elapsedMs,
+                          sr.chained ? 1 : 0, sr.hasShackleItem ? 1 : 0,
+                          sr.lockPresent ? 1 : 0, sr.owner[3], sr.owner[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            char c[96];
+            _snprintf(c, sizeof(c) - 1,
+                      "SCENARIO SHACKLE COUNT t=%lu npcs=%u shackled=%u",
+                      ctx.elapsedMs, n, shackled);
+            c[sizeof(c) - 1] = '\0'; coop::logLine(c);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // Log-only spike: passing just means it ran to completion and
+            // emitted its series. The oracle judges cross-client parity and the
+            // shackled-sighting requirement.
+            passed_ = true;
+            (void)sawShackled_;
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned int  MAXN            = 64;
+    static const unsigned long HOST_DURATION_MS = 40000;
+    static const unsigned long JOIN_DURATION_MS = 36000;
+    const char*   name_;
+    bool          passed_;
+    unsigned long lastLogMs_;
+    bool          sawShackled_;
+};
+
 } // namespace
 
 Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "carry_order")  return new CarryOrderScenario();
     if (name == "npc_carry")    return new NpcCarryScenario();
     if (name == "bed_pose")     return new BedPoseScenario();
+    if (name == "bed_wake")     return new BedWakeScenario();
+    if (name == "bed_lay")      return new BedLayScenario();
     if (name == "bed_put")      return new FurnPutScenario(1);
     if (name == "cage_put")     return new FurnPutScenario(2);
     if (name == "chain_put")    return new FurnPutScenario(3);
@@ -1655,6 +2091,8 @@ Scenario* makeCharStateScenario(const std::string& name) {
     if (name == "sneak_detect") return new SneakDetectScenario();
     if (name == "speed_sync")   return new SpeedSyncScenario();
     if (name == "speed_probe")  return new SpeedProbeScenario();
+    if (name == "shackle_probe") return new ShackleProbeScenario("shackle_probe");
+    if (name == "shackle_sync")  return new ShackleProbeScenario("shackle_sync");
     return 0;
 }
 

@@ -43,6 +43,10 @@ inline unsigned int invEntryHash(const InvItemEntry& e) {
     // as a content change (triggers a resend) and the peer reconciles the slot too.
     h ^= (unsigned int)(e.equipped ? 0x9E3779B9u : 0u);
     h ^= (unsigned int)e.slot * 2716044179u;
+    // Phase 6b: the shackle LOCK state is content: a locked vs unlocked shackle must
+    // hash differently so a lock toggle registers as a content change (triggers a
+    // resend) and the peer re-learns the owner-authoritative lock state.
+    h ^= (unsigned int)(e.locked ? 0x85EBCA6Bu : 0u);
     // The SECTION must be part of the fingerprint too: the two weapon slots ('hip' vs
     // 'back') share AttachSlot ATTACH_WEAPON, so `slot` is identical for both - without
     // hashing the section a Weapon I<->II move produces an UNCHANGED fingerprint and is
