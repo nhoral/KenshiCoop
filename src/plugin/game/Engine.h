@@ -1023,6 +1023,16 @@ void         clearAiSuspend();
 void         addAiSuspend(Character* c);
 unsigned int aiSuspendCount();
 
+// Task-selection observation spike (KENSHICOOP_TASK_SPIKE, OFF by default):
+// passively detours CharBody::setCurrentAction - the single seam every task
+// SELECTION result (AI scorer or player order) flows through before the body
+// executes it, separate from the periodicUpdate brain tick. Proves the seam is
+// hookable in isolation and logs the chosen (task, subject, location) tuple per
+// body (`[spike] SELECT` lines). Changes no behavior - the precondition probe
+// for streaming selection instead of suppressing the whole AI.
+bool         installTaskSelectSpikeHook();
+void         setTaskSelectSpike(bool on);
+
 // Join-side damage suppression (the "cosmetic fights are actually cosmetic"
 // guard): detour Character::hitByMeleeAttack so that, for bodies in the guarded
 // set, a locally-simulated melee hit applies NO damage (returns HIT_MISSED

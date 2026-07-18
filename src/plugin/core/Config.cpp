@@ -420,6 +420,8 @@ void loadConfig(Config& c) {
         // peer camera hint into the interest anchors. DEFAULT ON; the A/B
         // escape hatch restores tab-leader-only anchors.
         c.camInterest = envOr("KENSHICOOP_CAM_INTEREST", "1") != "0";
+        // Task-selection observation spike: OFF by default (diagnostic only).
+        c.taskSelectSpike = envOr("KENSHICOOP_TASK_SPIKE", "0") != "0";
         // Starve hold: "0" (explicit) restores legacy release-on-stale;
         // absent = 10 s guard-hold default.
         std::string sh = envOr("KENSHICOOP_STARVE_HOLD_MS", "");

@@ -1011,6 +1011,53 @@ void __fastcall periodicUpdate_hook(Character* self) {
     g_periodicOrig(self);
 }
 
+// ---- Task-selection observation spike (KENSHICOOP_TASK_SPIKE) --------------
+// The theoretical AI cut point (design chat 2026-07-18): CharBody::setCurrentAction
+// is the ONE seam every task-SELECTION result (AI scorer OR player order) flows
+// through before the body EXECUTES it - virtual vtable 0x18 / RVA 0x5C6740, wholly
+// separate from the whole-brain Character::_NV_periodicUpdate we suspend today. If
+// this passive detour fires, it proves the seam is hookable INDEPENDENTLY of the
+// periodic-update hook (the open spike question) and that "which task won" is
+// interceptable in isolation - the precondition for streaming selection instead of
+// suppressing the brain wholesale. It changes NOTHING: it reads the incoming
+// Tasker's (task key, subject, location) tuple and calls the original. Logging is
+// globally throttled; off by default (log volume). Members are read raw (no engine
+// calls) under SEH so a torn Tasker/CharBody can never fault the engine tick.
+typedef bool (__fastcall* SetCurrentActionFn)(CharBody* self, Tasker* t);
+SetCurrentActionFn g_setActionOrig    = 0;
+bool               g_taskSelectSpike  = false;
+unsigned long      g_taskSelectFires  = 0; // total detour fires (reachability proof)
+
+bool __fastcall setCurrentAction_hook(CharBody* self, Tasker* t) {
+    if (g_taskSelectSpike && self && t) {
+        __try {
+            ++g_taskSelectFires;
+            Character* c   = self->character;                 // CharBody 0x18
+            TaskData*  td  = t->taskData;                     // Tasker  0x70
+            int        key = td ? (int)td->key : -1;          // TaskData 0x44
+            hand       subj = t->subject;                     // Tasker  0x10
+            Ogre::Vector3 loc = t->location;                  // Tasker  0x58
+            char nm[40]; nm[0] = '\0';
+            if (c) charName(c, nm, sizeof(nm));
+            static unsigned long logTick = 0; // ~4 lines/s across all bodies
+            unsigned long now = GetTickCount();
+            if ((now - logTick) >= 250) {
+                logTick = now;
+                char b[192];
+                _snprintf(b, sizeof(b) - 1,
+                    "[spike] SELECT body='%s' task=%d subj=%u,%u loc=%.0f,%.0f,%.0f fires=%lu",
+                    nm, key, subj.index, subj.serial,
+                    loc.x, loc.y, loc.z, g_taskSelectFires);
+                b[sizeof(b) - 1] = '\0';
+                coop::logLine(b);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            // read fault: skip logging, still fall through to the original below
+        }
+    }
+    return g_setActionOrig(self, t);
+}
+
 // Join-side damage guard. Character::hitByMeleeAttack is where a landed melee
 // swing applies its Damages to the victim (wounds, blood loss, KO math). On the
 // join, fights involving host-authoritative bodies are COSMETIC - intent
@@ -1886,6 +1933,18 @@ bool installAiSuspendHook() {
     return KenshiLib::AddHook(addr, (void*)&periodicUpdate_hook,
                               (void**)&g_periodicOrig) == KenshiLib::SUCCESS;
 }
+
+bool installTaskSelectSpikeHook() {
+    // Disambiguate the two setCurrentAction overloads: hook the Tasker* twin
+    // (the one every scorer/order result funnels through), not the
+    // (TaskType, RootObject*) convenience overload.
+    intptr_t addr = KenshiLib::GetRealAddress(
+        static_cast<bool (CharBody::*)(Tasker*)>(&CharBody::_NV_setCurrentAction));
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&setCurrentAction_hook,
+                              (void**)&g_setActionOrig) == KenshiLib::SUCCESS;
+}
+void setTaskSelectSpike(bool on) { g_taskSelectSpike = on; }
 
 void clearAiSuspend()           { g_aiSuspended.clear(); }
 void addAiSuspend(Character* c) { if (c) g_aiSuspended.insert(c); }

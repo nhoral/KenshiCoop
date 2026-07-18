@@ -67,6 +67,7 @@ human/log-diff diagnostic only).
 | `[door] write`, `[build] mint/destroy/progress-write/probe-place`, `[prod] *` | EngineWorld.cpp | door/building/production write levers + probes | Test-DoorSync / Test-BuildSync / Test-ProdSync |
 | `[taskkey] key` | EngineEntity.cpp `logTaskKeyOnce` | first sighting of each task key (self-documenting enum) | diag |
 | `[cam] center=` | EngineEntity.cpp `cameraCenter` (~5 s throttle) | local camera world center (protocol 43 camera-anchored interest) | diag |
+| `[spike] SELECT` | EngineInternal.cpp `setCurrentAction_hook` (`KENSHICOOP_TASK_SPIKE`, off; ~4 lines/s) | passive observation of the AI/order task-SELECTION seam (`CharBody::setCurrentAction`): chosen `task=` (TaskType) + `subj=` (hand) + `loc=` per body - the "stream selection, not motion" precondition probe | diag |
 | `SETUP:` | EngineEntity/SpawnCombat scene helpers | scenario scene-setup progress | scenario oracles (setup evidence) |
 
 ## Replication plane (`src/plugin/sync/`)

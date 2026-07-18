@@ -1710,6 +1710,18 @@ __declspec(dllexport) void startPlugin() {
             coopLog("[ai] FAILED to install periodicUpdate detour; AI-suspend disabled");
         }
     }
+    // Task-selection observation spike (KENSHICOOP_TASK_SPIKE, off by default):
+    // passive detour on CharBody::setCurrentAction to prove the selection seam is
+    // hookable in isolation and log the chosen task tuple per body. No behavior
+    // change - a diagnostic for the "stream selection, not motion" direction.
+    if (g_cfg.taskSelectSpike) {
+        if (coop::engine::installTaskSelectSpikeHook()) {
+            coop::engine::setTaskSelectSpike(true);
+            coopLog("[spike] setCurrentAction detour installed; task-select observation ON (KENSHICOOP_TASK_SPIKE)");
+        } else {
+            coopLog("[spike] FAILED to install setCurrentAction detour (seam unresolved)");
+        }
+    }
     // Step-2 experiment: sitter no-detach A/B (manual runs only; off by default).
     if (!g_cfg.isHost && g_cfg.noDetach) {
         g_repl.setNoDetach(true);

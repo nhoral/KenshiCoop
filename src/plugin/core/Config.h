@@ -110,6 +110,12 @@ struct Config {
     // player is LOOKING (but no PC stands) stay streamed/listed. A/B hatch.
     bool         camInterest;        // KENSHICOOP_CAM_INTEREST         (on)
 
+    // Task-selection observation spike: passively hook CharBody::setCurrentAction
+    // (the AI/order selection->execution seam) and log the chosen task tuple per
+    // body. Off by default; a diagnostic for the "stream selection, not motion"
+    // design direction. Changes no behavior.
+    bool         taskSelectSpike;    // KENSHICOOP_TASK_SPIKE           (off)
+
     // Starved-replica guard hold: how long (ms) a driven body whose stream
     // went stale keeps its AI-suspend + damage-guard before releasing to
     // local simulation - a WAN stall must not become an authority transfer.
