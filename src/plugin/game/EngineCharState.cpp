@@ -269,6 +269,18 @@ bool readShackle(Character* c, ShackleRead* out) {
     }
 }
 
+// Jail-probe read lever: Character::isSlave() -> SlaveStateEnum as int
+// (0 NOT_SLAVE / 1 IS_SLAVE / 2 ESCAPING_SLAVE / 3 EX_SLAVE), or -1 if the
+// fn is unresolved / read faults. Read-only diagnostic (KENSHICOOP_JAIL_PROBE).
+int readSlaveState(Character* c) {
+    if (!c || !g_isSlaveFn) return -1;
+    __try {
+        return g_isSlaveFn(c);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
 bool shackleDbgOn() {
     static int on = -1;
     if (on < 0) { const char* e = getenv("KENSHICOOP_DEBUG_SHACKLE"); on = (e && e[0] == '1') ? 1 : 0; }

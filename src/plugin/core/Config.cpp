@@ -422,6 +422,10 @@ void loadConfig(Config& c) {
         c.camInterest = envOr("KENSHICOOP_CAM_INTEREST", "1") != "0";
         // Task-selection observation spike: OFF by default (diagnostic only).
         c.taskSelectSpike = envOr("KENSHICOOP_TASK_SPIKE", "0") != "0";
+        // Jail put-to-work desync spike: OFF by default (diagnostic only).
+        c.jailProbe = envOr("KENSHICOOP_JAIL_PROBE", "0") != "0";
+        // Jail put-to-work observation spike (Phase A): OFF by default.
+        c.jailObserve = envOr("KENSHICOOP_JAIL_OBSERVE", "0") != "0";
         // Starve hold: "0" (explicit) restores legacy release-on-stale;
         // absent = 10 s guard-hold default.
         std::string sh = envOr("KENSHICOOP_STARVE_HOLD_MS", "");

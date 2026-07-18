@@ -1647,7 +1647,8 @@ __declspec(dllexport) void startPlugin() {
         // stays quiet (log volume).
         g_repl.setAuditRows(g_cfg.scenario == "travel_parity" ||
                             g_cfg.scenario == "npc_sync" ||
-                            g_cfg.scenario == "world_parity");
+                            g_cfg.scenario == "world_parity" ||
+                            g_cfg.scenario == "jail_probe");
         char b[260];
         _snprintf(b, sizeof(b) - 1,
                   "KenshiCoop: interp delay=%u-%ums extrap=%ums stale=%ums snap=%.0fu "
@@ -1722,6 +1723,15 @@ __declspec(dllexport) void startPlugin() {
             coopLog("[spike] FAILED to install setCurrentAction detour (seam unresolved)");
         }
     }
+    // Jail put-to-work desync spike: correlated [jail] STATE traces (read-only).
+    g_repl.setJailProbe(g_cfg.jailProbe);
+    if (g_cfg.jailProbe)
+        coopLog("[jail] KENSHICOOP_JAIL_PROBE=1: captive-state [jail] STATE tracing ON");
+    // Jail put-to-work observation spike (Phase A): host runs the captive
+    // unopposed and logs its trajectory ([jail] OBSERVE) to classify intent.
+    g_repl.setJailObserve(g_cfg.jailObserve);
+    if (g_cfg.jailObserve)
+        coopLog("[jail] KENSHICOOP_JAIL_OBSERVE=1: captive drive/suspend/self-heal OFF; [jail] OBSERVE tracing ON");
     // Step-2 experiment: sitter no-detach A/B (manual runs only; off by default).
     if (!g_cfg.isHost && g_cfg.noDetach) {
         g_repl.setNoDetach(true);

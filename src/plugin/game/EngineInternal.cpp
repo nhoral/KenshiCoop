@@ -327,6 +327,7 @@ SetFurnModeFn     g_setBedModeFn      = 0;
 SetFurnModeFn     g_setPrisonModeFn   = 0;
 SetChainedModeFn  g_setChainedModeFn  = 0;
 GetShacklesFn     g_getShacklesFn     = 0;
+IsSlaveFn         g_isSlaveFn         = 0;
 SetStealthModeFn  g_setStealthModeFn  = 0;
 NotifySeeSneakFn  g_notifySeeSneakFn  = 0;
 CamGetCenterFn    g_camGetCenterFn    = 0;
@@ -1421,6 +1422,10 @@ void resolve() {
     g_getShacklesFn = (GetShacklesFn)KenshiLib::GetRealAddress(&Character::getChainedModeShackles);
     if (!g_getShacklesFn)
         coop::logErrLine("engine: could not resolve getChainedModeShackles (shackle read degraded)");
+    // Jail-probe slave-state read (non-fatal: unresolved -> readSlaveState = -1).
+    g_isSlaveFn = (IsSlaveFn)KenshiLib::GetRealAddress(&Character::isSlave);
+    if (!g_isSlaveFn)
+        coop::logErrLine("engine: could not resolve Character::isSlave (jail-probe slave read off)");
 
     // Stealth sync (protocol 20; non-fatal: unresolved -> stealth sync off).
     g_setStealthModeFn = (SetStealthModeFn)KenshiLib::GetRealAddress(&Character::setStealthMode);

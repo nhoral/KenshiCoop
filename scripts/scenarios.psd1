@@ -1422,5 +1422,21 @@
             Advisory = @()
             Tier = 'none'; WanVariant = $false   # run_spike.ps1 judges captures itself
         }
+        # jail_probe: read-only diagnostic for the "put jailed PC to work" desync
+        # (join PC briefly exits its cage then teleports back). Passive soak on
+        # the 'jailed' save (join PC caged in the camp); no scenario gate - the
+        # evidence is the KENSHICOOP_JAIL_PROBE [jail] STATE traces (own vs drv),
+        # the [furn] ENTER/EXIT/PEER-ENTER edges, and (with KENSHICOOP_TASK_SPIKE)
+        # the [spike] SELECT task the join's local AI picks for its own PC.
+        # auditRows is armed for this scenario for pos/context. Must run
+        # partitioned (-Inhabit / OWN_RANK) so the join actually owns the caged PC.
+        jail_probe = @{
+            Save = 'jailed'; Setup = ''; Tolerance = 6.0
+            Seconds = 220; KillGraceSec = 190
+            PrimaryGate = ''
+            Gating   = @()
+            Advisory = @()
+            Tier = 'none'; WanVariant = $false   # spike: [jail]/[furn]/[spike] traces
+        }
     }
 }

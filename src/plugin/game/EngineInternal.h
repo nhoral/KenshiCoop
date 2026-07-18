@@ -154,6 +154,9 @@ typedef void      (__fastcall* SetChainedModeFn)(Character* self, bool on,
 // Phase 6 shackle read lever: Character::getChainedModeShackles() -> equipped
 // LockedArmour* (shackle item) or null; non-null LockedArmour::lock == locked.
 typedef LockedArmour* (__fastcall* GetShacklesFn)(Character* self);
+// Jail-probe read lever: Character::isSlave() -> SlaveStateEnum (0 NOT_SLAVE /
+// 1 IS_SLAVE / 2 ESCAPING_SLAVE / 3 EX_SLAVE), returned in eax as int.
+typedef int       (__fastcall* IsSlaveFn)(Character* self);
 typedef void      (__fastcall* SetStealthModeFn)(Character* self, bool on);
 typedef void      (__fastcall* NotifySeeSneakFn)(Character* self, Character* who,
                                                  const int* seeingYnm, float prog01);
@@ -350,6 +353,7 @@ extern SetFurnModeFn     g_setBedModeFn;
 extern SetFurnModeFn     g_setPrisonModeFn;
 extern SetChainedModeFn  g_setChainedModeFn;
 extern GetShacklesFn     g_getShacklesFn;
+extern IsSlaveFn         g_isSlaveFn;
 extern SetStealthModeFn  g_setStealthModeFn;
 extern NotifySeeSneakFn  g_notifySeeSneakFn;
 extern CamGetCenterFn    g_camGetCenterFn;

@@ -238,6 +238,15 @@ function Set-CoopEnv {
     # for the shackle scenarios so the [shackledbg] series is captured alongside
     # the SCENARIO SHACKLE lines (same trace the manual camp session relies on).
     $env:KENSHICOOP_DEBUG_SHACKLE = if ($Scenario -like "shackle*") { "1" } else { "" }
+    # Jail put-to-work desync spike: [jail] STATE captive-state traces (own vs
+    # drv) + the [spike] SELECT task-selection trace, so the twitch timeline is
+    # captured on both sides. Both are read-only and default OFF everywhere else.
+    $env:KENSHICOOP_JAIL_PROBE = if ($Scenario -eq "jail_probe") { "1" } else { "" }
+    $env:KENSHICOOP_TASK_SPIKE = if ($Scenario -eq "jail_probe") { "1" } else { "" }
+    # Phase A observation: host runs the captive unopposed and logs its
+    # trajectory ([jail] OBSERVE) so we can classify the guard's put-to-work
+    # intent (relocate vs walk-round). Read-only; only for the jail_probe spike.
+    $env:KENSHICOOP_JAIL_OBSERVE = if ($Scenario -eq "jail_probe") { "1" } else { "" }
     # Host-only setup/re-arm scene.
     $env:KENSHICOOP_SETUP = if ($Mode -eq "host") { $Setup } else { "" }
     # Legacy in-plugin WAN sim (both clients; entities only).

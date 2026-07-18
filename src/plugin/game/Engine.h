@@ -1209,6 +1209,10 @@ struct ShackleRead {
     unsigned int owner[5]; // Character::slaveOwner (0x328) hand, all-zero if none
 };
 bool readShackle(Character* c, ShackleRead* out);
+// Jail-probe read lever (KENSHICOOP_JAIL_PROBE): Character::isSlave() as int
+// (0 NOT_SLAVE / 1 IS_SLAVE / 2 ESCAPING_SLAVE / 3 EX_SLAVE), -1 if unresolved
+// or faulted. Read-only; answers whether the join marks its own PC a prisoner.
+int readSlaveState(Character* c);
 // Phase 6 (6a spike): env-gated ([shackledbg], KENSHICOOP_DEBUG_SHACKLE)
 // per-character shackle/lock trace, throttled ~1 Hz. Enumerates nearby world
 // NPCs (prisoners are not in the player squad) and logs every body that is

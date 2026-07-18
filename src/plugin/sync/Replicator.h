@@ -602,6 +602,19 @@ public:
     // the players travel. Off by default (log volume).
     void setAuditRows(bool on) { auditRows_ = on; }
 
+    // Jail put-to-work desync spike (KENSHICOOP_JAIL_PROBE, read-only): emit
+    // correlated [jail] STATE traces for captive bodies - the owned PC in
+    // publishOwned (side=own) and each driven copy in applyTargets (side=drv)
+    // - so the brief cage-exit/re-cage twitch can be pinned. Off by default.
+    void setJailProbe(bool on) { jailProbe_ = on; }
+
+    // Phase A jail-observe (KENSHICOOP_JAIL_OBSERVE, read-only): on the host,
+    // stop driving/suspending/self-healing a peer-owned captive so the host's
+    // local sim runs it unopposed, and log its trajectory ([jail] OBSERVE) to
+    // classify the guard's "put to work" intent (relocate vs walk-round). Off
+    // by default; a spike lever, never shipped on.
+    void setJailObserve(bool on) { jailObserve_ = on; }
+
     unsigned int targetCount() const { return (unsigned int)targets_.size(); }
 
     // Stage 2 smoothness oracle: emit a "SCENARIO SMOOTH ..." summary describing
@@ -899,6 +912,13 @@ private:
     bool                      censusFreezeAi_;
     std::map<Key, unsigned long> censusFrozen_; // join: per-key freeze-hold tick
     bool                      auditRows_;     // travel_parity worldstate rows
+    bool                      jailProbe_;     // KENSHICOOP_JAIL_PROBE [jail] STATE
+    bool                      jailObserve_;   // KENSHICOOP_JAIL_OBSERVE [jail] OBSERVE
+    // Per-captive last-logged sample for the jail-observe spike (kind + pos +
+    // ms), so [jail] OBSERVE lines fire on change/move/timeout, not every tick.
+    struct JailObs { int kind; float x, y, z; unsigned long ms;
+                     JailObs() : kind(0), x(0), y(0), z(0), ms(0) {} };
+    std::map<Key, JailObs>    jailObs_;
     // Third-party furniture placement (protocol 36): ENTER edges detected on
     // peer-owned driven bodies in applyTargets (a guard jailing an arrested
     // player runs purely on the host sim, so the occupant's owner can never

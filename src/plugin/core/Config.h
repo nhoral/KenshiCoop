@@ -116,6 +116,17 @@ struct Config {
     // design direction. Changes no behavior.
     bool         taskSelectSpike;    // KENSHICOOP_TASK_SPIKE           (off)
 
+    // Jail put-to-work desync spike: emit correlated [jail] STATE traces for
+    // captive bodies (owned PC in publishOwned, driven copy in applyTargets) so
+    // the twitch (brief cage-exit then re-cage) can be pinned. Read-only.
+    bool         jailProbe;          // KENSHICOOP_JAIL_PROBE           (off)
+
+    // Jail put-to-work observation spike (Phase A): host stops driving/
+    // suspending/self-healing a peer-owned captive so its local sim runs
+    // unopposed and its trajectory ([jail] OBSERVE) reveals the guard's intent
+    // (relocate to a work spot vs walk a job round). Read-only diagnostic.
+    bool         jailObserve;        // KENSHICOOP_JAIL_OBSERVE         (off)
+
     // Starved-replica guard hold: how long (ms) a driven body whose stream
     // went stale keeps its AI-suspend + damage-guard before releasing to
     // local simulation - a WAN stall must not become an authority transfer.

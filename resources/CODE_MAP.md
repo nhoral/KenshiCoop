@@ -68,6 +68,7 @@ human/log-diff diagnostic only).
 | `[taskkey] key` | EngineEntity.cpp `logTaskKeyOnce` | first sighting of each task key (self-documenting enum) | diag |
 | `[cam] center=` | EngineEntity.cpp `cameraCenter` (~5 s throttle) | local camera world center (protocol 43 camera-anchored interest) | diag |
 | `[spike] SELECT` | EngineInternal.cpp `setCurrentAction_hook` (`KENSHICOOP_TASK_SPIKE`, off; ~4 lines/s) | passive observation of the AI/order task-SELECTION seam (`CharBody::setCurrentAction`): chosen `task=` (TaskType) + `subj=` (hand) + `loc=` per body - the "stream selection, not motion" precondition probe | diag |
+| `[jail] STATE` | ReplicatorPublish.cpp `publishOwned` (`side=own`) + ReplicatorDrive.cpp `applyTargets` (`side=drv`), gated by `KENSHICOOP_JAIL_PROBE` (off; ~4/s per captive body; run_test arms it + `TASK_SPIKE` for `jail_probe`) | spike 57 - correlated captive-state trace (`kind`/`chained`/`slaveOwner`/`isSlave`/`task`/`streamKind`/`localKind`/`pos`) for owned PC vs host driven copy; pins the jail "put to work" twitch (host self-heal re-cages a peer-owned copy its guard dragged out). `isSlave` via `readSlaveState` (`Character::isSlave`) | diag |
 | `SETUP:` | EngineEntity/SpawnCombat scene helpers | scenario scene-setup progress | scenario oracles (setup evidence) |
 
 ## Replication plane (`src/plugin/sync/`)

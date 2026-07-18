@@ -48,7 +48,7 @@ Replicator::Replicator()
       camHintSendMs_(0), peerCamMs_(0),
       midCursor_(0), midSliceMs_(0),
       censusParkDist_(0.0f), censusParks_(0), censusFreezeAi_(true),
-      auditRows_(false),
+      auditRows_(false), jailProbe_(false), jailObserve_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
@@ -158,6 +158,7 @@ void Replicator::resetSession() {
     drivenChars_.clear();
     drivenSeen_.clear();       // recently-driven grace (pointers dangle after swap)
     canonicalOf_.clear();      // capture-translation reverse map (same pointers)
+    jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)

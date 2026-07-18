@@ -847,9 +847,13 @@ const float SpawnFarScenario::ARRIVE_DIST = 30.0f;
 // tail samples, same reasoning as npc_sync).
 class WorldParityScenario : public Scenario {
 public:
-    WorldParityScenario() : passed_(false) {}
+    // Name-parameterized so the same passive-soak body backs both the gated
+    // world_parity parity run and the ungated jail_probe diagnostic spike (the
+    // jail-probe evidence is [jail]/[furn]/[spike] traces + auditRows, not a
+    // scenario verdict).
+    explicit WorldParityScenario(const char* name) : name_(name), passed_(false) {}
 
-    virtual const char* name() const { return "world_parity"; }
+    virtual const char* name() const { return name_; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -867,6 +871,7 @@ private:
     // (~24 aligned samples).
     static const unsigned long HOST_DURATION_MS = 180000;
     static const unsigned long JOIN_DURATION_MS = 160000;
+    const char* name_;
     bool passed_;
 };
 
@@ -881,7 +886,8 @@ Scenario* makeNpcScenario(const std::string& name) {
     if (name == "spawn_sync")   return new SpawnSyncScenario(/*probe=*/false);
     if (name == "npc_census")   return new NpcCensusScenario();
     if (name == "spawn_far")    return new SpawnFarScenario();
-    if (name == "world_parity") return new WorldParityScenario();
+    if (name == "world_parity") return new WorldParityScenario("world_parity");
+    if (name == "jail_probe")   return new WorldParityScenario("jail_probe");
     return 0;
 }
 

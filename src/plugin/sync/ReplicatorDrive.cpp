@@ -260,6 +260,55 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     sit/idle poses for NPCs arrive in Stage 5 (AI quiet-in-place).
         bool isSquad = engine::isLocalPlayerChar(gw, c);
 
+        // ---- Phase A jail-observe (KENSHICOOP_JAIL_OBSERVE, read-only spike) ----
+        // For a peer-owned captive (the join's jailed PC as driven on the host),
+        // temporarily let the host's LOCAL sim run it unopposed: skip drive,
+        // AI-suspend AND furniture self-heal, and log the full trajectory. This
+        // reveals what the host guard's "put to work" actually does to the body
+        // (does it relocate to a fixed work spot -> B-R, or walk a job round ->
+        // B-W). The body is still damage-guarded (harmless) and in drivenChars_
+        // (keeps host-authority suppression off) from above. Knob OFF by default.
+        if (jailObserve_) {
+            engine::FurnitureRead ofr;
+            bool ofrOk = engine::readFurniture(c, &ofr) && ofr.valid;
+            int localKindO = ofrOk ? ofr.kind : 0;
+            int slaveO = engine::readSlaveState(c);
+            bool captive = localKindO != 0 || slaveO > 0 ||
+                           (out.bodyState & (BODY_IN_CAGE | BODY_CHAINED | BODY_IN_BED));
+            if (captive) {
+                int streamKindO = (out.bodyState & BODY_IN_BED) ? 1
+                                : ((out.bodyState & BODY_IN_CAGE) ? 2
+                                : ((out.bodyState & BODY_CHAINED) ? 3 : 0));
+                // Log on any kind change, a >5u move, or every 500ms - enough to
+                // reconstruct the cage -> work trajectory without flooding.
+                JailObs& jo = jailObs_[it->first];
+                float dx = ax - jo.x, dy = ay - jo.y, dz = az - jo.z;
+                float moved2 = haveActual ? (dx*dx + dy*dy + dz*dz) : 0.0f;
+                bool first = (jo.ms == 0);
+                if (first || localKindO != jo.kind || moved2 > 25.0f ||
+                    (now - jo.ms) >= 500) {
+                    float step = (haveActual && !first) ? std::sqrt(moved2) : 0.0f;
+                    jo.kind = localKindO; jo.ms = now;
+                    if (haveActual) { jo.x = ax; jo.y = ay; jo.z = az; }
+                    char b[256];
+                    _snprintf(b, sizeof(b) - 1,
+                        "[jail] OBSERVE hand=%u,%u localKind=%d streamKind=%d chained=%d "
+                        "inWhat=%u,%u slave=%d task=%u raw=%u pos=%.1f,%.1f,%.1f step=%.1f",
+                        out.hIndex, out.hSerial, localKindO, streamKindO,
+                        (out.bodyState & BODY_CHAINED) ? 1 : 0,
+                        ofrOk ? ofr.furn[3] : 0u, ofrOk ? ofr.furn[4] : 0u,
+                        slaveO, out.task, out.rawTask,
+                        haveActual ? ax : 0.0f, haveActual ? ay : 0.0f,
+                        haveActual ? az : 0.0f, step);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+                // Do NOT drive / suspend / self-heal this body: let the host sim run it.
+                d.parked = false; d.haveDest = false;
+                if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                continue;
+            }
+        }
+
         // ---- Stage 2: body-state override (down / KO / ragdoll / dead) --------
         // A body the host reports as down (on the ground) must NOT be walk-driven or
         // parked upright - reproducing locomotion on a corpse/KO is exactly the
@@ -360,6 +409,30 @@ void Replicator::applyTargets(GameWorld* gw) {
             bool haveFr = engine::readFurniture(c, &lfr);
             int localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
             if (localKind == 3 && !chainSync_) localKind = 0;
+            // Jail put-to-work desync spike (KENSHICOOP_JAIL_PROBE, read-only):
+            // the DRIVEN view of a peer-owned captive (the host's copy of the
+            // join's jailed PC). streamKind is what the owner reports;
+            // localKind is where our copy actually sits. A streamKind=2/3 with
+            // localKind=0 (or vice-versa) is the twitch. Pairs with side=own.
+            if (jailProbe_ && (streamKind != 0 || localKind != 0)) {
+                static std::map<Key, unsigned long> s_drvJailMs;
+                Key jk = keyOf(out);
+                std::map<Key, unsigned long>::iterator jt = s_drvJailMs.find(jk);
+                if (jt == s_drvJailMs.end() || (now - jt->second) >= 250) {
+                    s_drvJailMs[jk] = now;
+                    int slave = engine::readSlaveState(c);
+                    char jb[224];
+                    _snprintf(jb, sizeof(jb) - 1,
+                              "[jail] STATE side=drv hand=%u,%u streamKind=%d localKind=%d "
+                              "chained=%d slaveOwner=%u,%u isSlave=%d task=%u raw=%u "
+                              "pos=%.1f,%.1f,%.1f mv=%d",
+                              out.hIndex, out.hSerial, streamKind, localKind,
+                              (out.bodyState & BODY_CHAINED) ? 1 : 0,
+                              lfr.furn[3], lfr.furn[4], slave, out.task, out.rawTask,
+                              out.x, out.y, out.z, out.cMoving ? 1 : 0);
+                    jb[sizeof(jb) - 1] = '\0'; coop::logLine(jb);
+                }
+            }
             // Remember the owner hand while locally chained, so a lost/late
             // reliable ENTER (or an AI break-out) can be re-applied below (the
             // continuous BODY_CHAINED bit carries no owner).

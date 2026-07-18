@@ -84,6 +84,41 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         buf[n++] = raw[i];
         ownHands_.insert(hk);
     }
+    // Jail put-to-work desync spike (KENSHICOOP_JAIL_PROBE, read-only): the
+    // OWNED view of any captive body (the join's real, authoritative PC while it
+    // is jailed). Correlate side=own here against side=drv from the host's
+    // driven copy (applyTargets) to pin the brief cage-exit/re-cage twitch.
+    if (jailProbe_) {
+        static std::map<Key, unsigned long> s_ownJailMs;
+        unsigned long jNow = nowMs();
+        for (unsigned int i = 0; i < n; ++i) {
+            const EntityState& e = buf[i];
+            Character* oc = engine::resolveCharByHand(
+                e.hIndex, e.hSerial, e.hType, e.hContainer, e.hContainerSerial);
+            if (!oc) continue;
+            engine::FurnitureRead fr;
+            engine::ShackleRead sr;
+            bool haveF = engine::readFurniture(oc, &fr) && fr.valid;
+            bool haveS = engine::readShackle(oc, &sr) && sr.valid;
+            int kind = haveF ? fr.kind : 0;
+            bool chained = haveS ? sr.chained : false;
+            if (kind == 0 && !chained) continue;   // only captive bodies
+            Key k = keyOf(e);
+            std::map<Key, unsigned long>::iterator jt = s_ownJailMs.find(k);
+            if (jt != s_ownJailMs.end() && (jNow - jt->second) < 250) continue;
+            s_ownJailMs[k] = jNow;
+            int slave = engine::readSlaveState(oc);
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                      "[jail] STATE side=own hand=%u,%u kind=%d chained=%d "
+                      "slaveOwner=%u,%u isSlave=%d task=%u raw=%u pos=%.1f,%.1f,%.1f mv=%d",
+                      e.hIndex, e.hSerial, kind, chained ? 1 : 0,
+                      haveS ? sr.owner[3] : 0u, haveS ? sr.owner[4] : 0u,
+                      slave, e.task, e.rawTask, e.x, e.y, e.z, e.cMoving ? 1 : 0);
+            b[sizeof(b) - 1] = '\0';
+            coop::logLine(b);
+        }
+    }
     // Combat-subject CANONICAL translation (join-initiated town combat, run
     // 20260712_180913): the capture reads the target's LOCAL hand, but a body
     // this client is DRIVING can live in a local runtime container that the
