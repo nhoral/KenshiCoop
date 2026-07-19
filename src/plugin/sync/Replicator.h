@@ -1299,11 +1299,14 @@ private:
     //              echo guard: an applied row is never re-detected as local).
     // lastSendVal/lastSendMs = change gate + safety resend (rows never sent
     //              never resend, so a settled diplomacy is silent).
-    // seqSeen    = newest per-sender seq applied (stale-row guard).
+    // seqSeen    = newest seq applied PER SENDER (keyed by the packet's
+    //              ownerId; both clients publish this symmetric channel with
+    //              INDEPENDENT counters, so one shared counter would let a
+    //              faster sender starve the slower one's rows as "stale").
     struct FacRow {
         float known; float lastSendVal; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
-        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seqSeen(0), seeded(false) {}
+        std::map<u32, u32> seqSeen; bool seeded;
+        FacRow() : known(0), lastSendVal(0), lastSendMs(0), seeded(false) {}
     };
     std::map<std::string, FacRow> facRows_;
     u32           facSeqOut_;
@@ -1312,12 +1315,13 @@ private:
     // Protocol 26 door-state sync, per door hand (the faction shape: known =
     // baseline, updated on every local change sent AND every received row
     // applied - the echo guard; lastSendMs = change gate + safety resend;
-    // seqSeen = stale-row guard).
+    // seqSeen = per-sender stale-row guard, keyed by the packet's ownerId -
+    // both clients publish this symmetric channel with independent counters).
     struct DoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
+        std::map<u32, u32> seqSeen; bool seeded;
         DoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                    seqSeen(0), seeded(false) {}
+                    seeded(false) {}
     };
     std::map<Key, DoorRow> doorRows_;
     u32           doorSeqOut_;
@@ -1364,12 +1368,13 @@ private:
     unsigned long buildSampleMs_;
     bool          buildSync_;
     // Protocol 28 placed-door rows, keyed by (placer building key, door
-    // index) - the protocol-26 DoorRow shape on the translated identity.
+    // index) - the protocol-26 DoorRow shape on the translated identity
+    // (seqSeen is per-sender for the same reason: both sides publish).
     struct BdoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
-        u32 seqSeen; bool seeded;
+        std::map<u32, u32> seqSeen; bool seeded;
         BdoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                     seqSeen(0), seeded(false) {}
+                     seeded(false) {}
     };
     std::map<std::pair<Key, int>, BdoorRow> bdoorRows_;
     u32           bdoorSeqOut_;
