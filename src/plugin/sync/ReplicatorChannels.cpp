@@ -11,6 +11,7 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/StaleGuard.h"
 
 namespace coop {
 
@@ -617,12 +618,11 @@ void Replicator::applyFactions(const SyncContext& ctx) {
         const FactionPacket& p = it->pkt;
         if (p.sid[0] == '\0') continue;
         FacRow& fr = facRows_[std::string(p.sid)];
-        // Per-sender stale guard: both clients publish this row with
-        // INDEPENDENT seq counters, so the comparison must be against the
-        // newest seq seen FROM THIS SENDER, not a shared high-water mark.
-        u32& seen = fr.seqSeen[p.ownerId];
-        if (seen != 0 && p.seq <= seen) continue; // stale row (this sender)
-        seen = p.seq;
+        // Per-sender stale guard (StaleGuard.h, prototest testStaleGuard):
+        // both clients publish this row with INDEPENDENT seq counters, so the
+        // comparison must be against the newest seq seen FROM THIS SENDER,
+        // not a shared high-water mark.
+        if (!staleRowAccept(fr.seqSeen, p.ownerId, p.seq)) continue;
         float us = -999.0f, them = -999.0f;
         engine::readRelationBySid(gw, p.sid, &us, &them);
         // Updating the baseline FIRST is the echo guard: the local change this
@@ -712,12 +712,11 @@ void Replicator::applyDoors(const SyncContext& ctx) {
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         DoorRow& dr = doorRows_[k];
-        // Per-sender stale guard: both clients publish this row with
-        // INDEPENDENT seq counters, so the comparison must be against the
-        // newest seq seen FROM THIS SENDER, not a shared high-water mark.
-        u32& seen = dr.seqSeen[p.ownerId];
-        if (seen != 0 && p.seq <= seen) continue; // stale row (this sender)
-        seen = p.seq;
+        // Per-sender stale guard (StaleGuard.h, prototest testStaleGuard):
+        // both clients publish this row with INDEPENDENT seq counters, so the
+        // comparison must be against the newest seq seen FROM THIS SENDER,
+        // not a shared high-water mark.
+        if (!staleRowAccept(dr.seqSeen, p.ownerId, p.seq)) continue;
         // Updating the baseline FIRST is the echo guard: the local change this
         // write causes must not be re-detected as ours next sample.
         dr.knownOpen = (int)p.open; dr.knownLocked = (int)p.locked;
@@ -1430,12 +1429,11 @@ void Replicator::applyBuildDoors(const SyncContext& ctx) {
                 localHand = pit->second.localHand;
         }
         BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
-        // Per-sender stale guard: both clients publish this row with
-        // INDEPENDENT seq counters, so the comparison must be against the
-        // newest seq seen FROM THIS SENDER, not a shared high-water mark.
-        u32& seen = row.seqSeen[p.ownerId];
-        if (seen != 0 && p.seq <= seen) continue; // stale row (this sender)
-        seen = p.seq;
+        // Per-sender stale guard (StaleGuard.h, prototest testStaleGuard):
+        // both clients publish this row with INDEPENDENT seq counters, so the
+        // comparison must be against the newest seq seen FROM THIS SENDER,
+        // not a shared high-water mark.
+        if (!staleRowAccept(row.seqSeen, p.ownerId, p.seq)) continue;
         // Updating the baseline FIRST is the echo guard: the local change this
         // write causes must not be re-detected as ours next sample.
         row.knownOpen = (int)p.open; row.knownLocked = (int)p.locked;
