@@ -847,18 +847,25 @@ const float SpawnFarScenario::ARRIVE_DIST = 30.0f;
 // tail samples, same reasoning as npc_sync).
 class WorldParityScenario : public Scenario {
 public:
-    // Name-parameterized so the same passive-soak body backs both the gated
-    // world_parity parity run and the ungated jail_probe diagnostic spike (the
-    // jail-probe evidence is [jail]/[furn]/[spike] traces + auditRows, not a
-    // scenario verdict).
-    explicit WorldParityScenario(const char* name) : name_(name), passed_(false) {}
+    // Name-parameterized so the same passive-soak body backs the gated
+    // world_parity parity run, the ungated jail_probe diagnostic spike, and the
+    // long-play jail_soak (spike 58). world_parity/jail_probe use the tuned
+    // ~160-180 s window; jail_soak runs ~10 min so the guard put-to-work
+    // cage<->pole cycle and census drift actually accumulate.
+    explicit WorldParityScenario(const char* name) : name_(name), passed_(false) {
+        if (std::string(name) == "jail_soak") {
+            hostDur_ = 570000; joinDur_ = 560000;   // long-play soak (~9.5 min)
+        } else {
+            hostDur_ = 180000; joinDur_ = 160000;   // parity/spike window
+        }
+    }
 
     virtual const char* name() const { return name_; }
 
     virtual void onStart(const ScenarioContext&) {}
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        unsigned long dur = ctx.isHost ? hostDur_ : joinDur_;
         if (ctx.elapsedMs >= dur) { passed_ = true; return true; }
         return false;
     }
@@ -868,9 +875,9 @@ public:
 private:
     // ~160 s of joined observation: long enough past the join's clock
     // catch-up (~40 s) that steady-state dominates the 5 s dump series
-    // (~24 aligned samples).
-    static const unsigned long HOST_DURATION_MS = 180000;
-    static const unsigned long JOIN_DURATION_MS = 160000;
+    // (~24 aligned samples). jail_soak overrides these in the ctor.
+    unsigned long hostDur_;
+    unsigned long joinDur_;
     const char* name_;
     bool passed_;
 };
@@ -888,6 +895,7 @@ Scenario* makeNpcScenario(const std::string& name) {
     if (name == "spawn_far")    return new SpawnFarScenario();
     if (name == "world_parity") return new WorldParityScenario("world_parity");
     if (name == "jail_probe")   return new WorldParityScenario("jail_probe");
+    if (name == "jail_soak")    return new WorldParityScenario("jail_soak");
     return 0;
 }
 

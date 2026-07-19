@@ -476,6 +476,23 @@ void Replicator::applyTargets(GameWorld* gw) {
                         "[furn] HEAL ENTER occ=%u,%u kind=3 was=%d ok=%d (fallthrough)",
                         out.hIndex, out.hSerial, localKind, ok ? 1 : 0);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    // Jail spike (KENSHICOOP_JAIL_PROBE, read-only): quantify the
+                    // re-seat as the user sees it. divergence = how far the local
+                    // copy had drifted from the owner's streamed pos when we
+                    // re-chained it (the visible teleport magnitude); localStep =
+                    // how far our copy moved since last tick while nominally
+                    // seated (>0 => the driven copy's OWN local AI is walking it -
+                    // the "exit cage to run" half of the oscillation).
+                    if (jailProbe_) {
+                        float dvg = haveActual ? std::sqrt(
+                            (ax-out.x)*(ax-out.x)+(ay-out.y)*(ay-out.y)+(az-out.z)*(az-out.z)) : 0.0f;
+                        float lstep = (haveActual && d.haveActual) ? std::sqrt(
+                            (ax-d.lx)*(ax-d.lx)+(ay-d.ly)*(ay-d.ly)+(az-d.lz)*(az-d.lz)) : 0.0f;
+                        char s[192]; _snprintf(s, sizeof(s) - 1,
+                            "[jail] SNAP hand=%u,%u kind=3 was=%d divergence=%.1f localStep=%.1f ok=%d",
+                            out.hIndex, out.hSerial, localKind, dvg, lstep, ok ? 1 : 0);
+                        s[sizeof(s) - 1] = '\0'; coop::logLine(s);
+                    }
                 }
             } else if (streamKind != 0) {
                 d.furnNoSeeTick = 0;
@@ -521,6 +538,19 @@ void Replicator::applyTargets(GameWorld* gw) {
                         "[furn] cage-quiet occ=%u,%u kind=%d",
                         out.hIndex, out.hSerial, streamKind);
                       q[sizeof(q) - 1] = '\0'; coop::logLine(q); }
+                    // Jail spike (see kind=3 SNAP above): divergence = teleport
+                    // magnitude of this re-seat; localStep = drift since last tick
+                    // while nominally in the cage/bed (>0 => local AI walked it).
+                    if (jailProbe_) {
+                        float dvg = haveActual ? std::sqrt(
+                            (ax-out.x)*(ax-out.x)+(ay-out.y)*(ay-out.y)+(az-out.z)*(az-out.z)) : 0.0f;
+                        float lstep = (haveActual && d.haveActual) ? std::sqrt(
+                            (ax-d.lx)*(ax-d.lx)+(ay-d.ly)*(ay-d.ly)+(az-d.lz)*(az-d.lz)) : 0.0f;
+                        char s[192]; _snprintf(s, sizeof(s) - 1,
+                            "[jail] SNAP hand=%u,%u kind=%d was=%d divergence=%.1f localStep=%.1f ok=%d",
+                            out.hIndex, out.hSerial, streamKind, localKind, dvg, lstep, ok ? 1 : 0);
+                        s[sizeof(s) - 1] = '\0'; coop::logLine(s);
+                    }
                 }
                 d.parked = false; d.haveDest = false;
                 if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }

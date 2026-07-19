@@ -1648,7 +1648,9 @@ __declspec(dllexport) void startPlugin() {
         g_repl.setAuditRows(g_cfg.scenario == "travel_parity" ||
                             g_cfg.scenario == "npc_sync" ||
                             g_cfg.scenario == "world_parity" ||
-                            g_cfg.scenario == "jail_probe");
+                            g_cfg.scenario == "jail_probe" ||
+                            g_cfg.scenario == "jail_soak" ||
+                            g_cfg.jailProbe);  // manual -JailProbe: no scenario name
         char b[260];
         _snprintf(b, sizeof(b) - 1,
                   "KenshiCoop: interp delay=%u-%ums extrap=%ums stale=%ums snap=%.0fu "

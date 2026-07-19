@@ -108,6 +108,21 @@ param(
     # session captures the exact tick a peer's driven copy diverges from the
     # owner (the reported "peer PC unlocks the shackles" desync).
     [switch]$DebugShackle,
+    # Jail long-play diagnostics (spike 58, KENSHICOOP_JAIL_PROBE/TASK_SPIKE=1 on
+    # both clients): arms the [jail] STATE/SNAP captive traces + [spike] SELECT
+    # task-selection + auditRows (SCENARIO WNPC/WORLD) so a manual
+    # jailed/slaves/cage2 session captures the guard put-to-work cage<->pole
+    # oscillation and census drift on BOTH sides with the NORMAL self-heal on
+    # (i.e. real replicated behavior). On exit both logs are copied into
+    # tools/manual-sessions/<stamp>/. All read-only, OFF by default.
+    [switch]$JailProbe,
+    # Jail OBSERVE (spike 57 phase A, KENSHICOOP_JAIL_OBSERVE=1): OPT-IN, requires
+    # -JailProbe. Runs peer-owned captives UNOPPOSED (drive/suspend/self-heal OFF)
+    # to classify the guard put-to-work trajectory. WARNING: this DISABLES the
+    # captive self-heal, so captives WILL exit furniture and walk off on the
+    # observing side (a diagnostic divergence, NOT a real desync). Do NOT use for
+    # parity/visual A-B; use plain -JailProbe for that.
+    [switch]$JailObserve,
     # Manual sessions tile the two game windows side-by-side BY DEFAULT (host left,
     # join right; scripts\arrange_windows.ps1, re-pinned through the load screen) on
     # the ULTRAWIDE (widest monitor, 3440x1440): each client window is sized to half
@@ -139,6 +154,10 @@ $hostExe = Join-Path $HostDir "kenshi_x64.exe"
 $joinExe = Join-Path $JoinDir "kenshi_x64.exe"
 if (-not (Test-Path $hostExe)) { throw "Host Kenshi not found: $hostExe" }
 if (-not $NoJoin -and -not (Test-Path $joinExe)) { throw "Join Kenshi not found: $joinExe (run scripts\setup_join_install.cmd)" }
+
+if ($JailObserve -and -not $JailProbe) {
+    throw "-JailObserve requires -JailProbe (it only toggles observe mode on top of the jail probes)."
+}
 
 if ($JoinSave -eq "") { $JoinSave = $Save }
 
@@ -281,6 +300,15 @@ function Set-CoopEnv {
     $env:KENSHICOOP_DEBUG_MARKERS = if ($DebugMarkers) { "1" } else { "" }
     # Phase 6 shackle trace on both clients (see -DebugShackle).
     $env:KENSHICOOP_DEBUG_SHACKLE = if ($DebugShackle) { "1" } else { "" }
+    # Jail long-play probes on BOTH clients (spike 58, see -JailProbe): STATE/SNAP
+    # + task-selection traces + auditRows (auditRows keys off KENSHICOOP_JAIL_PROBE
+    # in Plugin.cpp when no scenario name is set). NOTE: JAIL_OBSERVE is NOT armed
+    # by -JailProbe - observe disables the captive self-heal (captives exit
+    # furniture + walk off on the observing side), which is a diagnostic
+    # divergence, not real behavior. It is opt-in via -JailObserve.
+    $env:KENSHICOOP_JAIL_PROBE   = if ($JailProbe) { "1" } else { "" }
+    $env:KENSHICOOP_TASK_SPIKE   = if ($JailProbe) { "1" } else { "" }
+    $env:KENSHICOOP_JAIL_OBSERVE = if ($JailObserve) { "1" } else { "" }
     # Per-mode log next to the install so host/join don't clobber each other.
     $env:KENSHICOOP_LOG          = if ($Mode -eq "join") { "KenshiCoop_join.log" } else { "KenshiCoop_host.log" }
 }
@@ -349,6 +377,39 @@ if ($doTile -and $hostPid -ne 0) {
         "-Monitor", $TileMonitor, "-TimeoutSec", "90", "-RepeatSec", "$TileRepeatSec",
         "-ClientW", "$WindowW", "-ClientH", "$WindowH"
     ) | Out-Null
+}
+
+# Jail long-play (spike 58): auto-collect BOTH logs when the session ends. The
+# launcher returns immediately (manual play), so a hidden background waiter
+# blocks on the two game PIDs and copies host+join logs into a stamped dir the
+# moment you close the windows - no manual copy step, no clobbered evidence.
+if ($JailProbe -and $hostPid -ne 0) {
+    $repoRoot   = Split-Path -Parent $scriptDir
+    $stamp      = Get-Date -Format "yyyyMMdd_HHmmss"
+    $dest       = Join-Path $repoRoot ("tools\manual-sessions\jail_{0}_{1}" -f $Save.Replace(' ', '_'), $stamp)
+    $hostLogSrc = Join-Path $HostDir "KenshiCoop_host.log"
+    $joinLogSrc = Join-Path $JoinDir "KenshiCoop_join.log"
+    $pidCsv     = if ($joinPid -ne 0) { "$hostPid,$joinPid" } else { "$hostPid" }
+    $waiterPs   = Join-Path $env:TEMP ("kc_jail_waiter_{0}.ps1" -f $stamp)
+    @"
+`$ErrorActionPreference = 'SilentlyContinue'
+Wait-Process -Id $pidCsv
+New-Item -ItemType Directory -Force -Path '$dest' | Out-Null
+Copy-Item '$hostLogSrc' (Join-Path '$dest' 'KenshiCoop_host.log')
+Copy-Item '$joinLogSrc' (Join-Path '$dest' 'KenshiCoop_join.log')
+"@ | Set-Content -Path $waiterPs -Encoding UTF8
+    Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$waiterPs`""
+    ) | Out-Null
+    Write-Host ""
+    if ($JailObserve) {
+        Write-Host "  [jail] probes ARMED on both clients: STATE/SNAP + [spike] SELECT + auditRows + OBSERVE."
+        Write-Host "  [jail] WARNING: -JailObserve disables the captive self-heal - captives WILL exit"
+        Write-Host "  [jail]          furniture + walk off on the observing side (diagnostic, NOT a real desync)."
+    } else {
+        Write-Host "  [jail] probes ARMED on both clients: STATE/SNAP + [spike] SELECT + auditRows (self-heal ON)."
+    }
+    Write-Host "  [jail] on exit both logs -> $dest"
 }
 
 # Build-freshness guard: confirm the running plugin is the one we expect. In

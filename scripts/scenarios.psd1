@@ -1438,5 +1438,23 @@
             Advisory = @()
             Tier = 'none'; WanVariant = $false   # spike: [jail]/[furn]/[spike] traces
         }
+        # jail_soak: LONG-play version of jail_probe (spike 58). 15 min passive
+        # soak so the host guard's put-to-work cage<->pole cycle and census-band
+        # NPC drift actually accumulate (jail_probe's 220 s is too short to see
+        # them). Same probes (KENSHICOOP_JAIL_PROBE/TASK_SPIKE/JAIL_OBSERVE) +
+        # auditRows + the new [jail] SNAP re-seat metric. Default Save='jailed';
+        # override -Save 'slaves save' / -Save cage2 for the other testbeds. Run
+        # partitioned (-Inhabit / OWN_RANK) so each side owns one PC. No gate.
+        jail_soak = @{
+            Save = 'jailed'; Setup = ''; Tolerance = 6.0
+            # run_test kills at (early screenshot anchor + KillGraceSec), so the
+            # kill grace must exceed the whole soak window or the game is cut short
+            # before the plugin self-exits at Seconds. Keep KillGraceSec > Seconds.
+            Seconds = 600; KillGraceSec = 780
+            PrimaryGate = ''
+            Gating   = @()
+            Advisory = @()
+            Tier = 'none'; WanVariant = $false   # spike: [jail]/[furn]/[census]/[spike] traces
+        }
     }
 }

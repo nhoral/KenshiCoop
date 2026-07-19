@@ -241,11 +241,17 @@ function Set-CoopEnv {
     # Jail put-to-work desync spike: [jail] STATE captive-state traces (own vs
     # drv) + the [spike] SELECT task-selection trace, so the twitch timeline is
     # captured on both sides. Both are read-only and default OFF everywhere else.
-    $env:KENSHICOOP_JAIL_PROBE = if ($Scenario -eq "jail_probe") { "1" } else { "" }
-    $env:KENSHICOOP_TASK_SPIKE = if ($Scenario -eq "jail_probe") { "1" } else { "" }
+    # jail_soak (spike 58) is the long-play variant and arms the STATE/SNAP +
+    # task probes. NOTE: JAIL_OBSERVE is deliberately NOT armed for jail_soak -
+    # observe mode makes the host run the captive UNOPPOSED (skips the self-heal),
+    # which suppresses the very [jail] SNAP re-seat metric the soak measures. Use
+    # jail_probe (spike 57) for the observe trajectory instead.
+    $jailSpike = ($Scenario -eq "jail_probe" -or $Scenario -eq "jail_soak")
+    $env:KENSHICOOP_JAIL_PROBE = if ($jailSpike) { "1" } else { "" }
+    $env:KENSHICOOP_TASK_SPIKE = if ($jailSpike) { "1" } else { "" }
     # Phase A observation: host runs the captive unopposed and logs its
     # trajectory ([jail] OBSERVE) so we can classify the guard's put-to-work
-    # intent (relocate vs walk-round). Read-only; only for the jail_probe spike.
+    # intent (relocate vs walk-round). Read-only; jail_probe ONLY (see above).
     $env:KENSHICOOP_JAIL_OBSERVE = if ($Scenario -eq "jail_probe") { "1" } else { "" }
     # Host-only setup/re-arm scene.
     $env:KENSHICOOP_SETUP = if ($Mode -eq "host") { $Setup } else { "" }
