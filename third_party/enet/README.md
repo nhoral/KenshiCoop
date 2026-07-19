@@ -1,7 +1,7 @@
 # ENet (vendored dependency)
 
 KenshiCoop uses [ENet](http://enet.bespin.org/) for UDP networking (reliable +
-unreliable channels), the same transport family Kenshi-Online uses. ENet is a
+unreliable channels). ENet is a
 small, portable C library that compiles cleanly under both the VS2010 (v100)
 plugin toolchain and modern compilers.
 
