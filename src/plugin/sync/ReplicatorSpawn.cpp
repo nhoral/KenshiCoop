@@ -643,6 +643,12 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
                 bool ok = occ && engine::applyFurniture(0, occ, fh, kind, true);
+                // Spike 58 (kind-conflict anchor): remember the reliable-edge
+                // kind on the driven record, so a CHAINED-only continuous bit
+                // can't break an edge-vouched cage/bed (chainAnchorStep).
+                // Same targets_ seeding pattern as the deathLatched carry.
+                if (ownHands_.find(k) == ownHands_.end())
+                    targets_[k].furnEdgeKind = kind;
                 char fb[160]; _snprintf(fb, sizeof(fb) - 1,
                     "[furn] RECV ENTER id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
                     ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,
@@ -660,6 +666,13 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
                 bool ok = occ && engine::applyFurniture(0, occ, fh, kind, false);
+                // Spike 58: the reliable EXIT withdraws the vouch (find, not
+                // operator[] - an exit for a never-seen body must not seed a
+                // junk driven record).
+                {
+                    std::map<Key, Driven>::iterator dt = targets_.find(k);
+                    if (dt != targets_.end()) dt->second.furnEdgeKind = 0;
+                }
                 char fb[160]; _snprintf(fb, sizeof(fb) - 1,
                     "[furn] RECV EXIT id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
                     ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,

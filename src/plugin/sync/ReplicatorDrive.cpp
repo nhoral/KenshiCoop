@@ -456,6 +456,59 @@ void Replicator::applyTargets(GameWorld* gw) {
             // host's work pose at rest). Cage/bed (kinds 1-2) remain true
             // transform anchors below.
             if (streamKind == 3) {
+                // Kind-conflict anchor (spike 58 follow-up 1): the owner's
+                // reliable edges settle a chained+caged prisoner on the CAGE
+                // (publish kind priority), but the lossy continuous batch can
+                // still say CHAINED-only - so this branch used to break an
+                // edge-vouched cage and re-chain every FURN_HEAL_MS, a median
+                // 75-88 u (tail 885 u) re-seat teleport on 10-15 bodies per
+                // session. While a reliable edge vouches the local cage/bed
+                // (d.furnEdgeKind, stamped on RECV ENTER / host PEER-ENTER
+                // authoring), the cage/bed stays the transform anchor and the
+                // shackle is an EQUIP-only state: hold the body like the
+                // kind 1/2 path below and re-assert setChainedMode WITHOUT
+                // breaking the anchor (the protocol-42 SHACKLE RELOCK call,
+                // proven safe on a caged occupant). An UNVOUCHED local
+                // cage/bed is a stale attach at the wrong spot (the Flashbox
+                // case below) and still takes the break+re-chain path.
+                if (coop::chainAnchorStep(streamKind, localKind,
+                                          d.furnEdgeKind) ==
+                    coop::CHAIN_ANCHOR_HOLD) {
+                    d.furnNoSeeTick = 0;
+                    // Same hold as the kind 1/2 branch: an anchored captive
+                    // must not run its own decision layer, and a committed
+                    // destination must not walk it out between heals.
+                    if (aiSuspend_) {
+                        engine::addAiSuspend(c);
+                        engine::haltMovement(c);
+                    }
+                    // EQUIP-only shackle re-assert (throttled like the unlock
+                    // guard): remember the owner while chained, re-lock if the
+                    // local copy lost the chain (lockpick / AI break-out).
+                    engine::ShackleRead asr;
+                    bool haveAsr = engine::readShackle(c, &asr) && asr.valid;
+                    if (haveAsr && asr.chained &&
+                        (asr.owner[3] != 0 || asr.owner[4] != 0)) {
+                        for (int fi = 0; fi < 5; ++fi)
+                            d.chainOwner[fi] = asr.owner[fi];
+                        d.haveChainOwner = true;
+                    }
+                    if (haveAsr && !asr.chained &&
+                        (now - d.chainHealTick) >= FURN_HEAL_MS) {
+                        d.chainHealTick = now;
+                        bool ok = d.haveChainOwner
+                            ? engine::applyFurniture(gw, c, d.chainOwner, 3, true)
+                            : engine::applyFurniture(gw, c, 0, 3, true);
+                        engine::endAction(c);
+                        char b[160]; _snprintf(b, sizeof(b) - 1,
+                            "[furn] CHAIN EQUIP occ=%u,%u anchor=%d ok=%d",
+                            out.hIndex, out.hSerial, localKind, ok ? 1 : 0);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                    d.parked = false; d.haveDest = false;
+                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
+                    continue;
+                }
                 if (haveFr && localKind != 3 &&
                     (now - d.furnHealTick) >= FURN_HEAL_MS) {
                     d.furnHealTick = now;
@@ -506,7 +559,17 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // exception: suspend its decisions so it stays put. The suspend set is
                 // rebuilt every drive tick, so this self-clears the moment the host
                 // stops streaming the furniture bit (body released) and its AI resumes.
-                if (aiSuspend_) engine::addAiSuspend(c);
+                if (aiSuspend_) {
+                    engine::addAiSuspend(c);
+                    // Spike 58 follow-up 2: the suspend hook only blocks NEW
+                    // decisions - a destination the local AI committed before
+                    // it still walks the copy out between heals (8/22 jailed
+                    // SNAPs carried localStep>2 u, up to 28.6 u). Halt the
+                    // in-flight goal per tick, exactly like the census-freeze
+                    // upkeep, so localStep stays 0 and the twitch is a pure
+                    // (and now rare) re-seat instead of exit-then-snap.
+                    engine::haltMovement(c);
+                }
                 if (haveFr && localKind != streamKind &&
                     (now - d.furnHealTick) >= FURN_HEAL_MS) {
                     d.furnHealTick = now;
@@ -608,6 +671,10 @@ void Replicator::applyTargets(GameWorld* gw) {
                         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                     }
                     d.furnNoSeeTick = 0; // never self-heal-eject a host placement
+                    // The host's own placement is as authoritative as a
+                    // received edge: vouch the kind so a later CHAINED-only
+                    // continuous bit can't break this cage (spike 58 anchor).
+                    d.furnEdgeKind = localKind;
                     d.parked = false; d.haveDest = false;
                     if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
                     continue;
@@ -616,6 +683,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                     d.furnNoSeeTick = now;
                 } else if ((now - d.furnNoSeeTick) > FURN_EXIT_MS) {
                     d.furnNoSeeTick = 0;
+                    d.furnEdgeKind = 0; // debounced exit: the vouch dies with it
                     bool ok = engine::applyFurniture(gw, c, lfr.furn, localKind, false);
                     char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[furn] HEAL EXIT occ=%u,%u kind=%d ok=%d",
