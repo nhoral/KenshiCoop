@@ -1,12 +1,22 @@
 # Public-repo export staging (pushed to github.com/nhoral/KenshiCoop, not tracked here)
 dist/public-export/
 
-# Build outputs
+# Build outputs (all configs: Debug / Harness / Release)
 src/plugin/x64/
 build/
 dist/*.exe
+# Generated packages + mutable DLL artifacts under dist/ (the canonical shipped
+# DLL is built on demand and its SHA-256 is recorded in the kit's PROVENANCE.json;
+# we do not track multiple mutable copies). dist/mods/ (RE_Kenshi.json + .mod
+# template) stays tracked - it is a packaging SOURCE, not an output.
+dist/*.zip
+dist/*.dll
+dist/mod-kit/
 dist/remote-kit/
 dist/KenshiCoop-remote-kit-*.zip
+
+# Manual co-op session captures (logs + screenshots)
+tools/manual-sessions/
 
 # Vendored dependency source (fetched via clone/git-LFS, not committed; ~500MB)
 third_party/enet/enet/
@@ -33,11 +43,9 @@ tools/*.exe
 # Machine-specific config (committed template: scripts/lan.config.example.json)
 scripts/lan.config.json
 
-# Spike raw captures (findings docs are tracked; raw logs/screenshots are not)
-resources/spikes/*/raw/
-
-# Demo video (45 MB; too large for git)
-resources/Kenshi_Coop.mp4
+# Local assets / working notes (design docs, spikes, recordings, frames) - kept
+# locally, not tracked in the repo.
+resources/
 
 # Stray shell artifact
 nul

@@ -1,2 +1,0 @@
-# Keep findings docs + raw text logs in git; screenshots stay on disk only (large).
-*/raw/*.png
