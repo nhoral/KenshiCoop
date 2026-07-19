@@ -727,6 +727,14 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // which lands on the SAME new hand (run 120738) - would otherwise
     // silence our own edge's stream.
     if (pinOwned_.count(newK) || ownHands_.count(newK)) return;
+    // Author-release echo (gap 10 cross-tab control-release): a hand we
+    // ALREADY pinned peer is either our own release of a unit we moved into
+    // the peer's tab (publishSquadMoves) or a re-key this side already
+    // processed - classification and membership are settled, and the body
+    // (when local) is driven by direct hand resolution. Re-entering would
+    // fail the oldK resolve (our copy already re-containered away from it)
+    // and enroll a force-REQ whose reply can only dupe-defer forever - skip.
+    if (pinPeer_.count(newK)) return;
     // Phase 1b (control follows the squad transfer): does newK's destination tab
     // resolve to a rank THIS client owns? Uses the SAME predicate publishOwned
     // partitions on (ownRanks_ over the latched tabRank_). When true, the move
