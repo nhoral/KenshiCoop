@@ -1092,6 +1092,10 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // shackle/lock trace. No-op unless KENSHICOOP_DEBUG_SHACKLE=1, so it is
         // free to leave in the tick for manual-session characterization.
         coop::engine::shackleDbgTick(gw, g_cfg.isHost);
+        // Spike 59: env-gated ([bounty]) bounty/crime observer - direct reads
+        // of the Character+0xF0 inline BountyManager (sentinel-verified). No-op
+        // unless KENSHICOOP_BOUNTY_PROBE=1, so it is free to leave in the tick.
+        coop::engine::bountyProbeTick(gw, g_cfg.isHost);
         // Game-clock sync (protocol 25): the host broadcasts its absolute
         // in-game clock ~1 Hz; the join measures the offset and SLEWS - a
         // multiplier the speed layer's quiet writes fold in on top of the

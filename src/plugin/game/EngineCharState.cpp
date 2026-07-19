@@ -317,6 +317,181 @@ void shackleDbgTick(GameWorld* gw, bool isHost) {
     }
 }
 
+// ---- Spike 59: bounty/crime probe (KENSHICOOP_BOUNTY_PROBE) ----------------
+// Read-only observer for the engine's bounty/crime system - the SYNC_GAPS
+// gap-3 "remaining edge" that so far only has indirect [fac] AFFECT cause
+// evidence. Character::crimes is an INLINE BountyManager at Character+0xF0
+// (KenshiLib PDB layout, independently re-verified against an external RE
+// offset map - not derived from scanning here). BountyManager::me (+0x40
+// inside it) points back at the owning Character, which gives the probe a
+// free validity sentinel: me != c means the layout does not hold for this
+// build and NOTHING else is parsed. All reads SEH-guarded; zero behavior
+// change - the same observe-only contract as the jail/shackle probes.
+
+// One per-faction bounty row (POD mirror of the engine's Bounty value).
+struct BountyRow {
+    Faction*     fac;      // engine pointer (session-local identity only)
+    char         sid[64];  // faction GameData stringID (cross-client identity)
+    int          amount;   // Bounty::amount (cats)
+    unsigned int crimes;   // Bounty::crimes bitmask (CrimeEnum bits)
+    int          claimed;  // Bounty::bountyHasBeenClaimedOnce
+};
+
+// POD snapshot of one character's BountyManager state.
+struct BountyRead {
+    int          valid;      // 1 = me-sentinel matched; 0 = layout drift, do not trust
+    int          committing; // BountyManager::committingCrime (CrimeEnum; 0 = none)
+    char         vsSid[64];  // crimeAgainstFaction sid ("" = null/unreadable)
+    float        expiry;     // BountyManager::crimeExpiry
+    float        sentence;   // BountyManager::prisonSentenceToServe
+    int          hadBounty;  // BountyManager::_hadABountyAssignedForCurrentCrime
+    unsigned int nRows;      // bounties-map entries captured (capped at 8)
+    unsigned int mapSize;    // bounties map size() as reported
+    BountyRow    rows[8];
+};
+
+// Unguarded shim: boost iterators cannot share a frame with __try (C2712),
+// so the bounties-map walk lives here and the CALLER holds the SEH frame
+// (the factionBySidC pattern). Read-only iteration of the engine-owned map.
+static unsigned int readBountyRows(Character* c, BountyRow* out, unsigned int maxOut,
+                                   unsigned int* outMapSize) {
+    typedef ogre_unordered_map<Faction*, Bounty>::type BMap;
+    const BMap& m = c->crimes.bounties;
+    if (outMapSize) *outMapSize = (unsigned int)m.size();
+    unsigned int n = 0;
+    for (BMap::const_iterator it = m.begin(); it != m.end() && n < maxOut; ++it) {
+        BountyRow& r = out[n];
+        r.fac     = it->first;
+        r.amount  = it->second.amount;
+        r.crimes  = it->second.crimes;
+        r.claimed = it->second.bountyHasBeenClaimedOnce ? 1 : 0;
+        r.sid[0]  = '\0'; // filled by the caller (facSidOf holds its own SEH)
+        ++n;
+    }
+    return n;
+}
+
+// SEH-guarded snapshot of one body's bounty/crime state. Returns false only
+// when the read FAULTED; a sentinel mismatch returns true with valid=0 so the
+// tick can log the tripwire instead of silently skipping.
+static bool readBountyState(Character* c, BountyRead* out) {
+    if (!c || !out) return false;
+    memset(out, 0, sizeof(*out));
+    __try {
+        // Validity sentinel FIRST: BountyManager's constructor stores the
+        // owning Character in `me`. A mismatch means Character+0xF0 does not
+        // hold for this build - report it, parse nothing.
+        if (c->crimes.me != c) return true; // valid stays 0
+        out->committing = (int)c->crimes.committingCrime;
+        out->expiry     = c->crimes.crimeExpiry;
+        out->sentence   = c->crimes.prisonSentenceToServe;
+        out->hadBounty  = c->crimes._hadABountyAssignedForCurrentCrime ? 1 : 0;
+        facSidOf(c->crimes.crimeAgainstFaction, out->vsSid, sizeof(out->vsSid));
+        out->nRows = readBountyRows(c, out->rows, 8, &out->mapSize);
+        for (unsigned int i = 0; i < out->nRows; ++i)
+            facSidOf(out->rows[i].fac, out->rows[i].sid, sizeof(out->rows[i].sid));
+        out->valid = 1;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out->valid = 0;
+        return false;
+    }
+}
+
+bool bountyProbeOn() {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KENSHICOOP_BOUNTY_PROBE"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on == 1;
+}
+
+void bountyProbeTick(GameWorld* gw, bool isHost) {
+    if (!bountyProbeOn() || !gw) return;
+    static unsigned long lastMs = 0;
+    unsigned long now = GetTickCount();
+    if (lastMs != 0 && (now - lastMs) < 1000) return;
+    lastMs = now;
+
+    // Subjects: the local player squad FIRST (bounties are a player-facing
+    // system - the PCs are who accrue them), then nearby world NPCs (bounty
+    // targets the player could capture). listNpcs never returns the local
+    // squad, so the two sets are disjoint.
+    static const unsigned int MAXN = 64;
+    Character*   chars[MAXN];
+    unsigned int hnd[MAXN][2]; // index,serial for the log key
+    unsigned int n = 0;
+    __try {
+        if (gw->player) {
+            unsigned int pc = (unsigned int)gw->player->playerCharacters.size();
+            for (unsigned int i = 0; i < pc && n < MAXN; ++i) {
+                Character* c = gw->player->playerCharacters[i];
+                if (!c) continue;
+                unsigned int h[5];
+                if (!readObjectHand(static_cast<RootObject*>(c), h)) { h[3] = 0; h[4] = 0; }
+                chars[n] = c; hnd[n][0] = h[3]; hnd[n][1] = h[4]; ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    {
+        Character*  nchars[MAXN];
+        EntityState nst[MAXN];
+        unsigned int nn = listNpcs(gw, nchars, nst, MAXN);
+        for (unsigned int i = 0; i < nn && n < MAXN; ++i) {
+            chars[n] = nchars[i]; hnd[n][0] = nst[i].hIndex; hnd[n][1] = nst[i].hSerial; ++n;
+        }
+    }
+
+    unsigned int nValid = 0, nActive = 0;
+    for (unsigned int i = 0; i < n; ++i) {
+        BountyRead br;
+        if (!readBountyState(chars[i], &br)) continue; // read faulted; SCAN still counts it via n
+        if (!br.valid) {
+            // Layout-drift tripwire: log at most once per session so a game
+            // patch that moves the member is loud, not a silent no-data run.
+            static int warned = 0;
+            if (!warned) {
+                warned = 1;
+                char b[176];
+                _snprintf(b, sizeof(b) - 1,
+                          "[bounty] SENTINEL-MISMATCH host=%d hand=%u,%u (Character+0xF0 "
+                          "did not self-verify; parsing disabled)",
+                          isHost ? 1 : 0, hnd[i][0], hnd[i][1]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            continue;
+        }
+        ++nValid;
+        // Log only bodies with live crime/bounty state - a clean save stays quiet.
+        if (br.committing == 0 && br.nRows == 0) continue;
+        ++nActive;
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "[bounty] STATE host=%d hand=%u,%u crime=%d vs=%s expiry=%.1f "
+                  "sentence=%.1f had=%d rows=%u/%u",
+                  isHost ? 1 : 0, hnd[i][0], hnd[i][1], br.committing,
+                  br.vsSid[0] ? br.vsSid : "-", br.expiry, br.sentence,
+                  br.hadBounty, br.nRows, br.mapSize);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        for (unsigned int r = 0; r < br.nRows; ++r) {
+            _snprintf(b, sizeof(b) - 1,
+                      "[bounty] ROW host=%d hand=%u,%u fac=%s amount=%d crimes=0x%X claimed=%d",
+                      isHost ? 1 : 0, hnd[i][0], hnd[i][1],
+                      br.rows[r].sid[0] ? br.rows[r].sid : "-",
+                      br.rows[r].amount, br.rows[r].crimes, br.rows[r].claimed);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    // ~10 s heartbeat so a quiet run still proves the probe ran AND the
+    // sentinel held on every scanned body (valid == n is the health signal).
+    static unsigned long lastSumMs = 0;
+    if (lastSumMs == 0 || (now - lastSumMs) >= 10000) {
+        lastSumMs = now;
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "[bounty] SCAN host=%d n=%u valid=%u active=%u",
+                  isHost ? 1 : 0, n, nValid, nActive);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 bool applyFurniture(GameWorld* gw, Character* occupant,
                     const unsigned int furnHand[5], int kind, bool on) {
     (void)gw;

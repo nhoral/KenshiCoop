@@ -1103,6 +1103,18 @@ int readSlaveState(Character* c);
 // the env var is unset; SEH-guarded per body. `isHost` only tags the line.
 void shackleDbgTick(GameWorld* gw, bool isHost);
 bool shackleDbgOn();
+// Spike 59: env-gated ([bounty], KENSHICOOP_BOUNTY_PROBE) read-only observer
+// for the engine's bounty/crime system - the SYNC_GAPS gap-3 "remaining edge"
+// that so far only has indirect [fac] AFFECT cause evidence. Character::crimes
+// is an INLINE BountyManager at Character+0xF0 (KenshiLib PDB layout);
+// BountyManager::me points back at the owning Character and is checked as a
+// validity sentinel BEFORE any parse (a mismatch logs one SENTINEL-MISMATCH
+// tripwire and reads nothing). Enumerates the local player squad + nearby
+// world NPCs ~1 Hz and logs only bodies with live crime/bounty state, plus a
+// 10 s [bounty] SCAN heartbeat (valid==n is the layout-health signal). No-op
+// when the env var is unset; SEH-guarded per body; zero behavior change.
+void bountyProbeTick(GameWorld* gw, bool isHost);
+bool bountyProbeOn();
 // Place the local occupant into / remove it from the furniture at furnHand via
 // the engine's own setBedMode/setPrisonMode (kind: 1 bed, 2 cage) - pose,
 // attach and transform are engine-native. Idempotent: already in the desired
