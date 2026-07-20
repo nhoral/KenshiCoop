@@ -238,6 +238,52 @@ std::string saveFolderFor(const std::string& name) {
     return pathJoin(root, name);
 }
 
+bool saveNameSafe(const std::string& name) {
+    // Empty -> saveFolderFor("") resolves to the save ROOT: a commit would move
+    // the WHOLE save folder. Bound the length to the on-disk slot convention.
+    if (name.empty() || name.size() > 64) return false;
+    // A leading '.' or space is a reserved/hidden Windows name; reject outright.
+    if (name[0] == '.' || name[0] == ' ') return false;
+    for (size_t i = 0; i < name.size(); ++i) {
+        char c = name[i];
+        // No separators or drive markers: the name must stay a single folder
+        // directly under the save root (never escape it, never nest).
+        if (c == '\\' || c == '/' || c == ':') return false;
+        // No parent-dir traversal.
+        if (c == '.' && i + 1 < name.size() && name[i + 1] == '.') return false;
+    }
+    return true;
+}
+
+void recoverStrandedSave(const std::string& name) {
+    if (!saveNameSafe(name)) return; // never touch anything for an unsafe name
+    std::string finalDir = saveFolderFor(name);
+    std::string oldDir   = finalDir + "__old";
+    bool haveOld   = GetFileAttributesA(oldDir.c_str())   != INVALID_FILE_ATTRIBUTES;
+    bool haveFinal = GetFileAttributesA(finalDir.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (haveOld && !haveFinal) {
+        // Commit crashed AFTER moving the real save out but BEFORE moving the
+        // staging in: the real save only exists as __old. Put it back.
+        if (MoveFileExA(oldDir.c_str(), finalDir.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                      "[save] RECOVER restored stranded save '%s' from __old", name.c_str());
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                      "[save] RECOVER FAILED to restore '%s' from __old (err=%lu)",
+                      name.c_str(), GetLastError());
+            b[sizeof(b) - 1] = '\0'; coop::logErrLine(b);
+        }
+    } else if (haveOld && haveFinal) {
+        // The move-in completed but the process died before removing __old: the
+        // real save is already in place, so __old is a redundant backup - reclaim
+        // it (leaving it would poison the NEXT commit's move-out).
+        removeTree(oldDir, 0);
+    }
+}
+
 bool folderInventory(const std::string& folder, unsigned int* outFiles,
                      unsigned __int64* outBytes, unsigned __int64* outLatestWrite) {
     unsigned int files = 0;
@@ -536,9 +582,31 @@ void onSaveBegin(const SaveBeginPacket& b) {
     g_recvTotalBytes = b.totalBytes;
     g_recvBytes      = 0;
     g_recvStartTick  = GetTickCount();
-    g_recvStaging    = saveFolderFor(g_recvName + "__incoming");
     g_recvCrcs.assign(b.fileCount, fnv1aInit());
     g_recvSeen.assign(b.fileCount, 0);
+
+    // Refuse an unsafe name BEFORE deriving any on-disk path. saveFolderFor("")
+    // (or a name with separators / "..") would resolve staging/commit targets to
+    // the save ROOT or outside it - a subsequent commit would then move (delete)
+    // every real save on the join. An unsafe BEGIN stages nothing and drops all
+    // its FILE/DONE chunks (g_recvActive stays false).
+    if (!saveNameSafe(g_recvName)) {
+        g_recvActive  = false;
+        g_recvStaging.clear();
+        char eb[224];
+        _snprintf(eb, sizeof(eb) - 1,
+                  "[save] XFER-RECV REFUSED id=%u unsafe name='%s' (nothing staged)",
+                  b.xferId, name);
+        eb[sizeof(eb) - 1] = '\0'; coop::logErrLine(eb);
+        return;
+    }
+
+    // Heal a prior crashed commit of THIS save (real save stranded in __old)
+    // before we re-stage, so the incoming transfer never races a half-committed
+    // predecessor.
+    recoverStrandedSave(g_recvName);
+
+    g_recvStaging    = saveFolderFor(g_recvName + "__incoming");
 
     // A fresh staging folder: stale partials from an aborted transfer would
     // otherwise pollute the CRC verify.
@@ -603,10 +671,23 @@ int onSaveDone(const SaveDoneHeader& d, const u32* crcs,
     recvCloseFile();
     g_recvActive = false;
 
-    bool ok = (d.fileCount == g_recvFileCount);
+    // A commit is authorized ONLY by a fully-received, non-empty, safely-named,
+    // CRC-verified staging. Any shortfall leaves the join's EXISTING save fully
+    // intact - the failure path below only ever discards our private __incoming
+    // staging, never the real save. This is the core data-safety invariant:
+    //   * saveNameSafe: commit target can never be the save ROOT (root wipe).
+    //   * fileCount > 0: an empty/degenerate transfer can never replace a real
+    //     save with an empty folder (and then delete the __old backup).
+    //   * count agreement + crcs != 0: a truncated/table-less DONE cannot verify.
+    bool ok = saveNameSafe(g_recvName) &&
+              g_recvFileCount > 0 &&
+              d.fileCount == g_recvFileCount &&
+              crcs != 0;
     unsigned int bad = 0;
     if (ok) {
         for (u16 i = 0; i < d.fileCount; ++i) {
+            // A never-seen file (BEGIN promised it, no chunk arrived) fails the
+            // verify just like a CRC mismatch: we never commit a partial save.
             if (!g_recvSeen[i] || g_recvCrcs[i] != crcs[i]) { ++bad; ok = false; }
         }
     }

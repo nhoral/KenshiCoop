@@ -16,19 +16,24 @@ popd >nul
 set "VS10=C:\Program Files (x86)\Microsoft Visual Studio 10.0"
 set "VC=%VS10%\VC"
 set "SDK=C:\Program Files\Microsoft SDKs\Windows\v7.1"
+REM enet headers are needed only to PARSE net\NetLink.h (SaveXfer.cpp includes it);
+REM the queue* sinks it references are stubbed in savexfer_test.cpp (no ENet link).
+set "ENET=%REPO%\third_party\enet\enet\include"
 
 set "PATH=%VC%\bin\amd64;%VC%\bin;%VS10%\Common7\IDE;%SDK%\Bin\x64;%SDK%\Bin;%PATH%"
-set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat"
+set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat;%ENET%"
 set "LIB=%VC%\lib\amd64;%SDK%\Lib\x64"
 
 if not exist "%REPO%\dist" mkdir "%REPO%\dist"
 if not exist "%REPO%\build\prototest" mkdir "%REPO%\build\prototest"
 
 echo === Building prototest.exe (Release^|x64, v100) ===
-cl.exe /nologo /O2 /EHsc /W3 ^
+cl.exe /nologo /O2 /EHsc /W3 /DWIN32_LEAN_AND_MEAN ^
     /Fo"%REPO%\build\prototest\\" ^
     /Fe"%REPO%\dist\prototest.exe" ^
     "%REPO%\src\prototest\main.cpp" ^
+    "%REPO%\src\prototest\savexfer_test.cpp" ^
+    "%REPO%\src\plugin\sync\SaveXfer.cpp" ^
     "%REPO%\src\plugin\sync\Interp.cpp"
 if errorlevel 1 (
     echo prototest build FAILED

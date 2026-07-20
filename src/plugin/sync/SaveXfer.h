@@ -34,6 +34,25 @@ namespace savexfer {
 // %LOCALAPPDATA%\kenshi\save\<name> convention every harness script assumes.
 std::string saveFolderFor(const std::string& name);
 
+// ---- Data-safety guards (protocol 31 receiver) -------------------------------
+// A received transfer name must resolve to <saveRoot>/<name> and NEVER to the
+// save-folder ROOT or an escaping path. Rejects empty names, path separators,
+// ':', any ".." component, and a leading dot/space. The receiver refuses to
+// stage or commit an unsafe name: a malformed/empty BEGIN would otherwise
+// resolve saveFolderFor("") to the save ROOT and a commit would move (delete)
+// EVERY local save on the join (squad1, autosaves, _current, ...).
+bool saveNameSafe(const std::string& name);
+
+// Crash recovery for the coordinated-commit swap. onSaveDone commits by moving
+// save/<name>/ out to save/<name>__old/ and then the verified staging in. If
+// the process died - or a move faulted - inside that window, the real save is
+// stranded in save/<name>__old/ with NO save/<name>/ (the "join lost its save"
+// symptom). recoverStrandedSave restores it (or reclaims a redundant __old when
+// save/<name>/ already exists). Idempotent + no-op for an unsafe name. Called
+// defensively at the top of onSaveBegin so the next transfer of the same save
+// heals a prior crashed commit before it re-stages.
+void recoverStrandedSave(const std::string& name);
+
 // Recursive inventory of 'folder': file count, total bytes, and the newest
 // last-write FILETIME (as u64). Returns false when the folder doesn't exist.
 bool folderInventory(const std::string& folder, unsigned int* outFiles,

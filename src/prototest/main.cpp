@@ -39,8 +39,12 @@
 
 using namespace coop;
 
-static int g_failed = 0;
-static int g_total  = 0;
+// Non-static: savexfer_test.cpp folds its checks into the same run total.
+int g_failed = 0;
+int g_total  = 0;
+
+// SaveXfer receiver data-safety coverage (src/prototest/savexfer_test.cpp).
+void testSaveXfer();
 
 #define CHECK(name, cond) do { \
     ++g_total; \
@@ -1377,6 +1381,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testSaveXfer();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;
