@@ -207,6 +207,8 @@ void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pk
 
 void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outResearch_, pkt); }
 
+void NetLink::queueBounty(const BountyPacket& pkt) { pushLocked(outCs_, outBounty_, pkt); }
+
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
 void NetLink::queueBuildState(const BuildStatePacket& pkt) { pushLocked(outCs_, outBuildState_, pkt); }
@@ -705,6 +707,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
                             && inbound_) {
                             inbound_->pushResearch(rp.ownerId, rp);
+                        }
+                    } else if (type == PKT_BOUNTY) {
+                        // Reliable host-authoritative bounty/crime row
+                        // (protocol 45), applied via the BountyManager levers.
+                        BountyPacket bp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bp)
+                            && inbound_) {
+                            inbound_->pushBounty(bp.ownerId, bp);
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -1306,6 +1316,27 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < researchPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&researchPkts[i], sizeof(ResearchPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued bounty/crime rows on CH_RELIABLE (protocol
+        // 44). Host -> joins only (the Replicator only publishes on the host);
+        // change-gated + safety-resent by the caller, so a settled wanted level
+        // is near-silent. A lost row would leave a bounty diverged until the
+        // safety resend, so reliable is the right channel.
+        std::vector<BountyPacket> bountyPkts;
+        EnterCriticalSection(&outCs_);
+        bountyPkts.swap(outBounty_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < bountyPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&bountyPkts[i], sizeof(BountyPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

@@ -102,6 +102,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
+    CHECK_EQ("sizeof(BountyPacket)",            sizeof(BountyPacket),            86); // v45: bounty/crime row
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -207,7 +208,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v44: bulk channel + session epoch)", (int)PROTOCOL_VERSION, 44);
+    CHECK_EQ("PROTOCOL_VERSION (v45: bounty/crime / PKT_BOUNTY; v44 was bulk channel + session epoch)", (int)PROTOCOL_VERSION, 45);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -1355,6 +1356,79 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 13. Bounty/crime authority + convergence (Wire.h pure decision logic) ------
+// Locks the protocol-45 H2 witness-local rules WITHOUT a live engine (the engine
+// read/write shims stay behind SEH in EngineCharState.cpp): the HOST is the sole
+// publisher (a join must NEVER push its own bounty state upstream), and the
+// receiver drops stale rows, skips converged rows, and picks the raise/clear
+// lever by the signed amount delta. These are the exact rules publishBounties /
+// applyBounties + applyBountyRow implement.
+static void testBounty() {
+    std::printf("== bounty/crime authority + convergence (Wire.h) ==\n");
+
+    // Value triples: a clean baseline vs a mid-session bounty.
+    BountyVal clean; clean.amount = 0;   clean.crimes = 0;      clean.claimed = 0;
+    BountyVal wanted; wanted.amount = 500; wanted.crimes = 0x20; wanted.claimed = 0;
+
+    // --- Publish gate: HOST authoritative (H2) ---
+    // Host, seeded, the row MOVED (0 -> 500): publish.
+    CHECK("host publishes a bounty that appeared",
+          bountyShouldSend(/*isHost*/1, /*seeded*/1, &clean, &wanted, /*resendDue*/0) == 1);
+    // Host, seeded, unchanged, no resend due: stay silent.
+    CHECK("host silent on an unchanged row",
+          bountyShouldSend(1, 1, &wanted, &wanted, 0) == 0);
+    // Host, seeded, unchanged, but a safety resend is due: publish.
+    CHECK("host resends an unchanged row when due",
+          bountyShouldSend(1, 1, &wanted, &wanted, 1) == 1);
+    // Host, NOT yet seeded (first sight of a shared-save bounty): silent seed.
+    CHECK("host seeds the shared-save baseline silently",
+          bountyShouldSend(1, 0, &clean, &wanted, 0) == 0);
+
+    // --- The discriminator: a JOIN never publishes (unidirectional host->clients) ---
+    // Even with a genuine local movement, a resend due, and a seeded row, a
+    // non-host caller must produce ZERO upstream traffic. This is the test that
+    // fails if the host-only authority is ever broken.
+    CHECK("join never publishes an appeared bounty",
+          bountyShouldSend(/*isHost*/0, 1, &clean, &wanted, 0) == 0);
+    CHECK("join never publishes even with a resend due",
+          bountyShouldSend(0, 1, &wanted, &wanted, 1) == 0);
+    // Join "revert" attempt: it received the host's 500, then its own engine
+    // reads its (forked, still-clean) copy as 0 and would try to stream that
+    // back. It must NOT - the host stays authoritative.
+    CHECK("join revert to local 0 is never sent upstream",
+          bountyShouldSend(0, 1, &wanted, &clean, 1) == 0);
+
+    // --- Receiver apply decision ---
+    int delta = -12345;
+    // Stale row: incoming seq <= the newest already applied -> drop, no write.
+    CHECK("apply drops a stale seq",
+          bountyApplyDecision(/*seqSeen*/7, /*incoming*/5, 500, 0, &delta) == BOUNTY_APPLY_SKIP_STALE);
+    // Fresh seq, local already at the target -> converged, no write (resend/echo).
+    CHECK("apply skips an already-converged row",
+          bountyApplyDecision(3, 9, 500, 500, &delta) == BOUNTY_APPLY_SKIP_CONVERGED);
+    // Fresh seq, raise 0 -> 500: additive lever, delta = +500.
+    delta = 0;
+    CHECK("apply raises with a positive delta",
+          bountyApplyDecision(3, 9, 500, 0, &delta) == BOUNTY_APPLY_ADD);
+    CHECK("apply raise delta is target-current", delta == 500);
+    // Fresh seq, raise 200 -> 500: delta = +300 (additive keeps engine derived state).
+    delta = 0;
+    CHECK("apply partial raise delta",
+          bountyApplyDecision(3, 9, 500, 200, &delta) == BOUNTY_APPLY_ADD);
+    CHECK("apply partial raise delta value", delta == 300);
+    // Fresh seq, target 0 with a live local bounty: clearBounty, not a delta.
+    delta = 999;
+    CHECK("apply clears when target is zero",
+          bountyApplyDecision(3, 9, 0, 500, &delta) == BOUNTY_APPLY_CLEAR);
+    // seqSeen == 0 (first ever row) must NOT be treated as stale.
+    CHECK("apply accepts the first row (seqSeen 0)",
+          bountyApplyDecision(0, 1, 500, 0, &delta) == BOUNTY_APPLY_ADD);
+
+    // --- Tag / identity ---
+    CHECK("PKT_BOUNTY tag is 42",             PKT_BOUNTY == 42);
+    CHECK("PKT_BOUNTY distinct from CAM_HINT", PKT_BOUNTY != PKT_CAM_HINT);
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1377,6 +1451,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testBounty();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;
