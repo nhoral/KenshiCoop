@@ -62,7 +62,10 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <PreprocessorDefinitions>_DEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- WIN32_LEAN_AND_MEAN= (empty value): kenshi/util/PerfTimer.h re-defines it with an
+           empty body, so defining it as plain /D (implicit value 1) trips C4005 in every TU.
+           An empty definition makes the redefinition identical and silences the warning. -->
+      <PreprocessorDefinitions>_DEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -74,7 +77,8 @@
       <WarningLevel>Level3</WarningLevel>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- WIN32_LEAN_AND_MEAN=: see Debug config note (avoids C4005 vs PerfTimer.h). -->
+      <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- PDB for post-mortem minidump triage (2026-07-11 join crash). No codegen impact. -->
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
@@ -92,7 +96,8 @@
       <WarningLevel>Level3</WarningLevel>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- WIN32_LEAN_AND_MEAN=: see Debug config note (avoids C4005 vs PerfTimer.h). -->
+      <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <!-- PDB for post-mortem minidump triage (2026-07-11 join crash). No codegen impact. -->
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>

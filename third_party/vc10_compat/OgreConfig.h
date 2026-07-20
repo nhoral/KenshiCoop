@@ -6,6 +6,13 @@
 #ifndef KENSHICOOP_SHIM_OGRE_CONFIG_H
 #define KENSHICOOP_SHIM_OGRE_CONFIG_H
 
+// OgreBuildSettings.h (vendored dep) may already have defined these (USE_SIMD=1),
+// and we deliberately override to the plain-C path - #undef first so the override
+// stays intentional instead of tripping C4005 (macro redefinition). Do NOT turn
+// this into #ifndef: that would silently keep the dep's SIMD=1 and change the
+// Ogre::Aabb layout this shim exists to pin down.
+#undef OGRE_DOUBLE_PRECISION
+#undef OGRE_USE_SIMD
 #define OGRE_DOUBLE_PRECISION 0
 #define OGRE_USE_SIMD 0
 
