@@ -36,6 +36,13 @@ const EntityInterp::Snap& EntityInterp::at(int i) const {
     return ring_[idx];
 }
 
+void EntityInterp::copyLoco(EntityState* out, const Snap& s) {
+    // Dumps the time-aligned locomotion from snapshot 's' onto 'out'.
+    out->cSpeed  = s.cSpeed;
+    out->cMotionX = s.cMotionX; out->cMotionY = s.cMotionY; out->cMotionZ = s.cMotionZ;
+    out->cMoving = s.cMoving;
+}
+
 void EntityInterp::push(const EntityState& e, unsigned long nowMs, unsigned long arrivalMs) {
     // Wire v35 (send-stamped snapshots): a re-sent capture carries the SAME
     // stamp and a reordered datagram an OLDER one - recording either would
@@ -84,6 +91,12 @@ void EntityInterp::push(const EntityState& e, unsigned long nowMs, unsigned long
     Snap s;
     s.t = nowMs;
     s.x = e.x; s.y = e.y; s.z = e.z; s.heading = e.heading;
+    // Time-stamp the locomotion alongside the transform (see Snap in Interp.h):
+    // this lets sample() return the motion state of the snapshot that matches the
+    // render-delay position, instead of the newest one (the foot-slide fix).
+    s.cSpeed  = e.cSpeed;
+    s.cMotionX = e.cMotionX; s.cMotionY = e.cMotionY; s.cMotionZ = e.cMotionZ;
+    s.cMoving = e.cMoving;
     ring_[head_] = s;
     head_ = (head_ + 1) % CAP;
     if (count_ < CAP) ++count_;
@@ -162,6 +175,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     if (count_ == 1) {
         out->x = newest.x; out->y = newest.y; out->z = newest.z;
         out->heading = newest.heading;
+        copyLoco(out, newest);
         lastMode_ = SM_SINGLE;
         return true;
     }
@@ -172,6 +186,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     if (renderTime <= oldest.t) {
         out->x = oldest.x; out->y = oldest.y; out->z = oldest.z;
         out->heading = oldest.heading;
+        copyLoco(out, oldest); // oldest position -> its own motion state
         lastMode_ = SM_CLAMP_OLD;
         return true;
     }
@@ -195,6 +210,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
         if (seg <= 0.0f || (sdx * sdx + sdy * sdy + sdz * sdz) > cfg.snapDistSq) {
             out->x = newest.x; out->y = newest.y; out->z = newest.z;
             out->heading = newest.heading;
+            copyLoco(out, newest);
             return true;
         }
         float k = (float)ahead / seg; // extrapolation factor along last segment
@@ -202,6 +218,9 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
         out->y = newest.y + sdy * k;
         out->z = newest.z + sdz * k;
         out->heading = lerpAngle(prev.heading, newest.heading, 1.0f + k);
+        // Extrapolating over the newest segment: the newest snapshot's motion
+        // state is the one that matches this projected position.
+        copyLoco(out, newest);
         return true;
     }
 
@@ -216,6 +235,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
             if (dx * dx + dy * dy + dz * dz > cfg.snapDistSq) {
                 out->x = s1.x; out->y = s1.y; out->z = s1.z;
                 out->heading = s1.heading;
+                copyLoco(out, s1); // snap to the newer end -> its motion state
                 lastMode_ = SM_SEG_SNAP;
                 return true;
             }
@@ -225,6 +245,17 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
             out->y = lerpf(s0.y, s1.y, a);
             out->z = lerpf(s0.z, s1.z, a);
             out->heading = lerpAngle(s0.heading, s1.heading, a);
+            // Time-aligned locomotion: continuous speed/motion interpolate within
+            // the segment; the moving FLAG follows the segment's START, so a body
+            // still crossing the last segment before stopping reads "moving"
+            // (matching its still-gliding position) and only flips to idle once
+            // render time crosses into the already-stopped segment. This is the
+            // time alignment that removes foot-slide on stopping.
+            out->cSpeed  = lerpf(s0.cSpeed,  s1.cSpeed,  a);
+            out->cMotionX = lerpf(s0.cMotionX, s1.cMotionX, a);
+            out->cMotionY = lerpf(s0.cMotionY, s1.cMotionY, a);
+            out->cMotionZ = lerpf(s0.cMotionZ, s1.cMotionZ, a);
+            out->cMoving = s0.cMoving;
             lastMode_ = SM_LERP;
             return true;
         }
@@ -233,6 +264,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     // Fallback (shouldn't hit): newest pose.
     out->x = newest.x; out->y = newest.y; out->z = newest.z;
     out->heading = newest.heading;
+    copyLoco(out, newest);
     lastMode_ = SM_LERP;
     return true;
 }
