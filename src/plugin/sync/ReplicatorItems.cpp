@@ -361,6 +361,12 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
             // its own drop); authoring it here too would duplicate the proxy. World
             // NPC (class 0) and our own squad (class 1) drops still stream.
             if (ownerClassForHand(de[i].ownerHand) == 2) continue;
+            // The auto-revert re-drops a peer-picked-up proxy via Inventory::dropItem,
+            // which trips this same drop hook. Never re-author OUR OWN proxy as a fresh
+            // ground item - it would bounce back to the authoring client as a duplicate.
+            if (!proxyObjs.empty() &&
+                proxyObjs.count(engine::resolveObjectByHand(de[i].itemHand)) != 0)
+                continue; // our proxy re-dropped by the revert - not ours to publish
             Key k; k.t = de[i].itemHand[0]; k.c = de[i].itemHand[1]; k.cs = de[i].itemHand[2];
             k.i = de[i].itemHand[3]; k.s = de[i].itemHand[4];
             if (worldTrack_.find(k) != worldTrack_.end()) continue; // already tracked
@@ -514,6 +520,33 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
             if (dumpWi) { char b2[128]; _snprintf(b2, sizeof(b2) - 1,
                 "[wi] CULL owner=%u netId=%u", b->ownerId, *id);
                 b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
+        }
+    }
+}
+
+void Replicator::revertProxyPickups(GameWorld* gw) {
+    if (worldProxies_.empty()) return;
+    static int dumpWi = -1;
+    if (dumpWi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWi = (e && e[0] == '1') ? 1 : 0; }
+    // Each of our proxies is a real, unowned, PICKABLE ground object. If a local
+    // character grabbed one (isInInventory now true), retaining it would duplicate
+    // the authoring client's real item (that client's liveness only tracks its own
+    // object, so it never culls - the peer ends up with a second copy that mirrors
+    // back over the inventory channel). Re-drop it to its tracked ground spot BEFORE
+    // the inventory publish, so the pickup never becomes a persisted/streamed copy.
+    // dropProxyItemToGround is a no-op for proxies still on the ground, so this scan
+    // is cheap in the common (nothing picked up) case. NOT pickup conservation
+    // (Phase W4) - the item cannot be TAKEN by the peer yet; the dupe is just closed.
+    for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
+         pi != worldProxies_.end(); ++pi) {
+        WorldProxy& wp = pi->second;
+        if (!wp.obj) continue;
+        int r = engine::dropProxyItemToGround(gw, wp.obj, wp.x, wp.y, wp.z);
+        if (r && dumpWi) {
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[wi] REVERT-PICKUP owner=%u netId=%u pos=%.2f,%.2f,%.2f (re-dropped a peer-picked-up proxy)",
+                pi->first.first, pi->first.second, wp.x, wp.y, wp.z);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
 }

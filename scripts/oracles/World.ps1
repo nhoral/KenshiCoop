@@ -2313,3 +2313,46 @@ function Test-VendorTrade {
                 -Metrics @{ walletCrossed = $crossed } -Detail $detail)
 }
 
+# world_item_peer_pickup: NON-gear ground-item cross-client PICKUP conservation.
+# The HOST drops a common non-gear item (streams a W1 proxy); the JOIN picks that
+# proxy up into its own rank-1 bag. Every copy of the sid the client can see is
+# summed (rank0 + rank1 + ground); the conservation invariant is total <= 1 at all
+# times. The DUPE manifests on the HOST (its real dropped item stays on the ground
+# AND the join's picked-up copy mirrors back), so the gate is host maxtot<=1 AND
+# fintot==1. Both the drop (host) and the pickup (join) must be exercised, else the
+# gate would pass vacuously on a run where nothing happened.
+function Test-WorldItemPeerPickup {
+    param([string]$HostFile, [string]$JoinFile)
+    $rxHost = 'WPU verdict role=host pass=(\d+) dropped=(-?\d+) maxtot=(-?\d+) fintot=(-?\d+)'
+    $rxJoin = 'WPU verdict role=join pass=(\d+) picked=(-?\d+) maxtot=(-?\d+) fintot=(-?\d+)'
+    $dropped = -1; $hMax = -1; $hFin = -1; $picked = -1; $jMax = -1
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $dropped = [int]$g[2].Value; $hMax = [int]$g[3].Value; $hFin = [int]$g[4].Value
+        } else { Write-Host "  WI-PEER-PICKUP [host] no WPU verdict" }
+    }
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $picked = [int]$g[2].Value; $jMax = [int]$g[3].Value
+        } else { Write-Host "  WI-PEER-PICKUP [join] no WPU verdict" }
+    }
+    $why = @()
+    if ($dropped -le 0) { $why += "drop not exercised (dropped=$dropped)" }
+    if ($picked -le 0)  { $why += "pickup not exercised (picked=$picked)" }
+    if ($hMax -gt 1)    { $why += "DUPE on host (maxtot=$hMax > 1)" }
+    if ($hFin -ne 1)    { $why += "host did not settle to one copy (fintot=$hFin)" }
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  WI-PEER-PICKUP $v - dropped=$dropped picked=$picked host(max=$hMax fin=$hFin) join(max=$jMax) $detail"
+    if ($hMax -ge 2) {
+        Write-Host "    NOTE: host saw 2 copies => the peer's proxy pickup was not conserved (host kept its real ground item + gained the join's mirrored copy)"
+    }
+    return (Add-GateResult -Name "wi_peer_pickup" -Status $v `
+                -Metrics @{ dropped = $dropped; picked = $picked; hostMax = $hMax;
+                            hostFin = $hFin; joinMax = $jMax } -Detail $detail)
+}
+

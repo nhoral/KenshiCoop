@@ -1400,6 +1400,40 @@ int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
     return dropped;
 }
 
+// SEH-guarded (auto-revert mitigation, W1 non-gear pickup): re-drop a ground proxy
+// that a PEER picked up back onto the GROUND at (x,y,z). The peer must not RETAIN a
+// non-gear W1 proxy (the authoring client still holds the real object - retaining
+// the picked-up copy duplicates it), so we move it bag->ground via the engine's own
+// Inventory::dropItem (the same virtual the drop hook wraps) - a clean relocation,
+// NEVER a destroy. Then reposition the exact object to the tracked ground spot (the
+// vanilla drop lands it at the character's feet). Returns 1 if it was in an inventory
+// and got dropped, else 0.
+int dropProxyItemToGround(GameWorld* gw, void* item, float x, float y, float z) {
+    if (!gw || !item) return 0;
+    int ok = 0;
+    __try {
+        Item* it = reinterpret_cast<Item*>(item);
+        if (!it->isInInventory) return 0;    // still on the ground - nobody picked it up
+        // The PARENT inventory holding this item. NOTE: Item::getInventory() returns the
+        // item's OWN inventory (a container item's) - null for a plain item - so resolve
+        // the holding character from _whosInventoryWeAreIn and take ITS inventory.
+        const hand& h = it->_whosInventoryWeAreIn;
+        unsigned int cHand[5];
+        cHand[0] = (unsigned int)h.type; cHand[1] = h.container; cHand[2] = h.containerSerial;
+        cHand[3] = h.index; cHand[4] = h.serial;
+        RootObject* holder = resolveObjectByHand(cHand);
+        if (!holder) return 0;
+        Inventory* inv = holder->getInventory(); // the inventory currently holding it
+        if (!inv) return 0;
+        inv->dropItem(it);                   // virtual Inventory::dropItem: clean bag -> ground
+        Ogre::Vector3 pos(x, y, z);
+        Ogre::Quaternion rot = Ogre::Quaternion::IDENTITY;
+        it->setPositionRotation(pos, rot, /*fixedPosition*/true);
+        ok = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+    return ok;
+}
+
 // SEH-guarded (Phase W3): capture the WEAPON items the object at cHand currently holds, with
 // their REAL Item* handles. The drop detector remembers these per tick so that when a weapon
 // leaves the bag (drop), the prior tick's handle IS the now-grounded object - trackable for a
