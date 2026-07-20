@@ -26,15 +26,13 @@ namespace {
 // serial order, join t=24s toggles the SECOND (distinct doors - two
 // independent crossing legs for Test-DoorSync to pair). The probe gates only
 // that the script ran; the sync variant also requires the local write ok.
-class DoorProbeScenario : public Scenario {
+class DoorProbeScenario : public TimedScenario {
 public:
     explicit DoorProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0),
-          wrote_(false), writeOk_(false), censusLogged_(0) {
+        : TimedScenario(probe ? "door_probe" : "door_sync", /*evidenceMs=*/1000),
+          probe_(probe), wrote_(false), writeOk_(false), censusLogged_(0) {
         memset(sentinelHand_, 0, sizeof(sentinelHand_));
     }
-
-    virtual const char* name() const { return probe_ ? "door_probe" : "door_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -44,10 +42,8 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs))
             logCensus(ctx);
-        }
         unsigned long writeAt = ctx.isHost ? HOST_WRITE_AT_MS : JOIN_WRITE_AT_MS;
         if (!wrote_ && ctx.elapsedMs >= writeAt) {
             wrote_ = true;
@@ -62,8 +58,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     void logCensus(const ScenarioContext& ctx) {
@@ -142,8 +136,6 @@ private:
     static const unsigned int  MAX_LOG_ROWS     = 12;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     bool          wrote_;
     bool          writeOk_;
     unsigned int  censusLogged_;
@@ -170,17 +162,16 @@ private:
 // 3 s until complete. The probe gates only that the script ran (a REFUSED
 // placement is a finding, not a failure); the sync variant also requires
 // the local place + ramp-to-complete to have worked.
-class BuildProbeScenario : public Scenario {
+class BuildProbeScenario : public TimedScenario {
 public:
     explicit BuildProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), censusLogged_(0),
+        : TimedScenario(probe ? "build_probe" : "build_sync", /*evidenceMs=*/1000),
+          probe_(probe), censusLogged_(0),
           placed_(false), placeOk_(false), rampStep_(0), rampDoneOk_(false),
           nextRampMs_(0) {
         memset(ownHand_, 0, sizeof(ownHand_));
         ownSid_[0] = '\0';
     }
-
-    virtual const char* name() const { return probe_ ? "build_probe" : "build_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -190,10 +181,8 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs))
             logCensus(ctx);
-        }
         unsigned long placeAt = ctx.isHost ? HOST_PLACE_AT_MS : JOIN_PLACE_AT_MS;
         if (!placed_ && ctx.elapsedMs >= placeAt) {
             placed_ = true;
@@ -213,8 +202,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     void logCensus(const ScenarioContext& ctx) {
@@ -284,8 +271,6 @@ private:
     static const unsigned int  MAX_RAMP_STEPS   = 8;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     unsigned int  censusLogged_;
     bool          placed_;
     bool          placeOk_;
@@ -314,18 +299,17 @@ private:
 // host DESTROYS its shack t=42s; 55s duration. The probe gates the local
 // legs only (place + >=1 door + toggle stuck + destroy worked); crossing
 // is the sync oracle's job.
-class BdoorProbeScenario : public Scenario {
+class BdoorProbeScenario : public TimedScenario {
 public:
     explicit BdoorProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), censusLogged_(0),
+        : TimedScenario(probe ? "bdoor_probe" : "bdoor_sync", /*evidenceMs=*/1000),
+          probe_(probe), censusLogged_(0),
           placed_(false), placeOk_(false), rampStep_(0), rampDoneOk_(false),
           nextRampMs_(0), doorSeen_(false), toggled_(false), toggleOk_(false),
           destroyed_(false), destroyOk_(false) {
         memset(ownHand_, 0, sizeof(ownHand_));
         ownSid_[0] = '\0';
     }
-
-    virtual const char* name() const { return probe_ ? "bdoor_probe" : "bdoor_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -335,10 +319,8 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs))
             logCensus(ctx);
-        }
         unsigned long placeAt = ctx.isHost ? HOST_PLACE_AT_MS : JOIN_PLACE_AT_MS;
         if (!placed_ && ctx.elapsedMs >= placeAt) {
             placed_ = true;
@@ -368,8 +350,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     void logCensus(const ScenarioContext& ctx) {
@@ -481,8 +461,6 @@ private:
     static const unsigned int  MAX_RAMP_STEPS    = 8;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     unsigned int  censusLogged_;
     bool          placed_;
     bool          placeOk_;
@@ -526,10 +504,11 @@ private:
 // setProductionItem +2.5 t=58s; direct amount +1.0 t=61s; 70s duration.
 // Both tiers gate the local legs only (place + ramp + census + power write
 // + setItem write applied); crossing/convergence is the sync oracle's job.
-class ProdProbeScenario : public Scenario {
+class ProdProbeScenario : public TimedScenario {
 public:
     explicit ProdProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), censusLogged_(0),
+        : TimedScenario(probe ? "prod_probe" : "prod_sync", /*evidenceMs=*/1000),
+          probe_(probe), censusLogged_(0),
           placed_(false), placeGenOk_(false), placeBenchOk_(false),
           rampStep_(0), rampGenDone_(false), rampBenchDone_(false),
           nextRampMs_(0), nextOpMs_(0), opCount_(0), nextResearchMs_(0),
@@ -542,8 +521,6 @@ public:
         genSid_[0] = '\0'; benchSid_[0] = '\0';
     }
 
-    virtual const char* name() const { return probe_ ? "prod_probe" : "prod_sync"; }
-
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
         _snprintf(b, sizeof(b) - 1, "SCENARIO PRODPROBE start host=%d",
@@ -552,10 +529,8 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs))
             logCensus(ctx);
-        }
         if (ctx.isHost) {
             if (!placed_ && ctx.elapsedMs >= PLACE_AT_MS) {
                 placed_ = true;
@@ -605,8 +580,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     bool genLive() const   { return placeGenOk_ && rampGenDone_; }
@@ -779,8 +752,6 @@ private:
     static const unsigned int  MAX_RAMP_STEPS    = 8;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     unsigned int  censusLogged_;
     bool          placed_;
     bool          placeGenOk_;
@@ -828,17 +799,14 @@ private:
 // Pass: host = picked + startResearch rc=1 + final known=1. Join =
 // picked + final known=1 (probe: via its own lever; sync: via the wire) -
 // probe additionally requires its self-start rc=1.
-class ResearchProbeScenario : public Scenario {
+class ResearchProbeScenario : public TimedScenario {
 public:
     explicit ResearchProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), picked_(false),
+        : TimedScenario(probe ? "research_probe" : "research_sync", /*evidenceMs=*/1000),
+          probe_(probe), picked_(false),
           pickRc_(0), startDone_(false), startRc_(0), lastKnown_(-1),
           lastCan_(-1) {
         sid_[0] = '\0';
-    }
-
-    virtual const char* name() const {
-        return probe_ ? "research_probe" : "research_sync";
     }
 
     virtual void onStart(const ScenarioContext& ctx) {
@@ -858,9 +826,7 @@ public:
                       ctx.isHost ? "host" : "join", pickRc_, sid_, ctx.elapsedMs);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
-        if (picked_ && pickRc_ == 1 &&
-            (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0)) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (picked_ && pickRc_ == 1 && evidenceDue(ctx.elapsedMs)) {
             engine::researchQueryBySid(ctx.gw, sid_, &lastKnown_, &lastCan_);
             char b[160];
             _snprintf(b, sizeof(b) - 1,
@@ -905,8 +871,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long PICK_AT_MS    = 8000;
     static const unsigned long HOST_START_MS = 10000;
@@ -914,8 +878,6 @@ private:
     static const unsigned long DURATION_MS   = 45000;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     bool          picked_;
     int           pickRc_;
     bool          startDone_;
@@ -959,10 +921,11 @@ private:
 // (removal leg) and empties the bench container t=61s (churn leg); 70s.
 // Both tiers gate the local legs only (place + ramp + census + add landed +
 // recon removed + ops ran); crossing/convergence is the sync oracle's job.
-class StoreProbeScenario : public Scenario {
+class StoreProbeScenario : public TimedScenario {
 public:
     explicit StoreProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), censusLogged_(0),
+        : TimedScenario(probe ? "store_probe" : "store_sync", /*evidenceMs=*/1000),
+          probe_(probe), censusLogged_(0),
           placed_(false), placeBenchOk_(false), placeChestOk_(false),
           rampStep_(0), rampBenchDone_(false), rampChestDone_(false),
           nextRampMs_(0), nextOpMs_(0), opCount_(0), addDone_(false),
@@ -975,8 +938,6 @@ public:
         benchSid_[0] = '\0'; chestSid_[0] = '\0'; addSid_[0] = '\0';
     }
 
-    virtual const char* name() const { return probe_ ? "store_probe" : "store_sync"; }
-
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
         _snprintf(b, sizeof(b) - 1, "SCENARIO STOREPROBE start host=%d",
@@ -985,10 +946,8 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs))
             logCensus(ctx);
-        }
         if (ctx.isHost) {
             if (!placed_ && ctx.elapsedMs >= PLACE_AT_MS) {
                 placed_ = true;
@@ -1038,8 +997,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     bool benchLive() const { return placeBenchOk_ && rampBenchDone_; }
@@ -1269,8 +1226,6 @@ private:
     static const int           RECON_KEEP     = 2;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     unsigned int  censusLogged_;
     bool          placed_;
     bool          placeBenchOk_;

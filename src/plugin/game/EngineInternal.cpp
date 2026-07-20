@@ -15,6 +15,47 @@
 namespace coop {
 namespace engine {
 
+// ---- Phase 5c: typed, throttled SEH-fault accounting ------------------------
+// Per-op counter + last-log timestamp. Main-thread only (engine invariant), so
+// plain statics need no locking. Declarations live in EngineFaults.h.
+namespace {
+struct FaultState { unsigned int count; unsigned long lastMs; };
+FaultState g_faults[FAULT_OP_COUNT] = { { 0, 0 } };
+const char* const kFaultNames[FAULT_OP_COUNT] = {
+    "resolve_char",   // FAULT_RESOLVE_CHAR
+    "resolve_object", // FAULT_RESOLVE_OBJECT
+    "hand_read",      // FAULT_HAND_READ
+    "inv_of",         // FAULT_INV_OF
+    "capture",        // FAULT_CAPTURE
+    "apply",          // FAULT_APPLY
+    "other"           // FAULT_OTHER
+};
+} // namespace
+
+const char* faultOpName(FaultOp op) {
+    if ((unsigned)op >= (unsigned)FAULT_OP_COUNT) return "unknown";
+    return kFaultNames[op];
+}
+
+unsigned int faultCount(FaultOp op) {
+    if ((unsigned)op >= (unsigned)FAULT_OP_COUNT) return 0;
+    return g_faults[op].count;
+}
+
+void noteFault(FaultOp op) {
+    if ((unsigned)op >= (unsigned)FAULT_OP_COUNT) return;
+    FaultState& s = g_faults[op];
+    ++s.count;
+    unsigned long now = coop::wallClockMs();
+    if (faultShouldLog(s.count, now, &s.lastMs, 1000)) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[engine] FAULT op=%s n=%u",
+                  faultOpName(op), s.count);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+    }
+}
+
 // SaveManager entry points, resolved at load. getSingleton is a static member;
 // load(name) and savesExist are __thiscall (passed via __fastcall self in RCX).
 typedef SaveManager* (__fastcall* SaveMgrGetFn)();
@@ -1323,6 +1364,18 @@ lektor<GameData*> g_dataScratch; // reused seat-template scan buffer (main threa
 // One reused scratch buffer for the interest query (main thread only).
 lektor<RootObject*> g_npcQuery;
 
+// ---- Phase 5d: owned capability registry ----------------------------------
+// Per-capability availability, folded from the CapRow table at the END of
+// resolve(). Fail-closed: all false until g_capsEvaluated flips, so capAvailable
+// reports "off" for the whole window before resolution has actually happened.
+static bool g_capAvail[CAP_COUNT] = { false };
+static bool g_capsEvaluated = false;
+
+bool capAvailable(Capability c) {
+    if (!g_capsEvaluated || c < 0 || c >= CAP_COUNT) return false;
+    return g_capAvail[c];
+}
+
 void resolve() {
     g_getFn  = (SaveMgrGetFn)KenshiLib::GetRealAddress(&SaveManager::getSingleton);
     g_loadFn = (SaveMgrLoadNameFn)KenshiLib::GetRealAddress(
@@ -1330,26 +1383,17 @@ void resolve() {
     g_savesExistFn = (SaveMgrSavesExistFn)KenshiLib::GetRealAddress(&SaveManager::savesExist);
     g_saveFn = (SaveMgrSaveNameFn)KenshiLib::GetRealAddress(&SaveManager::save);
     g_saveMgrExecFn = (SaveMgrExecFn)KenshiLib::GetRealAddress(&SaveManager::execute);
-    if (!g_getFn || !g_loadFn)
-        coop::logErrLine("engine: could not resolve SaveManager load functions");
-
     // Protocol 31: locate the active save on disk (spike 39 RVAs, runtime-
     // validated by save_probe). Non-fatal: saveInfo falls back to the
     // %LOCALAPPDATA%\kenshi\save convention the harness already assumes.
     g_saveMgrCurGameFn = (SaveMgrStrFn)KenshiLib::GetRealAddress(&SaveManager::getCurrentGame);
     g_saveMgrPathFn    = (SaveMgrStrFn)KenshiLib::GetRealAddress(&SaveManager::getSavePath);
-    if (!g_saveMgrCurGameFn || !g_saveMgrPathFn)
-        coop::logErrLine("engine: could not resolve getCurrentGame/getSavePath (save-path fallback)");
-
     // Entity resolve path: hand->Character lookup and the 5-arg hand ctor
     // (overloaded, so disambiguate via an explicit member-pointer cast).
     g_handGetCharFn = (HandGetCharFn)KenshiLib::GetRealAddress(&hand::getCharacter);
     g_handCtorFn = (HandCtorFn)KenshiLib::GetRealAddress(
         static_cast<hand* (hand::*)(unsigned int, unsigned int, itemType,
                                     unsigned int, unsigned int)>(&hand::_CONSTRUCTOR));
-    if (!g_handGetCharFn || !g_handCtorFn)
-        coop::logErrLine("engine: could not resolve hand resolve functions");
-
     g_charSetDestFn = (CharSetDestFn)KenshiLib::GetRealAddress(
         static_cast<void (Character::*)(const Ogre::Vector3&, bool)>(
             &Character::setDestination));
@@ -1363,9 +1407,6 @@ void resolve() {
     g_clearGoalsFn = (ClearGoalsFn)KenshiLib::GetRealAddress(&Character::clearAllAIGoals);
     g_removeUpdateFn = (UpdateListFn)KenshiLib::GetRealAddress(&GameWorld::removeFromUpdateListMain);
     g_addUpdateFn    = (UpdateListFn)KenshiLib::GetRealAddress(&GameWorld::addToUpdateListMain);
-    if (!g_getCharsFn)
-        coop::logErrLine("engine: could not resolve getCharactersWithinSphere (NPC stream off)");
-
     // Stage 5 pose reproduction. Non-fatal: if unresolved, rest NPCs idle-park.
     g_taskerKeyFn = (TaskerKeyFn)KenshiLib::GetRealAddress(&Tasker::key);
     g_taskerDescFn = (TaskerDescFn)KenshiLib::GetRealAddress(&Tasker::getDescription);
@@ -1390,67 +1431,34 @@ void resolve() {
         &MedicalSystem::setRobotLimbItem);
     g_medGetLimbStateFn = (MedGetLimbStateFn)KenshiLib::GetRealAddress(
         &MedicalSystem::getLimbState);
-    if (!g_medAmputateFn || !g_medCrushLimbFn)
-        coop::logErrLine("engine: could not resolve limb-loss functions (limb sync off)");
-
     // Character stats sync (protocol 17; non-fatal: unresolved -> stats sync off).
     g_statsGetRefFn = (StatsGetRefFn)KenshiLib::GetRealAddress(&CharStats::getStatRef);
     g_statsRecalcFn = (StatsRecalcFn)KenshiLib::GetRealAddress(&CharStats::_NV_periodicUpdate);
-    if (!g_statsGetRefFn)
-        coop::logErrLine("engine: could not resolve CharStats accessors (stats sync off)");
-
     // Carried-body sync (protocol 18; non-fatal: unresolved -> carry sync off).
     g_pickupObjectFn = (PickupObjectFn)KenshiLib::GetRealAddress(&Character::pickupObject);
     g_dropCarriedFn  = (DropCarriedFn)KenshiLib::GetRealAddress(&Character::dropCarriedObject);
     g_isBeingCarriedFn = (CharBodyBoolFn)KenshiLib::GetRealAddress(&Character::isBeingCarried);
-    if (!g_pickupObjectFn || !g_dropCarriedFn)
-        coop::logErrLine("engine: could not resolve carry functions (carry sync off)");
-
     // Furniture occupancy (protocol 19; non-fatal: unresolved -> occupancy sync off).
     g_setBedModeFn    = (SetFurnModeFn)KenshiLib::GetRealAddress(&Character::setBedMode);
     g_setPrisonModeFn = (SetFurnModeFn)KenshiLib::GetRealAddress(&Character::setPrisonMode);
-    if (!g_setBedModeFn || !g_setPrisonModeFn)
-        coop::logErrLine("engine: could not resolve bed/prison setters (occupancy sync off)");
-
     // Chained/pole prisoner (protocol 41; non-fatal: unresolved -> chain sync off).
     g_setChainedModeFn = (SetChainedModeFn)KenshiLib::GetRealAddress(&Character::setChainedMode);
-    if (!g_setChainedModeFn)
-        coop::logErrLine("engine: could not resolve setChainedMode (chain/pole sync off)");
-
     // Phase 6 shackle read lever (non-fatal: unresolved -> readShackle reports
     // only Character::isChained, no shackle-item/lock discrimination).
-    g_getShacklesFn = (GetShacklesFn)KenshiLib::GetRealAddress(&Character::getChainedModeShackles);
-    if (!g_getShacklesFn)
-        coop::logErrLine("engine: could not resolve getChainedModeShackles (shackle read degraded)");
-    // Jail-probe slave-state read (non-fatal: unresolved -> readSlaveState = -1).
+    g_getShacklesFn = (GetShacklesFn)KenshiLib::GetRealAddress(&Character::getChainedModeShackles);    // Jail-probe slave-state read (non-fatal: unresolved -> readSlaveState = -1).
     g_isSlaveFn = (IsSlaveFn)KenshiLib::GetRealAddress(&Character::isSlave);
-    if (!g_isSlaveFn)
-        coop::logErrLine("engine: could not resolve Character::isSlave (jail-probe slave read off)");
-
     // Stealth sync (protocol 20; non-fatal: unresolved -> stealth sync off).
     g_setStealthModeFn = (SetStealthModeFn)KenshiLib::GetRealAddress(&Character::setStealthMode);
     g_notifySeeSneakFn = (NotifySeeSneakFn)KenshiLib::GetRealAddress(&Character::notifyICanSeeYouSneaking);
-    if (!g_setStealthModeFn || !g_notifySeeSneakFn)
-        coop::logErrLine("engine: could not resolve stealth functions (stealth sync off)");
-
     // Camera-anchored interest (spike 35; non-fatal: unresolved -> camera
     // anchor off, interest falls back to squad-tab leaders only).
     g_camGetCenterFn = (CamGetCenterFn)KenshiLib::GetRealAddress(&CameraClass::getCenter);
     g_camIsInitFn    = (CamIsInitFn)KenshiLib::GetRealAddress(&CameraClass::isInitialised);
-    if (!g_camGetCenterFn || !g_camIsInitFn)
-        coop::logErrLine("engine: could not resolve CameraClass accessors (camera interest off)");
-
     // Consensus game-speed sync (non-fatal: unresolved -> speed sync off).
     g_setGameSpeedFn = (SetGameSpeedFn)KenshiLib::GetRealAddress(&GameWorld::setGameSpeed);
-    g_userPauseFn    = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::userPause);
-    if (!g_setGameSpeedFn || !g_userPauseFn)
-        coop::logErrLine("engine: could not resolve game-speed setters (speed sync off)");
-    g_togglePauseFn = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::togglePause);
+    g_userPauseFn    = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::userPause);    g_togglePauseFn = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::togglePause);
     g_setFrameSpeedMultFn =
         (SetFrameSpeedMultFn)KenshiLib::GetRealAddress(&GameWorld::setFrameSpeedMultiplier);
-    if (!g_setFrameSpeedMultFn)
-        coop::logErrLine("engine: could not resolve setFrameSpeedMultiplier (quiet speed apply off)");
-
     // Door/gate state (protocol 26; non-fatal: unresolved -> door sync off).
     g_doorIsOpenFn     = (DoorBoolFn)KenshiLib::GetRealAddress(&DoorStuff::isOpen);
     g_doorIsLockedFn   = (DoorBoolFn)KenshiLib::GetRealAddress(&DoorStuff::isLocked);
@@ -1460,9 +1468,6 @@ void resolve() {
     g_doorForceCloseFn = (DoorActFn)KenshiLib::GetRealAddress(&DoorStuff::_forceDoorClosedUT);
     g_doorLockFn       = (DoorVoidFn)KenshiLib::GetRealAddress(&DoorStuff::lockDoor);
     g_doorUnlockFn     = (DoorVoidFn)KenshiLib::GetRealAddress(&DoorStuff::unlockDoor);
-    if (!g_doorIsOpenFn || !g_doorOpenFn || !g_doorCloseFn)
-        coop::logErrLine("engine: could not resolve DoorStuff functions (door sync off)");
-
     // Construction progress (protocol 27; non-fatal: unresolved -> build sync off).
     g_buildSetProgFn = (BuildProgFn)KenshiLib::GetRealAddress(
         &Building::_NV_setConstructionProgress);
@@ -1470,9 +1475,6 @@ void resolve() {
         &Building::_NV_addConstructionProgress);
     g_buildNotifyDoneFn = (BuildDoneFn)KenshiLib::GetRealAddress(
         &Building::_NV_notifyConstructionComplete);
-    if (!g_buildSetProgFn || !g_buildAddProgFn)
-        coop::logErrLine("engine: could not resolve construction-progress setters (build sync off)");
-
     // Production machine levers (protocol 33; non-fatal: unresolved -> prod sync off).
     g_machPowerFn        = (MachPowerSetFn)KenshiLib::GetRealAddress(
         &UseableStuff::_NV_switchPowerOn);
@@ -1498,17 +1500,11 @@ void resolve() {
         &StorageBuilding::_NV_getProductionItemData);
     g_machProdDataCraftFn = (MachProdItemDataFn)KenshiLib::GetRealAddress(
         &CraftingBuilding::_NV_getProductionItemData);
-    if (!g_machPowerFn || !g_machSetProdItemFn || !g_machOperateProdFn)
-        coop::logErrLine("engine: could not resolve machine levers (prod sync off)");
-
     // Game-clock reads (protocol 25; non-fatal: unresolved -> time sync off).
     g_getTimeHoursFn = (GetTimeHoursFn)KenshiLib::GetRealAddress(
         &GameWorld::getTimeStamp_inGameHours);
     g_getHourLenFn = (GetHourLenFn)KenshiLib::GetRealAddress(
         &GameWorld::getLengthOfHourInRealSeconds);
-    if (!g_getTimeHoursFn || !g_getHourLenFn)
-        coop::logErrLine("engine: could not resolve game-clock reads (time sync off)");
-
     // AI-gating probe lever (non-fatal: only used when the probe is enabled).
     g_recruitFn = (RecruitFn)KenshiLib::GetRealAddress(
         static_cast<bool (PlayerInterface::*)(Character*, bool)>(&PlayerInterface::recruit));
@@ -1529,9 +1525,6 @@ void resolve() {
     g_platoonRefreshInvFn =
         (PlatoonRefreshInvFn)KenshiLib::GetRealAddress(&ActivePlatoon::refreshInventory);
     g_shopGetTraderFn = (ShopGetTraderFn)KenshiLib::GetRealAddress(&ShopTrader::getTrader);
-    if (!g_getPlatoonFn || !g_ownGetMoneyFn || !g_ownSetMoneyFn)
-        coop::logErrLine("engine: could not resolve wallet accessors (money sync off)");
-
     // Test-scene spawn fns (non-fatal: only used by the host-side setup step).
     g_createCharFn = (CreateCharFn)KenshiLib::GetRealAddress(
         &RootObjectFactory::createRandomCharacter);
@@ -1570,9 +1563,6 @@ void resolve() {
     g_relSetFn     = (RelSetFn)KenshiLib::GetRealAddress(&FactionRelations::setRelation);
     g_relIsEnemyFn = (RelBoolFn)KenshiLib::GetRealAddress(&FactionRelations::isEnemy);
     g_relIsAllyFn  = (RelBoolFn)KenshiLib::GetRealAddress(&FactionRelations::isAlly);
-    if (!g_relGetFn || !g_relSetFn)
-        coop::logErrLine("engine: could not resolve faction-relation accessors (faction sync off)");
-
     // Honest pose oracle reads (non-fatal).
     g_getBip01Fn   = (GetBip01Fn)KenshiLib::GetRealAddress(&Character::getPositionBip01);
     g_getBoneWorldFn = (GetBoneWorldPosFn)KenshiLib::GetRealAddress(&Character::getBoneWorldPosition);
@@ -1601,8 +1591,85 @@ void resolve() {
     // Engagement escalation: the AI's own commit-an-attack entry (non-fatal:
     // unresolved -> escalation degrades to the goal/order paths).
     g_attackTargetFn = (AttackTargetFn)KenshiLib::GetRealAddress(&Character::attackTarget);
-    if (!g_attackTargetFn)
-        coop::logLine("[engine] WARN Character::attackTarget unresolved - combat force-escalation off");
+
+    // ---- Phase 5d: fold the resolved pointers into the capability registry ---
+    // ONE table naming which resolved slots back each engine capability. The
+    // typed GetRealAddress(&Class::method) assignments stay inline above (a
+    // member-function pointer is a heterogeneous compile-time type that can't
+    // live in a uniform C++03 array), but their success/failure is now judged
+    // and REPORTED here in one place instead of scattered hand-written null
+    // checks. A missing REQUIRED slot fails its whole capability and logs a
+    // named "[engine] CAP-MISS op=<name> cap=<cap>" line the oracles can watch;
+    // the "[engine] CAPS <name>=<0|1> ..." fingerprint records the full picture.
+    {
+        static const CapRow kCapRows[] = {
+            { (void**)&g_getFn,             "SaveManager::get",              CAP_SAVELOAD,      true },
+            { (void**)&g_loadFn,            "SaveManager::load",             CAP_SAVELOAD,      true },
+            { (void**)&g_saveMgrCurGameFn,  "SaveManager::getCurrentGame",   CAP_SAVEPATH,      true },
+            { (void**)&g_saveMgrPathFn,     "SaveManager::getSavePath",      CAP_SAVEPATH,      true },
+            { (void**)&g_handGetCharFn,     "hand::getCharacter",            CAP_HAND_RESOLVE,  true },
+            { (void**)&g_handCtorFn,        "hand::ctor5",                   CAP_HAND_RESOLVE,  true },
+            { (void**)&g_getCharsFn,        "getCharactersWithinSphere",     CAP_NPC_STREAM,    true },
+            { (void**)&g_medAmputateFn,     "MedicalSystem::amputate",       CAP_LIMB,          true },
+            { (void**)&g_medCrushLimbFn,    "MedicalSystem::crushLimb",      CAP_LIMB,          true },
+            { (void**)&g_statsGetRefFn,     "CharStats::getStatRef",         CAP_STATS,         true },
+            { (void**)&g_pickupObjectFn,    "Character::pickupObject",       CAP_CARRY,         true },
+            { (void**)&g_dropCarriedFn,     "Character::dropCarriedObject",  CAP_CARRY,         true },
+            { (void**)&g_setBedModeFn,      "Character::setBedMode",         CAP_FURNITURE,     true },
+            { (void**)&g_setPrisonModeFn,   "Character::setPrisonMode",      CAP_FURNITURE,     true },
+            { (void**)&g_setChainedModeFn,  "Character::setChainedMode",     CAP_CHAIN,         true },
+            { (void**)&g_getShacklesFn,     "Character::getChainedShackles", CAP_SHACKLE,       true },
+            { (void**)&g_isSlaveFn,         "Character::isSlave",            CAP_SLAVE,         true },
+            { (void**)&g_setStealthModeFn,  "Character::setStealthMode",     CAP_STEALTH,       true },
+            { (void**)&g_notifySeeSneakFn,  "Character::notifySeeSneaking",  CAP_STEALTH,       true },
+            { (void**)&g_camGetCenterFn,    "CameraClass::getCenter",        CAP_CAMERA,        true },
+            { (void**)&g_camIsInitFn,       "CameraClass::isInitialised",    CAP_CAMERA,        true },
+            { (void**)&g_setGameSpeedFn,    "GameWorld::setGameSpeed",       CAP_SPEED,         true },
+            { (void**)&g_userPauseFn,       "GameWorld::userPause",          CAP_SPEED,         true },
+            { (void**)&g_setFrameSpeedMultFn,"GameWorld::setFrameSpeedMult", CAP_QUIET_SPEED,   true },
+            { (void**)&g_doorIsOpenFn,      "DoorStuff::isOpen",             CAP_DOOR,          true },
+            { (void**)&g_doorOpenFn,        "DoorStuff::openDoor",           CAP_DOOR,          true },
+            { (void**)&g_doorCloseFn,       "DoorStuff::closeDoor",          CAP_DOOR,          true },
+            { (void**)&g_buildSetProgFn,    "Building::setConstructionProg", CAP_BUILD,         true },
+            { (void**)&g_buildAddProgFn,    "Building::addConstructionProg", CAP_BUILD,         true },
+            { (void**)&g_machPowerFn,       "UseableStuff::switchPowerOn",   CAP_MACHINE,       true },
+            { (void**)&g_machSetProdItemFn, "ProductionBuilding::setProdItem",CAP_MACHINE,      true },
+            { (void**)&g_machOperateProdFn, "ProductionBuilding::operate",   CAP_MACHINE,       true },
+            { (void**)&g_getTimeHoursFn,    "GameWorld::getTimeStampHours",  CAP_TIME,          true },
+            { (void**)&g_getHourLenFn,      "GameWorld::getHourLenSeconds",  CAP_TIME,          true },
+            { (void**)&g_getPlatoonFn,      "Character::getPlatoon",         CAP_WALLET,        true },
+            { (void**)&g_ownGetMoneyFn,     "Ownerships::getMoney",          CAP_WALLET,        true },
+            { (void**)&g_ownSetMoneyFn,     "Ownerships::setMoney",          CAP_WALLET,        true },
+            { (void**)&g_relGetFn,          "FactionRelations::getRelation", CAP_FACTION,       true },
+            { (void**)&g_relSetFn,          "FactionRelations::setRelation", CAP_FACTION,       true },
+            { (void**)&g_attackTargetFn,    "Character::attackTarget",       CAP_COMBAT_ESCALATE,true }
+        };
+        const int nRows = (int)(sizeof(kCapRows) / sizeof(kCapRows[0]));
+        capEvaluate(kCapRows, nRows, g_capAvail);
+        g_capsEvaluated = true;
+
+        char capLine[192];
+        for (int i = 0; i < nRows; ++i) {
+            if (kCapRows[i].required && !capRowResolved(kCapRows[i])) {
+                _snprintf(capLine, sizeof(capLine) - 1,
+                          "[engine] CAP-MISS op=%s cap=%s",
+                          kCapRows[i].name, capName(kCapRows[i].cap));
+                capLine[sizeof(capLine) - 1] = '\0';
+                coop::logLine(capLine);
+            }
+        }
+        // One-line availability fingerprint for the oracle/diagnostic surface.
+        std::string caps = "[engine] CAPS";
+        for (int c = 0; c < CAP_COUNT; ++c) {
+            caps += ' ';
+            caps += capName((Capability)c);
+            caps += g_capAvail[c] ? "=1" : "=0";
+        }
+        coop::logLine(caps.c_str());
+        if (!capCoreOk(g_capAvail))
+            coop::logLine("[engine] CAPS INCOMPATIBLE - core hand-resolve missing "
+                          "(runtime image unsupported)");
+    }
 
     // Spike 402: prove which executable is actually mapped and record the
     // KenshiLib-remapped entry points for the native save/object-serialisation
@@ -1688,81 +1755,10 @@ bool gameplayLive(GameWorld* gw) {
     }
 }
 
-int probeNativeSnapshot(GameWorld* gw) {
-    Character* c = leader(gw);
-    if (!c) return 0;
-
-    // Keep every allocation in probe-owned containers. Character::serialise
-    // writes state GameData records into `output`'s source container; nothing
-    // is inserted into GameWorld::savedata or the live platoon container.
-    GameDataContainer output;
-    output.setName("KenshiCoop r402 native snapshot");
-    const std::string sid("kenshicoop-r402-instances");
-    const std::string displayName("KenshiCoop r402 instances");
-    GameData* instances =
-        output.createNewData(INSTANCE_COLLECTION, sid, displayName);
-    if (!instances) {
-        coop::logErrLine("[r402] native snapshot: INSTANCE_COLLECTION create failed");
-        return 0;
-    }
-
-    GameSaveState state = c->serialise(&output, instances, 0);
-    const unsigned int stateCount = (unsigned int)state.states.size();
-    const unsigned int instanceCount =
-        (unsigned int)instances->instances.size();
-    const unsigned int recordCount =
-        (unsigned int)output._getAllData().size();
-
-    char tempDir[MAX_PATH];
-    tempDir[0] = '\0';
-    if (!GetTempPathA(MAX_PATH, tempDir)) {
-        coop::logErrLine("[r402] native snapshot: GetTempPath failed");
-        return -1;
-    }
-    char filename[MAX_PATH];
-    _snprintf(filename, sizeof(filename) - 1,
-              "%sKenshiCoop-r402-%lu.mod", tempDir,
-              (unsigned long)GetCurrentProcessId());
-    filename[sizeof(filename) - 1] = '\0';
-
-    const std::string file(filename);
-    const bool saved = output.save(file, 0);
-    WIN32_FILE_ATTRIBUTE_DATA attr;
-    memset(&attr, 0, sizeof(attr));
-    const bool fileExists =
-        GetFileAttributesExA(filename, GetFileExInfoStandard, &attr) != 0;
-    const unsigned __int64 fileBytes = fileExists
-        ? (((unsigned __int64)attr.nFileSizeHigh << 32) |
-           (unsigned __int64)attr.nFileSizeLow)
-        : 0;
-
-    GameDataContainer loaded;
-    const std::string modName("KenshiCoop-r402");
-    const bool loadedOk = saved &&
-        loaded.load(file, modName, 0, 0, true);
-    GameData* loadedInstances =
-        loadedOk ? loaded.getData(sid, INSTANCE_COLLECTION) : 0;
-    const unsigned int loadedInstanceCount = loadedInstances
-        ? (unsigned int)loadedInstances->instances.size() : 0;
-    const unsigned int loadedRecordCount = loadedOk
-        ? (unsigned int)loaded._getAllData().size() : 0;
-
-    char line[480];
-    _snprintf(line, sizeof(line) - 1,
-              "[r402] native snapshot states=%u instances=%u records=%u "
-              "save=%d bytes=%llu load=%d loadedInstances=%u "
-              "loadedRecords=%u file='%s'",
-              stateCount, instanceCount, recordCount, saved ? 1 : 0,
-              fileBytes, loadedOk ? 1 : 0, loadedInstanceCount,
-              loadedRecordCount, filename);
-    line[sizeof(line) - 1] = '\0';
-    coop::logLine(line);
-
-    if (!saved || !loadedOk) return -1;
-    return stateCount > 0 && instanceCount == 1 &&
-           loadedInstanceCount == instanceCount &&
-           loadedRecordCount == recordCount ? 1 : 0;
-}
+// probeNativeSnapshot (the spike-402 native-snapshot round-trip probe) moved to
+// EngineProbe.cpp (Phase 5e, HARNESS-ONLY). It uses the external leader(); the
+// spike-402 ADDRESS-only trace above stays here (it runs from installEngineDetours
+// at startup, gated by KENSHICOOP_SPIKE=402).
 
 // Overwrite SaveManager::currentGame in place. getCurrentGame() returns a
 // reference to the member (modelled as a pointer via g_saveMgrCurGameFn), so we

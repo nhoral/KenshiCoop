@@ -48,6 +48,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
 
 Import-Module (Join-Path $scriptDir "CoopOracles.psm1") -Force
+Import-Module (Join-Path $scriptDir "CoopHarness.psm1") -Force
 $manifest = Get-ScenarioManifest
 
 # ---- LAN config -----------------------------------------------------------------
@@ -131,7 +132,7 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw "local deploy failed" }
 }
 Write-Host "=== push DLL to $($cfg.host) (protocol lockstep) ==="
-$dll = Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"
+$dll = Join-Path $repoRoot "src\plugin\x64\Harness\KenshiCoop.dll"
 $modDirFwd = "$($cfg.kenshiDir -replace '\\', '/')/mods/KenshiCoop"
 & scp -o BatchMode=yes $dll "${target}:$modDirFwd/"
 if ($LASTEXITCODE -ne 0) { throw "DLL push failed (is Kenshi running on $($cfg.host)?)" }
@@ -168,13 +169,20 @@ $runArgs = [pscustomobject]@{
         KENSHICOOP_TEST_SECONDS       = "$Seconds"
         KENSHICOOP_SCENARIO           = $Scenario
         KENSHICOOP_SETUP              = $Setup
-        KENSHICOOP_INV_DUMP           = $(if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -eq "world_armor_drop" -or $Scenario -like "world_item_*") { "1" } else { "" })
         KENSHICOOP_PROBE_AISUSPEND    = ""
         KENSHICOOP_NETSIM_DELAY_MS    = "0"
         KENSHICOOP_NETSIM_JITTER_MS   = "0"
         KENSHICOOP_NETSIM_LOSS_PCT    = "0"
         KENSHICOOP_FAKE_CLOCK_SKEW_MS = "0"
         KENSHICOOP_ARM_TIMEOUT_MS     = "$armTimeoutMs"
+    }
+}
+# Merge the scenario's manifest DiagEnv into the remote host env (channel A/B
+# knobs + log-only traces - the single source of truth Config.cpp no longer
+# hard-codes). The remote runner applies run_args.json env verbatim.
+if ($null -ne $manifestEntry -and $manifestEntry.ContainsKey('DiagEnv')) {
+    foreach ($k in $manifestEntry.DiagEnv.Keys) {
+        Add-Member -InputObject $runArgs.env -NotePropertyName $k -NotePropertyValue "$($manifestEntry.DiagEnv[$k])" -Force
     }
 }
 $argsLocal = Join-Path $OutDir "run_args.json"
@@ -227,8 +235,10 @@ try {
     $env:KENSHICOOP_LOG                = $joinLog
     $env:KENSHICOOP_SCENARIO           = $Scenario
     $env:KENSHICOOP_SETUP              = ""
-    $env:KENSHICOOP_INV_DUMP           = $runArgs.env.KENSHICOOP_INV_DUMP
     $env:KENSHICOOP_PROBE_AISUSPEND    = ""
+    # Per-scenario channel A/B knobs + diagnostic traces from the manifest DiagEnv
+    # (mirrors the remote host env above; hermetic clear + apply on the join side).
+    [void](Set-CoopDiagEnv -Entry $manifestEntry)
     $env:KENSHICOOP_NETSIM_DELAY_MS    = "0"
     $env:KENSHICOOP_NETSIM_JITTER_MS   = "0"
     $env:KENSHICOOP_NETSIM_LOSS_PCT    = "0"

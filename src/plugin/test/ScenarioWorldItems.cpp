@@ -159,16 +159,14 @@ private:
 // channel or the snapshot echo into dupes is the design risk this scenario gates.
 // Both sides pick the sid deterministically (same gamedata + same save), so the join
 // gates on the exact template appearing. WLOOT log contract; judged by Test-WeaponLoot.
-class WeaponLootScenario : public Scenario {
+class WeaponLootScenario : public TimedScenario {
 public:
     WeaponLootScenario()
-        : passed_(false), have_(false), isHost_(false),
+        : TimedScenario("weapon_loot", 0), have_(false), isHost_(false),
           step_(0), added_(0), maxCount_(0), finalCount_(0), qual_(-1) {
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
         sid_[0] = '\0';
     }
-    virtual const char* name() const { return "weapon_loot"; }
-
     virtual void onStart(const ScenarioContext& ctx) {
         isHost_ = ctx.isHost;
         // The squad LEADER (index 0 = tab 0, host-owned) - deterministic across
@@ -239,10 +237,8 @@ public:
         }
         return false;
     }
-    virtual bool passed() const { return passed_; }
-
 private:
-    bool         passed_, have_, isHost_;
+    bool         have_, isHost_;
     unsigned int hand_[5];
     char         sid_[48];
     int          step_, added_, maxCount_, finalCount_, qual_;
@@ -255,16 +251,14 @@ private:
 // object's itemType/hand/pos and whether getObjectsWithinSphere enumerates it (the
 // `enumerated=` verdict) - the facts the W1 interest-scan + proxy design depends on. The
 // join is a passive observer (the drop is host-authored; W0 has no world-item channel).
-class DropProbeScenario : public Scenario {
+class DropProbeScenario : public TimedScenario {
 public:
     DropProbeScenario()
-        : passed_(false), have_(false), step_(0), seeded_(0), dropped_(0),
+        : TimedScenario("drop_probe", 0), have_(false), step_(0), seeded_(0), dropped_(0),
           nearBefore_(0), nearAfter_(0), dropType_(0) {
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
         sid_[0] = '\0';
     }
-
-    virtual const char* name() const { return "drop_probe"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         have_ = engine::pickInventoryContainer(ctx.gw, hand_);
@@ -335,12 +329,9 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long HOST_DURATION_MS = 14000;
     static const unsigned long JOIN_DURATION_MS = 12000;
-    bool         passed_;
     bool         have_;
     int          step_;
     int          seeded_;
@@ -471,17 +462,15 @@ private:
 // settles) and PERSISTED (never dropped back to 0 once seen) - a flicker or a
 // premature cull fails the persistence leg. No despawn here (world_item_sync
 // already covers the cull leg); this isolates appear + stay.
-class WorldItemDropScenario : public Scenario {
+class WorldItemDropScenario : public TimedScenario {
 public:
     WorldItemDropScenario()
-        : passed_(false), have_(false), lastLogMs_(0), step_(0),
+        : TimedScenario("world_item_drop", 0), have_(false), lastLogMs_(0), step_(0),
           seeded_(0), dropped_(0), dropType_(0),
           sawItem_(false), persistOk_(true) {
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
         sid_[0] = '\0';
     }
-
-    virtual const char* name() const { return "world_item_drop"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         have_ = engine::pickInventoryContainer(ctx.gw, hand_);
@@ -545,13 +534,10 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long HOST_DURATION_MS = 24000; // outlive the join's window
     static const unsigned long JOIN_DURATION_MS = 20000;
     static const unsigned long APPEAR_MS        = 9000;  // drop@5s + replication slack
-    bool          passed_;
     bool          have_;
     unsigned long lastLogMs_;
     int           step_;
@@ -577,10 +563,10 @@ private:
 // oracle gates that the POST-reload count did not grow past the PRE-reload count
 // on either side (no +K layer) and that a WORLD-RELOAD edge actually occurred.
 // Reuses the load_sync save/ACK/load coordination + world-swap detection.
-class RejoinItemsScenario : public Scenario {
+class RejoinItemsScenario : public TimedScenario {
 public:
     RejoinItemsScenario()
-        : passed_(false), have_(false), lastLogMs_(0), step_(0),
+        : TimedScenario("rejoin_items", 0), have_(false), lastLogMs_(0), step_(0),
           baselineN_(-1), preReloadN_(-1), postReloadN_(-1), lastN_(0),
           dropped_(0), saveIssued_(false), saveOk_(false), ackSeen_(false),
           ackOk_(false), loadIssued_(false), loadOk_(false),
@@ -589,8 +575,6 @@ public:
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
         sid_[0] = '\0';
     }
-
-    virtual const char* name() const { return "rejoin_items"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         have_ = engine::pickInventoryContainer(ctx.gw, hand_);
@@ -764,8 +748,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned int  MAXW            = 64;
     static const int           DROP_K          = 3;
@@ -775,7 +757,7 @@ private:
     static const unsigned long TAIL_HOLD_MS    = 8000;
     static const unsigned long DURATION_MS     = 150000;
 
-    bool          passed_, have_;
+    bool          have_;
     unsigned long lastLogMs_;
     int           step_;
     int           baselineN_, preReloadN_, postReloadN_, lastN_;

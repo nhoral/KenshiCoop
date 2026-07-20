@@ -12,9 +12,12 @@
 //          not forward +connect_lobby from a cold start). We join the lobby,
 //          read the owner (= host SteamID) and connect as the client.
 //
-// Everything runs on the MAIN thread: our callbacks are dispatched by Kenshi's
-// own SteamAPI_RunCallbacks() pump (we never call it ourselves - that would
-// double-dispatch the game's callbacks), and tick() polls lobby membership. The
+// Everything runs on the MAIN thread: tick() drives the Steam callback pump
+// itself (SteamAPI_RunCallbacks) because Kenshi does not - its async CreateLobby
+// result never dispatched until we added the call. This is safe even if the game
+// also pumped: RunCallbacks just drains the message queue, so sequential
+// main-thread calls can't double-deliver a single posted callback. tick() also
+// polls lobby membership. The
 // resolved peer is handed back through the ConnectFn (the plugin's coopUiConnect),
 // which reuses the normal Steam-transport connect path. Manual ID entry stays as
 // a fallback for setups where the overlay is unavailable.

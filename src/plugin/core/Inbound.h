@@ -297,9 +297,82 @@ struct InboundCamHint {
     CamHintPacket pkt;
 };
 
+// --- Structural world-state classification (Phase 4) -------------------------
+// Every inbound queue is exactly one of two kinds, chosen at its DECLARATION:
+//   WorldQ<T>   - describes the CURRENT world; dropped on a session-reset edge
+//                 (reload / reconnect / disconnect). It self-registers into the
+//                 owner's world-state reset list on construction, so
+//                 flushWorldState() clears it automatically - a WorldQ CANNOT be
+//                 forgotten from the reset (the class of bug that once let a
+//                 cross-owner invXfer intent survive a world reload).
+//   SessionQ<T> - OUTLIVES the world swap (the connection persists): presence
+//                 edges + the coordinated save/load handshake. Never registered,
+//                 so flushWorldState() leaves it intact by construction.
+// Both forward the only three operations Inbound performs on a queue - push_back
+// (net thread), swap-drain (main thread, via the std::deque& conversion) and
+// clear (flush) - so the push/drain methods below are unchanged.
+struct IClearableQueue {
+    virtual void clearQueue() = 0;
+    virtual ~IClearableQueue() {}
+};
+
+template<class T>
+class WorldQ : public IClearableQueue {
+public:
+    // cap == 0: unbounded (reliable queues MUST stay unbounded - dropping a
+    // save chunk or an event corrupts the stream). cap > 0: a bounded mailbox
+    // for an UNRELIABLE latest-wins traffic class (entity/stealth/cam), where a
+    // stalled main thread would otherwise let the queue grow without limit; on
+    // overflow the OLDEST entry is dropped, which is exactly "newest wins" for
+    // continuous state (Phase 4d bounded mailboxes).
+    explicit WorldQ(std::vector<IClearableQueue*>& reg, size_t cap = 0)
+      : cap_(cap) { reg.push_back(this); }
+    void push_back(const T& v) {
+        if (cap_ && q_.size() >= cap_) q_.pop_front();
+        q_.push_back(v);
+    }
+    operator std::deque<T>&() { return q_; }
+    virtual void clearQueue() { q_.clear(); }
+private:
+    std::deque<T> q_;
+    size_t        cap_;
+    WorldQ(const WorldQ&);
+    WorldQ& operator=(const WorldQ&);
+};
+
+template<class T>
+class SessionQ {
+public:
+    SessionQ() {}
+    void push_back(const T& v) { q_.push_back(v); }
+    operator std::deque<T>&() { return q_; }
+private:
+    std::deque<T> q_;
+    SessionQ(const SessionQ&);
+    SessionQ& operator=(const SessionQ&);
+};
+
 class Inbound {
 public:
-    Inbound()  { InitializeCriticalSection(&cs_); sawRemote_ = false; }
+    // WorldQ members self-register into worldReset_ (declared first, below), so
+    // the init list wires every world-state queue to the structural reset.
+    Inbound()
+      : sawRemote_(false), generation_(0),
+        // Bounded mailboxes (Phase 4d): the three UNRELIABLE latest-wins queues
+        // carry a drop-oldest cap so a stalled main thread cannot grow them
+        // without bound. ent_ = ~12 s of a 20 Hz * 17-entity stream; stealth/cam
+        // are ~1 Hz refreshes. Every other queue is reliable and stays unbounded.
+        ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
+        wi_(worldReset_),         wir_(worldReset_),        npcCensus_(worldReset_),
+        wd_(worldReset_),         invXfer_(worldReset_),    wp_(worldReset_),
+        med_(worldReset_),        treat_(worldReset_),      speed_(worldReset_),
+        stats_(worldReset_),      money_(worldReset_),      faction_(worldReset_),
+        time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
+        research_(worldReset_),   buildPlace_(worldReset_), buildState_(worldReset_),
+        buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
+        spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64) {
+        InitializeCriticalSection(&cs_);
+    }
     ~Inbound() { DeleteCriticalSection(&cs_); }
 
     // NET thread: a peer joined (id) / a peer left (id, or OWNER_ID_ALL).
@@ -323,6 +396,15 @@ public:
     bool sawRemoteEntity() {
         EnterCriticalSection(&cs_); bool v = sawRemote_; LeaveCriticalSection(&cs_);
         return v;
+    }
+    // MAIN thread: the current session generation. Bumped by flushWorldState()
+    // on every world-state reset edge (reload / reconnect / disconnect). A
+    // reference or index captured under an older generation is known-stale.
+    // Phase 0 seed for the Phase 4 wire epoch - cheap now, consumed later by
+    // the SessionController + stale-generation packet rejection.
+    u32 sessionGeneration() {
+        EnterCriticalSection(&cs_); u32 g = generation_; LeaveCriticalSection(&cs_);
+        return g;
     }
     // NET thread: one received reliable event, owner-tagged.
     void pushEvent(u32 ownerId, const EventPacket& ev) {
@@ -624,64 +706,81 @@ public:
     }
 
     // MAIN thread, session reset (protocol 32): drop every queued packet that
-    // describes the OLD world after a reload edge. Presence (connect/leave
-    // edges) and the coordinated-load queues themselves survive - the
-    // connection never drops across a world swap, and a LOAD_NACK arriving
-    // while the host was mid-swap must still be answered.
+    // describes the OLD world after a reload / reconnect / disconnect edge, and
+    // start a new session generation.
+    //
+    // Coverage is STRUCTURAL: every WorldQ registered itself into worldReset_ at
+    // construction, so iterating that list clears exactly the world-state queues
+    // and nothing else - a queue added later cannot be silently forgotten (the
+    // bug that let a cross-owner invXfer transfer intent survive a world reload).
+    // SessionQ queues (presence + the coordinated save/load handshake) never
+    // register, so they survive by construction - a NACK/GO arriving mid-swap
+    // must not be dropped.
     void flushWorldState() {
         EnterCriticalSection(&cs_);
-        ent_.clear();       evt_.clear();        inv_.clear();
-        wi_.clear();        wir_.clear();        wd_.clear();
-        wp_.clear();        med_.clear();        treat_.clear();
-        speed_.clear();     stats_.clear();      money_.clear();
-        faction_.clear();   time_.clear();       door_.clear();
-        buildPlace_.clear(); buildState_.clear(); buildDoor_.clear();
-        buildRemove_.clear(); stealth_.clear();   spawnReq_.clear();
-        spawnInfo_.clear(); prod_.clear();       npcCensus_.clear();
-        research_.clear();  camHint_.clear();
+        for (size_t i = 0; i < worldReset_.size(); ++i)
+            worldReset_[i]->clearQueue();
+        // Peer-readiness is world-scoped: the owned-entity batch that set
+        // sawRemote_ described the OLD world, so a fresh session must
+        // re-observe the peer before time-sensitive host actions (e.g. a live
+        // spawn) or a scenario may arm again.
+        sawRemote_ = false;
+        ++generation_;
         LeaveCriticalSection(&cs_);
     }
 
 private:
     CRITICAL_SECTION          cs_;
-    bool                      sawRemote_; // set once any peer entity batch arrives
-    std::deque<u32>           conn_;
-    std::deque<u32>           leave_;
-    std::deque<InboundEntity> ent_;
-    std::deque<InboundEvent>  evt_;
-    std::deque<InboundInv>    inv_;
-    std::deque<InboundWorldItems>  wi_;
-    std::deque<InboundWorldRemove> wir_;
-    std::deque<InboundNpcCensus>   npcCensus_;
-    std::deque<InboundWorldDrop>   wd_;
-    std::deque<InboundInvXfer>     invXfer_;
-    std::deque<InboundWorldPickup> wp_;
-    std::deque<InboundMedical>     med_;
-    std::deque<InboundTreatment>   treat_;
-    std::deque<InboundSpeed>       speed_;
-    std::deque<InboundStats>       stats_;
-    std::deque<InboundMoney>       money_;
-    std::deque<InboundFaction>     faction_;
-    std::deque<InboundTime>        time_;
-    std::deque<InboundDoor>        door_;
-    std::deque<InboundProd>        prod_;
-    std::deque<InboundResearch>    research_;
-    std::deque<InboundBuildPlace>  buildPlace_;
-    std::deque<InboundBuildState>  buildState_;
-    std::deque<InboundBuildDoor>   buildDoor_;
-    std::deque<InboundBuildRemove> buildRemove_;
-    std::deque<InboundStealth>     stealth_;
-    std::deque<InboundSpawnReq>    spawnReq_;
-    std::deque<InboundSpawnInfo>   spawnInfo_;
-    std::deque<InboundSaveReq>     saveReq_;
-    std::deque<InboundSaveBegin>   saveBegin_;
-    std::deque<InboundSaveFile>    saveFile_;
-    std::deque<InboundSaveDone>    saveDone_;
-    std::deque<InboundSaveAck>     saveAck_;
-    std::deque<InboundLoadGo>      loadGo_;
-    std::deque<InboundLoadReq>     loadReq_;
-    std::deque<InboundLoadNack>    loadNack_;
-    std::deque<InboundCamHint>     camHint_;
+    bool                      sawRemote_;  // set once any peer entity batch arrives
+    u32                       generation_; // session generation; bumped on flush
+    // World-state reset list: every WorldQ below self-registers here at
+    // construction so flushWorldState() clears them structurally. MUST be
+    // declared before the WorldQ members (member init order).
+    std::vector<IClearableQueue*> worldReset_;
+
+    // SESSION-PRESERVING: presence edges (the connection persists across a swap).
+    SessionQ<u32>                  conn_;
+    SessionQ<u32>                  leave_;
+
+    // WORLD-STATE: describe the current world; auto-cleared on a session reset.
+    WorldQ<InboundEntity>          ent_;
+    WorldQ<InboundEvent>           evt_;
+    WorldQ<InboundInv>             inv_;
+    WorldQ<InboundWorldItems>      wi_;
+    WorldQ<InboundWorldRemove>     wir_;
+    WorldQ<InboundNpcCensus>       npcCensus_;
+    WorldQ<InboundWorldDrop>       wd_;
+    WorldQ<InboundInvXfer>         invXfer_;
+    WorldQ<InboundWorldPickup>     wp_;
+    WorldQ<InboundMedical>         med_;
+    WorldQ<InboundTreatment>       treat_;
+    WorldQ<InboundSpeed>           speed_;
+    WorldQ<InboundStats>           stats_;
+    WorldQ<InboundMoney>           money_;
+    WorldQ<InboundFaction>         faction_;
+    WorldQ<InboundTime>            time_;
+    WorldQ<InboundDoor>            door_;
+    WorldQ<InboundProd>            prod_;
+    WorldQ<InboundResearch>        research_;
+    WorldQ<InboundBuildPlace>      buildPlace_;
+    WorldQ<InboundBuildState>      buildState_;
+    WorldQ<InboundBuildDoor>       buildDoor_;
+    WorldQ<InboundBuildRemove>     buildRemove_;
+    WorldQ<InboundStealth>         stealth_;
+    WorldQ<InboundSpawnReq>        spawnReq_;
+    WorldQ<InboundSpawnInfo>       spawnInfo_;
+    WorldQ<InboundCamHint>         camHint_;
+
+    // SESSION-PRESERVING: coordinated save (protocol 31) + load (protocol 32)
+    // handshake - a GO/NACK/chunk arriving mid-swap must survive the reset.
+    SessionQ<InboundSaveReq>       saveReq_;
+    SessionQ<InboundSaveBegin>     saveBegin_;
+    SessionQ<InboundSaveFile>      saveFile_;
+    SessionQ<InboundSaveDone>      saveDone_;
+    SessionQ<InboundSaveAck>       saveAck_;
+    SessionQ<InboundLoadGo>        loadGo_;
+    SessionQ<InboundLoadReq>       loadReq_;
+    SessionQ<InboundLoadNack>      loadNack_;
 
     Inbound(const Inbound&);
     Inbound& operator=(const Inbound&);

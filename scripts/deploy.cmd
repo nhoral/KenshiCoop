@@ -12,7 +12,14 @@ popd >nul
 set "KENSHI=%~1"
 if "%KENSHI%"=="" set "KENSHI=C:\Program Files (x86)\Steam\steamapps\common\Kenshi"
 
-set "DLL=%REPO%\src\plugin\x64\Release\KenshiCoop.dll"
+REM Build config to deploy (Phase 1 build separation). Default = Harness (the
+REM test build with the scenario runner). Pass "Release" as the 2nd argument to
+REM deploy the shipped player DLL instead.
+REM   Usage:  scripts\deploy.cmd ["C:\path\to\Kenshi"] [Harness|Release|Debug]
+set "CONFIG=%~2"
+if "%CONFIG%"=="" set "CONFIG=Harness"
+
+set "DLL=%REPO%\src\plugin\x64\%CONFIG%\KenshiCoop.dll"
 set "JSON=%REPO%\dist\mods\KenshiCoop\RE_Kenshi.json"
 set "DST=%KENSHI%\mods\KenshiCoop"
 

@@ -21,14 +21,12 @@ namespace {
 // the healer's copy is pristine (nothing to bandage, n=0) and the owner never
 // sees the treatment. The vitals-sync + treatment-forwarding features are what
 // turn this green.)
-class MedicOrderScenario : public Scenario {
+class MedicOrderScenario : public TimedScenario {
 public:
     MedicOrderScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastHealMs_(0),
+        : TimedScenario("medic_order", 0), recvCount_(0), lastLogMs_(0), lastHealMs_(0),
           haveOwn_(false), havePeer_(false), woundLogged_(false),
           healLogged_(false) {}
-
-    virtual const char* name() const { return "medic_order"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -96,8 +94,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Shared timeline: host wounds A at 10s, join heals A 20-27s; join wounds B
     // at 32s, host heals B 42-49s.
@@ -140,7 +136,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     unsigned long lastHealMs_;
@@ -162,13 +157,11 @@ private:
 // latency budget (event or self-heal), and both sides converge on exactly one
 // severed ground item per amputation (host-authoritative world-item channel;
 // the join's local duplicate must be deduped).
-class LimbLossScenario : public Scenario {
+class LimbLossScenario : public TimedScenario {
 public:
     LimbLossScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario("limb_loss", 0), recvCount_(0), lastLogMs_(0),
           haveOwn_(false), havePeer_(false), cutLogged_(false) {}
-
-    virtual const char* name() const { return "limb_loss"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -220,8 +213,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long A_CUT_AT_MS      = 12000;
     static const unsigned long B_CUT_AT_MS      = 30000;
@@ -265,7 +256,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveOwn_;
@@ -283,13 +273,11 @@ private:
 // at 2 Hz; the Test-StatsSync oracle gates: each raised value crosses to the
 // peer copy within a latency budget, stays sticky, and stats neither side
 // touched do not drift.
-class StatsSyncScenario : public Scenario {
+class StatsSyncScenario : public TimedScenario {
 public:
     StatsSyncScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario("stats_sync", 0), recvCount_(0), lastLogMs_(0),
           haveOwn_(false), havePeer_(false), raiseLogged_(false) {}
-
-    virtual const char* name() const { return "stats_sync"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -346,8 +334,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long A_RAISE_AT_MS    = 12000;
     static const unsigned long B_RAISE_AT_MS    = 30000;
@@ -397,7 +383,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveOwn_;

@@ -184,15 +184,23 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
         if (ahead > cfg.maxExtrapMs) ahead = cfg.maxExtrapMs;
         float seg = (float)(newest.t - prev.t);
         lastMode_ = SM_EXTRAP;
-        if (seg <= 0.0f) {
+        float sdx = newest.x - prev.x, sdy = newest.y - prev.y, sdz = newest.z - prev.z;
+        // Last segment was a source teleport (a park/fast-travel jump), OR the
+        // two samples share a timestamp: hold the newest pose instead of dead-
+        // reckoning ALONG the jump vector. Extrapolating a teleport multiplies
+        // its delta by k = ahead/seg and flings the body thousands of units past
+        // its real position (then holds that phantom while starved until the next
+        // update snaps it back - the roaming/fast-travel warp). Mirrors the in-
+        // segment teleport guard below (same snapDistSq threshold).
+        if (seg <= 0.0f || (sdx * sdx + sdy * sdy + sdz * sdz) > cfg.snapDistSq) {
             out->x = newest.x; out->y = newest.y; out->z = newest.z;
             out->heading = newest.heading;
             return true;
         }
         float k = (float)ahead / seg; // extrapolation factor along last segment
-        out->x = newest.x + (newest.x - prev.x) * k;
-        out->y = newest.y + (newest.y - prev.y) * k;
-        out->z = newest.z + (newest.z - prev.z) * k;
+        out->x = newest.x + sdx * k;
+        out->y = newest.y + sdy * k;
+        out->z = newest.z + sdz * k;
         out->heading = lerpAngle(prev.heading, newest.heading, 1.0f + k);
         return true;
     }

@@ -479,10 +479,11 @@ unsigned int Replicator::tabRepresentatives(GameWorld* gw, unsigned int rankHand
     return nRanks;
 }
 
-void Replicator::publishMoney(GameWorld* gw, NetLink& net, u32 ownerId) {
+void Replicator::publishMoney(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!moneySync_) return;
-    const unsigned long RESEND_MS   = 5000; // safety resend (a lost write self-heals)
-    const unsigned long MIN_SEND_MS = 1000; // wallets move in bursts; ~1 Hz is plenty
+    const unsigned long RESEND_MS   = tuning_.moneyResendMs;  // safety resend (a lost write self-heals)
+    const unsigned long MIN_SEND_MS = tuning_.moneyMinSendMs; // wallets move in bursts; ~1 Hz is plenty
     const unsigned int  MAX_RANKS   = 8;
     unsigned long now = nowMs();
     unsigned int rankHand[MAX_RANKS][5];
@@ -494,9 +495,12 @@ void Replicator::publishMoney(GameWorld* gw, NetLink& net, u32 ownerId) {
         int money = -1;
         if (!engine::readWalletByHand(rankHand[r], &money) || money < 0) continue;
         MoneyPub& mp = moneyPub_[r];
-        if (mp.lastSendMs != 0 && (now - mp.lastSendMs) < MIN_SEND_MS) continue;
-        if (money == mp.lastSent && (now - mp.lastSendMs) < RESEND_MS) continue;
         bool changed = (money != mp.lastSent);
+        // Money has no silent seed step, so a never-sent row is resend-due: a
+        // fresh wallet still streams once. (resendUnsent = true.)
+        if (!sync::gateShouldSend(changed, now, mp.lastSendMs, MIN_SEND_MS,
+                                  RESEND_MS, /*resendUnsent*/ true))
+            continue;
         mp.lastSent = money; mp.lastSendMs = now;
         MoneyPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
@@ -513,7 +517,8 @@ void Replicator::publishMoney(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
-void Replicator::applyMoney(GameWorld* gw, Inbound& in) {
+void Replicator::applyMoney(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
     std::deque<InboundMoney> got;
     in.drainMoney(got);
     if (got.empty()) return;
@@ -544,10 +549,11 @@ void Replicator::applyMoney(GameWorld* gw, Inbound& in) {
     }
 }
 
-void Replicator::publishFactions(GameWorld* gw, NetLink& net, u32 ownerId) {
+void Replicator::publishFactions(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!factionSync_) return;
-    const unsigned long SAMPLE_MS = 1000;  // relations move in bursts; 1 Hz is plenty
-    const unsigned long RESEND_MS = 10000; // safety resend for rows we ever sent
+    const unsigned long SAMPLE_MS = tuning_.factionSampleMs; // relations move in bursts; 1 Hz is plenty
+    const unsigned long RESEND_MS = tuning_.factionResendMs; // safety resend for rows we ever sent
     const float         EPS       = 0.5f;  // engine values are whole-ish numbers
     unsigned long now = nowMs();
 
@@ -557,7 +563,9 @@ void Replicator::publishFactions(GameWorld* gw, NetLink& net, u32 ownerId) {
     // diff below is what actually replicates.
     engine::FactionDelta deltas[16];
     unsigned int nDeltas = engine::drainFactionDeltas(deltas, 16);
-    if (nDeltas == 0 && facSampleMs_ != 0 && (now - facSampleMs_) < SAMPLE_MS) return;
+    // A real mutation this tick (nDeltas > 0) forces a sample regardless of the
+    // 1 Hz throttle so the row crosses within a tick.
+    if (nDeltas == 0 && !sync::gateSampleDue(now, facSampleMs_, SAMPLE_MS)) return;
     facSampleMs_ = now;
 
     const unsigned int MAX_FACTIONS = 96;
@@ -574,8 +582,11 @@ void Replicator::publishFactions(GameWorld* gw, NetLink& net, u32 ownerId) {
             continue;
         }
         bool changed = (cur - fr.known >= EPS) || (fr.known - cur >= EPS);
-        bool resend  = fr.lastSendMs != 0 && (now - fr.lastSendMs) >= RESEND_MS;
-        if (!changed && !resend) continue;
+        // Seeded silently above, so a never-sent row holds (resendUnsent=false);
+        // only a real move or a post-send safety resend crosses.
+        if (!sync::gateShouldSend(changed, now, fr.lastSendMs, /*minSendMs*/ 0,
+                                  RESEND_MS, /*resendUnsent*/ false))
+            continue;
         fr.known = cur; fr.lastSendVal = cur; fr.lastSendMs = now;
         FactionPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
@@ -595,7 +606,8 @@ void Replicator::publishFactions(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
-void Replicator::applyFactions(GameWorld* gw, Inbound& in) {
+void Replicator::applyFactions(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
     std::deque<InboundFaction> got;
     in.drainFaction(got);
     if (got.empty()) return;
@@ -605,7 +617,7 @@ void Replicator::applyFactions(GameWorld* gw, Inbound& in) {
         const FactionPacket& p = it->pkt;
         if (p.sid[0] == '\0') continue;
         FacRow& fr = facRows_[std::string(p.sid)];
-        if (fr.seqSeen != 0 && p.seq <= fr.seqSeen) continue; // stale row
+        if (!sync::gateSeqAccept(fr.seqSeen, p.seq)) continue; // stale/dup row
         fr.seqSeen = p.seq;
         float us = -999.0f, them = -999.0f;
         engine::readRelationBySid(gw, p.sid, &us, &them);
@@ -624,12 +636,13 @@ void Replicator::applyFactions(GameWorld* gw, Inbound& in) {
     }
 }
 
-void Replicator::publishDoors(GameWorld* gw, NetLink& net, u32 ownerId) {
+void Replicator::publishDoors(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!doorSync_) return;
-    const unsigned long SAMPLE_MS = 1000;  // doors move in clicks; 1 Hz is plenty
-    const unsigned long RESEND_MS = 10000; // safety resend for rows we ever sent
+    const unsigned long SAMPLE_MS = tuning_.doorSampleMs;  // doors move in clicks; 1 Hz is plenty
+    const unsigned long RESEND_MS = tuning_.doorResendMs;  // safety resend for rows we ever sent
     unsigned long now = nowMs();
-    if (doorSampleMs_ != 0 && (now - doorSampleMs_) < SAMPLE_MS) return;
+    if (!sync::gateSampleDue(now, doorSampleMs_, SAMPLE_MS)) return;
     doorSampleMs_ = now;
 
     const unsigned int MAX_DOORS = 64;
@@ -657,8 +670,12 @@ void Replicator::publishDoors(GameWorld* gw, NetLink& net, u32 ownerId) {
             continue;
         }
         bool changed = (r.open != dr.knownOpen) || (r.locked != dr.knownLocked);
-        bool resend  = dr.lastSendMs != 0 && (now - dr.lastSendMs) >= RESEND_MS;
-        if (!changed && !resend) continue;
+        // Doors seed their baseline silently above, so a never-sent row holds
+        // (resendUnsent = false); only a real change or a post-send safety
+        // resend crosses. No burst throttle - the 1 Hz sample gate paces it.
+        if (!sync::gateShouldSend(changed, now, dr.lastSendMs, /*minSendMs*/ 0,
+                                  RESEND_MS, /*resendUnsent*/ false))
+            continue;
         dr.knownOpen = r.open; dr.knownLocked = r.locked; dr.lastSendMs = now;
         DoorPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
@@ -680,8 +697,8 @@ void Replicator::publishDoors(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
-void Replicator::applyDoors(GameWorld* gw, Inbound& in) {
-    (void)gw;
+void Replicator::applyDoors(const SyncContext& ctx) {
+    Inbound& in = *ctx.in;
     std::deque<InboundDoor> got;
     in.drainDoor(got);
     if (got.empty()) return;
@@ -691,7 +708,7 @@ void Replicator::applyDoors(GameWorld* gw, Inbound& in) {
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
         DoorRow& dr = doorRows_[k];
-        if (dr.seqSeen != 0 && p.seq <= dr.seqSeen) continue; // stale row
+        if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
         dr.seqSeen = p.seq;
         // Updating the baseline FIRST is the echo guard: the local change this
         // write causes must not be re-detected as ours next sample.
@@ -724,12 +741,13 @@ inline int qProd(float v) {
 }
 } // namespace
 
-void Replicator::publishProd(GameWorld* gw, NetLink& net, u32 ownerId) {
+void Replicator::publishProd(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!prodSync_) return;
-    const unsigned long SAMPLE_MS = 1000;  // machines tick slowly; 1 Hz is plenty
-    const unsigned long RESEND_MS = 10000; // safety resend = the join drift corrector
+    const unsigned long SAMPLE_MS = tuning_.prodSampleMs;  // machines tick slowly; 1 Hz is plenty
+    const unsigned long RESEND_MS = tuning_.prodResendMs;  // safety resend = the join drift corrector
     unsigned long now = nowMs();
-    if (prodSampleMs_ != 0 && (now - prodSampleMs_) < SAMPLE_MS) return;
+    if (!sync::gateSampleDue(now, prodSampleMs_, SAMPLE_MS)) return;
     prodSampleMs_ = now;
 
     const unsigned int MAX_MACH = 48;
@@ -762,8 +780,11 @@ void Replicator::publishProd(GameWorld* gw, NetLink& net, u32 ownerId) {
                        qOut != pr.qOut || qIn0 != pr.qIn0 || qIn1 != pr.qIn1 ||
                        qGr != pr.qGrown || qDi != pr.qDied ||
                        qGs != pr.qGrowStart || qHv != pr.qHarv;
-        bool resend = pr.sent && (now - pr.lastSendMs) >= RESEND_MS;
-        if (!changed && !resend) continue;
+        // `changed` already folds in first-sight (!pr.sent), so a never-sent row
+        // always crosses; resendUnsent is moot here. Safety resend after RESEND_MS.
+        if (!sync::gateShouldSend(changed, now, pr.lastSendMs, /*minSendMs*/ 0,
+                                  RESEND_MS, /*resendUnsent*/ false))
+            continue;
         bool first = !pr.sent;
         pr.sent = true; pr.lastSendMs = now;
         pr.knownPower = r.powerOn; pr.knownState = r.productionState;
@@ -803,8 +824,8 @@ void Replicator::publishProd(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
-void Replicator::applyProd(GameWorld* gw, Inbound& in) {
-    (void)gw;
+void Replicator::applyProd(const SyncContext& ctx) {
+    Inbound& in = *ctx.in;
     std::deque<InboundProd> got;
     in.drainProd(got);
     if (got.empty()) return;
@@ -814,7 +835,7 @@ void Replicator::applyProd(GameWorld* gw, Inbound& in) {
         Key wk; wk.t = p.key[0]; wk.c = p.key[1]; wk.cs = p.key[2];
         wk.i = p.key[3]; wk.s = p.key[4];
         ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wk)];
-        if (pr.seqSeen != 0 && p.seq <= pr.seqSeen) continue; // stale row
+        if (!sync::gateSeqAccept(pr.seqSeen, p.seq)) continue; // stale/dup row
         pr.seqSeen = p.seq;
         // Resolve the wire key to OUR machine's hand: baked hands resolve
         // directly; a placer key is either a building WE placed (our own
@@ -892,12 +913,13 @@ void Replicator::applyProd(GameWorld* gw, Inbound& in) {
     }
 }
 
-void Replicator::publishResearch(GameWorld* gw, NetLink& net, u32 ownerId) {
+void Replicator::publishResearch(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!researchSync_) return;
-    const unsigned long SAMPLE_MS = 1000;  // unlocks are rare; 1 Hz is plenty
-    const unsigned long RESEND_MS = 15000; // lost-row / late-prereq corrector
+    const unsigned long SAMPLE_MS = tuning_.researchSampleMs; // unlocks are rare; 1 Hz is plenty
+    const unsigned long RESEND_MS = tuning_.researchResendMs; // lost-row / late-prereq corrector
     unsigned long now = nowMs();
-    if (researchSampleMs_ != 0 && (now - researchSampleMs_) < SAMPLE_MS) return;
+    if (!sync::gateSampleDue(now, researchSampleMs_, SAMPLE_MS)) return;
     researchSampleMs_ = now;
 
     // The known set is bounded by the RESEARCH record count (384 on the sync
@@ -910,8 +932,11 @@ void Replicator::publishResearch(GameWorld* gw, NetLink& net, u32 ownerId) {
         const char* sid = sids + (size_t)i * SID_CAP;
         ResearchRow& rr = researchRows_[std::string(sid)];
         bool first  = !rr.sent;
-        bool resend = rr.sent && (now - rr.lastSendMs) >= RESEND_MS;
-        if (!first && !resend) continue;
+        // Known-set membership is monotonic (no value to diff): send on first
+        // sight then resend periodically. No silent seed -> resendUnsent=true.
+        if (!sync::gateShouldSend(/*changed*/ false, now, rr.lastSendMs,
+                                  /*minSendMs*/ 0, RESEND_MS, /*resendUnsent*/ true))
+            continue;
         rr.sent = true; rr.lastSendMs = now;
         ResearchPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
@@ -929,7 +954,8 @@ void Replicator::publishResearch(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
-void Replicator::applyResearch(GameWorld* gw, Inbound& in) {
+void Replicator::applyResearch(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
     std::deque<InboundResearch> got;
     in.drainResearch(got);
     if (got.empty()) return;
@@ -942,7 +968,7 @@ void Replicator::applyResearch(GameWorld* gw, Inbound& in) {
         sid[sizeof(sid) - 1] = '\0';
         if (!sid[0]) continue;
         ResearchRow& rr = researchRows_[std::string(sid)];
-        if (rr.seqSeen != 0 && p.seq <= rr.seqSeen) continue; // stale row
+        if (!sync::gateSeqAccept(rr.seqSeen, p.seq)) continue; // stale/dup row
         rr.seqSeen = p.seq;
         if (rr.applied) continue; // landed earlier; resends are no-ops
         int known = -1, can = -1;
@@ -961,8 +987,8 @@ void Replicator::applyResearch(GameWorld* gw, Inbound& in) {
     }
 }
 
-void Replicator::publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId) {
-    (void)gw;
+void Replicator::publishBuilds(const SyncContext& ctx) {
+    NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
 
     // 1. Local placement edges -> PLACE announcements (drained every tick so
@@ -1030,10 +1056,10 @@ void Replicator::publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId) {
 
     // 2. Progress rows for buildings WE placed (~1 Hz, change-gated + 10 s
     // safety resend while incomplete; the final complete row latches).
-    const unsigned long SAMPLE_MS = 1000;
-    const unsigned long RESEND_MS = 10000;
+    const unsigned long SAMPLE_MS = tuning_.buildSampleMs;
+    const unsigned long RESEND_MS = tuning_.buildResendMs;
     unsigned long now = nowMs();
-    if (buildSampleMs_ != 0 && (now - buildSampleMs_) < SAMPLE_MS) return;
+    if (!sync::gateSampleDue(now, buildSampleMs_, SAMPLE_MS)) return;
     buildSampleMs_ = now;
     const float EPS = 0.005f;
     for (std::map<Key, OwnBuild>::iterator it = ownBuilds_.begin();
@@ -1046,8 +1072,11 @@ void Replicator::publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId) {
             continue; // destroyed/unloaded locally - stop streaming quietly
         float dp = cur.progress - ob.lastProg;
         bool changed = (dp > EPS || dp < -EPS) || (cur.complete != ob.lastComplete);
-        bool resend  = ob.lastSendMs != 0 && (now - ob.lastSendMs) >= RESEND_MS;
-        if (!changed && !resend) continue;
+        // The PLACE seeds lastProg=-1, so the first sample always diverges;
+        // thereafter a real progress move or a post-send resend crosses.
+        if (!sync::gateShouldSend(changed, now, ob.lastSendMs, /*minSendMs*/ 0,
+                                  RESEND_MS, /*resendUnsent*/ false))
+            continue;
         ob.lastProg = cur.progress; ob.lastComplete = cur.complete;
         ob.lastSendMs = now;
         BuildStatePacket pkt;
@@ -1071,7 +1100,8 @@ void Replicator::publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
-void Replicator::applyBuilds(GameWorld* gw, Inbound& in) {
+void Replicator::applyBuilds(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
     // Announcements first (same-channel ordered-reliable means a STATE row
     // never precedes its PLACE on the wire; keep that property here too).
     std::deque<InboundBuildPlace> places;
@@ -1120,7 +1150,7 @@ void Replicator::applyBuilds(GameWorld* gw, Inbound& in) {
             continue; // mint refused or key unknown - skip silently
         PeerBuild& pb = f->second;
         if (pb.removed) continue; // tombstoned (REMOVE already applied)
-        if (pb.seqSeen != 0 && p.seq <= pb.seqSeen) continue; // stale row
+        if (!sync::gateSeqAccept(pb.seqSeen, p.seq)) continue; // stale/dup row
         pb.seqSeen = p.seq;
         engine::BuildRead cur;
         if (engine::readBuildingByHand(pb.localHand, &cur)) {
@@ -1168,6 +1198,49 @@ void Replicator::applyBuilds(GameWorld* gw, Inbound& in) {
                   pb.localHand[0], pb.localHand[1], pb.localHand[2],
                   pb.localHand[3], pb.localHand[4], p.seq);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+// Phase 6c: the channel-descriptor registry for the change-gated SAMPLED
+// channels. Each row names a channel and how the tick drives it - its master
+// enable (a Replicator bool member), an optional SECOND enable (build doors
+// ride buildSync_ AND bdoorSync_), its publish/apply members (uniform
+// SyncContext signature), and its DIRECTION: BOTH = symmetric detector on both
+// clients (the applied-row baseline keeps it echo-free); HOST_AUTH = the host
+// publishes and the join applies (world-simulation authority, no echo path).
+// The array ORDER is the wire cadence order and MUST match the historical
+// publish sequence the explicit tick blocks had. Adding a sampled channel is
+// one row here plus its publish/apply pair - no edit to the Plugin tick.
+// Built inside a member function so the pointer-to-private-members resolve.
+void Replicator::driveSampledChannels(const SyncContext& ctx) {
+    typedef void (Replicator::*ChFn)(const SyncContext&);
+    struct Desc {
+        bool Replicator::* enable;   // master gate (== the old g_cfg.* gate)
+        bool Replicator::* enable2;  // second gate (0 = none)
+        ChFn               publish;
+        ChFn               apply;
+        bool               hostAuth; // true = host publishes / join applies
+    };
+    static const Desc kCh[] = {
+        { &Replicator::factionSync_,  0,                     &Replicator::publishFactions,   &Replicator::applyFactions,   false },
+        { &Replicator::doorSync_,     0,                     &Replicator::publishDoors,      &Replicator::applyDoors,      false },
+        { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
+        { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
+        { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  }
+    };
+    const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
+    for (int i = 0; i < n; ++i) {
+        const Desc& d = kCh[i];
+        if (!(this->*(d.enable))) continue;
+        if (d.enable2 && !(this->*(d.enable2))) continue;
+        if (d.hostAuth) {
+            if (ctx.isHost) (this->*(d.publish))(ctx);
+            else            (this->*(d.apply))(ctx);
+        } else {
+            (this->*(d.publish))(ctx);
+            (this->*(d.apply))(ctx);
+        }
     }
 }
 
@@ -1254,13 +1327,13 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
-void Replicator::publishBuildDoors(GameWorld* gw, NetLink& net, u32 ownerId) {
-    (void)gw;
+void Replicator::publishBuildDoors(const SyncContext& ctx) {
+    NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!bdoorSync_) return;
-    const unsigned long SAMPLE_MS = 1000;  // the protocol-26 door cadence
-    const unsigned long RESEND_MS = 10000; // safety resend for rows ever sent
+    const unsigned long SAMPLE_MS = tuning_.bdoorSampleMs; // the protocol-26 door cadence
+    const unsigned long RESEND_MS = tuning_.bdoorResendMs; // safety resend for rows ever sent
     unsigned long now = nowMs();
-    if (bdoorSampleMs_ != 0 && (now - bdoorSampleMs_) < SAMPLE_MS) return;
+    if (!sync::gateSampleDue(now, bdoorSampleMs_, SAMPLE_MS)) return;
     bdoorSampleMs_ = now;
 
     const unsigned int MAX_DOORS_PER_BUILDING = 4;
@@ -1294,8 +1367,12 @@ void Replicator::publishBuildDoors(GameWorld* gw, NetLink& net, u32 ownerId) {
                 }
                 bool changed = (dr.open != row.knownOpen) ||
                                (dr.locked != row.knownLocked);
-                bool resend  = row.lastSendMs != 0 && (now - row.lastSendMs) >= RESEND_MS;
-                if (!changed && !resend) continue;
+                // Seeded silently above (resendUnsent=false); like protocol-26
+                // doors, only a real toggle or a post-send resend crosses.
+                if (!sync::gateShouldSend(changed, now, row.lastSendMs,
+                                          /*minSendMs*/ 0, RESEND_MS,
+                                          /*resendUnsent*/ false))
+                    continue;
                 row.knownOpen = dr.open; row.knownLocked = dr.locked;
                 row.lastSendMs = now;
                 BuildDoorPacket pkt;
@@ -1323,8 +1400,8 @@ void Replicator::publishBuildDoors(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
-void Replicator::applyBuildDoors(GameWorld* gw, Inbound& in) {
-    (void)gw;
+void Replicator::applyBuildDoors(const SyncContext& ctx) {
+    Inbound& in = *ctx.in;
     std::deque<InboundBuildDoor> got;
     in.drainBuildDoor(got);
     if (got.empty()) return;
@@ -1345,7 +1422,7 @@ void Replicator::applyBuildDoors(GameWorld* gw, Inbound& in) {
                 localHand = pit->second.localHand;
         }
         BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
-        if (row.seqSeen != 0 && p.seq <= row.seqSeen) continue; // stale row
+        if (!sync::gateSeqAccept(row.seqSeen, p.seq)) continue; // stale/dup row
         row.seqSeen = p.seq;
         // Updating the baseline FIRST is the echo guard: the local change this
         // write causes must not be re-detected as ours next sample.

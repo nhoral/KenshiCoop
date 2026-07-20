@@ -27,10 +27,11 @@ namespace {
 // the rows were sent once into the void, arming the resend; the building
 // NEVER mints); the sync arm gates that the connect-edge resync closes all
 // four immediately.
-class LatejoinProbeScenario : public Scenario {
+class LatejoinProbeScenario : public TimedScenario {
 public:
     explicit LatejoinProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), censusLogged_(0),
+        : TimedScenario(probe ? "latejoin_probe" : "latejoin_sync", 1000),
+          probe_(probe), censusLogged_(0),
           mutDoor_(false), mutFac_(false), mutMoney_(false), mutBuild_(false),
           doorOk_(false), facOk_(false), moneyOk_(false), buildOk_(false),
           buildDone_(false), rampStep_(0), nextRampTick_(0), nextDoorFixMs_(0),
@@ -40,8 +41,6 @@ public:
         facSid_[0] = '\0'; buildSid_[0] = '\0';
         doorWant_ = -1;
     }
-
-    virtual const char* name() const { return probe_ ? "latejoin_probe" : "latejoin_sync"; }
 
     // PRE-ARM (host only): all four mutations land while the join is still
     // loading/connecting. elapsedMs here is time since GAMEPLAY START.
@@ -121,8 +120,7 @@ public:
         if (ctx.isHost && buildOk_ && !buildDone_ && rampStep_ < MAX_RAMP_STEPS &&
             GetTickCount() >= nextRampTick_)
             doRampStep(ctx);
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             logCensus(ctx);
         }
         if (ctx.elapsedMs >= DURATION_MS) {
@@ -138,8 +136,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // -- pre-arm mutations (host) --------------------------------------------
@@ -353,8 +349,6 @@ private:
     static const int           FAC_SENTINEL   = -85; // distinct from faction_sync's -75
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     unsigned int  censusLogged_;
     bool          mutDoor_, mutFac_, mutMoney_, mutBuild_;
     bool          doorOk_, facOk_, moneyOk_, buildOk_, buildDone_;
@@ -382,14 +376,13 @@ private:
 // quiescence watcher, logging SAVEWATCH ~1 Hz and SAVEDONE once. The JOIN
 // idles (its half of protocol 31 arrives in phase 12b). The [save] LOCAL-SAVE
 // detour line is the edge evidence the oracle cross-checks.
-class SaveProbeScenario : public Scenario {
+class SaveProbeScenario : public TimedScenario {
 public:
     SaveProbeScenario()
-        : passed_(false), issued_(false), issueOk_(false), done_(false),
+        : TimedScenario("save_probe", 0),
+          issued_(false), issueOk_(false), done_(false),
           doneKind_(0), lastWatchLogMs_(0), lastTickMs_(0), maxTickGapMs_(0),
           doneFiles_(0), doneBytes_(0), doneWaitMs_(0) {}
-
-    virtual const char* name() const { return "save_probe"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -459,8 +452,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     void logSaveInfo(const char* when, unsigned long t) {
         char curGame[96], savePath[512];
@@ -476,7 +467,6 @@ private:
     static const unsigned long SAVE_AT_MS  = 3000;
     static const unsigned long DURATION_MS = 45000;
 
-    bool          passed_;
     bool          issued_, issueOk_, done_;
     int           doneKind_;
     unsigned long lastWatchLogMs_;
@@ -507,10 +497,11 @@ const char* const SaveProbeScenario::SAVE_NAME = "coopresume";
 // engine::loadSave('coopresume') MID-SESSION and measures the swap. The JOIN
 // deliberately does NOT load - it logs its leader position ~2 s as the
 // unsynced divergence baseline (its coordinated half arrives in 13b).
-class LoadProbeScenario : public Scenario {
+class LoadProbeScenario : public TimedScenario {
 public:
     LoadProbeScenario()
-        : passed_(false), censused_(false), censusOk_(false), saveIssued_(false),
+        : TimedScenario("load_probe", 0),
+          censused_(false), censusOk_(false), saveIssued_(false),
           saveOk_(false), loadIssued_(false), loadOk_(false), wasLive_(false),
           execTried_(false), swapSeen_(false), swapDone_(false), resolved_(false),
           resolveOk_(false), loadIssueMs_(0), resolveAtMs_(0), lastSigLogMs_(0),
@@ -518,8 +509,6 @@ public:
           preCount_(0), preLeader_(0) {
         memset(hand_, 0, sizeof(hand_));
     }
-
-    virtual const char* name() const { return "load_probe"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -712,8 +701,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long CENSUS_AT_MS     = 3000;
     static const unsigned long SAVE_AT_MS       = 4000;
@@ -722,7 +709,6 @@ private:
     static const unsigned long RESOLVE_SETTLE_MS = 4000;
     static const unsigned long DURATION_MS      = 100000;
 
-    bool          passed_;
     bool          censused_, censusOk_, saveIssued_, saveOk_;
     bool          loadIssued_, loadOk_, wasLive_, execTried_;
     bool          swapSeen_, swapDone_, resolved_, resolveOk_;
@@ -749,10 +735,11 @@ const char* const LoadProbeScenario::SAVE_NAME = "coopresume";
 // sites and logs LSSITE rows - the oracle gates host-hand == join-hand (the
 // shared-save-lineage identity claim, POST-load), GO receipt + the join's
 // load issue, and both sides' WORLD-RELOAD/session-reset log evidence.
-class LoadSyncScenario : public Scenario {
+class LoadSyncScenario : public TimedScenario {
 public:
     LoadSyncScenario()
-        : passed_(false), placed_(false), placeOk_(false), saveIssued_(false),
+        : TimedScenario("load_sync", 0),
+          placed_(false), placeOk_(false), saveIssued_(false),
           saveOk_(false), ackSeen_(false), ackOk_(false), loadIssued_(false),
           loadOk_(false), sigWas2_(false), swapSeen_(false), swapDone_(false),
           censused_(false), siteSeen_(false), dropStartMs_(0), sigClearedMs_(0),
@@ -760,8 +747,6 @@ public:
         memset(ownHand_, 0, sizeof(ownHand_));
         ownSid_[0] = '\0';
     }
-
-    virtual const char* name() const { return "load_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -920,8 +905,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long PLACE_AT_MS      = 8000;
     static const unsigned long SAVE_AT_MS       = 12000;
@@ -931,7 +914,6 @@ private:
     static const unsigned long TAIL_HOLD_MS     = 8000;
     static const unsigned long DURATION_MS      = 110000;
 
-    bool          passed_;
     bool          placed_, placeOk_, saveIssued_, saveOk_;
     bool          ackSeen_, ackOk_, loadIssued_, loadOk_;
     bool          sigWas2_, swapSeen_, swapDone_, censused_, siteSeen_;
@@ -954,17 +936,16 @@ const char* const LoadSyncScenario::SAVE_NAME = "coopresume";
 //   join: the staged save VERIFIED + COMMITTED (lastCommitResult == 1).
 // The oracle cross-checks the log evidence (LOCAL-SAVE edge, QUIESCED,
 // XFER-SENT/COMMIT file+byte equality, ACK ok=1).
-class SaveSyncScenario : public Scenario {
+class SaveSyncScenario : public TimedScenario {
 public:
     explicit SaveSyncScenario(bool stage1)
-        : stage1_(stage1), passed_(false), placed_(false), placeOk_(false),
+        : TimedScenario(stage1 ? "save_stage1" : "save_sync", 0),
+          stage1_(stage1), placed_(false), placeOk_(false),
           rampStep_(0), nextRampMs_(0), issued_(false), issueOk_(false),
           sentLogged_(false), commitLogged_(false), lastStatusMs_(0) {
         memset(ownHand_, 0, sizeof(ownHand_));
         ownSid_[0] = '\0';
     }
-
-    virtual const char* name() const { return stage1_ ? "save_stage1" : "save_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -1059,8 +1040,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long PLACE_AT_MS       = 8000;
     static const unsigned long RAMP_STEP_MS      = 3000;
@@ -1069,7 +1048,6 @@ private:
     static const unsigned long DURATION_MS       = 45000;
 
     bool          stage1_;
-    bool          passed_;
     bool          placed_, placeOk_;
     unsigned int  rampStep_;
     unsigned long nextRampMs_;
@@ -1091,12 +1069,11 @@ const char* const SaveSyncScenario::SAVE_NAME = "coopresume";
 // clients enumerate it under the SAME save-stable hand - the identity-reset
 // claim, proven. Each side logs RESUMESITE rows ~1 Hz; the Test-SaveResume
 // oracle gates host-hand == join-hand.
-class ResumeCheckScenario : public Scenario {
+class ResumeCheckScenario : public TimedScenario {
 public:
     ResumeCheckScenario()
-        : passed_(false), lastCensusMs_(0), siteSeen_(false) {}
-
-    virtual const char* name() const { return "resume_check"; }
+        : TimedScenario("resume_check", 0),
+          lastCensusMs_(0), siteSeen_(false) {}
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -1135,12 +1112,9 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long DURATION_MS = 30000;
 
-    bool          passed_;
     unsigned long lastCensusMs_;
     bool          siteSeen_;
 };

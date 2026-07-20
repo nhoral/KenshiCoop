@@ -207,7 +207,9 @@ struct Config {
     bool          xferSync;
 
     // Cross-owner trade veto (KENSHICOOP_BLOCK_XFER: "1" force on, "0" force off,
-    // unset = ON for real sessions [scenario == ""] and the xfer_block scenario).
+    // unset = OFF for real sessions - Protocol 37 replicate-the-trade is the
+    // real-session default - and auto-ON ONLY for the xfer_block scenario, which
+    // exists to keep the veto code exercised).
     // When on, a UI inventory drag whose SOURCE and DESTINATION squad characters
     // are owned by DIFFERENT clients is refused at the engine (Inventory::tryAddItem
     // detour) - the item stays in the source bag and nothing crosses the ownership
@@ -495,6 +497,12 @@ void loadConfig(Config& out);
 // coop_config.json into 'c'. Called on the panel's Connect so a friend-code edit
 // applies without restarting the game. No-op for keys absent from the file.
 void reloadPeerFromFile(Config& c);
+
+// One-line summary of the RESOLVED (effective) config - every sync channel's
+// on/off state plus the key tuning knobs - for the startup log. Makes "which
+// config did this run actually use?" answerable from the log alone (real
+// sessions included), instead of having to reconstruct it from env + file.
+std::string describeConfig(const Config& c);
 
 } // namespace coop
 

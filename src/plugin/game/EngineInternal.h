@@ -28,6 +28,14 @@
 #define BOOST_SYSTEM_NO_DEPRECATED 1
 
 #include "Engine.h"
+// Phase 5a domain split: the adapter re-includes the narrow public headers carved
+// out of Engine.h so the domain TUs (which define these entry points) still see
+// their declarations.
+#include "EngineUi.h"
+#include "EngineScenario.h"
+#include "EngineProbe.h"
+#include "EngineFaults.h" // Phase 5c: typed, throttled SEH-fault accounting
+#include "EngineCaps.h"   // Phase 5d: owned capability registry over resolve()
 #include "../CoopLog.h"
 #include "../../netproto/ContentHash.h" // invEntryHash / sectionNameHash (shared with prototest)
 
@@ -523,6 +531,12 @@ void restoreVoteButtons();
 
 // EngineEntity.cpp:
 
+// SEH-guarded RootObject::getInventory(): the ~24-times-copied
+// __try{inv=ro->getInventory()}__except{0} pattern in one place (Phase 5c). 0 on
+// null/fault; a fault bumps FAULT_INV_OF. Safe to call from inside another SEH
+// frame (it is a leaf with its own frame).
+Inventory* invOf(RootObject* ro);
+
 // Once-per-(npc,fixture) "[seatres]" resolve diagnostic.
 void logSeatResolveOnce(const char* side, int task, u32 npcIdx, u32 npcSer,
                         u32 sIdx, u32 sSer, u32 sType, u32 sCont, u32 sContSer,
@@ -559,6 +573,18 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
 GameData* findItemTemplateImpl(GameWorld* gw, const char* sid, unsigned int typeCat);
 // Spawn a character from a random template into the given faction.
 Character* spawnCharInFaction(GameWorld* gw, float fwd, float side, Faction* fac);
+// Generic WEAPON_MANUFACTURER GameData for weapon fabrication when the wire
+// carried no manufacturer sid (spike 451). First enumerated record, cached per
+// session. Externalised (Phase 5e) so the weapon-mint probes in EngineProbe.cpp
+// can reuse it; the definition stays in EngineInventory.cpp.
+GameData* fallbackWeaponManufacturer(GameWorld* gw);
+// Create `qty` of the template (sid, typeCat) and add it to inv (spike-451 weapon
+// recipe for WEAPONs; blank-handle fabricate for the rest). Externalised (Phase
+// 5e) so probeFabricateWeaponLoose in EngineProbe.cpp can reuse it; the definition
+// stays in EngineInventory.cpp.
+bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
+                      unsigned int typeCat, int qty, int qualityBucket, bool equip,
+                      const char* manufacturer = 0, const char* material = 0);
 
 // EngineSpawnCombat.cpp:
 

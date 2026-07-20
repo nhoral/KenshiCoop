@@ -26,6 +26,8 @@
 #include "../../netproto/Wire.h"
 #include "../core/Inbound.h"
 #include "../net/NetLink.h"
+#include "SyncContext.h" // Phase 6: per-tick channel call environment
+#include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
 
 class GameWorld;
 class Character;
@@ -290,12 +292,12 @@ public:
     // RANK - change-gated on the reliable channel with a ~1 Hz floor and a
     // periodic safety resend (the publishStats pacing). Kenshi's wallet is
     // per-Platoon; nothing else about money is on the wire (shop_probe).
-    void publishMoney(GameWorld* gw, NetLink& net, u32 ownerId);
+    void publishMoney(const SyncContext& ctx);
 
     // BEFORE engine (protocol 22): drain received wallet snapshots and write
     // each PEER-owned tab's money onto our local copy of that tab's platoon
     // via Ownerships::setMoney. Never writes a rank we own.
-    void applyMoney(GameWorld* gw, Inbound& in);
+    void applyMoney(const SyncContext& ctx);
 
     // Per-tab wallet sync master enable (KENSHICOOP_MONEY_SYNC).
     void setMoneySync(bool v) { moneySync_ = v; }
@@ -336,13 +338,13 @@ public:
     // run the same detector, so a change replicates from whichever engine it
     // happened on; applying a received row updates the local baseline, which
     // is what makes the channel echo-free.
-    void publishFactions(GameWorld* gw, NetLink& net, u32 ownerId);
+    void publishFactions(const SyncContext& ctx);
 
     // BEFORE engine (protocol 24): drain received relation rows and write each
     // one onto BOTH local table directions via FactionRelations::setRelation
     // (the probe showed the engine keeps them mirrored). Stale rows (per-sid
     // seq guard) and already-converged rows are skipped.
-    void applyFactions(GameWorld* gw, Inbound& in);
+    void applyFactions(const SyncContext& ctx);
 
     // Faction-relation sync master enable (KENSHICOOP_FACTION_SYNC).
     void setFactionSync(bool v) { factionSync_ = v; }
@@ -353,7 +355,7 @@ public:
     // per-hand safety resend for rows ever sent). Both clients run the same
     // detector, so a door change replicates from whichever engine it
     // happened on (a local click, an NPC, or the write applyDoors made).
-    void publishDoors(GameWorld* gw, NetLink& net, u32 ownerId);
+    void publishDoors(const SyncContext& ctx);
 
     // BEFORE engine (protocol 26): drain received door rows; each one that
     // resolves locally is applied through the engine's own door actions
@@ -361,7 +363,7 @@ public:
     // BEFORE the write (echo-free); stale rows (per-hand seq guard) and
     // already-converged rows are skipped; unresolvable hands are skipped
     // silently (out-of-interest or runtime door - accepted edge).
-    void applyDoors(GameWorld* gw, Inbound& in);
+    void applyDoors(const SyncContext& ctx);
 
     // Door-state sync master enable (KENSHICOOP_DOOR_SYNC).
     void setDoorSync(bool v) { doorSync_ = v; }
@@ -372,7 +374,7 @@ public:
     // building WE placed (~1 Hz) and stream change-gated PKT_BUILD_STATE
     // progress rows (10 s safety resend while incomplete; the final
     // complete=1 row latches the channel silent for that site).
-    void publishBuilds(GameWorld* gw, NetLink& net, u32 ownerId);
+    void publishBuilds(const SyncContext& ctx);
 
     // BEFORE engine (protocol 27): drain received announcements - each new
     // key mints a local construction site through the same createBuilding
@@ -381,7 +383,7 @@ public:
     // then apply received progress rows through the engine's own
     // setConstructionProgress via that map (per-key seq guard drops stale
     // rows; unknown keys are skipped silently).
-    void applyBuilds(GameWorld* gw, Inbound& in);
+    void applyBuilds(const SyncContext& ctx);
 
     // Placed-building sync master enable (KENSHICOOP_BUILD_SYNC).
     void setBuildSync(bool v) { buildSync_ = v; }
@@ -392,14 +394,14 @@ public:
     // + door index; own placements key by our hand, minted proxies through
     // the reverse map) - the protocol-26 symmetric door shape, so a placed
     // door replicates from whichever engine moved it.
-    void publishBuildDoors(GameWorld* gw, NetLink& net, u32 ownerId);
+    void publishBuildDoors(const SyncContext& ctx);
 
     // BEFORE engine (protocol 28): drain received placed-door rows; resolve
     // the key through the build maps (own hand or minted local hand), read
     // door #index of that building, and apply through the engine's own door
     // actions. Baseline updates BEFORE the write (echo-free); per-key seq
     // guard; unknown/tombstoned keys skip silently.
-    void applyBuildDoors(GameWorld* gw, Inbound& in);
+    void applyBuildDoors(const SyncContext& ctx);
 
     // Placed-building door + removal sync master enable (KENSHICOOP_BDOOR_SYNC).
     void setBdoorSync(bool v) { bdoorSync_ = v; }
@@ -417,7 +419,7 @@ public:
     // safety resend (which is also what keeps a join whose own engine
     // drifted converging). Identity: baked hand (keyKind=0) or protocol-27
     // placer key through the build maps (keyKind=1).
-    void publishProd(GameWorld* gw, NetLink& net, u32 ownerId);
+    void publishProd(const SyncContext& ctx);
 
     // BEFORE engine (protocol 33, join side): drain received machine rows;
     // resolve the key (baked hand directly; placer key through ownBuilds_/
@@ -426,7 +428,7 @@ public:
     // amount + farm-float writes; a still-null output buffer is first
     // MATERIALIZED via the native setProductionItem). Per-key seq guard
     // drops stale rows; unresolvable keys skip silently (out-of-interest).
-    void applyProd(GameWorld* gw, Inbound& in);
+    void applyProd(const SyncContext& ctx);
 
     // Production machine sync master enable (KENSHICOOP_PROD_SYNC).
     void setProdSync(bool v) { prodSync_ = v; }
@@ -437,17 +439,28 @@ public:
     // row per known sid - first sight sends (the host's known set IS the
     // session baseline), then a safety resend covers a lost row / a join
     // whose apply lever needed prerequisites that arrived later.
-    void publishResearch(GameWorld* gw, NetLink& net, u32 ownerId);
+    void publishResearch(const SyncContext& ctx);
 
     // BEFORE engine (protocol 38, join side): drain received known-research
     // rows; sids already known locally are skipped (idempotent), the rest
     // apply through Research::startResearch - the exact lever a research-UI
     // click commits (flips isKnown in the same tick, spike 401). Per-sid
     // seq guard drops stale rows.
-    void applyResearch(GameWorld* gw, Inbound& in);
+    void applyResearch(const SyncContext& ctx);
 
     // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
     void setResearchSync(bool v) { researchSync_ = v; }
+
+    // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
+    // buildings, placed-building doors, production, research) from one
+    // channel-descriptor registry. Replaces the per-channel if-blocks the tick
+    // used to inline: the table owns each channel's master enable, direction
+    // (symmetric vs host-authoritative), and cadence ORDER (which must match the
+    // historical publish sequence). Called once per pre-engine tick with the
+    // SyncContext; each row's own body still guards on its enable + gameplay
+    // liveness. Money/recruit/squad/stealth/speed/time stay explicit (different
+    // cadence positions / patterns).
+    void driveSampledChannels(const SyncContext& ctx);
 
     // Storage/machine container sync (protocol 34, KENSHICOOP_STORE_SYNC):
     // when set (HOST only - host-authoritative world containers), a ~1 Hz
@@ -774,6 +787,18 @@ private:
     void applyRest(Character* c, Driven& d, const EntityState& out,
                    bool haveActual, float ax, float ay, float az, unsigned long now,
                    bool isSquad);
+
+    // Drive-tick epilogue (Phase 7 Workstream C): the self-contained post-loop
+    // passes split out of applyTargets. Each reads/writes only Replicator members
+    // and the tick clock (`now`) - never any per-body loop local - so the split is
+    // behavior/byte identical. Called in order at the tail of applyTargets.
+    //   * prune the recently-driven grace map (drivenSeen_/canonicalOf_);
+    void pruneDriveGrace(unsigned long now);
+    //   * emit the ~3-5 s throttled telemetry rollups
+    //     ([ai]/[interp]/worstZero/[combat]/[trust] - the oracle stat lines);
+    void logDriveTelemetry(unsigned long now);
+    //   * age out long-stale targets_ entries (reliable-event latches preserved).
+    void ageOutStaleTargets(unsigned long now);
 
     std::map<Key, Driven> targets_;
     // Host side: last bodyState we published per owned entity (+ when it was last
@@ -1254,6 +1279,12 @@ private:
         StatsPub() : hash(0), lastSendMs(0) {}
     };
     std::map<Key, StatsPub> statsPub_;
+    // Phase 6d: owned send-cadence tunables for the change-gated sampled channels
+    // (money + the six registry channels). Default-constructed to today's tuned
+    // values; the channel bodies bind their old local SAMPLE_MS/MIN_SEND_MS/
+    // RESEND_MS names to these fields, so behavior is unchanged - this is the one
+    // place their cadence now lives. See SyncTuning.h.
+    SyncTuning tuning_;
     // Protocol 22: per OWNED tab rank, the last SENT wallet value + send time
     // (change gate + safety resend). A settled economy is silent.
     struct MoneyPub {

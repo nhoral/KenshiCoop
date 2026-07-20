@@ -37,8 +37,11 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
 
 if (-not $SkipBuild) {
-    Write-Host "=== build plugin ==="
-    & cmd.exe /c "`"$scriptDir\build_plugin.cmd`""
+    # The PLAYER release ships the Release config: the shipped DLL excludes the
+    # scenario harness (~12k lines) and does not define KENSHICOOP_HARNESS
+    # (Phase 1 build separation). The test pipeline uses Harness instead.
+    Write-Host "=== build plugin (Release / shipped, no scenario harness) ==="
+    & cmd.exe /c "`"$scriptDir\build_plugin.cmd`" Release"
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 }
 
@@ -51,6 +54,13 @@ $dll  = Resolve-First @(
     (Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"),
     (Join-Path $repoRoot "dist\mods\KenshiCoop\KenshiCoop.dll")
 ) "KenshiCoop.dll"
+
+# Canonical shipped-DLL hash (Phase 1 provenance). Package from ONE DLL and
+# assert the packaged copy is byte-identical to it, so the release artifact's
+# SHA-256 is verifiable rather than a mutable file tracked under dist\.
+$canonSha = (Get-FileHash -Algorithm SHA256 $dll).Hash
+Write-Host "Canonical Release DLL SHA-256: $canonSha"
+Write-Host "  source: $dll"
 $json = Resolve-First @(
     (Join-Path $repoRoot "dist\mods\KenshiCoop\RE_Kenshi.json"),
     (Join-Path $HostDir  "mods\KenshiCoop\RE_Kenshi.json")
@@ -164,7 +174,25 @@ TROUBLESHOOTING
     the same release.
 '@ | Set-Content (Join-Path $kitDir "README.txt") -Encoding UTF8
 
-# Zip: the archive contains the KenshiCoop\ folder + README.txt.
+# Provenance: assert the PACKAGED DLL is byte-identical to the canonical build,
+# then record the hash next to the kit so the release artifact is verifiable.
+$packagedDll = Join-Path $modDir "KenshiCoop.dll"
+$packagedSha = (Get-FileHash -Algorithm SHA256 $packagedDll).Hash
+if ($packagedSha -ne $canonSha) {
+    throw "packaged DLL hash ($packagedSha) != canonical Release DLL hash ($canonSha)"
+}
+$protoLine = Select-String -Path (Join-Path $repoRoot "src\netproto\Wire.h") `
+    -Pattern 'PROTOCOL_VERSION\s*=\s*(\d+)' | Select-Object -First 1
+$proto = if ($protoLine) { $protoLine.Matches[0].Groups[1].Value } else { "?" }
+@{
+    dllSha256       = $canonSha
+    protocolVersion = $proto
+    builtUtc        = (Get-Date).ToUniversalTime().ToString("o")
+    config          = "Release"
+} | ConvertTo-Json | Set-Content (Join-Path $kitDir "PROVENANCE.json") -Encoding UTF8
+Write-Host "Packaged DLL SHA-256 verified == canonical."
+
+# Zip: the archive contains the KenshiCoop\ folder + README.txt + PROVENANCE.json.
 $zip = Join-Path $repoRoot "dist\KenshiCoop-kit.zip"
 if (Test-Path $zip) { Remove-Item $zip }
 Compress-Archive -Path (Join-Path $kitDir "*") -DestinationPath $zip

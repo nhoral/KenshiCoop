@@ -273,6 +273,7 @@
         # self-heal), never reverts, and both sides converge on the severed
         # ground item (host-authoritative world-item channel + join dedupe).
         limb_loss = @{
+            DiagEnv = @{ KENSHICOOP_WORLD_SYNC = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'limb_loss'
             Gating   = @('limb_loss', 'clock_sync')
@@ -472,6 +473,7 @@
         # measurement - a finding, not a gate). Save 'sync': a live town gives
         # findNearbyNonPlayerFaction real factions to mint squads in.
         spawn_probe = @{
+            DiagEnv = @{ KENSHICOOP_SPAWN_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'spawn_probe'
             Gating   = @('spawn_probe', 'clock_sync')
@@ -489,6 +491,7 @@
         # recorded as FINDINGs that gate the 1b/1c design. Save 'sync': the
         # bar town puts real ShopTraders in range.
         shop_probe = @{
+            DiagEnv = @{ KENSHICOOP_MONEY_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'shop_probe'
             Gating   = @('shop_probe', 'clock_sync')
@@ -519,6 +522,7 @@
         # regenerates vendor stock per client; the [shop] BUY-LOCAL detour is
         # collecting field evidence for that mirror).
         vendor_trade = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'vendor_trade'
             Gating   = @('vendor_trade', 'clock_sync')
@@ -535,6 +539,7 @@
         # that the script ran; the identity/tab/peer-reaction findings gate
         # the 2b design. Save 'sync': the bar town has world NPCs in range.
         recruit_probe = @{
+            DiagEnv = @{ KENSHICOOP_RECRUIT_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'recruit_probe'
             Gating   = @('recruit_probe', 'clock_sync')
@@ -553,6 +558,7 @@
         # reaction findings gate the 16b design. Save 'squad1': the baked
         # 2-tab squad both ownership ranks partition on.
         squad_probe = @{
+            DiagEnv = @{ KENSHICOOP_SQUAD_SYNC = '0' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'squad_probe'
             Gating   = @('squad_probe', 'clock_sync')
@@ -615,6 +621,7 @@
         # the sid-stability / crossing / operative-row findings gate the 3b
         # channel design.
         faction_probe = @{
+            DiagEnv = @{ KENSHICOOP_FACTION_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'faction_probe'
             Gating   = @('faction_probe', 'clock_sync')
@@ -641,6 +648,7 @@
         # that the clocks are readable + monotonic; the absolute-vs-relative /
         # offset / drift / rate-vs-fsm findings gate the 25 channel design.
         time_probe = @{
+            DiagEnv = @{ KENSHICOOP_TIME_SYNC = '0'; KENSHICOOP_SPEED_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'time_probe'
             Gating   = @('time_probe', 'clock_sync')
@@ -671,6 +679,7 @@
         # no doors in range the probe FAILS loudly and the entry moves to a
         # save with a town/base before 5b.
         door_probe = @{
+            DiagEnv = @{ KENSHICOOP_DOOR_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'door_probe'
             Gating   = @('door_probe', 'clock_sync')
@@ -703,6 +712,7 @@
         # if BOTH placements refuse, the probe fails loudly and the entry
         # moves to a wilderness save before 6b.
         build_probe = @{
+            DiagEnv = @{ KENSHICOOP_BUILD_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'build_probe'
             Gating   = @('build_probe', 'clock_sync')
@@ -733,6 +743,7 @@
         # peer's mint, toggle non-crossing, the post-destroy ghost) gate the
         # protocol-28 channel design.
         bdoor_probe = @{
+            DiagEnv = @{ KENSHICOOP_BDOOR_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'bdoor_probe'
             Gating   = @('bdoor_probe', 'clock_sync')
@@ -761,6 +772,7 @@
         # stuck); the findings (scale, per-client decay agreement, sentinel
         # non-crossing, dazedOrAlert range) gate the protocol-29 fold-in.
         hunger_probe = @{
+            DiagEnv = @{ KENSHICOOP_HUNGER_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'hunger_probe'
             Gating   = @('hunger_probe', 'clock_sync')
@@ -792,6 +804,7 @@
         # findings (per-channel heal latency via safety resends, the
         # building that NEVER mints) motivate the connect-edge resync.
         latejoin_probe = @{
+            DiagEnv = @{ KENSHICOOP_LATEJOIN_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'latejoin_probe'
             Gating   = @('latejoin_probe', 'clock_sync')
@@ -821,6 +834,7 @@
         # before) and the folder-quiescence completion edge (latency + file
         # count/bytes + the gameplay hitch while the engine writes).
         save_probe = @{
+            DiagEnv = @{ KENSHICOOP_SAVE_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'save_probe'
             Gating   = @('save_probe', 'clock_sync')
@@ -882,6 +896,7 @@
         # do save-stable hands re-resolve in the fresh world. The JOIN
         # deliberately does NOT load (the 13a divergence baseline).
         load_probe = @{
+            DiagEnv = @{ KENSHICOOP_LOAD_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'load_probe'
             Gating   = @('load_probe', 'clock_sync')
@@ -920,6 +935,7 @@
         # owner-vs-idle divergence, write-lever stickiness, power
         # non-crossing, research evidence) gate the protocol-33 design.
         prod_probe = @{
+            DiagEnv = @{ KENSHICOOP_PROD_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'prod_probe'
             Gating   = @('prod_probe', 'clock_sync')
@@ -955,6 +971,7 @@
         # t=10-25s divergence window (the unlock must NOT cross with the
         # hatch off), join self-lever landed AND stuck to run end.
         research_probe = @{
+            DiagEnv = @{ KENSHICOOP_RESEARCH_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'research_probe'
             Gating   = @('research_probe', 'clock_sync')
@@ -995,6 +1012,7 @@
         # vs INV_ITEMS_MAX, owner-vs-idle container divergence, add
         # non-crossing, post-empty churn) gate the protocol-34 design.
         store_probe = @{
+            DiagEnv = @{ KENSHICOOP_STORE_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'store_probe'
             Gating   = @('store_probe', 'clock_sync')
@@ -1014,6 +1032,7 @@
         # chest add CROSSED onto the join's minted copy, and the FINAL chest
         # content hashes agree (so the reconcile-removal crossed too).
         store_sync = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'store_sync'
             Gating   = @('store_sync', 'clock_sync')
@@ -1140,6 +1159,7 @@
         # buttons; a loud simulated click must move them AND register as
         # captured intent (the hook-based vote source).
         speed_probe = @{
+            DiagEnv = @{ KENSHICOOP_SPEED_SYNC = '0'; KENSHICOOP_DEBUG_SPEED = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'speed_probe'
             Gating   = @('speed_probe', 'clock_sync')
@@ -1154,6 +1174,7 @@
         # flags any chained/lock divergence (the reported "peer PC unlocks the
         # shackles" desync). No behavior change ships in 6a.
         shackle_probe = @{
+            DiagEnv = @{ KENSHICOOP_DEBUG_SHACKLE = '1' }
             Save = 'camp'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'shackle_probe'
             Gating   = @('shackle_probe', 'clock_sync')
@@ -1168,6 +1189,7 @@
         # peer's driven copy reports it cleared is a FAIL. Shared-hand parity is
         # asserted; the no-shared-hand identity caveat defers to the manual gate.
         shackle_sync = @{
+            DiagEnv = @{ KENSHICOOP_DEBUG_SHACKLE = '1' }
             Save = 'camp'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'shackle_sync'
             Gating   = @('shackle_sync', 'clock_sync')
@@ -1206,6 +1228,7 @@
         # follow latency, and the combat demotion. WanVariant: the SET/REQ
         # channel is reliable and must converge under loss.
         speed_sync = @{
+            DiagEnv = @{ KENSHICOOP_TIME_SYNC = '0'; KENSHICOOP_DEBUG_SPEED = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'speed_sync'
             Gating   = @('speed_sync', 'clock_sync')
@@ -1269,6 +1292,7 @@
 
         # ---- inventory ---------------------------------------------------------------
         inv_order = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'inv_sync'
             Gating   = @('inv_sync', 'clock_sync')
@@ -1276,6 +1300,7 @@
             Tier = 'full'; WanVariant = $false
         }
         inv_bidir = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'inv_bidir'
             Gating   = @('inv_bidir', 'clock_sync')
@@ -1283,6 +1308,7 @@
             Tier = 'smoke'; WanVariant = $true
         }
         inv_equip = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'inv_equip'
             Gating   = @('inv_equip', 'clock_sync')
@@ -1290,6 +1316,7 @@
             Tier = 'full'; WanVariant = $false
         }
         inv_reequip = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'inv_reequip'
             Gating   = @('inv_reequip', 'clock_sync')
@@ -1297,6 +1324,7 @@
             Tier = 'full'; WanVariant = $false
         }
         inv_addequip = @{
+            DiagEnv = @{ KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'add_equip'
             Gating   = @('add_equip')
@@ -1308,6 +1336,7 @@
         # owner engine moves; the oracle REPORTS the conservation outcome as evidence.
         # Not in a tier: it documents the bug the transfer-intent channel then fixes.
         trade_probe = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_XFER_SYNC = '0'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'trade_probe'
             Gating   = @('trade_probe')
@@ -1320,6 +1349,7 @@
         # (no wipe), the traded WEAPON survives on BOTH clients (real-object
         # relocation) and both clients agree on the final per-rank state.
         trade_peer = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'trade_peer'
             Gating   = @('trade_peer', 'clock_sync')
@@ -1335,6 +1365,7 @@
         # with zero dupes on either side (fabrication must not race the W2
         # conservation channel or the snapshot echo).
         weapon_loot = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'weapon_loot'
             Gating   = @('weapon_loot', 'clock_sync')
@@ -1351,6 +1382,7 @@
             Tier = 'none'; WanVariant = $false   # W0 diagnostic; evidence, not a sync gate
         }
         world_item_sync = @{
+            DiagEnv = @{ KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'wi_sync'
             Gating   = @('wi_sync', 'clock_sync')
@@ -1362,6 +1394,7 @@
         # (join ground drops never appeared on the host) closed by the
         # bidirectional W1 stream with owner-scoped netIds + the proxy echo guard.
         world_item_join = @{
+            DiagEnv = @{ KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'wi_join'
             Gating   = @('wi_join', 'clock_sync')
@@ -1379,6 +1412,7 @@
         # WORLD-RELOAD edge. clock_sync is NOT gated (the reload restarts the
         # in-game clock series, same as load_sync).
         rejoin_items = @{
+            DiagEnv = @{ KENSHICOOP_INV_DUMP = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'rejoin_items'
             Gating   = @('rejoin_items')
@@ -1386,6 +1420,7 @@
             Tier = 'full'; WanVariant = $false
         }
         wpn_relocate = @{
+            DiagEnv = @{ KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'wpn_relocate'
             Gating   = @('wpn_relocate')
@@ -1393,6 +1428,7 @@
             Tier = 'full'; WanVariant = $false
         }
         world_weapon_drop = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'weapon_drop'
             Gating   = @('weapon_drop', 'clock_sync')
@@ -1400,6 +1436,7 @@
             Tier = 'smoke'; WanVariant = $true
         }
         world_armor_drop = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'armor_drop'
             Gating   = @('armor_drop', 'clock_sync')
@@ -1409,11 +1446,24 @@
 
         # ---- diagnostics (never in a tier) --------------------------------------------
         inv_wpnseq = @{
+            DiagEnv = @{ KENSHICOOP_INV_DUMP = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = ''
             Gating   = @()
             Advisory = @()
             Tier = 'none'; WanVariant = $false   # local [recon] trace diagnostic
+        }
+        # xfer_block: cross-owner trade VETO exercise (manual/diagnostic, not in a
+        # tier). Blocks direct squad-to-squad drags and forces ground drops; needs
+        # the inventory channel live to drag on, and the veto armed. DiagEnv carries
+        # both knobs so no launcher (or Config.cpp) has to name the scenario.
+        xfer_block = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_BLOCK_XFER = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = ''
+            Gating   = @()
+            Advisory = @()
+            Tier = 'none'; WanVariant = $false   # veto-path diagnostic
         }
         spike = @{
             Save = 'c'; Setup = ''; Tolerance = 3.0
@@ -1431,6 +1481,7 @@
         # auditRows is armed for this scenario for pos/context. Must run
         # partitioned (-Inhabit / OWN_RANK) so the join actually owns the caged PC.
         jail_probe = @{
+            DiagEnv = @{ KENSHICOOP_JAIL_PROBE = '1'; KENSHICOOP_TASK_SPIKE = '1'; KENSHICOOP_JAIL_OBSERVE = '1' }
             Save = 'jailed'; Setup = ''; Tolerance = 6.0
             Seconds = 220; KillGraceSec = 190
             PrimaryGate = ''
@@ -1446,6 +1497,7 @@
         # override -Save 'slaves save' / -Save cage2 for the other testbeds. Run
         # partitioned (-Inhabit / OWN_RANK) so each side owns one PC. No gate.
         jail_soak = @{
+            DiagEnv = @{ KENSHICOOP_JAIL_PROBE = '1'; KENSHICOOP_TASK_SPIKE = '1' }
             Save = 'jailed'; Setup = ''; Tolerance = 6.0
             # run_test kills at (early screenshot anchor + KillGraceSec), so the
             # kill grace must exceed the whole soak window or the game is cut short

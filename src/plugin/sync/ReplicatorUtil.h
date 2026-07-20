@@ -28,9 +28,11 @@
 #define _CRT_SECURE_NO_WARNINGS 1
 
 #include "Replicator.h"
-#include "../game/Engine.h"
+#include "../game/EngineSync.h" // Phase 5a: the Replicator's canonical narrow engine include
 #include "../core/WorkPose.h" // poseClearElapsed (debounced task-clear predicate)
 #include "../core/DeathLatch.h" // rekeyCarryLatch (down/death latch carry on re-key)
+#include "ChangeGate.h" // Phase 6: shared change-gated send/accept policy
+#include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "../CoopLog.h"
 
 #include <windows.h> // GetTickCount

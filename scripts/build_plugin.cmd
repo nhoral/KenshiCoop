@@ -12,6 +12,14 @@ REM   - third_party/enet/enet patched for C89 (scripts/apply_enet_patch is impli
 REM     see third_party/enet/patches/0001-enet-c89-for-loops.patch)
 setlocal
 
+REM Build configuration (Phase 1 build separation). Default = Harness, the
+REM optimized TEST build that INCLUDES the scenario runner - this is what the
+REM regression/manual pipeline needs. Pass "Release" to produce the shipped
+REM player DLL (no scenario code); "Debug" for a dev build.
+REM   Usage:  scripts\build_plugin.cmd [Harness|Release|Debug]
+set "CONFIG=%~1"
+if "%CONFIG%"=="" set "CONFIG=Harness"
+
 REM Repo root = parent of this script's folder.
 set "REPO=%~dp0.."
 pushd "%REPO%" >nul
@@ -41,11 +49,11 @@ set "INCLUDE=%VC%\include;%SDK%\Include;%REPO%\third_party\vc10_compat;%KL%\Kens
 REM Libs: VC10 x64 CRT + Win SDK 7.1 x64 + KenshiLib (kenshilib.lib, OgreMain_x64.lib).
 set "LIB=%VC%\lib\amd64;%SDK%\Lib\x64;%KL%\KenshiLib\Libraries"
 
-echo === Building KenshiCoop.dll (Release^|x64, v100) ===
+echo === Building KenshiCoop.dll (%CONFIG%^|x64, v100) ===
 where cl.exe
 
 REM UseEnv=true: use the INCLUDE/LIB/PATH above instead of registry-derived paths.
 REM TrackFileAccess=false: avoid Tracker.exe TRK0002 under redirected shells.
-"%MSBUILD%" "%REPO%\src\plugin\KenshiCoop.vcxproj" /p:Configuration=Release /p:Platform=x64 /p:UseEnv=true /p:TrackFileAccess=false /nologo /v:minimal
+"%MSBUILD%" "%REPO%\src\plugin\KenshiCoop.vcxproj" /p:Configuration=%CONFIG% /p:Platform=x64 /p:UseEnv=true /p:TrackFileAccess=false /nologo /v:minimal
 
 endlocal

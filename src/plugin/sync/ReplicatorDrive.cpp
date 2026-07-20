@@ -1493,6 +1493,16 @@ void Replicator::applyTargets(GameWorld* gw) {
         }
         if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
     }
+    pruneDriveGrace(now);
+    logDriveTelemetry(now);
+    ageOutStaleTargets(now);
+}
+
+// --- Drive-tick epilogue phases (Phase 7 Workstream C) --------------------
+// Split verbatim out of applyTargets' post-loop tail: each reads/writes only
+// Replicator members + the tick clock, so behavior is identical.
+
+void Replicator::pruneDriveGrace(unsigned long now) {
     // Prune the recently-driven grace map on a horizon well past the grace
     // window (pointers to despawned bodies must not accumulate; they are
     // never dereferenced, only compared, but the map should stay small).
@@ -1504,6 +1514,9 @@ void Replicator::applyTargets(GameWorld* gw) {
         }
         else ++ds;
     }
+}
+
+void Replicator::logDriveTelemetry(unsigned long now) {
     if (aiSuspend_ && (now - aiLogTick_) > 3000) {
         aiLogTick_ = now;
         char b[96];
@@ -1589,7 +1602,9 @@ void Replicator::applyTargets(GameWorld* gw) {
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
     }
+}
 
+void Replicator::ageOutStaleTargets(unsigned long now) {
     // Step 6: age out long-stale entries so a session's worth of interest-boundary
     // passers-by doesn't accumulate forever. Reliable-event latches are PRESERVED
     // (a dead body must stay dead even while unstreamed); everything else is

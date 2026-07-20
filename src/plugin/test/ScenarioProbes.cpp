@@ -24,10 +24,11 @@ namespace {
 // batches (the harness baseline keeps only the dispatcher + the smoke probe).
 // Add a probe by extending dispatchStart()/dispatchTick() with a new id branch.
 // ===========================================================================
-class SpikeScenario : public Scenario {
+class SpikeScenario : public TimedScenario {
 public:
     SpikeScenario()
-        : passed_(false), passedSet_(false), started_(false), smokeDone_(false),
+        : TimedScenario("spike", /*evidenceMs=*/0),
+          passedSet_(false), started_(false), smokeDone_(false),
           nativeDone_(false), lastLogMs_(0), durMs_(30000), wmStep_(0),
           r4Step_(0), r4Ops_(0), r4NextMs_(0), r4Have_(false), r4Placed_(false),
           r4Started_(false) {
@@ -38,7 +39,6 @@ public:
         r4ResSid_[0] = '\0';
         for (int i = 0; i < 5; ++i) r4Hand_[i] = 0;
     }
-    virtual const char* name() const { return "spike"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         started_ = true;
@@ -65,8 +65,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     void logSpike(const char* fmt, ...) {
@@ -321,7 +319,6 @@ private:
     }
 
     std::string   id_;
-    bool          passed_;
     bool          passedSet_;
     bool          started_;
     bool          smokeDone_;
@@ -364,13 +361,12 @@ private:
 // 22 wallet channel LEFT ON, the sentinel writes must CROSS - each side's
 // WALLET series must converge to the peer's sentinel. Test-MoneySync gates on
 // that convergence (the shop_probe run gates only on the evidence existing).
-class ShopProbeScenario : public Scenario {
+class ShopProbeScenario : public TimedScenario {
 public:
     explicit ShopProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), actDone_(false),
+        : TimedScenario(probe ? "shop_probe" : "money_sync", /*evidenceMs=*/1000),
+          probe_(probe), actDone_(false),
           buyRes_(-9), walletReads_(0), sawVendor_(false) {}
-
-    virtual const char* name() const { return probe_ ? "shop_probe" : "money_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -382,8 +378,7 @@ public:
     virtual bool onTick(const ScenarioContext& ctx) {
         // 1 Hz evidence: vendor census + per-tab wallet series (both sides).
         // The money_sync leg skips the vendor census (wallet-only gate).
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             if (probe_) logVendors(ctx);
             logWallets(ctx);
         }
@@ -407,8 +402,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     void logVendors(const ScenarioContext& ctx) {
@@ -531,8 +524,6 @@ private:
     static const float         VENDOR_RADIUS;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     bool          actDone_;
     int           buyRes_;
     unsigned int  walletReads_;
@@ -559,13 +550,12 @@ const float ShopProbeScenario::VENDOR_RADIUS = 100.0f;
 //   * host t=6s: seed its rank-0 wallet to 5000; t=10s: TRADE - one test item
 //     into the rank-0 leader's inventory + wallet -= 250 (-> 4750).
 //   * join t=18s/t=22s: same on its rank-1 tab with 7000 -> 6750.
-class VendorTradeScenario : public Scenario {
+class VendorTradeScenario : public TimedScenario {
 public:
     VendorTradeScenario()
-        : passed_(false), lastEvidenceMs_(0), seeded_(false), traded_(false),
+        : TimedScenario("vendor_trade", /*evidenceMs=*/1000),
+          seeded_(false), traded_(false),
           tradeOk_(false), walletReads_(0) {}
-
-    virtual const char* name() const { return "vendor_trade"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -575,8 +565,7 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             logSeries(ctx);
         }
         unsigned long seedAt  = ctx.isHost ? HOST_SEED_AT_MS  : JOIN_SEED_AT_MS;
@@ -589,8 +578,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // One WALLET + one TINV line per distinct squad tab (keyed by rank).
@@ -679,8 +666,6 @@ private:
     static const int           SEED_JOIN        = 7000;
     static const int           PRICE            = 250;
 
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     bool          seeded_;
     bool          traded_;
     bool          tradeOk_;
@@ -712,14 +697,13 @@ private:
 // the logs - the peer re-keyed its local body to each recruited hand (baked
 // legs, no duplicate proxy) or minted one via the bidirectional describe
 // channel (runtime legs), and tracked it (SCENARIO PROXY series).
-class RecruitProbeScenario : public Scenario {
+class RecruitProbeScenario : public TimedScenario {
 public:
     explicit RecruitProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0),
+        : TimedScenario(probe ? "recruit_probe" : "recruit_sync", /*evidenceMs=*/1000),
+          probe_(probe),
           bakedDone_(false), runtimeDone_(false),
           bakedRes_(-9), runtimeRes_(-9), tabsLogged_(0) {}
-
-    virtual const char* name() const { return probe_ ? "recruit_probe" : "recruit_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -729,8 +713,7 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             logTabs(ctx);
         }
         unsigned long bakedAt   = ctx.isHost ? HOST_ACT_AT_MS : JOIN_ACT_AT_MS;
@@ -752,8 +735,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // Distinct sorted squad-tab containers + squad size: the rank-partition
@@ -801,8 +782,6 @@ private:
     static const unsigned int  MAX_SQUAD      = 48;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     bool          bakedDone_;
     bool          runtimeDone_;
     int           bakedRes_;
@@ -834,10 +813,11 @@ private:
 // no cross-hand correlation is needed. Test-RecruitCtl gates gait-parity
 // (driver median speed vs owner median per phase) + anti-phantom (no proxy
 // BOUND for a CONTROL-FLIP-claimed hand; end squad-size parity).
-class RecruitCtlScenario : public Scenario {
+class RecruitCtlScenario : public TimedScenario {
 public:
     RecruitCtlScenario()
-        : passed_(false), lastGaitMs_(0), lastWalkMs_(0), altDir_(0),
+        : TimedScenario("recruit_ctl", /*evidenceMs=*/0),
+          lastGaitMs_(0), lastWalkMs_(0), altDir_(0),
           recruitDone_(false), recruitRes_(-9), subject_(0),
           moveDone_(false), moveRes_(-9), baseN_(0), haveHome_(false) {
         memset(recruitHand_, 0, sizeof(recruitHand_));
@@ -845,8 +825,6 @@ public:
         for (int i = 0; i < MAX_BASE; ++i)
             for (int j = 0; j < 5; ++j) baseHands_[i][j] = 0;
     }
-
-    virtual const char* name() const { return "recruit_ctl"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         // Baseline squad hands: the join identifies the NEW member (the recruit)
@@ -927,8 +905,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     static bool sameHand(const unsigned int a[5], const unsigned int b[5]) {
@@ -1061,7 +1037,6 @@ private:
     static const unsigned int  MAX_SQUAD     = 48;
     static const unsigned int  MAX_BASE      = 48;
 
-    bool          passed_;
     unsigned long lastGaitMs_;
     unsigned long lastWalkMs_;
     unsigned int  altDir_;
@@ -1111,17 +1086,16 @@ private:
 // Probe gates only that the script ran (census + both sides' attempts
 // logged); the sync tier additionally requires every scripted move to have
 // LANDED locally (rc=1) - crossing is Test-SquadSync's job.
-class SquadProbeScenario : public Scenario {
+class SquadProbeScenario : public TimedScenario {
 public:
     explicit SquadProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), tabsLogged_(0),
+        : TimedScenario(probe ? "squad_probe" : "squad_sync", /*evidenceMs=*/1000),
+          probe_(probe), tabsLogged_(0),
           sepDone_(false), sepRc_(-9), backDone_(false), backRc_(-9),
           back2Done_(false), back2Rc_(-9), havePick_(false) {
         memset(memberHand_, 0, sizeof(memberHand_));
         memset(homeHand_, 0, sizeof(homeHand_));
     }
-
-    virtual const char* name() const { return probe_ ? "squad_probe" : "squad_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -1131,8 +1105,7 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             logTabs(ctx);
             // Probe tier: the scenario owns the roster poll + edge drain (sync
             // is forced OFF, so the Replicator is not competing for the queue).
@@ -1187,8 +1160,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // Distinct sorted squad-tab containers with per-tab member counts: the
@@ -1319,8 +1290,6 @@ private:
     static const unsigned int  MAX_SQUAD         = 48;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     unsigned int  tabsLogged_;
     bool          sepDone_;
     int           sepRc_;
@@ -1349,15 +1318,14 @@ private:
 // writes sentinel -75 on the first sorted faction, join t=22s writes +65 on
 // the second (both rows). The probe gates only that the script ran; the sync
 // variant requires both writes ok - Test-FactionSync gates the convergence.
-class FactionProbeScenario : public Scenario {
+class FactionProbeScenario : public TimedScenario {
 public:
     explicit FactionProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0),
+        : TimedScenario(probe ? "faction_probe" : "faction_sync", /*evidenceMs=*/1000),
+          probe_(probe),
           wrote_(false), writeOk_(false), relLogged_(0) {
         sentinelSid_[0] = '\0';
     }
-
-    virtual const char* name() const { return probe_ ? "faction_probe" : "faction_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -1367,8 +1335,7 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             logRelations(ctx);
         }
         unsigned long writeAt = ctx.isHost ? HOST_WRITE_AT_MS : JOIN_WRITE_AT_MS;
@@ -1385,8 +1352,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // One FACREL line per INTERESTING faction row (nonzero relation on either
@@ -1460,8 +1425,6 @@ private:
     static const int           SENTINEL_JOIN    = 65;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     bool          wrote_;
     bool          writeOk_;
     unsigned int  relLogged_;
@@ -1484,13 +1447,12 @@ private:
 // off, applies directly), BOTH sides click in the sync variant (the consensus
 // arbitrates min(2,2)=2x) so convergence is tested across a speed change.
 // The probe gates only that the script ran; Test-TimeSync gates convergence.
-class TimeProbeScenario : public Scenario {
+class TimeProbeScenario : public TimedScenario {
 public:
     explicit TimeProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0),
+        : TimedScenario(probe ? "time_probe" : "time_sync", /*evidenceMs=*/1000),
+          probe_(probe),
           burstOn_(false), burstOff_(false), samples_(0) {}
-
-    virtual const char* name() const { return probe_ ? "time_probe" : "time_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -1499,8 +1461,7 @@ public:
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             logClock(ctx);
         }
         // The burst clicker: probe = host only (speedSync off, direct apply);
@@ -1524,8 +1485,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     void logClock(const ScenarioContext& ctx) {
@@ -1558,8 +1517,6 @@ private:
     static const unsigned long SYNC_DURATION_MS = 65000;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     bool          burstOn_;
     bool          burstOff_;
     unsigned int  samples_;
@@ -1583,15 +1540,14 @@ private:
 // hunger (own-tab leader, current * 0.6 - proportional, so no scale
 // assumption); 50s duration. Both tiers gate the local legs (census ran +
 // sentinel wrote and stuck); crossing is the sync oracle's job.
-class HungerProbeScenario : public Scenario {
+class HungerProbeScenario : public TimedScenario {
 public:
     explicit HungerProbeScenario(bool probe)
-        : probe_(probe), passed_(false), lastEvidenceMs_(0), censusLogged_(0),
+        : TimedScenario(probe ? "hunger_probe" : "hunger_sync", /*evidenceMs=*/1000),
+          probe_(probe), censusLogged_(0),
           haveOwn_(false), wrote_(false), writeOk_(false) {
         memset(ownHand_, 0, sizeof(ownHand_));
     }
-
-    virtual const char* name() const { return probe_ ? "hunger_probe" : "hunger_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -1602,8 +1558,7 @@ public:
 
     virtual bool onTick(const ScenarioContext& ctx) {
         if (!haveOwn_) latchOwn(ctx);
-        if (ctx.elapsedMs - lastEvidenceMs_ >= 1000 || lastEvidenceMs_ == 0) {
-            lastEvidenceMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             logCensus(ctx);
         }
         unsigned long writeAt = ctx.isHost ? HOST_WRITE_AT_MS : JOIN_WRITE_AT_MS;
@@ -1617,8 +1572,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     void latchOwn(const ScenarioContext& ctx) {
@@ -1690,8 +1643,6 @@ private:
     static const unsigned int  MAX_LOG_ROWS     = 8;
 
     bool          probe_;
-    bool          passed_;
-    unsigned long lastEvidenceMs_;
     unsigned int  censusLogged_;
     bool          haveOwn_;
     bool          wrote_;

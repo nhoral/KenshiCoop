@@ -11,6 +11,15 @@
 > arguments and return value. Signatures are taken verbatim from the KenshiLib
 > headers under `third_party/KenshiLib_deps/KenshiLib/Include/` and from this
 > repo's `src/`.
+>
+> **Legacy note (Phase 1).** The original transport/facade stack — `NetClient`,
+> `MainThreadQueue`, `ScenarioApi`, and `netproto/Protocol.h` — was **removed**.
+> Sections that describe that stack are kept for historical context only. The
+> live equivalents are: transport `net/NetLink`, the main-thread bridge
+> `core/Inbound`, the wire protocol `netproto/Wire.h` (history in
+> `resources/PROTOCOL_HISTORY.md`), and the scenario runner in
+> `src/plugin/test/` (Harness build only). Canonical copy:
+> [`resources/resources.md`](../resources/resources.md).
 
 ---
 

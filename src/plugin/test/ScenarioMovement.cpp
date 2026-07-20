@@ -14,13 +14,12 @@ namespace {
 // destination and streams its transform; the JOIN drives its local copy of that
 // same (shared-save) leader to the received transform. Host logs MEMBER, join
 // logs RECV; the runner cross-checks them within tolerance.
-class LeaderMoveScenario : public Scenario {
+class LeaderMoveScenario : public TimedScenario {
 public:
     LeaderMoveScenario()
-        : started_(false), passed_(false), recvCount_(0),
-          lastLogMs_(0), haveStart_(false), sx_(0), sy_(0), sz_(0) {}
-
-    virtual const char* name() const { return "leader_move"; }
+        : TimedScenario("leader_move", 500),
+          started_(false), recvCount_(0),
+          haveStart_(false), sx_(0), sy_(0), sz_(0) {}
 
     virtual void onStart(const ScenarioContext& ctx) {
         started_ = true;
@@ -36,8 +35,7 @@ public:
     virtual bool onTick(const ScenarioContext& ctx) {
         // Emit a MEMBER/RECV line ~2 Hz so the runner has positions to compare
         // and an anchor to time its screenshot.
-        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
-            lastLogMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             Character* ld = engine::leader(ctx.gw);
             if (ctx.isHost) {
                 // Oscillate between the start point and a far offset so the leader
@@ -77,8 +75,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // 24s -> 62s (2026-07-10): the join's session-start clock catch-up slews
     // its sim at up to 2x for the first ~35-40 s, and the smoothness oracle
@@ -90,9 +86,7 @@ private:
     static const unsigned long LEG_MS      = 6000;  // oscillation half-period (sparse reversals)
     static const float         LEG;                 // straight-walk leg length (units)
     bool          started_;
-    bool          passed_;
     unsigned int  recvCount_;
-    unsigned long lastLogMs_;
     bool          haveStart_;
     float         sx_, sy_, sz_;
 };
@@ -196,13 +190,11 @@ const float FastMarchScenario::LEG = 25.0f;
 // directions by hand: host MEMBER(rank0) vs join RECV(rank0), and join MEMBER(rank1)
 // vs host RECV(rank1). Proves each player's character is present + correctly placed
 // on the other client. Requires a shared save with >=2 controllable squad members.
-class CoopPresenceScenario : public Scenario {
+class CoopPresenceScenario : public TimedScenario {
 public:
     CoopPresenceScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario("coop_presence", 500), recvCount_(0),
           haveStart_(false), sx_(0), sy_(0), sz_(0) {}
-
-    virtual const char* name() const { return "coop_presence"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -210,8 +202,7 @@ public:
         const unsigned int ownRank  = ctx.isHost ? 0u : 1u; // our squad-tab rank
         const unsigned int peerRank = ctx.isHost ? 1u : 0u; // the peer's squad-tab rank
 
-        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
-            lastLogMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             EntityState sq[MAX_SQUAD];
             unsigned int n = engine::captureSquad(ctx.gw, /*leaderOnly*/ false, sq, MAX_SQUAD);
 
@@ -264,8 +255,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Full hand order (used only to pick a stable per-tab "leader" mover).
     static bool handLess(const EntityState& a, const EntityState& b) {
@@ -307,9 +296,7 @@ private:
     static const unsigned long LEG_MS           = 4000;  // oscillation half-period
     static const unsigned int  MAX_SQUAD        = 32;
     static const float         LEG;
-    bool          passed_;
     unsigned int  recvCount_;
-    unsigned long lastLogMs_;
     bool          haveStart_;
     float         sx_, sy_, sz_;
 };
@@ -335,13 +322,11 @@ const float CoopPresenceScenario::LEG = 12.0f;
 // Replicator::setAuditRows when this scenario is armed) so Test-TravelParity
 // can measure join-only ghosts under zone streaming + census re-centering,
 // exactly the free-play failure mode.
-class TravelParityScenario : public Scenario {
+class TravelParityScenario : public TimedScenario {
 public:
     TravelParityScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), hopsDone_(0),
+        : TimedScenario("travel_parity", 1000), recvCount_(0), hopsDone_(0),
           haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
-
-    virtual const char* name() const { return "travel_parity"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         // Anchor = the MOVER's start: the join's rank-1 tab leader (both
@@ -366,9 +351,7 @@ public:
     virtual bool onTick(const ScenarioContext& ctx) {
         unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
 
-        if (haveAnchor_ &&
-            (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0)) {
-            lastLogMs_ = ctx.elapsedMs;
+        if (haveAnchor_ && evidenceDue(ctx.elapsedMs)) {
             EntityState sq[MAX_SQUAD];
             unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
             int mv = tabLeaderIdx(sq, n, 1); // the join's mover
@@ -443,8 +426,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Long windows: the manifest entry raises the runner's self-exit backstop
     // (Seconds=220) and kill grace (KillGraceSec=190) for this scenario, so
@@ -458,9 +439,7 @@ private:
     static const float         HOP;         // leg length (units)
     static const float         FOLLOW_STOP; // stop short of the peer (units)
     static const float         FOLLOW_SNAP; // teleport catch-up past this gap
-    bool          passed_;
     unsigned int  recvCount_;
-    unsigned long lastLogMs_;
     unsigned int  hopsDone_;
     bool          haveAnchor_;
     float         ax_, ay_, az_;
@@ -479,13 +458,11 @@ const float TravelParityScenario::FOLLOW_SNAP = 150.0f;
 // from the shared save - keeps the bar streamed. Both sides log the standard NPC
 // MEMBER/RECV series; the runner's SPLIT-INTEREST oracle checks that bar-anchored
 // NPCs (near the logged bar anchor) still track AFTER the host moved away.
-class SplitInterestScenario : public Scenario {
+class SplitInterestScenario : public TimedScenario {
 public:
     SplitInterestScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario("split_interest", 500), recvCount_(0),
           movedLogged_(false), haveBar_(false), bx_(0), by_(0), bz_(0) {}
-
-    virtual const char* name() const { return "split_interest"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         // Bar anchor = the rank-1 tab leader's position (the member that STAYS).
@@ -534,8 +511,7 @@ public:
 
         // Standard NPC series on both sides (captureNpcs is dual-sphere now, so
         // the host's MEMBER set must keep covering the bar after the move).
-        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
-            lastLogMs_ = ctx.elapsedMs;
+        if (evidenceDue(ctx.elapsedMs)) {
             EntityState npcs[MAX_LOG];
             unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
             const char* kind = ctx.isHost ? "MEMBER" : "RECV";
@@ -551,8 +527,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     static bool ctnrLess(const EntityState& a, const EntityState& b) {
@@ -584,9 +558,7 @@ private:
     static const unsigned int  MAX_LOG          = 40;
     static const float         SPLIT_DIST;               // how far rank-0 relocates
 
-    bool          passed_;
     unsigned int  recvCount_;
-    unsigned long lastLogMs_;
     bool          movedLogged_;
     bool          haveBar_;
     float         bx_, by_, bz_;
@@ -620,13 +592,11 @@ const float SplitInterestScenario::SPLIT_DIST = 260.0f;
 // line (no crash / no truncated log); the join logs 'handshake: peer left' ->
 // '[leave] cleared proxies='; no '[drive] STALE' hand is driven after it was
 // unbound and no '[drive]' fires after the leave; proxy count returns toward 0.
-class CampApproachScenario : public Scenario {
+class CampApproachScenario : public TimedScenario {
 public:
     CampApproachScenario()
-        : passed_(false), lastLogMs_(0), hopsDone_(0),
+        : TimedScenario("camp_approach", 1000), hopsDone_(0),
           haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
-
-    virtual const char* name() const { return "camp_approach"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         // Anchor = this side's own squad leader (both clients resolve their own
@@ -648,9 +618,7 @@ public:
     virtual bool onTick(const ScenarioContext& ctx) {
         unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
 
-        if (haveAnchor_ &&
-            (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0)) {
-            lastLogMs_ = ctx.elapsedMs;
+        if (haveAnchor_ && evidenceDue(ctx.elapsedMs)) {
             Character* ld = engine::leader(ctx.gw);
             if (!ctx.isHost) {
                 // JOIN: hop the leader one HOP further out every HOP_DWELL_MS to
@@ -698,8 +666,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Host exits FIRST (the peer drop); join outlives it by ~20 s to log the
     // post-leave cleanup while still hopping. Manifest raises Seconds/KillGrace
@@ -713,8 +679,6 @@ private:
     static const unsigned int  HOPS             = 12;     // total legs
     static const float         HOP;                       // leg length (units)
 
-    bool          passed_;
-    unsigned long lastLogMs_;
     unsigned int  hopsDone_;
     bool          haveAnchor_;
     float         ax_, ay_, az_;

@@ -29,17 +29,15 @@ namespace {
 // carrier while carried (median carrier-carried distance small - the dragged/
 // teleported-body artifact shows up as huge gaps), and the drop crosses (the
 // peer's copy leaves the carried state within budget).
-class CarryOrderScenario : public Scenario {
+class CarryOrderScenario : public TimedScenario {
 public:
     CarryOrderScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario("carry_order", 0), recvCount_(0), lastLogMs_(0),
           haveL0_(false), haveM2_(false), haveL1_(false),
           aDown_(false), aPick_(false), aWalk_(false), aDrop_(false),
           bPick_(false), bWalk_(false), bDrop_(false),
           cDown_(false), cPick_(false), cWalk_(false), cDrop_(false),
           cRevive_(false), lastHoldMs_(0) {}
-
-    virtual const char* name() const { return "carry_order"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -139,8 +137,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // Shared timeline (peer-armed clock on both sides). Each carry leg is
@@ -254,7 +250,6 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL0_, haveM2_, haveL1_;
@@ -280,15 +275,13 @@ private:
 // evidence the pickup applied locally. Both sides log the same "SCENARIO CARRY"
 // series as carry_order; Test-NpcCarry gates pickup-crossed / tracks-carrier /
 // drop-crossed on the M2 + NPC series.
-class NpcCarryScenario : public Scenario {
+class NpcCarryScenario : public TimedScenario {
 public:
     NpcCarryScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario("npc_carry", 0), recvCount_(0), lastLogMs_(0),
           haveL0_(false), haveM2_(false), haveNpc_(false),
           nDown_(false), nPick_(false), nWalk_(false), nDrop_(false),
           lastHoldMs_(0) {}
-
-    virtual const char* name() const { return "npc_carry"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -354,8 +347,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     static const unsigned long NPC_LATCH_AT_MS  = 6000;
@@ -492,7 +483,6 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL0_, haveM2_, haveNpc_;
@@ -513,13 +503,11 @@ private:
 // sides log the standard MEMBER/RECV series (task= + pelvis=); Test-BedPose
 // anchors on the "SCENARIO BED ORDER" marker and gates host-committed /
 // join-committed / co-located.
-class BedPoseScenario : public Scenario {
+class BedPoseScenario : public TimedScenario {
 public:
     BedPoseScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), haveL0_(false),
+        : TimedScenario("bed_pose", 0), recvCount_(0), lastLogMs_(0), haveL0_(false),
           orderLogged_(false), lastOrderMs_(0), orderOk_(false) {}
-
-    virtual const char* name() const { return "bed_pose"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -568,8 +556,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long ORDER_AT_MS      = 14000; // join logs standing baseline first
     static const unsigned long HOST_DURATION_MS = 60000; // approach + in-bed observation
@@ -590,7 +576,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL0_;
@@ -611,14 +596,12 @@ private:
 // BODY_IN_BED, the [furn] BED FAST-EXIT fires) and co-locate with the host.
 // Test-BedWake anchors on "SCENARIO BEDWAKE ORDER/MOVE" and gates:
 // host-entered / host-moved-away / join-left-bed / join-co-located.
-class BedWakeScenario : public Scenario {
+class BedWakeScenario : public TimedScenario {
 public:
     BedWakeScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), haveL0_(false),
+        : TimedScenario("bed_wake", 0), recvCount_(0), lastLogMs_(0), haveL0_(false),
           orderLogged_(false), lastOrderMs_(0), orderOk_(false),
           moveLogged_(false), lastMoveMs_(0), moveOk_(false) {}
-
-    virtual const char* name() const { return "bed_wake"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -690,8 +673,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long ORDER_AT_MS      = 14000; // join logs standing baseline first
     static const unsigned long MOVE_AT_MS       = 34000; // give the join time to commit the pose
@@ -723,7 +704,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL0_;
@@ -753,16 +733,14 @@ private:
 // height + BODY_IN_BED in the MEMBER/RECV series: (1) both clients read the KO'd
 // body IN_BED with a LOW (laying) pelvis, and (2) after the wake both clients
 // have it OUT of the bed and co-located (it can get up and leave).
-class BedLayScenario : public Scenario {
+class BedLayScenario : public TimedScenario {
 public:
     BedLayScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario("bed_lay", 0), recvCount_(0), lastLogMs_(0),
           haveM2_(false), haveL1_(false),
           lastPutMs_(0), lastHoldMs_(0), lastMoveMs_(0),
           aDown_(false), aPut_(false), aPutOk_(false), aWake_(false), aMoved_(false),
           bDown_(false), bPut_(false), bPutOk_(false), bWake_(false), bMoved_(false) {}
-
-    virtual const char* name() const { return "bed_lay"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -855,8 +833,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long A_DOWN_AT_MS     = 6000;
     static const unsigned long A_PUT_AT_MS      = 12000;
@@ -943,7 +919,6 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveM2_, haveL1_;
@@ -973,20 +948,17 @@ private:
 // "SCENARIO FURN hand=i,s t=ms in=<0|1|2> furn=i,s pos=x,y,z bs=n" line at
 // 2 Hz reading the LOCAL character (on the peer that is the driven copy -
 // exactly what must have entered). Test-FurnPut gates on both windows.
-class FurnPutScenario : public Scenario {
+class FurnPutScenario : public TimedScenario {
 public:
     explicit FurnPutScenario(int kind)
-        : kind_(kind), passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario(kind == 4 ? "pole_put"
+                      : (kind == 3 ? "chain_put"
+                      : (kind == 2 ? "cage_put" : "bed_put")), 0),
+          kind_(kind), recvCount_(0), lastLogMs_(0),
           haveM2_(false), haveL1_(false), lastHoldMs_(0),
           aDown_(false), aPut_(false), aOut_(false),
           bDown_(false), bPut_(false), bOut_(false),
           aPutOk_(false), bPutOk_(false), lastPutMs_(0) {}
-
-    virtual const char* name() const {
-        return kind_ == 4 ? "pole_put"
-             : (kind_ == 3 ? "chain_put"
-             : (kind_ == 2 ? "cage_put" : "bed_put"));
-    }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1063,8 +1035,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // Shared timeline (peer-armed clock on both sides): KO settles 6 s before
@@ -1150,7 +1120,6 @@ private:
     }
 
     int           kind_;
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveM2_, haveL1_;
@@ -1181,14 +1150,12 @@ private:
 //   t=44s  JOIN exits its OWN body (owner-authored exit, the symmetric path).
 // Both sides log the 2 Hz "SCENARIO FURN hand=..." occupancy series for L1;
 // Test-CagePeer gates author/apply/occupancy/no-eject/exit-clean.
-class CagePeerScenario : public Scenario {
+class CagePeerScenario : public TimedScenario {
 public:
     CagePeerScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), haveL1_(false),
+        : TimedScenario("cage_peer_sync", 0), recvCount_(0), lastLogMs_(0), haveL1_(false),
           lastHoldMs_(0), downDone_(false), putDone_(false), outDone_(false),
           putOk_(false), lastPutMs_(0) {}
-
-    virtual const char* name() const { return "cage_peer_sync"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1250,8 +1217,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const int           KIND = 2; // cage (setPrisonMode)
     static const unsigned long DOWN_AT_MS      = 8000;
@@ -1300,7 +1265,6 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL1_;
@@ -1319,14 +1283,12 @@ private:
 // The JOIN logs the same series off its OWN L1 (baseline: mode stays off
 // locally - nothing streams stealth yet in this spike). Log-only; the oracle
 // just gates "host saw detection entries while the mode was on".
-class SneakProbeScenario : public Scenario {
+class SneakProbeScenario : public TimedScenario {
 public:
     SneakProbeScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), haveL1_(false),
+        : TimedScenario("sneak_probe", 0), recvCount_(0), lastLogMs_(0), haveL1_(false),
           onDone_(false), offDone_(false), onOk_(false), lastActMs_(0),
           sawSeer_(false) {}
-
-    virtual const char* name() const { return "sneak_probe"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1371,8 +1333,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     static const unsigned long ON_AT_MS         = 8000;
@@ -1429,7 +1389,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL1_;
@@ -1446,14 +1405,12 @@ private:
 // T+45/T+70 - the host's copy must follow. Both sides log a 2 Hz
 // "SCENARIO SNEAK hand=i,s t=ms mode=0|1 bs=n" series for BOTH subjects; the
 // oracle asserts the PEER's copy flips mode within budget on all four edges.
-class SneakPoseScenario : public Scenario {
+class SneakPoseScenario : public TimedScenario {
 public:
     SneakPoseScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0),
+        : TimedScenario("sneak_pose", 0), recvCount_(0), lastLogMs_(0),
           haveL0_(false), haveL1_(false),
           aOnDone_(false), aOffDone_(false), bOnDone_(false), bOffDone_(false) {}
-
-    virtual const char* name() const { return "sneak_pose"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1502,8 +1459,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     static const unsigned long A_ON_MS  = 10000;
@@ -1555,7 +1510,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL0_, haveL1_;
@@ -1573,13 +1527,11 @@ private:
 // oracle asserts the join accumulated entries while sneaking (via the
 // feedback channel - "[sneak] DETECT RECV ... applied>=1" proves the path)
 // and that they cleared after the sneak ended.
-class SneakDetectScenario : public Scenario {
+class SneakDetectScenario : public TimedScenario {
 public:
     SneakDetectScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), haveL1_(false),
+        : TimedScenario("sneak_detect", 0), recvCount_(0), lastLogMs_(0), haveL1_(false),
           onDone_(false), offDone_(false) {}
-
-    virtual const char* name() const { return "sneak_detect"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1623,8 +1575,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     static const unsigned long ON_AT_MS         = 10000;
@@ -1674,7 +1624,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          haveL1_;
@@ -1699,16 +1648,14 @@ private:
 // Test-SpeedSync oracle time-aligns the two series (CLOCKSYNC-corrected) and
 // gates the transition count, the denied lone raise, each transition's follow
 // latency, the match fraction, and the combat window sitting at 1x.
-class SpeedSyncScenario : public Scenario {
+class SpeedSyncScenario : public TimedScenario {
 public:
     SpeedSyncScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
+        : TimedScenario("speed_sync", 0), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
           haveOwn_(false), haveStriker_(false), hostClicked_(false),
           hostClicked1_(false), hostClicked3b_(false),
           joinClicked3a_(false), joinClicked1_(false), joinClicked3b_(false),
           combatIssued_(false) {}
-
-    virtual const char* name() const { return "speed_sync"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1835,8 +1782,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Shared (peer-ready-armed) timeline; the combat window runs 62 s -> end.
     static const unsigned long HOST_3X_AT_MS      = 10000;
@@ -1870,7 +1815,6 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     unsigned long lastOrderMs_;
@@ -1898,14 +1842,12 @@ private:
 //   3. The intent hooks capture the loud click as a vote (INTENT line) and
 //      stay silent for quiet writes.
 // The join idles and logs its own series (harness anchor only).
-class SpeedProbeScenario : public Scenario {
+class SpeedProbeScenario : public TimedScenario {
 public:
     SpeedProbeScenario()
-        : passed_(false), lastLogMs_(0), quiet3_(false), loud2_(false),
+        : TimedScenario("speed_probe", 0), lastLogMs_(0), quiet3_(false), loud2_(false),
           quiet1_(false), quietPause_(false), quietResume_(false),
           actsOk_(true) {}
-
-    virtual const char* name() const { return "speed_probe"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1970,8 +1912,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long QUIET3_AT_MS     = 8000;
     static const unsigned long LOUD2_AT_MS      = 16000;
@@ -1989,7 +1929,6 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    bool          passed_;
     unsigned long lastLogMs_;
     bool          quiet3_;
     bool          loud2_;
@@ -2011,12 +1950,10 @@ private:
 // ShackleSync turns the probe's characterization metrics into a STRICT gate -
 // a shared prisoner whose owner reports chained/locked while the peer's driven
 // copy reports it cleared is now a FAIL (the guard is supposed to prevent it).
-class ShackleProbeScenario : public Scenario {
+class ShackleProbeScenario : public TimedScenario {
 public:
     ShackleProbeScenario(const char* nm)
-        : name_(nm), passed_(false), lastLogMs_(0), sawShackled_(false) {}
-
-    virtual const char* name() const { return name_; }
+        : TimedScenario(nm, 0), lastLogMs_(0), sawShackled_(false) {}
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -2061,14 +1998,10 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned int  MAXN            = 64;
     static const unsigned long HOST_DURATION_MS = 40000;
     static const unsigned long JOIN_DURATION_MS = 36000;
-    const char*   name_;
-    bool          passed_;
     unsigned long lastLogMs_;
     bool          sawShackled_;
 };

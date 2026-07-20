@@ -1,8 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="16.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Build configurations (Phase 1 build separation):
+      Debug    - dev build, scenario harness INCLUDED (KENSHICOOP_HARNESS).
+      Harness  - optimized TEST build, scenario harness INCLUDED. This is what
+                 the regression/manual pipeline builds+deploys (build_plugin.cmd
+                 and deploy.cmd default to Harness). Output: x64\Harness.
+      Release  - optimized SHIPPED build, scenario harness EXCLUDED. The player
+                 kit (make_mod_kit.ps1) builds+packages this. It contains no
+                 test/Scenario*.cpp (~12k lines) and does not define
+                 KENSHICOOP_HARNESS, so the scenario runner in Plugin.cpp
+                 compiles out. Output: x64\Release.
+  -->
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
       <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Harness|x64">
+      <Configuration>Harness</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
     <ProjectConfiguration Include="Release|x64">
@@ -23,6 +39,13 @@
     <PlatformToolset>v100</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Harness|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v100</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
@@ -39,10 +62,28 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
-      <PreprocessorDefinitions>_DEBUG;KENSHICOOP_EXPORTS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
+      <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Harness|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- PDB for post-mortem minidump triage (2026-07-11 join crash). No codegen impact. -->
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ProgramDatabaseFile>$(OutDir)KenshiCoop.pdb</ProgramDatabaseFile>
       <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -66,9 +107,10 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <!-- Clean rebuild entry + modules. The legacy monolith (KenshiCoop.cpp,
-         NetClient.cpp, Scenario.cpp) stays on disk as a read-only reference until
-         the rebuild reaches squad parity (Stage 4), but is NOT compiled - only
-         one startPlugin export may exist. -->
+         Scenario.cpp) stays on disk as a read-only reference until the rebuild
+         reaches squad parity (Stage 4), but is NOT compiled - only one
+         startPlugin export may exist. (The orphaned NetClient/MainThreadQueue/
+         ScenarioApi/Protocol.h stack was deleted in Phase 1.) -->
     <ClCompile Include="Plugin.cpp" />
     <ClCompile Include="CoopLog.cpp" />
     <ClCompile Include="core\Config.cpp" />
@@ -77,10 +119,17 @@
     <ClCompile Include="net\SteamInvite.cpp" />
     <ClCompile Include="game\EngineInternal.cpp" />
     <ClCompile Include="game\EngineEntity.cpp" />
+    <ClCompile Include="game\EngineUi.cpp" />
     <ClCompile Include="game\EngineInventory.cpp" />
     <ClCompile Include="game\EngineSpawnCombat.cpp" />
     <ClCompile Include="game\EngineCharState.cpp" />
     <ClCompile Include="game\EngineWorld.cpp" />
+    <!-- Diagnostic probes (spike 401/451/402): HARNESS-ONLY, excluded from the
+         shipped Release DLL like the Scenario*.cpp harness (Phase 5e). Its only
+         callers are the probe scenarios, which are themselves Release-excluded. -->
+    <ClCompile Include="game\EngineProbe.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="game\ZoneQuery.cpp" />
     <ClCompile Include="sync\Interp.cpp" />
     <ClCompile Include="sync\ReplicatorCore.cpp" />
@@ -91,18 +140,45 @@
     <ClCompile Include="sync\ReplicatorItems.cpp" />
     <ClCompile Include="sync\ReplicatorChannels.cpp" />
     <ClCompile Include="sync\SaveXfer.cpp" />
-    <ClCompile Include="test\Scenario.cpp" />
-    <ClCompile Include="test\ScenarioSupport.cpp" />
-    <ClCompile Include="test\ScenarioMovement.cpp" />
-    <ClCompile Include="test\ScenarioNpc.cpp" />
-    <ClCompile Include="test\ScenarioCombat.cpp" />
-    <ClCompile Include="test\ScenarioMedical.cpp" />
-    <ClCompile Include="test\ScenarioInventory.cpp" />
-    <ClCompile Include="test\ScenarioWorldItems.cpp" />
-    <ClCompile Include="test\ScenarioCharState.cpp" />
-    <ClCompile Include="test\ScenarioProbes.cpp" />
-    <ClCompile Include="test\ScenarioBuildings.cpp" />
-    <ClCompile Include="test\ScenarioSession.cpp" />
+    <!-- Scenario harness: EXCLUDED from the shipped Release DLL, compiled in
+         Debug + Harness. Keep this exclusion list in sync with the scenario
+         drift check (scripts/tests/Contract.Tests.ps1). -->
+    <ClCompile Include="test\Scenario.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioSupport.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioMovement.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioNpc.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioCombat.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioMedical.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioInventory.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioWorldItems.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioCharState.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioProbes.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioBuildings.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="test\ScenarioSession.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='Release'">true</ExcludedFromBuild>
+    </ClCompile>
     <!-- ENet (Windows source set). unix.c is intentionally excluded. -->
     <ClCompile Include="..\..\third_party\enet\enet\callbacks.c" />
     <ClCompile Include="..\..\third_party\enet\enet\compress.c" />
@@ -124,6 +200,7 @@
     <ClInclude Include="sync\Replicator.h" />
     <ClInclude Include="sync\SaveXfer.h" />
     <ClInclude Include="test\Scenario.h" />
+    <ClInclude Include="test\ScenarioTimed.h" />
     <ClInclude Include="test\ScenarioSupport.h" />
     <ClInclude Include="..\netproto\Wire.h" />
   </ItemGroup>

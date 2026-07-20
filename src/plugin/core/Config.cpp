@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "OwnRanks.h"
 #include <cstdlib>
+#include <cstdio>
 #include <map>
 #include <fstream>
 #include <iterator>
@@ -136,36 +137,24 @@ void loadConfig(Config& c) {
 
     // Inventory sync (Phase 4a). Env semantics: "1" = force on, "0" = force off
     // (escape hatch), unset = ON for REAL sessions (scenario == "" - the 2026-07-07
-    // remote session played with it off and equipment changes never crossed), and
-    // auto-on for the inventory scenarios (so the test + manual gate just work).
-    // Scripted test scenarios outside that list keep it off, as before.
+    // remote session played with it off and equipment changes never crossed) and the
+    // manual inventory setup scene. Scripted test scenarios that need it (the inv_*,
+    // trade_*, world_*_drop, vendor/store/weapon_loot family) now force it ON via
+    // their manifest DiagEnv (KENSHICOOP_INV_SYNC=1) instead of being named here.
     {
         std::string env = envOr("KENSHICOOP_INV_SYNC", "");
-        bool auto_ = (c.scenario == "") || // free play / real co-op session
-                     (c.setupScene == "inventory") ||
-                     (c.scenario == "inv_order") || (c.scenario == "inv_bidir") ||
-                     (c.scenario == "inv_equip") || (c.scenario == "inv_reequip") ||
-                     (c.scenario == "vendor_trade") || // 1c: the bought item crosses on this channel
-                     (c.scenario == "store_sync") ||   // protocol 34 rides the container channel
-
-                     (c.scenario == "world_weapon_drop") || // W2 drop must beat the inv-reconcile destroy
-                     (c.scenario == "world_armor_drop") ||
-                     (c.scenario == "trade_probe") ||  // cross-owner drag baseline needs the live channel
-                     (c.scenario == "trade_peer") ||   // protocol 37 fix rides + suppresses this channel
-                     (c.scenario == "xfer_block") ||   // veto test drags between owned tabs
-                     (c.scenario == "weapon_loot");    // acquisition crosses on the snapshot channel
+        bool auto_ = (c.scenario == "") || (c.setupScene == "inventory");
         c.invSync = (env == "1") || (env != "0" && auto_);
     }
 
     // Cross-owner transfer intents (protocol 37). Env semantics: "1" = force on,
     // "0" = force off (escape hatch), unset = ON whenever invSync is on - the drag
     // dupe/wipe/weapon-vanish is a real-session bug, so the fix defaults on with the
-    // channel it repairs. Forced OFF for trade_probe: that diagnostic baselines the
-    // UNFIXED signatures the intent channel exists to close.
+    // channel it repairs. The trade_probe diagnostic (which baselines the UNFIXED
+    // signatures) forces it OFF via its manifest DiagEnv (KENSHICOOP_XFER_SYNC=0).
     {
         std::string env = envOr("KENSHICOOP_XFER_SYNC", "");
         c.xferSync = (env == "1") || (env != "0" && c.invSync);
-        if (c.scenario == "trade_probe") c.xferSync = false;
     }
 
     // Cross-owner trade veto (OPT-IN). Blocks direct squad-to-squad drags and
@@ -175,30 +164,22 @@ void loadConfig(Config& c) {
     // owner is not a squad character - see the 2026-07-13 session), so a blocked
     // drag leaked as a phantom ground drop. Protocol 37 is post-hoc (diffs container
     // totals) and therefore path-agnostic, so REAL sessions now ALLOW + replicate.
-    // Env semantics: "1" = force the veto on; unset/"0" = off. Only the dedicated
-    // xfer_block scenario auto-enables it (to keep the veto code exercised).
+    // Env semantics: "1" = force the veto on; unset/"0" = off. The dedicated
+    // xfer_block scenario arms it via its manifest DiagEnv (KENSHICOOP_BLOCK_XFER=1).
     {
         std::string env = envOr("KENSHICOOP_BLOCK_XFER", "");
-        bool auto_ = (c.scenario == "xfer_block");
-        c.blockXfer = (env == "1") || (env != "0" && auto_);
+        c.blockXfer = (env == "1");
         if (c.blockXfer) c.xferSync = false; // veto supersedes replicate
     }
 
     // World-item sync (Phase W1/W2). Env semantics: "1" = force on, "0" = force off
     // (escape hatch), unset = ON for REAL sessions (scenario == "" - dropped gear was
-    // invisible cross-client in the 2026-07-07 remote session with it off), and
-    // auto-on for the world_item_* family (the drop_probe diagnostic is host-only and
-    // needs no world stream), the W2 conservation-drop scenarios (which ride the
-    // world-drop channel), and limb_loss (protocol 16: the severed-limb GROUND item
-    // replicates via this channel - the host's real item streams as a W1 proxy, the
-    // join's local copy is deduped).
+    // invisible cross-client in the 2026-07-07 remote session with it off). The
+    // scripted world scenarios that need it (world_item_*, world_*_drop, limb_loss)
+    // force it ON via their manifest DiagEnv (KENSHICOOP_WORLD_SYNC=1).
     {
         std::string env = envOr("KENSHICOOP_WORLD_SYNC", "");
-        bool auto_ = (c.scenario == "") || // free play / real co-op session
-                     (c.scenario.compare(0, 11, "world_item_") == 0) ||
-                     (c.scenario == "world_weapon_drop") ||
-                     (c.scenario == "world_armor_drop") ||
-                     (c.scenario == "limb_loss");
+        bool auto_ = (c.scenario == ""); // free play / real co-op session
         c.worldSync = (env == "1") || (env != "0" && auto_);
     }
 
@@ -209,11 +190,10 @@ void loadConfig(Config& c) {
     c.medSync = envOr("KENSHICOOP_MED_SYNC", "1") != "0";
 
     // Consensus game-speed sync: DEFAULT ON - requests min-arbitrated by the
-    // host, combat caps fast-forward at 1x. "0" is the A/B escape hatch.
-    // Forced OFF for the speed_probe spike: the probe drives the quiet/loud
-    // writers directly and the replicator's enforcement would fight it.
+    // host, combat caps fast-forward at 1x. "0" is the A/B escape hatch. The
+    // speed_probe spike (which drives the quiet/loud writers directly) and
+    // time_probe force it OFF via their manifest DiagEnv (KENSHICOOP_SPEED_SYNC=0).
     c.speedSync = envOr("KENSHICOOP_SPEED_SYNC", "1") != "0";
-    if (c.scenario == "speed_probe") c.speedSync = false;
 
     // Character stats sync (protocol 17): DEFAULT ON - owner-authoritative
     // CharStats stream for player-squad members. Without it a driven copy
@@ -238,117 +218,27 @@ void loadConfig(Config& c) {
     c.chainSync = envOr("KENSHICOOP_CHAIN_SYNC", "1") != "0";
     c.stealthSync = envOr("KENSHICOOP_STEALTH_SYNC", "1") != "0";
     c.moneySync   = envOr("KENSHICOOP_MONEY_SYNC", "1") != "0";
-    // Forced OFF for the shop_probe diagnostic - that scenario exists to
-    // measure the UNSYNCED wallet/vendor baseline (its sentinel writes must
-    // not cross), and its findings gate this channel's design.
-    if (c.scenario == "shop_probe") c.moneySync = false;
-
-    // Runtime-spawn proxy replication (protocol 21, DEFAULT ON): the join
-    // mints local proxy bodies for host runtime spawns it cannot resolve.
-    // Forced OFF for the spawn_probe diagnostic - that scenario exists to
-    // baseline the unresolved-hand + suppression failure modes, and the
-    // proxy channel would paper over them. "0" is the A/B escape hatch.
-    c.spawnSync = envOr("KENSHICOOP_SPAWN_SYNC", "1") != "0";
-    if (c.scenario == "spawn_probe") c.spawnSync = false;
-
+    c.spawnSync   = envOr("KENSHICOOP_SPAWN_SYNC", "1") != "0";
     c.recruitSync = envOr("KENSHICOOP_RECRUIT_SYNC", "1") != "0";
-    // Forced OFF for the recruit_probe diagnostic - it exists to measure the
-    // UNSYNCED recruit baseline (duplicate proxies, invisible join recruits),
-    // and its findings gate this channel's design.
-    if (c.scenario == "recruit_probe") c.recruitSync = false;
-
     c.factionSync = envOr("KENSHICOOP_FACTION_SYNC", "1") != "0";
-    // Forced OFF for the faction_probe diagnostic - it exists to measure the
-    // UNSYNCED relation baseline (its sentinel writes must not cross), and
-    // its findings gate this channel's design.
-    if (c.scenario == "faction_probe") c.factionSync = false;
-
-    c.timeSync = envOr("KENSHICOOP_TIME_SYNC", "1") != "0";
-    // Forced OFF for the time_probe diagnostic - it measures the raw unsynced
-    // clock (initial offset + drift rate on the shared save) and the clock-
-    // rate-vs-fsm relation. speedSync is forced off WITH it: the probe's
-    // host-side speed burst must apply directly instead of being arbitrated
-    // back to min(host, join) by the consensus.
-    if (c.scenario == "time_probe") { c.timeSync = false; c.speedSync = false; }
-    // Forced OFF for speed_sync: that scenario gates RAW fsm equality between
-    // the clients, and the clock slew makes the join's fsm INTENTIONALLY
-    // diverge (effective * slew) during catch-up - a by-design conflict, not
-    // a regression (run 143057). The slew/consensus COMPOSITION is gated by
-    // time_sync instead (its script includes consensus speed clicks).
-    if (c.scenario == "speed_sync") c.timeSync = false;
-
-    c.doorSync = envOr("KENSHICOOP_DOOR_SYNC", "1") != "0";
-    // Forced OFF for the door_probe diagnostic - it measures the UNSYNCED
-    // door baseline (its sentinel toggles must not cross) and its findings
-    // gate the protocol-26 channel's design.
-    if (c.scenario == "door_probe") c.doorSync = false;
-
-    c.buildSync = envOr("KENSHICOOP_BUILD_SYNC", "1") != "0";
-    // Forced OFF for the build_probe diagnostic - it measures the UNSYNCED
-    // placed-building baseline (its programmatic placement + progress ramp
-    // must stay strictly local) and its findings gate the protocol-27
-    // channel's design.
-    if (c.scenario == "build_probe") c.buildSync = false;
-
-    c.bdoorSync = envOr("KENSHICOOP_BDOOR_SYNC", "1") != "0";
-    // Forced OFF for the bdoor_probe diagnostic - it measures the UNSYNCED
-    // placed-door + removal baseline (its door toggle must not cross and the
-    // peer's proxy must survive the placer's destroy as a ghost) with the
-    // protocol-27 mint channel still ON (the proxies must exist to measure).
-    if (c.scenario == "bdoor_probe") c.bdoorSync = false;
-
-    c.hungerSync = envOr("KENSHICOOP_HUNGER_SYNC", "1") != "0";
-    // Forced OFF for the hunger_probe diagnostic - it measures the UNSYNCED
-    // hunger baseline (per-client decay rates, owner-vs-copy divergence, the
-    // sentinel write staying local) while the rest of the medical snapshot
-    // keeps streaming (the A/B isolates the hunger fields alone).
-    if (c.scenario == "hunger_probe") c.hungerSync = false;
-
-    c.saveSync = envOr("KENSHICOOP_SAVE_SYNC", "1") != "0";
-    // Forced OFF for the save_probe diagnostic - it measures the RAW save
-    // behaviour (detour edge, runtime path resolution, folder-quiescence
-    // latency, gameplay hitch) with no coordination or transfer on top.
-    if (c.scenario == "save_probe") c.saveSync = false;
-
-    c.loadSync = envOr("KENSHICOOP_LOAD_SYNC", "1") != "0";
-    // Forced OFF for the load_probe diagnostic - it measures the RAW world
-    // swap (detour edge, mainLoop behaviour across the load screen, host-side
-    // survival with sync running, unsynced join divergence) with no
-    // coordination on top.
-    if (c.scenario == "load_probe") c.loadSync = false;
-
-    c.prodSync = envOr("KENSHICOOP_PROD_SYNC", "1") != "0";
-    // Forced OFF for the prod_probe diagnostic - it measures the UNSYNCED
-    // machine baseline (owner-vs-idle output divergence, write-lever behaviour,
-    // power cross-apply absence) that protocol 33 exists to close.
-    if (c.scenario == "prod_probe") c.prodSync = false;
-
+    c.timeSync    = envOr("KENSHICOOP_TIME_SYNC", "1") != "0";
+    c.doorSync    = envOr("KENSHICOOP_DOOR_SYNC", "1") != "0";
+    c.buildSync   = envOr("KENSHICOOP_BUILD_SYNC", "1") != "0";
+    c.bdoorSync   = envOr("KENSHICOOP_BDOOR_SYNC", "1") != "0";
+    c.hungerSync  = envOr("KENSHICOOP_HUNGER_SYNC", "1") != "0";
+    c.saveSync    = envOr("KENSHICOOP_SAVE_SYNC", "1") != "0";
+    c.loadSync    = envOr("KENSHICOOP_LOAD_SYNC", "1") != "0";
+    c.prodSync    = envOr("KENSHICOOP_PROD_SYNC", "1") != "0";
     c.researchSync = envOr("KENSHICOOP_RESEARCH_SYNC", "1") != "0";
-    // Forced OFF for the research_probe diagnostic - it measures the UNSYNCED
-    // tech-tree baseline (host unlock never crossing, join-side startResearch
-    // lever stickiness) that protocol 38 exists to close.
-    if (c.scenario == "research_probe") c.researchSync = false;
-
-    c.storeSync = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
-    // Forced OFF for the store_probe diagnostic - it measures the UNSYNCED
-    // container baseline (building-container capture/reconcile levers, the
-    // owner-vs-idle content divergence, capacity, reconcile churn) that
-    // protocol 34 exists to close. Rides the container-inventory channel, so
-    // it is also dead whenever invSync is off.
-    if (c.scenario == "store_probe") c.storeSync = false;
-
-    c.squadSync = envOr("KENSHICOOP_SQUAD_SYNC", "1") != "0";
-    // Forced OFF for the squad_probe diagnostic - it measures the UNSYNCED
-    // squad-move baseline (which hand fields a move re-keys, whether the tab
-    // ranks reshuffle, what the peer sees) that protocol 35 exists to close.
-    if (c.scenario == "squad_probe") c.squadSync = false;
-
+    c.storeSync   = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
+    c.squadSync   = envOr("KENSHICOOP_SQUAD_SYNC", "1") != "0";
     c.latejoinSync = envOr("KENSHICOOP_LATEJOIN_SYNC", "1") != "0";
-    // Forced OFF for the latejoin_probe diagnostic - it measures the UNSYNCED
-    // late-join baseline: which pre-connect mutations reach the join (and how
-    // slowly), and that a pre-connect building placement NEVER mints on the
-    // peer (the permanent describe/mint loss the resync exists to close).
-    if (c.scenario == "latejoin_probe") c.latejoinSync = false;
+    // NOTE: every channel above DEFAULTS ON for real sessions; the diagnostic
+    // "*_probe" scenarios (and time_probe/speed_sync) that need a channel OFF to
+    // measure the unsynced baseline force it via their manifest DiagEnv (e.g.
+    // shop_probe -> KENSHICOOP_MONEY_SYNC=0). This keeps scenario NAMES out of the
+    // shipped plugin - the manifest (scripts/scenarios.psd1) is the single source
+    // of truth for per-scenario channel A/B; see Contract.Tests's DiagEnv guard.
 
     // Transport: "udp" (default) keeps the stock ENet/UDP path (the whole local
     // harness runs on it); "steam" tunnels ENet over Steam P2P by SteamID (no
@@ -454,6 +344,59 @@ void loadConfig(Config& c) {
         c.ownRanksFromEnv = parseRankList(ranks, c.ownRanks);
         resolveOwnRanks(c.ownRanks, c.isHost, c.ownRanksFromEnv);
     }
+}
+
+std::string describeConfig(const Config& c) {
+    // Compact "on/off" channel roster + the knobs most likely to explain a
+    // divergence. Kept on one line so it is greppable in the log.
+    std::string s = "KenshiCoop: effective cfg";
+    s += " scenario='" + c.scenario + "'";
+    if (!c.setupScene.empty()) s += " setup='" + c.setupScene + "'";
+    s += " transport=" + c.transport;
+    struct Flag { const char* name; bool on; };
+    const Flag flags[] = {
+        { "inv",     c.invSync },      { "xfer",    c.xferSync },
+        { "blockXfer", c.blockXfer },  { "world",   c.worldSync },
+        { "med",     c.medSync },      { "speed",   c.speedSync },
+        { "stats",   c.statsSync },    { "carry",   c.carrySync },
+        { "furn",    c.furnSync },     { "chain",   c.chainSync },
+        { "stealth", c.stealthSync },  { "money",   c.moneySync },
+        { "spawn",   c.spawnSync },    { "recruit", c.recruitSync },
+        { "faction", c.factionSync },  { "time",    c.timeSync },
+        { "door",    c.doorSync },     { "build",   c.buildSync },
+        { "bdoor",   c.bdoorSync },    { "hunger",  c.hungerSync },
+        { "save",    c.saveSync },     { "load",    c.loadSync },
+        { "prod",    c.prodSync },     { "research",c.researchSync },
+        { "store",   c.storeSync },    { "squad",   c.squadSync },
+        { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
+        { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
+        { "censusFreezeAi", c.censusFreezeAi },
+    };
+    s += " on=[";
+    bool first = true;
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+        if (!flags[i].on) continue;
+        if (!first) s += ",";
+        s += flags[i].name;
+        first = false;
+    }
+    s += "] off=[";
+    first = true;
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); ++i) {
+        if (flags[i].on) continue;
+        if (!first) s += ",";
+        s += flags[i].name;
+        first = false;
+    }
+    s += "]";
+    char b[160];
+    _snprintf(b, sizeof(b) - 1,
+              " censusR=%.0f mintR=%.0f park=%.0f snap=%.1f/%.2fs armMs=%lu",
+              c.censusRadius, c.spawnMintRadius, c.censusParkDist,
+              c.snapDist, c.snapSeconds, c.scenarioArmTimeoutMs);
+    b[sizeof(b) - 1] = '\0';
+    s += b;
+    return s;
 }
 
 void reloadPeerFromFile(Config& c) {

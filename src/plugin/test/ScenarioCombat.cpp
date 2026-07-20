@@ -18,13 +18,11 @@ namespace {
 // primitives populate during a live fight before we replicate them. The duelists are
 // runtime host spawns (not baked), so the join only logs whatever NPCs it has; the
 // host log is the deliverable. Periodically re-arms disengaged duelists.
-class CombatProbeScenario : public Scenario {
+class CombatProbeScenario : public TimedScenario {
 public:
     CombatProbeScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastRearmMs_(0),
+        : TimedScenario("combat_probe", 0), recvCount_(0), lastLogMs_(0), lastRearmMs_(0),
           haveDuel_(false) {}
-
-    virtual const char* name() const { return "combat_probe"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         if (ctx.isHost) {
@@ -66,13 +64,10 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long HOST_DURATION_MS = 40000;
     static const unsigned long JOIN_DURATION_MS = 28000;
     static const unsigned int  MAX_LOG          = 40;
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     unsigned long lastRearmMs_;
@@ -88,13 +83,11 @@ private:
 // copies via captureNpcs, the RECV series shows task flip NONE->65024 (combat) only
 // AFTER the order - proving a live peaceful->fighting transition, not a baked load
 // state. The runner splits the RECV series on "SCENARIO COMBAT issued".
-class CombatOrderScenario : public Scenario {
+class CombatOrderScenario : public TimedScenario {
 public:
     CombatOrderScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), combatLogged_(false),
+        : TimedScenario("combat_order", 0), recvCount_(0), lastLogMs_(0), combatLogged_(false),
           havePins_(false), lastRearmMs_(0) {}
-
-    virtual const char* name() const { return "combat_order"; }
 
     // Pre-arm: pin both duelists while they are still at their baked spawn and
     // hold them peaceful until the armed clock begins (see craft_order rationale).
@@ -156,8 +149,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long ORDER_AT_MS      = 18000;
     static const unsigned long HOST_DURATION_MS = 52000;
@@ -176,7 +167,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          combatLogged_;
@@ -195,13 +185,11 @@ private:
 // the join's local sim had B winning. The runner asserts: the host sent a combat
 // KO/death with a non-zero actor, the join received that exact event (hand + actor), and
 // the join's victim is down afterwards. Reuses combat_order's pin/hold baseline.
-class CombatKillScenario : public Scenario {
+class CombatKillScenario : public TimedScenario {
 public:
     CombatKillScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), combatLogged_(false),
+        : TimedScenario("combat_kill", 0), recvCount_(0), lastLogMs_(0), combatLogged_(false),
           havePins_(false), lastRearmMs_(0), lastWoundMs_(0), koLogged_(false) {}
-
-    virtual const char* name() const { return "combat_kill"; }
 
     // Same pre-arm pin+hold as combat_order.
     virtual void onGameplay(const ScenarioContext& ctx) {
@@ -319,8 +307,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long ORDER_AT_MS      = 14000;
     static const unsigned long KO_DELAY_MS      = 14000; // fight visibly before the takedown
@@ -342,7 +328,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          combatLogged_;
@@ -371,16 +356,14 @@ private:
 //     fights back automatically, which streams ITS combat intent join->host.
 //   Window B: NPC2 melees the HOST's tab-0 leader - the same mechanism with the
 //     victim owned by the host (all-local control, join renders both copies).
-class PlayerCombatScenario : public Scenario {
+class PlayerCombatScenario : public TimedScenario {
 public:
     PlayerCombatScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderAMs_(0),
+        : TimedScenario("player_combat", 0), recvCount_(0), lastLogMs_(0), lastOrderAMs_(0),
           lastOrderBMs_(0), haveOwn_(false), havePeer_(false), haveNpcA_(false),
           haveNpcB_(false), issuedA_(false), issuedB_(false),
           noFightA_(0), noFightB_(0),
           lastVicBloodA_(-1.0f), lastVicBloodB_(-1.0f) {}
-
-    virtual const char* name() const { return "player_combat"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -428,8 +411,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // Shared (peer-ready-armed) timeline: NPC1 fights the join's leader 12-34s,
@@ -589,7 +570,6 @@ private:
             logScenarioEntity(ctx.isHost ? "MEMBER" : "RECV", npcs[i]);
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     unsigned long lastOrderAMs_;
@@ -622,14 +602,12 @@ private:
 //   host:  [combat] order hand=A tgt=V r=2 (the driven join-PC copy engaged),
 //          "SCENARIO ASSAULT hostview fight=1 tgt=V" (host's local combat read
 //          of the join-PC copy), SCENARIO VITALS for V on both sides.
-class AssaultTownScenario : public Scenario {
+class AssaultTownScenario : public TimedScenario {
 public:
     AssaultTownScenario()
-        : passed_(false), lastLogMs_(0), lastOrderMs_(0), haveOwn_(false),
+        : TimedScenario("assault_town", 0), lastLogMs_(0), lastOrderMs_(0), haveOwn_(false),
           havePeer_(false), haveVic_(false), issued_(false), pickFailLogged_(false),
           hostFightSeen_(0) {}
-
-    virtual const char* name() const { return "assault_town"; }
 
     virtual void onGameplay(const ScenarioContext& ctx) {
         latchLeaders(ctx);
@@ -714,8 +692,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long ASSAULT_AT_MS    = 10000;
     static const unsigned long HOST_DURATION_MS = 52000;
@@ -750,7 +726,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned long lastLogMs_;
     unsigned long lastOrderMs_;
     bool          haveOwn_;
@@ -772,13 +747,11 @@ private:
 // lie down / stand up. Window B inverts it: the JOIN KOs + revives its OWN tab-1
 // member and the host's driven copy must follow. Both sides log squad
 // MEMBER/RECV + VITALS series.
-class PlayerKoScenario : public Scenario {
+class PlayerKoScenario : public TimedScenario {
 public:
     PlayerKoScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastAssertMs_(0),
+        : TimedScenario("player_ko", 0), recvCount_(0), lastLogMs_(0), lastAssertMs_(0),
           haveSubj_(false), downLogged_(false), reviveLogged_(false) {}
-
-    virtual const char* name() const { return "player_ko"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -849,8 +822,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Sequential windows on the peer-ready-armed shared timeline:
     // A (host victim): down 10-24s, revive at 24s. B (join victim): down 34-48s,
@@ -876,7 +847,6 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     unsigned long lastAssertMs_;
@@ -898,13 +868,11 @@ private:
 // teleport count (artifact gone), host-vs-join position tracking, and - from the
 // host MEMBER task series - that BOTH stances (active 0xFE00 / waiting 0xFE01)
 // actually streamed (else the run proves nothing).
-class CombatCrowdScenario : public Scenario {
+class CombatCrowdScenario : public TimedScenario {
 public:
     CombatCrowdScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
+        : TimedScenario("combat_crowd", 0), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
           haveOwn_(false), nStrikers_(0), nSeen_(0), issuedLogged_(false) {}
-
-    virtual const char* name() const { return "combat_crowd"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -988,8 +956,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Shared (peer-ready-armed) timeline; the crowd window runs 10 s -> end.
     static const unsigned long COMBAT_AT_MS     = 10000;
@@ -1039,7 +1005,6 @@ private:
             coop::logLine("SCENARIO CROWD pick FAILED (too few upright NPCs)");
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     unsigned long lastOrderMs_;
@@ -1064,13 +1029,11 @@ private:
 // [combat] stats rollup records the aggregate. N is env-tunable
 // (KENSHICOOP_BATTLE_N, default 16, clamp 4..MAX_BATTLERS) so ONE build runs the
 // 10v10 / 20v20 / 40v40 ladder. Both sides log SCENARIO MEMBER/RECV like crowd.
-class CombatBattleScenario : public Scenario {
+class CombatBattleScenario : public TimedScenario {
 public:
     CombatBattleScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
+        : TimedScenario("combat_battle", 0), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
           nBattlers_(0), nSeen_(0), spawned_(false), issuedLogged_(false) {}
-
-    virtual const char* name() const { return "combat_battle"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1140,8 +1103,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Shared (peer-ready-armed) timeline; the battle window runs 10 s -> end.
     static const unsigned long COMBAT_AT_MS     = 10000;
@@ -1186,7 +1147,6 @@ private:
         if (nSeen_ < MAX_REMEMBER) seen_[nSeen_++] = e;
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     unsigned long lastOrderMs_;
@@ -1207,16 +1167,14 @@ private:
 // combat snap/warp path than sustained melee. Both sides log SCENARIO MEMBER/RECV
 // (the enemy copies) for the warp measurement + Test-CombatSnapRate, plus
 // SCENARIO WIN buff/spawned/down for the outcome oracle.
-class CombatWinScenario : public Scenario {
+class CombatWinScenario : public TimedScenario {
 public:
     CombatWinScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
+        : TimedScenario("combat_win", 0), recvCount_(0), lastLogMs_(0), lastOrderMs_(0),
           nEnemies_(0), nSeen_(0), nBuffed_(0), nOwn_(0), maxDown_(0),
           spawned_(false), buffed_(false), issuedLogged_(false), haveOwn_(false) {
         for (int j = 0; j < 5; ++j) ownHand_[j] = 0;
     }
-
-    virtual const char* name() const { return "combat_win"; }
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -1291,8 +1249,6 @@ public:
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     // Shared (peer-ready-armed) timeline; the win window runs 10 s -> end.
@@ -1398,7 +1354,6 @@ private:
         if (nSeen_ < MAX_REMEMBER) seen_[nSeen_++] = e;
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     unsigned long lastOrderMs_;

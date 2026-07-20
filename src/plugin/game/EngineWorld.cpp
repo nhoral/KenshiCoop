@@ -80,15 +80,13 @@ unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut
                     strncpy(v.sid, gd->stringID.c_str(), sizeof(v.sid) - 1);
                     v.sid[sizeof(v.sid) - 1] = '\0';
                 }
-                Inventory* inv = 0;
-                __try { inv = o->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+                Inventory* inv = invOf(o);
                 if (inv) v.src = 1;
                 Character* trader = traderOf(st);
                 if (trader) {
                     readObjectHand(static_cast<RootObject*>(trader), v.traderHand);
                     if (!inv) {
-                        __try { inv = trader->getInventory(); }
-                        __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+                        inv = invOf(static_cast<RootObject*>(trader));
                         if (inv) v.src = 2;
                     }
                 }
@@ -1195,8 +1193,7 @@ int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]) {
     RootObject* ro = resolveObjectByHand(vHand);
     if (!ro) return -1;
     __try {
-        Inventory* inv = 0;
-        __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+        Inventory* inv = invOf(ro);
         if (inv) return 1;
         if (!g_getPlatoonFn || !g_platoonRefreshInvFn) {
             coop::logLine("[shop] ensure-stock fns-unresolved"); return 0;
@@ -1208,7 +1205,7 @@ int ensureVendorStock(GameWorld* gw, const unsigned int vHand[5]) {
         ActivePlatoon* ap = g_getPlatoonFn(trader);
         if (!ap) { coop::logLine("[shop] ensure-stock platoon-null"); return 0; }
         g_platoonRefreshInvFn(ap, /*firstTime=*/true);
-        __try { inv = ro->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+        inv = invOf(ro);
         if (!inv) coop::logLine("[shop] ensure-stock refresh-ran inv-still-null");
         return inv ? 1 : 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
@@ -1233,14 +1230,13 @@ int probeVendorBuy(GameWorld* gw, const unsigned int vHand[5],
         // Same stock-container pick as listVendorsNear: the ShopTrader's own
         // (lazy) Inventory first, else the trader CHARACTER's - whether buyItem
         // works against the character container is itself probe evidence.
-        Inventory* vinv = 0; int src = 0;
-        __try { vinv = vendor->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { vinv = 0; }
+        int src = 0;
+        Inventory* vinv = invOf(vendor);
         if (vinv) src = 1;
         if (!vinv) {
             Character* trader = traderOf(static_cast<ShopTrader*>(vendor));
             if (trader) {
-                __try { vinv = trader->getInventory(); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { vinv = 0; }
+                vinv = invOf(static_cast<RootObject*>(trader));
                 if (vinv) src = 2;
             }
         }

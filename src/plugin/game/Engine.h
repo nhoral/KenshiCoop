@@ -114,6 +114,24 @@ Character* resolve(const EntityState& e);
 Character* resolveCharByHand(unsigned int idx, unsigned int ser, unsigned int type,
                              unsigned int cont, unsigned int contSer);
 
+// ---- Canonical typed hand capture/resolve (Phase 5b: ObjectHand) ------------
+// Typed replacements for the raw-array read*/resolve*ByHand helpers. They own
+// the engine's hand-ctor arg order in ONE place, so no caller hand-indexes a
+// u32[5]. The raw-array helpers (readObjectHand/readHand/resolveObjectByHand/
+// resolveCharByHand) are thin adapters over these, using ObjectHand's from*/to*
+// converters for the two legacy array orders. Migrate call sites to these to
+// drop the [3]/[4]/[0]... remaps entirely.
+//
+// SEH-guarded: read obj/char ->handle into a typed ObjectHand. Returns false on
+// null/fault (out is left untouched); the id/serial name the object.
+bool handOf(RootObject* obj, ObjectHand& out);
+bool charHandOf(Character* c, ObjectHand& out);
+// SEH-guarded: resolve a typed hand to this machine's local Character*/RootObject*
+// (same engine hand path as resolve(EntityState)). 0 if unloaded here /
+// unresolvable / faulted.
+Character* resolveChar(const ObjectHand& h);
+RootObject* resolveObject(const ObjectHand& h);
+
 // SEH-guarded RAW apply: teleport the body to the entity transform via the
 // movement controller (no interpolation). Stage 1 apply path.
 bool applyRaw(Character* c, const EntityState& e);
@@ -254,131 +272,25 @@ bool  markerUpdate(void* label, const char* text, int colorId);
 void  markerDestroy(void* label);
 
 // ---- In-game co-op session panel ---------------------------------------------
-// A native DatapanelGUI opened with F2 that lets the player pick role + transport
-// (buttons/checkboxes - the only reliably interactive DatapanelGUI controls;
-// MyGUI comboboxes/editboxes have no usable RVAs and don't receive keyboard focus
-// during gameplay) and Connect/Disconnect. The friend's Steam ID is entered by
-// clipboard: "Copy my Steam ID" puts the player's own id on the clipboard to
-// share, and "Paste friend's Steam ID" reads the friend's id back in (per-session,
-// never written to disk). The UDP endpoint (ip/port) still comes from
-// coop_config.json. The GUI layer stays session-agnostic: live status is passed IN
-// via *st and the user's actions are handed BACK through the callbacks (the plugin
-// root owns the session/config wiring). Main-thread only; SEH-guarded.
-struct CoopPanelState {
-    unsigned long long selfSteamId; // steamp2p::selfId (0 = Steam not up)
-    unsigned long long peerSteamId; // config steamPeer fallback (0 = unset; pasted id wins)
-    bool               running;     // net thread up
-    bool               peerPresent; // peer connected
-    bool               isHost;      // current armed role (seeds the Host toggle)
-    int                transportSel;// current armed transport (0 steam, 1 udp)
-    const char*        detail;      // one-line status string for the panel/overlay
-};
-// The panel's role/transport selections at the moment Connect is hit. peerId is the
-// Steam ID pasted in-panel this session (0 if none), and overrides the config
-// steamPeer in coopUiConnect; the UDP endpoint is re-read from the config there.
-typedef void (*CoopConnectFn)(bool isHost, bool useSteam, unsigned long long peerId);
-typedef void (*CoopDisconnectFn)();
-void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect);
-
-// Persistent co-op connection-status overlay: a single ScreenLabel tracked to the
-// local leader (the spike-47/48 screenshot-proven render path) whose caption shows
-// the live session status, colored by state (0 = offline/red, 1 = waiting/yellow,
-// 2 = connected/green). Recreated if the leader pointer changes (world reload) and
-// updated in place via _NV_setCaption when the text/state changes. Pass show=false
-// to remove it. Main-thread only; SEH-guarded.
-void coopOverlayTick(GameWorld* gw, const char* text, int state, bool show);
+// Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
+// CoopDisconnectFn, coopPanelTick, coopOverlayTick. The UI root (Plugin.cpp)
+// includes EngineUi.h directly; the adapter (EngineInternal.h) re-includes it.
 
 // ---- Deterministic test-scene setup (host-side; baked into a save) ---------
-// These spawn objects into the live world so the user can SAVE the result. Once
-// saved, the spawned chair/NPC become ordinary save entities with save-stable
-// hands that resolve identically on both clients - the only way a controlled
-// actor can sync (a runtime spawn alone gets a host-only hand the join can't see).
+// Moved to EngineScenario.h (Phase 5a domain split): spawnSeatInFront,
+// spawnNpcInFront, spawnMachineInFront, orderWorkAt, findFurnitureNear,
+// orderUseBed, setupCraftScene, rearmCraftScene, setupDownScene, rearmDownScene,
+// setupSquadScene, pickDownSubject, holdSubjectUpright, orderDownSubject,
+// killSubject, woundSubject. The scenario harness (ScenarioSupport.h) + auto-bake
+// (Plugin.cpp) include EngineScenario.h; the adapter (EngineInternal.h) re-includes it.
 
-// SEH-guarded: place a seat (stool/chair/bench) furniture building 'fwd' metres in
-// front of the local leader (and 'side' metres to its right), facing the leader.
-// Returns true if a seat template was found and createBuilding did not fault.
-// 'spawned' (optional) receives the new object for hand logging.
-bool spawnSeatInFront(GameWorld* gw, float fwd, float side, RootObject** spawned);
-
-// SEH-guarded: spawn a loose world character (player faction, NOT enlisted in the
-// squad, so it travels the host-authoritative NPC path) at 'fwd'/'side' from the
-// leader. Returns the new Character* (or 0).
-Character* spawnNpcInFront(GameWorld* gw, float fwd, float side);
-
-// SEH-guarded: place an OPERABLE work-fixture building (research bench, training
-// dummy, machine...) 'fwd'/'side' from the leader, facing the leader, owned by
-// 'owner' (pass a non-player faction so the fixture is a world-owned station, or 0
-// for unowned). Used by the 'craft' setup scene to bake a save-stable work station
-// both clients resolve. 'spawned' (optional) receives the new object for hand
-// logging. Returns true if a machine template was found and createBuilding did not
-// fault.
-bool spawnMachineInFront(GameWorld* gw, float fwd, float side, Faction* owner,
-                         RootObject** spawned);
-
-// SEH-guarded: issue 'c' a player-style work order/job to perform 'task' (e.g.
-// OPERATE_MACHINERY / USE_TRAINING_DUMMY) AT 'fixture', at the fixture's position.
-// Clears prior goals first. Used by the setup scene to force the host NPC into the
-// work pose so the captured task streams to the join. Returns true if issued.
-bool orderWorkAt(Character* c, RootObject* fixture, int task);
-
-// Find the BAKED bed (kind=1) or prison cage (kind=2) near the leader by
-// scanning loaded BUILDING objects by template name (fixture relocation after
-// a bedcage1 reload; same shape as findWorkFixtureNear).
-RootObject* findFurnitureNear(GameWorld* gw, int kind);
-
-// Order the subject (by hand) to USE the baked bed via the player-order path
-// (USE_BED_ORDER at the bed fixture). Guarded no-op (returns true) when the
-// subject is already on a bed task. orderedTask/useBedTask report the numeric
-// TaskType ids for scenario logging. Host-side scenario scaffold.
-bool orderUseBed(GameWorld* gw, const unsigned int subjHand[5],
-                 int* orderedTask, int* useBedTask);
-
-// 'craft' setup scene (host-side): spawn a save-stable work fixture + a world NPC
-// and force the NPC into the matching work pose (OPERATE_MACHINERY / training), so
-// the host captures the work task and the join reproduces it once the save is
-// baked. All task-enum selection is internal. Returns true if a fixture spawned.
-bool setupCraftScene(GameWorld* gw);
-
-// Craft RE-ARM (host-side): a worker's addGoal intent does NOT serialise, so a baked
-// craft scene reloads with an idle worker. Re-find the baked fixture + nearest
-// non-squad worker by search and re-issue the work goal, so the host resumes
-// streaming the work task. Idempotent (no-ops when the worker is already on task);
-// safe to call once on load and then periodically. Returns true if a goal is active.
-bool rearmCraftScene(GameWorld* gw);
-
-// Stage 2 body-state. knockDown drops a Character into (on=true) / out of (on=false)
-// full-body ragdoll. setupDownScene spawns a non-squad world NPC and ragdolls it (a
-// controllable "down" subject); rearmDownScene re-applies ragdoll to that subject on
-// an interval (a healthy body recovers and stands). Host-only.
+// ---- Down-state drive primitives (SYNC; used by the Replicator down path) ---
+// knockDown drops a Character into (on=true) / out of (on=false) full-body
+// ragdoll - the join calls it to reproduce a host-authoritative down edge.
 bool knockDown(Character* c, bool on);
 // Maintain an already-down body each tick by topping the KO timer (no re-collapse).
 // Prevents the get-up/flop flicker without re-triggering the ragdoll fall. Join-side.
 bool holdDown(Character* c);
-bool setupDownScene(GameWorld* gw);
-// Re-knock every non-squad NPC near the leader so down bodies stay down (a healthy
-// ragdoll recovers; ragdoll does not persist across save/load). Returns count, or -1.
-int  rearmDownScene(GameWorld* gw);
-
-// Phase 3.5 bake: build a SECOND player squad tab (recruit two bodies, separate one
-// into its own player platoon). Gives the bidirectional ownership partition two tabs
-// to split (host owns tab 0, join owns tab 1). Host-only; user SAVEs the result.
-bool setupSquadScene(GameWorld* gw);
-
-// down_order LIVE-transition helpers (Stage 2). pickDownSubject pins the non-squad
-// NPC nearest the leader (its hand, readObjectHand layout); holdSubjectUpright keeps
-// it idle/in-range during the baseline; orderDownSubject knocks THAT subject out at
-// the order point so the join must transition upright -> down.
-bool pickDownSubject(GameWorld* gw, unsigned int subjHand[5]);
-bool holdSubjectUpright(GameWorld* gw, const unsigned int subjHand[5]);
-bool orderDownSubject(GameWorld* gw, const unsigned int subjHand[5]);
-// death_order: KILL the pinned subject (scaffold) so Character::isDead() flips and
-// the host emits a reliable EVT_DEATH. Idempotent; re-assertable on a throttle.
-bool killSubject(GameWorld* gw, const unsigned int subjHand[5]);
-// combat_kill: WEAKEN the subject (lower blood only, never heal/collapse) so an
-// ongoing real melee downs it decisively within the window - the down edge comes from
-// genuine combat, not a scaffold. Returns true if applied. subjHand readObjectHand layout.
-bool woundSubject(GameWorld* gw, const unsigned int subjHand[5], float blood);
 
 // ---- Protocol 21: runtime-spawn proxy replication ---------------------------
 // NPC sync resolves bodies by save-stable hand, so a squad the host's spawn
@@ -848,39 +760,15 @@ int reequipLooseItem(GameWorld* gw, const unsigned int cHand[5],
 int seedEquippedItem(GameWorld* gw, const unsigned int cHand[5],
                      char* outSid, unsigned int outLen, unsigned int* outType);
 
-// DIAGNOSTIC: probe whether the engine factory can instantiate WEAPON base templates at
-// all (createItem returns null for the save weapon even with manufacturer+material). Tries
-// the first `maxTry` weapon templates with no/man/man+mat and logs [wpndiag] success
-// counts. Trials are added to cHand's inventory and immediately destroyed.
-void diagWeaponCreate(GameWorld* gw, const unsigned int cHand[5], int maxTry);
+// Moved to EngineProbe.h (Phase 5a domain split): the spike-451 weapon-mint
+// fabrication probes (diagWeaponCreate, installCreateItemTraceHook,
+// probeReplayWeaponMint, probeFabricateWeaponLoose, commonNovelWeaponSid) and the
+// spike-402 native-snapshot round-trip (probeNativeSnapshot). The probe scenarios
+// (ScenarioSupport.h) include EngineProbe.h; the adapter (EngineInternal.h)
+// re-includes it. The spike-401 research block below STAYS here because three of
+// its entry points are protocol-38 SYNC calls (interleaved sync+probe).
 
-// Spike 451 (weapon fabrication recipe): detour BOTH RootObjectFactory::createItem
-// overloads + copyItem and log every WEAPON-template call the ENGINE itself makes -
-// full args, caller RVA and result ("[mkspy] ..." lines) - so the plugin can mimic
-// the engine's own weapon-mint recipe (our 6-arg call returns null for every weapon
-// template; diagWeaponCreate measured 0/24). The last SUCCESSFUL engine weapon mint's
-// args are captured for probeReplayWeaponMint. Install once (host side).
-bool installCreateItemTraceHook();
-// Replay the last captured engine weapon mint from PLUGIN context: same GameData
-// pointers/level/faction, a fresh blank hand, tryAddItem into cHand's inventory.
-// Returns 1 created+added / 0 nothing captured or create returned null / -1 fault.
-int probeReplayWeaponMint(GameWorld* gw, const unsigned int cHand[5]);
-// Phase-2 persistence check: fabricate ONE weapon LOOSE through the normal wire
-// path (createItemAndAdd, spike-451 recipe, first WEAPON template + fallback
-// manufacturer) into cHand's inventory, writing the template sid to outSid so the
-// caller can equip it later (reequipLooseItem) and re-census for persistence.
-// Returns 1 on success.
-int probeFabricateWeaponLoose(GameWorld* gw, const unsigned int cHand[5],
-                              char* outSid, unsigned int outLen);
-// SEH-guarded (weapon_loot): deterministically pick a NOVEL weapon template - the
-// first WEAPON GameData (enumeration order is gamedata-stable, so both clients pick
-// the same one) that is not FISTS and whose sid is not currently in cHand's
-// container. Fabricating it simulates a mid-session weapon acquisition (loot /
-// vendor buy) of a weapon that exists in NO shared-save inventory. Returns 1 and
-// writes the sid on success.
-int commonNovelWeaponSid(GameWorld* gw, const unsigned int cHand[5],
-                         char* outSid, unsigned int outLen);
-
+// ---- Protocol 38: research / tech-tree sync (+ spike 401 store probes) -------
 // Spike 401 (research tech-tree store): the unlock store is
 // PlayerInterface::technology - a `Research*` with NO KenshiLib header (forward
 // declaration only), the documented "progress store unmapped" gap. The probe
@@ -902,13 +790,14 @@ int probeCurrentResearchSid(char* outSid, unsigned int outLen);
 // Query the live Research store for one RESEARCH GameData by sid, through the
 // engine's own predicates (recovered 1.0.65 RVAs: isKnown 0x82f300, canResearch
 // 0x832fa0 - the exact calls the research UI's click handler makes). Returns
-// 1 ok / 0 unresolvable (no store, sid unknown) / -1 fault.
+// 1 ok / 0 unresolvable (no store, sid unknown) / -1 fault. SYNC (protocol 38).
 int researchQueryBySid(GameWorld* gw, const char* sid, int* outKnown,
                        int* outCan);
 // The engine's own selection lever: Research::startResearch(GameData*)
 // (recovered RVA 0x834550) - what a research-UI click commits after its
 // canResearch/isKnown gauntlet. The CALLER checks those first (this replays
 // the click, not the gauntlet). Returns 1 called / 0 unresolvable / -1 fault.
+// SYNC (protocol 38): the join applies a host-authoritative research start.
 int researchStartBySid(GameWorld* gw, const char* sid);
 // Deterministic subject pick: the FIRST RESEARCH record that is not known and
 // canResearch (gamedata enumeration order is shared, so every client picks the
@@ -920,7 +809,7 @@ unsigned int probeResearchEnum(GameWorld* gw, unsigned int maxLog);
 // Collect the sids of every KNOWN research (Research::isKnown over the shared
 // RESEARCH enumeration) into outSids (each entry sidCap bytes, NUL-terminated).
 // The protocol-38 publish sampler. Returns the number written (<= maxN);
-// 0 also covers store-unresolved/fault.
+// 0 also covers store-unresolved/fault. SYNC (protocol 38).
 unsigned int researchEnumKnown(GameWorld* gw, char* outSids,
                                unsigned int sidCap, unsigned int maxN);
 // Research-bench read beyond ProdRead: techLevel (getTechLevel), the
@@ -928,13 +817,6 @@ unsigned int researchEnumKnown(GameWorld* gw, char* outSids,
 // scalar) and the power bit. Returns 1 ok / 0 not a research bench / -1 fault.
 int probeResearchBenchRead(const unsigned int mHand[5], int* outTech,
                            float* outProg, int* outPower);
-
-// Spike 402: serialize the local leader through Kenshi's native
-// RootObjectContainer -> GameSaveState -> GameDataContainer pipeline into an
-// isolated temporary container, save it as a micro-save, then load it into a
-// second isolated container. Does NOT apply the snapshot to the live object.
-// Returns 1 round-trip ok / 0 unavailable or empty / -1 native save/load failed.
-int probeNativeSnapshot(GameWorld* gw);
 
 // ---- Honest pose oracle (downstream of the actual body, not the task flag) --
 // SEH-guarded: read pose signals that reflect the RENDERED body, so a pose check

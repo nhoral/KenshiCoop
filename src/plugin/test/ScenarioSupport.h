@@ -17,8 +17,11 @@
 #define _CRT_SECURE_NO_WARNINGS 1
 
 #include "Scenario.h"
+#include "ScenarioTimed.h" // Phase 7: shared timed-scenario base (duration/cadence/passed)
 #include "../CoopLog.h"
 #include "../game/Engine.h"
+#include "../game/EngineScenario.h" // Phase 5a: deterministic test-scene builders
+#include "../game/EngineProbe.h"    // Phase 5a: spike-401/451/402 diagnostic probes
 #include "../sync/SaveXfer.h" // save_probe / save_sync (protocol 31)
 
 #include <kenshi/GameWorld.h>

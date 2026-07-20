@@ -34,16 +34,33 @@
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
 #include "game/Engine.h"
+#include "game/EngineUi.h"       // Phase 5a: F2 co-op panel + status overlay
+#include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
-#include "test/Scenario.h"
+#ifdef KENSHICOOP_HARNESS
+#include "test/Scenario.h" // scenario runner: Harness/Debug builds only (Phase 1)
+#endif
 
 namespace {
 
-coop::Config     g_cfg;
-coop::NetLink    g_net;
-coop::Inbound    g_inbound;
-coop::Replicator g_repl;
+// PluginHost (Phase 3): composition root owning the four long-lived subsystem
+// singletons as one cohesive object instead of four loose globals. The g_cfg /
+// g_net / g_inbound / g_repl names remain as references INTO the host so every
+// existing call site is unchanged; later phases thread the host explicitly and
+// fold the session-state globals in behind a SessionController.
+struct PluginHost {
+    coop::Config     cfg;
+    coop::NetLink    net;
+    coop::Inbound    inbound;
+    coop::Replicator repl;
+};
+PluginHost g_host;
+
+coop::Config&     g_cfg     = g_host.cfg;
+coop::NetLink&    g_net     = g_host.net;
+coop::Inbound&    g_inbound = g_host.inbound;
+coop::Replicator& g_repl    = g_host.repl;
 coop::u32        g_tick = 0;
 
 // Last GameWorld seen by the main-loop hook. The F2-panel UI callbacks
@@ -60,20 +77,92 @@ static int coopInvOwnerClass(const unsigned int h[5]) {
     return g_repl.ownerClassForHand(h);
 }
 
-bool  g_gameStarted   = false;
-DWORD g_gameStartTick = 0;
+// SessionController (Phase 3): the mutable per-session lifecycle state that used
+// to live as ~18 loose file globals - peer presence, the gameplay-start edge,
+// the title auto-load gate, and the coordinated save/load (protocol 31/32)
+// coordination counters + latches. Grouping them behind one object makes the
+// session boundary explicit and gives the reset helpers (sessionResetForUi /
+// sessionResetForWorldReload) a single, named place to clear. As with
+// PluginHost, the historical g_* names remain as references INTO the controller
+// so every call site is unchanged (zero churn). C++03: defaults are set in the
+// constructor (no in-class member initializers).
+struct SessionController {
+    bool         gameStarted;      // gameplay has been live at least once
+    DWORD        gameStartTick;    // GetTickCount at the gameplay-start edge
+    bool         autoLoadDone;     // title auto-load fired (settle gate)
+    DWORD        titleFirstTick;   // first title tick (settle gate base)
+    bool         peerPresent;      // a peer is connected right now
+    // Coordinated save (protocol 31).
+    std::string  savePending;      // host: save name awaiting quiescence
+    coop::u32    saveReqId;        // join: monotonic PKT_SAVE_REQ counter
+    // Push-save-on-connect bootstrap (host): when a peer connects the host bakes
+    // a fresh save of its live world and, once the folder quiesces, sends the
+    // join a LOAD_GO for it (not a blind stream) - the join loads it if it has an
+    // identical copy, else NACKs and driveLoadSync's fallback transfer streams
+    // the folder first. Lets a joiner enter the host's world with no pre-shared
+    // save.
+    bool         bootstrapArmed;   // host: a connect-triggered save is baking
+    std::string  bootstrapName;    // host: that save's name (== savePending)
+    // World-swap edge detection (protocol 32): once gameplay has started,
+    // gameplayLive dropping means the engine is swapping worlds (a load); live
+    // again = the reload edge (session-reset point). Sub-second dips are FLICKER
+    // and do NOT count - a real load screen lasts seconds and a spurious reset
+    // would wipe live session state mid-game.
+    DWORD        swapStartTick;    // != 0: gameplay non-live, swap running
+    coop::u32    swapHookTicks;    // mainLoop ticks observed during the swap
+    // Coordinated load (protocol 32).
+    bool         loadSuppressOn;   // join: current suppression lever state
+    coop::u32    loadIdOut;        // host: monotonic LOAD_GO id
+    coop::u32    loadIdSeen;       // join: newest GO loadId handled
+    coop::u32    loadReqId;        // join: monotonic PKT_LOAD_REQ counter
+    std::string  loadXferPending;  // host: save awaiting post-reload transfer (NACK)
+    std::string  loadAfterCommit;  // join: save to load once its transfer commits
+    coop::u32    loadCommitBase;   // join: savexfer::commitSeq() at NACK time
+    // Deferred-signal backstop: SaveManager::load only SETS the LOADGAME signal;
+    // it can sit unconsumed mid-session. Armed on every coordinated load issue;
+    // if the swap hasn't started after the grace window, pump execute() once.
+    DWORD        loadPumpArmTick;  // != 0: backstop armed at this tick
 
-// Auto-load state (title-screen settle gate).
-bool  g_autoLoadDone   = false;
-DWORD g_titleFirstTick = 0;
+    SessionController()
+      : gameStarted(false), gameStartTick(0), autoLoadDone(false),
+        titleFirstTick(0), peerPresent(false),
+        saveReqId(0), bootstrapArmed(false),
+        swapStartTick(0), swapHookTicks(0),
+        loadSuppressOn(false), loadIdOut(0), loadIdSeen(0), loadReqId(0),
+        loadCommitBase(0), loadPumpArmTick(0) {}
+};
+SessionController g_session;
 
-// Scenario harness state.
+bool&        g_gameStarted    = g_session.gameStarted;
+DWORD&       g_gameStartTick   = g_session.gameStartTick;
+bool&        g_autoLoadDone    = g_session.autoLoadDone;
+DWORD&       g_titleFirstTick  = g_session.titleFirstTick;
+bool&        g_peerPresent     = g_session.peerPresent;
+std::string& g_savePending     = g_session.savePending;
+coop::u32&   g_saveReqId       = g_session.saveReqId;
+bool&        g_bootstrapArmed  = g_session.bootstrapArmed;
+std::string& g_bootstrapName   = g_session.bootstrapName;
+DWORD&       g_swapStartTick   = g_session.swapStartTick;
+coop::u32&   g_swapHookTicks   = g_session.swapHookTicks;
+bool&        g_loadSuppressOn  = g_session.loadSuppressOn;
+coop::u32&   g_loadIdOut       = g_session.loadIdOut;
+coop::u32&   g_loadIdSeen      = g_session.loadIdSeen;
+coop::u32&   g_loadReqId       = g_session.loadReqId;
+std::string& g_loadXferPending = g_session.loadXferPending;
+std::string& g_loadAfterCommit = g_session.loadAfterCommit;
+coop::u32&   g_loadCommitBase  = g_session.loadCommitBase;
+DWORD&       g_loadPumpArmTick  = g_session.loadPumpArmTick;
+
+// Scenario harness state. Harness/Debug builds only - the shipped Release DLL
+// excludes test/Scenario*.cpp and does not define KENSHICOOP_HARNESS (Phase 1).
+#ifdef KENSHICOOP_HARNESS
 coop::Scenario* g_scenario        = 0;
 bool            g_scenarioStarted = false;
 DWORD           g_scenarioStartTick = 0;
 unsigned int    g_scenarioTick    = 0;
 DWORD           g_scenarioDoneTick = 0; // !=0 once RESULT logged; begins capture hold
 const DWORD     SCENARIO_HOLD_MS  = 4000; // hold synced state on screen for capture
+#endif
 
 // Test-scene setup (host-only): one-shot world spawn the user then saves.
 bool            g_setupDone     = false;
@@ -82,44 +171,10 @@ DWORD           g_lastCraftRearmTick = 0; // throttle host craft re-arm
 DWORD           g_bakeSaveTick  = 0;     // != 0: auto-bake save armed at this tick
 const DWORD     CRAFT_REARM_MS  = 3000; // re-issue the work goal at most this often
 
-// Coordinated save (protocol 31) state.
-bool         g_peerPresent   = false; // a peer is connected right now
-std::string  g_savePending;           // host: save name awaiting quiescence
-coop::u32    g_saveReqId     = 0;     // join: monotonic PKT_SAVE_REQ counter
-
-// Push-save-on-connect bootstrap (host). When a peer connects the host bakes a
-// fresh save of its live world and, once that folder quiesces, sends the join a
-// LOAD_GO for it (NOT a blind stream): the join loads it if it already has an
-// identical copy, otherwise NACKs and the existing fallback-transfer path (see
-// driveLoadSync) streams the folder before the join loads. This lets a joiner
-// enter the host's world from the main menu with no pre-shared save.
-bool         g_bootstrapArmed = false; // host: a connect-triggered save is baking
-std::string  g_bootstrapName;          // host: that save's name (matches g_savePending)
-
-// Coordinated load (protocol 32) state. World-swap edge detection: after
-// gameplay has started once, gameplayLive dropping means the engine is
-// swapping worlds (a load); live again = the reload edge (session reset
-// point). Sub-second dips are logged as FLICKER and do NOT count - a real
-// load screen lasts seconds, and a spurious reset would wipe live session
-// state mid-game.
-DWORD        g_swapStartTick = 0;     // != 0: gameplay non-live, swap running
-coop::u32    g_swapHookTicks = 0;     // mainLoop ticks observed during the swap
-const DWORD  SWAP_MIN_MS     = 400;   // shorter dips are flicker, not a reload
-
-// Protocol 32 coordination state.
-bool         g_loadSuppressOn   = false; // join: current suppression lever state
-coop::u32    g_loadIdOut        = 0;     // host: monotonic LOAD_GO id
-coop::u32    g_loadIdSeen       = 0;     // join: newest GO loadId handled
-coop::u32    g_loadReqId        = 0;     // join: monotonic PKT_LOAD_REQ counter
-std::string  g_loadXferPending;          // host: save awaiting post-reload transfer (NACK)
-std::string  g_loadAfterCommit;          // join: save to load once its transfer commits
-coop::u32    g_loadCommitBase   = 0;     // join: savexfer::commitSeq() at NACK time
-// Deferred-signal backstop: SaveManager::load only SETS the LOADGAME signal;
-// load_probe run 1 saw it sit unconsumed mid-session (run 2's engine consumed
-// it in ~0.5 s on its own). Arm on every coordinated load issue; if the swap
-// hasn't started after the grace window, pump execute() manually once.
-DWORD        g_loadPumpArmTick  = 0;
-const DWORD  LOAD_PUMP_GRACE_MS = 2000;
+// Session-state timing constants (the mutable coordination state itself now
+// lives in SessionController / g_session above).
+const DWORD  SWAP_MIN_MS        = 400;   // shorter world-swap dips are flicker, not a reload
+const DWORD  LOAD_PUMP_GRACE_MS = 2000;  // deferred-LOADGAME backstop grace window
 
 // Original function pointers, filled by KenshiLib::AddHook.
 void (*g_mainLoop_orig)(GameWorld*, float) = 0;
@@ -151,6 +206,35 @@ void warnIfNoPortraits(const std::string& name) {
                   "(squad avatars will render blank)", name.c_str());
         b[sizeof(b) - 1] = '\0'; coopErr(b);
     }
+}
+
+// SessionController reset primitives (Phase 3). The old world / peer is gone, so
+// both drop the Replicator's session maps and the Inbound world-state queues in
+// a fixed order; centralizing them keeps that order from drifting between the
+// several edges that each need one.
+
+// UI connect/disconnect teardown: the world is live (reconnect/disconnect from
+// within a running game), so despawn our minted NPC + world-item proxies before
+// clearing the maps - else a reconnect leaves orphaned duplicates or bakes them
+// into the next save. Falls back to a plain map reset if no world has ticked yet.
+void sessionResetForUi() {
+    g_peerPresent = false;
+    if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
+    else          g_repl.resetSession();
+    g_inbound.flushWorldState();
+    g_net.bumpSessionEpoch(); // v44: fence off any in-flight prior-session batch
+}
+
+// World-reload session reset (protocol 32): the old world is gone - every
+// pointer cache and session map describes it. Peer presence and the suppression
+// levers survive (the connection never dropped). Both roles run this on their
+// OWN reload edge, and the synchronous-swap backstop reuses it, so the reset
+// order (repl maps, then inbound queues) is defined in exactly one place.
+void sessionResetForWorldReload() {
+    g_repl.resetSession();
+    g_inbound.flushWorldState();
+    g_net.bumpSessionEpoch(); // v44: post-reload batches supersede the old session
+    coopLog("[load] inbound world-state queues flushed");
 }
 
 // Push-save-on-connect (host): bake a fresh save of the live world and arm the
@@ -233,6 +317,48 @@ void processNetEvents(GameWorld* gw) {
     if (!leaves.empty()) {
         g_repl.clearPeerReplicationState(gw);
         g_inbound.flushWorldState();
+    }
+}
+
+// SaveLoadCoordinator receive primitive (protocol 31): the join-side save-
+// transfer receive pump. Drain staged BEGIN/FILE/DONE packets, verify + commit
+// the streamed folder, and ACK the outcome. This identical work is needed on two
+// paths - the normal saveSync receiver half (driveSaveSync) and the saveSync-
+// gated-off fallback transfer (driveLoadSync) - so it lives here once instead of
+// being copy-pasted into both. Emits no log line, so the oracle log contract is
+// unaffected by the extraction.
+void pumpSaveReceive() {
+    std::deque<coop::InboundSaveBegin> begins;
+    g_inbound.drainSaveBegins(begins);
+    for (std::deque<coop::InboundSaveBegin>::iterator it = begins.begin();
+         it != begins.end(); ++it)
+        coop::savexfer::onSaveBegin(it->pkt);
+
+    std::deque<coop::InboundSaveFile> chunks;
+    g_inbound.drainSaveFiles(chunks);
+    for (std::deque<coop::InboundSaveFile>::iterator it = chunks.begin();
+         it != chunks.end(); ++it)
+        coop::savexfer::onSaveFile(it->hdr, it->path.c_str(),
+                                   it->data.empty() ? 0 : &it->data[0]);
+
+    std::deque<coop::InboundSaveDone> dones;
+    g_inbound.drainSaveDones(dones);
+    for (std::deque<coop::InboundSaveDone>::iterator it = dones.begin();
+         it != dones.end(); ++it) {
+        coop::u16 files = 0;
+        unsigned __int64 bytes = 0;
+        int ok = coop::savexfer::onSaveDone(it->hdr,
+                                            it->crcs.empty() ? 0 : &it->crcs[0],
+                                            &files, &bytes);
+        coop::SaveAckPacket ack;
+        memset(&ack, 0, sizeof(ack));
+        ack.type    = (coop::u8)coop::PKT_SAVE_ACK;
+        ack.ownerId = g_net.localId();
+        ack.xferId  = it->hdr.xferId;
+        ack.ok      = ok ? 1 : 0;
+        ack.files   = files;
+        ack.bytes   = bytes;
+        g_net.queueSaveAck(ack);
     }
 }
 
@@ -355,39 +481,8 @@ void driveSaveSync() {
             coop::savexfer::noteAck(it->pkt.xferId, it->pkt.ok ? 1 : 0);
         }
     } else {
-        // Receiver half: stage, verify, commit, acknowledge.
-        std::deque<coop::InboundSaveBegin> begins;
-        g_inbound.drainSaveBegins(begins);
-        for (std::deque<coop::InboundSaveBegin>::iterator it = begins.begin();
-             it != begins.end(); ++it)
-            coop::savexfer::onSaveBegin(it->pkt);
-
-        std::deque<coop::InboundSaveFile> chunks;
-        g_inbound.drainSaveFiles(chunks);
-        for (std::deque<coop::InboundSaveFile>::iterator it = chunks.begin();
-             it != chunks.end(); ++it)
-            coop::savexfer::onSaveFile(it->hdr, it->path.c_str(),
-                                       it->data.empty() ? 0 : &it->data[0]);
-
-        std::deque<coop::InboundSaveDone> dones;
-        g_inbound.drainSaveDones(dones);
-        for (std::deque<coop::InboundSaveDone>::iterator it = dones.begin();
-             it != dones.end(); ++it) {
-            coop::u16 files = 0;
-            unsigned __int64 bytes = 0;
-            int ok = coop::savexfer::onSaveDone(it->hdr,
-                                                it->crcs.empty() ? 0 : &it->crcs[0],
-                                                &files, &bytes);
-            coop::SaveAckPacket ack;
-            memset(&ack, 0, sizeof(ack));
-            ack.type    = (coop::u8)coop::PKT_SAVE_ACK;
-            ack.ownerId = g_net.localId();
-            ack.xferId  = it->hdr.xferId;
-            ack.ok      = ok ? 1 : 0;
-            ack.files   = files;
-            ack.bytes   = bytes;
-            g_net.queueSaveAck(ack);
-        }
+        // Receiver half: stage, verify, commit, acknowledge (shared pump).
+        pumpSaveReceive();
     }
 }
 
@@ -587,38 +682,8 @@ void driveLoadSync(GameWorld* gw) {
         // The transfer's receive half (BEGIN/FILE/DONE -> stage/verify/
         // commit/ACK) normally lives in driveSaveSync; run it here when
         // saveSync is gated off so the fallback transfer still lands.
-        if (!g_cfg.saveSync) {
-            std::deque<coop::InboundSaveBegin> begins;
-            g_inbound.drainSaveBegins(begins);
-            for (std::deque<coop::InboundSaveBegin>::iterator it = begins.begin();
-                 it != begins.end(); ++it)
-                coop::savexfer::onSaveBegin(it->pkt);
-            std::deque<coop::InboundSaveFile> chunks;
-            g_inbound.drainSaveFiles(chunks);
-            for (std::deque<coop::InboundSaveFile>::iterator it = chunks.begin();
-                 it != chunks.end(); ++it)
-                coop::savexfer::onSaveFile(it->hdr, it->path.c_str(),
-                                           it->data.empty() ? 0 : &it->data[0]);
-            std::deque<coop::InboundSaveDone> dones;
-            g_inbound.drainSaveDones(dones);
-            for (std::deque<coop::InboundSaveDone>::iterator it = dones.begin();
-                 it != dones.end(); ++it) {
-                coop::u16 files = 0;
-                unsigned __int64 bytes = 0;
-                int ok = coop::savexfer::onSaveDone(it->hdr,
-                                                    it->crcs.empty() ? 0 : &it->crcs[0],
-                                                    &files, &bytes);
-                coop::SaveAckPacket ack;
-                memset(&ack, 0, sizeof(ack));
-                ack.type    = (coop::u8)coop::PKT_SAVE_ACK;
-                ack.ownerId = g_net.localId();
-                ack.xferId  = it->hdr.xferId;
-                ack.ok      = ok ? 1 : 0;
-                ack.files   = files;
-                ack.bytes   = bytes;
-                g_net.queueSaveAck(ack);
-            }
-        }
+        if (!g_cfg.saveSync)
+            pumpSaveReceive();
 
         // Pending latch: load once the transfer for OUR save committed.
         if (!g_loadAfterCommit.empty() &&
@@ -684,15 +749,19 @@ void coopPanelDrive(GameWorld* gw) {
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
-void mainLoop_hook(GameWorld* gw, float dt) {
-    ++g_tick;
-    g_lastGw = gw; // cache for the argument-less F2 UI callbacks
+// ---------------------------------------------------------------------------
+// TickPipeline stages (Phase 3). mainLoop_hook drives these in a fixed order
+// every frame; each stage was lifted VERBATIM out of the old monolithic hook,
+// so per-tick behavior is unchanged - the hook now reads as an explicit
+// sequence. All stages share the file-static plugin globals (g_cfg, g_repl,
+// g_net, g_inbound, ...) and are defined here, just before the hook that uses
+// them, so no forward declarations are needed.
+// ---------------------------------------------------------------------------
 
-    coopPanelDrive(gw);
-
-    // Protocol 32: world-swap edge detection. Runs FIRST so the reload edge
-    // (and, under load-sync, the session reset) lands before any sync code
-    // touches pointers from the torn-down world this tick.
+// Protocol 32 world-swap edge detection. Runs FIRST so the reload edge (and,
+// under load-sync, the session reset) lands before any sync code touches
+// pointers from the torn-down world this tick.
+void tickWorldSwapEdge(GameWorld* gw) {
     if (g_gameStarted) {
         bool live = coop::engine::gameplayLive(gw);
         if (!live && g_swapStartTick == 0) {
@@ -715,18 +784,528 @@ void mainLoop_hook(GameWorld* gw, float dt) {
                           "[load] WORLD-RELOAD swapMs=%lu hookTicksDuringSwap=%u",
                           (unsigned long)swapMs, (unsigned)g_swapHookTicks);
                 b[sizeof(b) - 1] = '\0'; coopLog(b);
-                // Session reset (protocol 32): the old world is gone - every
-                // pointer cache and session map describes it. Both sides run
-                // this on their OWN reload edge; peer presence and the
-                // suppression levers survive (the connection never dropped).
-                if (g_cfg.loadSync) {
-                    g_repl.resetSession();
-                    g_inbound.flushWorldState();
-                    coopLog("[load] inbound world-state queues flushed");
-                }
+                // Session reset (protocol 32): centralized order (repl maps then
+                // inbound queues). Peer presence + suppression levers survive.
+                if (g_cfg.loadSync)
+                    sessionResetForWorldReload();
             }
         }
     }
+}
+
+// Test-scene setup: host spawns the controlled scene ONCE, a few seconds after
+// gameplay starts, then leaves the game running so the user can arrange the pose
+// (e.g. seat the character) and SAVE. Baking it into a save gives the chair/NPC
+// save-stable hands that resolve on both clients.
+void tickSetupScene(GameWorld* gw) {
+    if (!g_setupDone && !g_cfg.setupScene.empty() && g_cfg.isHost && gw &&
+        g_gameStarted && (GetTickCount() - g_gameStartTick) >= SETUP_DELAY_MS) {
+        g_setupDone = true;
+        if (g_cfg.setupScene == "craft") {
+            // Crafting/gathering (Stage 3a): spawn a work fixture + an NPC and force
+            // the NPC to work it, so the host streams the work task. Both clients
+            // load the baked save, so the fixture has save-stable hands on both.
+            coop::engine::setupCraftScene(gw);
+        } else if (g_cfg.setupScene == "down") {
+            // Body-state (Stage 2) BAKE: spawn a non-squad world NPC and ragdoll it,
+            // so the user can SAVE a 'down1' that both clients then load.
+            coop::engine::setupDownScene(gw);
+        } else if (g_cfg.setupScene == "downhold") {
+            // Body-state VALIDATION: the subject is already baked into the save - do
+            // NOT spawn a duplicate. The periodic re-arm below keeps it down.
+            coopLog("SETUP(downhold): no spawn - re-arm keeps baked down bodies down");
+        } else if (g_cfg.setupScene == "duel") {
+            // Combat (Stage 3c) BAKE: spawn two PEACEFUL non-squad NPCs (same faction)
+            // so the user can SAVE a neutral 'duel1' that both clients load. The fight
+            // is triggered live later (combat_order) so the join sees the transition.
+            bool ok = coop::engine::setupDuelScene(gw);
+            coopLog(ok ? "SETUP(duel): peaceful duelists spawned - SAVE 'duel1' now"
+                       : "SETUP(duel): duelist spawn FAILED");
+        } else if (g_cfg.setupScene == "squad") {
+            // Bidirectional presence (Phase 3.5) BAKE: build a SECOND player squad tab
+            // so host (tab 0) and join (tab 1) each own a tab. User SAVEs e.g. 'squad1'.
+            bool ok = coop::engine::setupSquadScene(gw);
+            coopLog(ok ? "SETUP(squad): second squad tab built - SAVE your two-tab save now"
+                       : "SETUP(squad): squad-tab build FAILED");
+        } else if (g_cfg.setupScene == "bedcage") {
+            // Bed+cage occupancy (protocol 19) BAKE: spawn a bed and a prison
+            // cage near the leader so both clients load save-stable furniture
+            // hands. With KENSHICOOP_BAKESAVE set the save is written
+            // automatically a few seconds later (no manual menu round-trip).
+            bool ok = coop::engine::setupBedCageScene(gw);
+            coopLog(ok ? "SETUP(bedcage): bed + cage spawned - SAVE 'bedcage1' now"
+                       : "SETUP(bedcage): spawn FAILED");
+            if (ok && !g_cfg.bakeSave.empty())
+                g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
+        } else if (g_cfg.setupScene == "pole") {
+            // Prisoner-pole occupancy (protocol 19 kind=4) BAKE: spawn one
+            // standing prisoner POLE in front of the leader so both clients load
+            // a save-stable pole hand. The pole_put controlled test then KOs a PC
+            // and setPrisonMode's it onto the pole (visibly a body ON A POLE, not
+            // in a cage). With KENSHICOOP_BAKESAVE the save writes automatically.
+            bool ok = coop::engine::setupPoleScene(gw);
+            coopLog(ok ? "SETUP(pole): prisoner pole spawned - SAVE 'pole1' now"
+                       : "SETUP(pole): spawn FAILED (no pole template? see candidates)");
+            if (ok && !g_cfg.bakeSave.empty())
+                g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
+        } else if (g_cfg.setupScene == "buffpc") {
+            // Stat buff BAKE (single client): raise EVERY player-squad PC to 120 in
+            // all stats, then leave the game running so the user can SAVE manually
+            // (or auto-bake if KENSHICOOP_BAKESAVE is set). No coop peer required.
+            unsigned int nb = coop::engine::buffAllPlayerStats(gw, 120.0f);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SETUP(buffpc): buffed %u PC(s) to 120 in every stat - SAVE now", nb);
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+            if (nb > 0 && !g_cfg.bakeSave.empty())
+                g_bakeSaveTick = GetTickCount() + 4000; // let the recalc settle
+        } else if (g_cfg.setupScene == "inventory") {
+            // Inventory (Phase 4a) BAKE: spawn a save-stable storage container in front
+            // of the leader + seed it with items so both clients load an identical
+            // container with a resolvable hand. User SAVEs e.g. 'inv1'.
+            unsigned int ch[5] = { 0, 0, 0, 0, 0 };
+            bool ok = coop::engine::setupInventoryScene(gw, ch);
+            if (ok) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                "SETUP(inventory): container hand=%u,%u,%u,%u,%u - SAVE 'inv1' now",
+                ch[0], ch[1], ch[2], ch[3], ch[4]); b[sizeof(b) - 1] = '\0'; coopLog(b); }
+            else coopLog("SETUP(inventory): container prep FAILED");
+        } else {
+            RootObject* seat = 0;
+            bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);
+            if (ok && seat) {
+                unsigned int h[5];
+                if (coop::engine::readObjectHand(seat, h))
+                    { char b[160]; _snprintf(b, sizeof(b)-1,
+                        "SETUP: spawned seat hand=%u,%u,%u,%u,%u",
+                        h[3], h[4], h[0], h[1], h[2]); b[sizeof(b)-1]='\0'; coopLog(b); }
+                else coopLog("SETUP: spawned seat (hand unread)");
+            } else {
+                coopLog("SETUP: seat spawn FAILED (no seat template or createBuilding faulted)");
+            }
+            if (g_cfg.setupScene == "npc") {
+                Character* npc = coop::engine::spawnNpcInFront(gw, 2.5f, 1.0f);
+                coopLog(npc ? "SETUP: spawned world NPC" : "SETUP: NPC spawn FAILED");
+            }
+        }
+        coopLog("SETUP: scene ready - arrange the pose and SAVE the game now");
+    }
+}
+
+// Deferred auto-bake: write the fixture save once the armed settle window
+// elapses. One-shot; the self-exit timer (KENSHICOOP_TEST_SECONDS) then ends
+// the bake run.
+void tickAutoBake() {
+    if (g_bakeSaveTick != 0 && GetTickCount() >= g_bakeSaveTick) {
+        g_bakeSaveTick = 0;
+        bool ok = coop::engine::saveGameAs(g_cfg.bakeSave);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SETUP: auto-bake save '%s' %s",
+                  g_cfg.bakeSave.c_str(), ok ? "ISSUED" : "FAILED");
+        b[sizeof(b) - 1] = '\0'; coopLog(b);
+    }
+}
+
+// Host re-arm + inventory-owner registration. Baked work goals / ragdoll state
+// do not survive save/load and drift over time, so re-issue them on an interval;
+// and (re)resolve the owned container so publishInventories streams its contents.
+void tickHostRearm(GameWorld* gw) {
+    // Craft re-arm (host): a baked work goal does not persist across save/load, and a
+    // world worker's own AI can drift off-station. Re-issue the work goal on an
+    // interval so the host keeps streaming the work task throughout the scene. The
+    // call is throttled and no-ops when the worker is already on task, so it never
+    // thrashes the worker's pathing. Only the 'craft' scene arms this.
+    if (g_cfg.setupScene == "craft" && g_cfg.isHost && gw && g_gameStarted &&
+        (GetTickCount() - g_lastCraftRearmTick) >= CRAFT_REARM_MS) {
+        g_lastCraftRearmTick = GetTickCount();
+        coop::engine::rearmCraftScene(gw);
+    }
+
+    // Down re-arm (host): a healthy ragdolled body recovers and stands back up, and
+    // ragdoll state does not survive save/load. Re-knock the nearby non-squad bodies
+    // on an interval so they stay on the ground throughout the scene. Both the bake
+    // ('down') and the spawn-free validation ('downhold') arm this.
+    if ((g_cfg.setupScene == "down" || g_cfg.setupScene == "downhold") &&
+        g_cfg.isHost && gw && g_gameStarted &&
+        (GetTickCount() - g_lastCraftRearmTick) >= CRAFT_REARM_MS) {
+        g_lastCraftRearmTick = GetTickCount();
+        coop::engine::rearmDownScene(gw);
+    }
+
+    // Inventory owner registration (host, Phase 4a): when inventory sync is active,
+    // (re)resolve the baked storage container nearest the leader (else the leader's own
+    // inventory) and register it as the owned container so publishInventories streams
+    // its contents. Re-resolved on an interval because the container hand only resolves
+    // once the world block has loaded. The join never registers (it reconciles).
+    if (g_cfg.invSync && g_cfg.isHost && gw && g_gameStarted) {
+        static DWORD lastInvReg = 0;
+        if (GetTickCount() - lastInvReg >= (DWORD)CRAFT_REARM_MS) {
+            lastInvReg = GetTickCount();
+            unsigned int ch[5];
+            if (coop::engine::pickInventoryContainer(gw, ch))
+                g_repl.setOwnedContainerHand(ch);
+        }
+    }
+}
+
+// Scenario completion hold (harness): once a verdict is logged, keep driving the
+// synced bodies on screen for the capture window, then self-exit cleanly.
+void tickScenarioHold() {
+#ifdef KENSHICOOP_HARNESS
+    if (g_scenario && g_scenarioDoneTick != 0) {
+        if (GetTickCount() - g_scenarioDoneTick >= SCENARIO_HOLD_MS) {
+            coop::logClose();
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+    }
+#endif
+}
+
+// Phase 6: build the per-tick channel call environment (SyncContext) from the
+// long-lived globals. A cheap POD rebuilt per call, so localId() is read at the
+// same point it always was (byte-identical to the old loose-arg calls).
+static coop::SyncContext replCtx(GameWorld* gw) {
+    coop::SyncContext c;
+    c.gw = gw; c.net = &g_net; c.in = &g_inbound;
+    c.localId = g_net.localId(); c.isHost = g_cfg.isHost;
+    return c;
+}
+
+// Replication publish (pre-engine). BIDIRECTIONAL presence: both clients stream
+// their OWNED squad subset (partitioned by hand-rank) and drive the peer's; the
+// host additionally streams world NPCs. Ingest received targets BEFORE the engine
+// tick so apply targets are current. worldLive is sampled ONCE pre-engine by the
+// caller (see the comment there); every channel is gated by its own Config knob.
+void tickReplicatePublish(GameWorld* gw, bool worldLive) {
+    if (worldLive) {
+        g_repl.ingest(g_inbound);
+        // Phase 4a: drain received container-contents snapshots into the per-container
+        // cache (reconciled after the engine tick by applyInventories).
+        g_repl.ingestInv(g_inbound);
+        // Both clients latch reliable transition events (KO/death/revive) for the bodies
+        // they drive, before apply (a side can emit an event for its own owned body and
+        // the peer that drives that body must honour it).
+        g_repl.applyEvents(gw, g_inbound);
+    }
+    if (worldLive) {
+        g_repl.publishOwned(gw, g_net, g_net.localId());
+        // Both clients stream the contents of every squad member they OWN (host tab 0,
+        // join tab 1) on content-change - bidirectional, disjoint by the same tab
+        // partition as positional sync. Gated on invSync so ordinary co-op sessions add
+        // no inventory traffic; the peer reconciles via applyInventories (skips own).
+        if (g_cfg.invSync)
+            g_repl.publishInventories(gw, g_net, g_net.localId());
+        // Protocol 37: BOTH clients diff every tracked container (own + received)
+        // against its baseline to catch a completed cross-owner UI drag - the one
+        // inventory write the single-writer snapshots cannot represent - and author
+        // a reliable PKT_INV_XFER so the peer relocates its own copy (conservation).
+        // RETIRED by the trade veto (blockXfer): a refused drag can never complete,
+        // so there is nothing to detect/replicate - Config forces xferSync off when
+        // blockXfer is on, making this (and applyTransfers below) a no-op. The
+        // xferLatch_/xferDefer_ reconcile-race machinery then stays dormant (never
+        // populated). KENSHICOOP_BLOCK_XFER=0 restores this replicate-the-trade path.
+        if (g_cfg.xferSync)
+            g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
+        // Phase W1 (bidirectional): BOTH clients stream the free ground items they
+        // author in their interest sphere - owner-scoped netId spaces, peer items
+        // filtered by the proxy echo guard - so a join-side drop of materials/food
+        // finally appears on the host. Proxies reconcile after the engine tick
+        // (applyWorldItems, also both sides now).
+        if (g_cfg.worldSync)
+            g_repl.publishWorldItems(gw, g_net, g_net.localId());
+        // Phase W2: BOTH clients watch their OWNED characters for a WEAPON drop and author a
+        // reliable conservation intent so the peer relocates its own copy of that weapon (a
+        // weapon can't be rebuilt via the W1 proxy path). Bidirectional; gated on worldSync.
+        if (g_cfg.worldSync)
+            g_repl.detectAndPublishWeaponDrops(gw, g_net, g_net.localId());
+        // Phase 2 (player combat + medical): owner-authoritative vitals sync for
+        // player-squad members, both directions. publishMedical streams OUR
+        // members' medical model (change-gated, reliable); applyMedical writes
+        // received snapshots onto the peer copies we drive AND forwards any
+        // local first aid administered on those copies back to their owner;
+        // applyTreatments lands forwarded first aid on the bodies we own.
+        // Ordered after publishOwned (they use the ownHands_ set it refreshes).
+        if (g_cfg.medSync) {
+            g_repl.publishMedical(gw, g_net, g_net.localId());
+            g_repl.applyMedical(gw, g_inbound, g_net, g_net.localId());
+            g_repl.applyTreatments(gw, g_inbound);
+        }
+        // Character stats sync (protocol 17): owner-authoritative CharStats
+        // stream for player-squad members, both directions. publishStats
+        // streams OUR members' stats (change-gated, reliable); applyStats
+        // writes received snapshots onto the peer copies we drive. Ordered
+        // after publishOwned (they use the ownHands_ set it refreshes).
+        if (g_cfg.statsSync) {
+            g_repl.publishStats(gw, g_net, g_net.localId());
+            g_repl.applyStats(gw, g_inbound);
+        }
+        // Per-tab wallet sync (protocol 22): each client streams the money of
+        // the squad tabs it OWNS (change-gated reliable, keyed by tab rank);
+        // received snapshots land on the peer tabs via Ownerships::setMoney.
+        // Ordered after publishOwned (ownership ranks are the partition rule).
+        if (g_cfg.moneySync) {
+            g_repl.publishMoney(replCtx(gw));
+            g_repl.applyMoney(replCtx(gw));
+        }
+        // Recruitment sync (protocol 23): drain the recruit detour's edge queue
+        // into reliable EVT_RECRUIT events (subject = old hand, actor = new
+        // hand) and pin recruited hands to their recruiter's ownership. The
+        // receive half (re-key) lives in applyEvents above. Ordered after
+        // publishOwned so this tick's recruits pin BEFORE next tick's census.
+    if (g_cfg.recruitSync)
+        g_repl.publishRecruits(gw, g_net, g_net.localId());
+
+    // Squad management sync (protocol 35): poll the roster's pointer->hand
+    // baseline (~2 Hz; a squad-tab move re-containers the body but the
+    // Character* survives) and author reliable EVT_SQUAD_MOVE re-key edges,
+    // pinning moved hands to the mover's ownership. The receive half (shared
+    // EVT_RECRUIT re-key path) lives in applyEvents above.
+    if (g_cfg.squadSync)
+        g_repl.publishSquadMoves(gw, g_net, g_net.localId());
+
+    // Change-gated sampled channels (Phase 6c): faction relations (protocol 24),
+    // baked doors (26), placed buildings (27), placed-building doors (28),
+    // production machines (33), and research (38). Each is a self-contained
+    // publish/apply pair sharing the ChangeGate policy + SyncContext; the
+    // channel-descriptor registry inside driveSampledChannels owns their
+    // per-channel enable, direction (symmetric detector vs host-authoritative),
+    // and cadence order, so adding a sampled channel is one table row there -
+    // not an edit to this tick. Ordered after recruit/squad (ownership pins)
+    // and before stealth/speed/time, exactly as the explicit blocks were.
+    g_repl.driveSampledChannels(replCtx(gw));
+        // Stealth sync (protocol 20): the HOST is the world-detection authority
+        // - it streams each DRIVEN sneaker's whoSeesMeSneaking back to the
+        // sneaker's owner; every client replays received snapshots onto the
+        // bodies it OWNS (the indicators render on the owner's screen). The
+        // posture half lives inside applyTargets (continuous BODY_SNEAK apply).
+        if (g_cfg.stealthSync) {
+            if (g_cfg.isHost)
+                g_repl.publishStealth(gw, g_net, g_net.localId());
+            g_repl.applyStealthFeedback(gw, g_inbound);
+        }
+        // Consensus game-speed sync: detect local speed clicks as REQUESTS,
+        // host arbitrates effective = min(requests) (capped at 1x while either
+        // player squad fights) and broadcasts; the join applies the SET. Runs
+        // after publishOwned (the combat flag samples the ownHands_ set).
+        if (g_cfg.speedSync)
+            g_repl.syncSpeed(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+        // Phase 6 (6a evidence spike): env-gated ([shackledbg]) per-character
+        // shackle/lock trace. No-op unless KENSHICOOP_DEBUG_SHACKLE=1, so it is
+        // free to leave in the tick for manual-session characterization.
+        coop::engine::shackleDbgTick(gw, g_cfg.isHost);
+        // Game-clock sync (protocol 25): the host broadcasts its absolute
+        // in-game clock ~1 Hz; the join measures the offset and SLEWS - a
+        // multiplier the speed layer's quiet writes fold in on top of the
+        // arbitrated consensus effective. AFTER syncSpeed so a slew change
+        // applies against this tick's consensus state.
+        if (g_cfg.timeSync)
+            g_repl.syncTime(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+        // Runtime-spawn proxy replication (protocol 21): the join asks about
+        // streamed hands it couldn't resolve last tick (host RUNTIME spawns)
+        // and mints local proxy bodies from the host's replies; the host
+        // answers requests. BEFORE the engine tick so a proxy bound this
+        // frame is driven by this frame's applyTargets.
+        if (g_cfg.spawnSync)
+            g_repl.syncSpawns(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+    }
+}
+
+// Coordinated save + load (protocols 31/32) run under g_gameStarted, NOT
+// worldLive: they must keep pumping DURING a world swap (the join drains the
+// host's LOAD_GO and issues its own load; the host's fallback transfer and the
+// deferred-signal state advance) and they only touch net packets, file IO and
+// the load/save ENTRY points - never a cached world pointer the swap invalidates.
+void tickCoordinatedSaveLoad(GameWorld* gw) {
+    if (g_gameStarted) {
+        // Coordinated save + session resume (protocol 31): host-arbitrated
+        // save edges, folder-quiescence completion, paced in-band folder
+        // transfer, staged+verified commit on the join.
+        if (g_cfg.saveSync)
+            driveSaveSync();
+        // Coordinated load (protocol 32): host-arbitrated load edges,
+        // fingerprint-verified join follow, SaveXfer fallback on divergence.
+        if (g_cfg.loadSync)
+            driveLoadSync(gw);
+    }
+}
+
+// Scenario onStart (harness) fires once, BEFORE the engine tick, so a host-issued
+// move order takes effect this frame.
+//
+// PEER-READY ARMING: the scenario clock does NOT start at gameplay start - it
+// starts when this client first receives a peer's owned-entity batch
+// (Inbound::sawRemoteEntity). On the HOST that flips true exactly when the JOIN
+// is loaded + streaming, so every scripted host action (orders, kills, item adds
+// - all timed off ctx.elapsedMs) happens with the join watching, instead of
+// racing its load screen. On the JOIN the host's stream is already arriving by
+// the time it reaches gameplay, so it arms ~immediately - which also aligns both
+// clients' scenario clocks to roughly the same wall moment. Fallback: arm anyway
+// after scenarioArmTimeoutMs of gameplay (peer never connected / host-only
+// diagnostics); 0 = arm immediately (spike runs).
+void tickScenarioStart(GameWorld* gw) {
+#ifdef KENSHICOOP_HARNESS
+    if (g_scenario && g_gameStarted && gw && !g_scenarioStarted) {
+        bool  peerReady = g_inbound.sawRemoteEntity();
+        DWORD waitedMs  = GetTickCount() - g_gameStartTick;
+        bool  fallback  = (g_cfg.scenarioArmTimeoutMs == 0) ||
+                          (waitedMs >= (DWORD)g_cfg.scenarioArmTimeoutMs);
+        // Pre-arm phase: every tick until arming, let the scenario pin/hold its
+        // subjects while the freshly-loaded world is still in its baked pose
+        // (waiting a join-load before pinning loses wandering NPCs).
+        {
+            coop::ScenarioContext pctx;
+            pctx.gw = gw; pctx.isHost = g_cfg.isHost; pctx.localId = g_net.localId();
+            pctx.elapsedMs = waitedMs; pctx.tick = g_scenarioTick;
+            pctx.peerReady = peerReady;
+            g_scenario->onGameplay(pctx);
+        }
+        if (peerReady || fallback) {
+            g_scenarioStarted   = true;
+            g_scenarioStartTick = GetTickCount();
+            coop::ScenarioContext ctx;
+            ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
+            ctx.elapsedMs = 0; ctx.tick = g_scenarioTick;
+            ctx.peerReady = peerReady;
+            char m[200];
+            _snprintf(m, sizeof(m) - 1, "SCENARIO arm trigger=%s waitedMs=%lu",
+                      peerReady ? "peer-ready" : "timeout", (unsigned long)waitedMs);
+            m[sizeof(m) - 1] = '\0';
+            coopLog(m);
+            _snprintf(m, sizeof(m) - 1, "SCENARIO %s start", g_scenario->name());
+            m[sizeof(m) - 1] = '\0';
+            coopLog(m);
+            g_scenario->onStart(ctx);
+        }
+    }
+#endif // KENSHICOOP_HARNESS
+}
+
+// Replication apply (post-engine) so our transform is the last word the renderer
+// samples (the local AI re-decides at the start of the next tick). Both clients
+// drive the PEER's owned bodies; applyTargets skips our OWN owned hands. Re-sample
+// live: the engine tick may have STARTED a swap (gameplay just went non-live), in
+// which case the caches are now stale - skip apply this tick too (the reset runs
+// next tick's top on the reload edge).
+void tickReplicateApply(GameWorld* gw, bool worldLive) {
+    if (worldLive && coop::engine::gameplayLive(gw)) {
+        g_repl.applyTargets(gw);
+        // Phase W2: relocate our own copy of any DROPPED weapon to the ground BEFORE the
+        // inventory reconcile runs, so the conservation move beats the (debounced) removal
+        // reconcile that would otherwise DESTROY the weapon we cannot refabricate.
+        if (g_cfg.worldSync) {
+            g_repl.applyWeaponDrops(gw, g_inbound);
+            // Phase W3: re-home tracked ground copies into the picking character's bag, also
+            // before the inventory reconcile (which can't refabricate a weapon into the proxy).
+            g_repl.applyWeaponPickups(gw, g_inbound);
+        }
+        // Protocol 37: relocate our copy of any cross-owner TRADED item between the
+        // two containers BEFORE the inventory reconcile, so the conservation move
+        // beats the stale-snapshot dupe/wipe (and traded gear survives - no
+        // fabrication on this path).
+        if (g_cfg.xferSync)
+            g_repl.applyTransfers(gw, g_inbound, g_net.localId());
+        // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
+        // for (the join applies the host's container; the host skips its own).
+        g_repl.applyInventories(gw);
+        // Phase W1 (bidirectional): BOTH clients spawn/update/cull local proxies for
+        // the peer's streamed ground items, keyed (ownerId, netId) so the per-sender
+        // netId spaces never collide.
+        if (g_cfg.worldSync)
+            g_repl.applyWorldItems(gw, g_inbound);
+        // Host-authoritative world: only the JOIN hides/freezes any local NPC the
+        // host isn't streaming (so the join can't run a divergent copy). The host IS
+        // the world authority, so it never suppresses.
+        // NPC existence census (protocol 36): the host broadcasts its 1 Hz
+        // wide-radius hand list; the join drains it and lets the wide-radius
+        // pass in enforceHostAuthority cull local-only ghosts at render range.
+        if (!g_cfg.isHost) {
+            g_repl.applyNpcCensus(g_inbound);
+            g_repl.enforceHostAuthority(gw);
+        } else {
+            g_repl.publishNpcCensus(gw, g_net, g_net.localId());
+        }
+        // Camera-anchored interest (protocol 43): both sides publish their
+        // LOCAL camera to the engine's anchor store; the join additionally
+        // ships its center to the host at ~1 Hz, and the host folds a fresh
+        // peer hint into interestCenters. Runs even with CAM_INTEREST off
+        // (the engine-side knob makes interestCenters ignore the anchors)
+        // so an A/B toggle needs no session restart logic.
+        g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+    }
+}
+
+// Coordinated load (protocol 32): deferred-signal backstop. The engine usually
+// consumes the LOADGAME signal on its own within ~0.5 s (load_probe run 2), but
+// run 1 saw it sit forever - if the swap hasn't begun after the grace window,
+// pump SaveManager::execute() once from this end-of-tick context (the engine tick
+// above is done with the world).
+void tickLoadPumpBackstop(GameWorld* gw) {
+    if (g_loadPumpArmTick != 0 && g_cfg.loadSync) {
+        if (g_swapStartTick != 0) {
+            g_loadPumpArmTick = 0; // the swap started on its own
+        } else if (GetTickCount() - g_loadPumpArmTick >= LOAD_PUMP_GRACE_MS) {
+            g_loadPumpArmTick = 0;
+            int delay = -1;
+            int sig = coop::engine::saveMgrSignal(&delay);
+            if (sig == 2 /*LOADGAME*/) {
+                bool ok = coop::engine::saveMgrExecute();
+                int sigAfter = coop::engine::saveMgrSignal(0);
+                char b[144];
+                _snprintf(b, sizeof(b) - 1,
+                          "[load] EXEC pumped (deferred LOADGAME stalled) ok=%d sigAfter=%d",
+                          ok ? 1 : 0, sigAfter);
+                b[sizeof(b) - 1] = '\0'; coopLog(b);
+                // If execute() swapped the world SYNCHRONOUSLY (signal consumed
+                // and we're still live), the reload-edge detector never saw a
+                // non-live frame, so it won't run the session reset - force it
+                // here. The caches from the OLD world are dangling right now.
+                if (ok && sigAfter != 2 && g_swapStartTick == 0 &&
+                    coop::engine::gameplayLive(gw)) {
+                    coopLog("[load] synchronous execute swap - forcing session reset");
+                    sessionResetForWorldReload();
+                }
+            }
+        }
+    } else if (g_loadPumpArmTick != 0) {
+        g_loadPumpArmTick = 0;
+    }
+}
+
+// Scenario onTick (harness) AFTER apply, so a join's RECV line reflects the
+// applied pos; on completion it emits the smoothness summary + verdict and begins
+// the capture hold.
+void tickScenarioTick(GameWorld* gw) {
+#ifdef KENSHICOOP_HARNESS
+    if (g_scenario && g_gameStarted && gw && g_scenarioStarted && g_scenarioDoneTick == 0) {
+        coop::ScenarioContext ctx;
+        ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
+        ctx.elapsedMs = GetTickCount() - g_scenarioStartTick;
+        ctx.tick = ++g_scenarioTick;
+        ctx.peerReady = g_inbound.sawRemoteEntity();
+        if (g_scenario->onTick(ctx)) {
+            // Stage 2: the receiver emits its interpolation smoothness summary
+            // alongside the verdict so the runner can assert per-frame gliding.
+            if (!g_cfg.isHost) g_repl.logSmoothSummary();
+            bool ok = g_scenario->passed();
+            char m[48];
+            _snprintf(m, sizeof(m) - 1, "SCENARIO RESULT %s", ok ? "PASS" : "FAIL");
+            m[sizeof(m) - 1] = '\0';
+            coopLog(m);
+            g_scenarioDoneTick = GetTickCount(); // begin the capture hold
+        }
+    }
+#endif // KENSHICOOP_HARNESS
+}
+
+void mainLoop_hook(GameWorld* gw, float dt) {
+    ++g_tick;
+    g_lastGw = gw; // cache for the argument-less F2 UI callbacks
+
+    coopPanelDrive(gw);
+
+    // Protocol 32 world-swap edge detection + session reset. Runs FIRST so the
+    // reload edge lands before any sync code touches pointers from the torn-down
+    // world this tick.
+    tickWorldSwapEdge(gw);
 
     if (!g_gameStarted && coop::engine::gameplayLive(gw)) {
         g_gameStarted   = true;
@@ -824,159 +1403,22 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         }
     }
 
-    // Test-scene setup: host spawns the controlled scene ONCE, a few seconds after
-    // gameplay starts, then leaves the game running so the user can arrange the
-    // pose (e.g. seat the character) and SAVE. Baking it into a save gives the
-    // chair/NPC save-stable hands that resolve on both clients.
-    if (!g_setupDone && !g_cfg.setupScene.empty() && g_cfg.isHost && gw &&
-        g_gameStarted && (GetTickCount() - g_gameStartTick) >= SETUP_DELAY_MS) {
-        g_setupDone = true;
-        if (g_cfg.setupScene == "craft") {
-            // Crafting/gathering (Stage 3a): spawn a work fixture + an NPC and force
-            // the NPC to work it, so the host streams the work task. Both clients
-            // load the baked save, so the fixture has save-stable hands on both.
-            coop::engine::setupCraftScene(gw);
-        } else if (g_cfg.setupScene == "down") {
-            // Body-state (Stage 2) BAKE: spawn a non-squad world NPC and ragdoll it,
-            // so the user can SAVE a 'down1' that both clients then load.
-            coop::engine::setupDownScene(gw);
-        } else if (g_cfg.setupScene == "downhold") {
-            // Body-state VALIDATION: the subject is already baked into the save - do
-            // NOT spawn a duplicate. The periodic re-arm below keeps it down.
-            coopLog("SETUP(downhold): no spawn - re-arm keeps baked down bodies down");
-        } else if (g_cfg.setupScene == "duel") {
-            // Combat (Stage 3c) BAKE: spawn two PEACEFUL non-squad NPCs (same faction)
-            // so the user can SAVE a neutral 'duel1' that both clients load. The fight
-            // is triggered live later (combat_order) so the join sees the transition.
-            bool ok = coop::engine::setupDuelScene(gw);
-            coopLog(ok ? "SETUP(duel): peaceful duelists spawned - SAVE 'duel1' now"
-                       : "SETUP(duel): duelist spawn FAILED");
-        } else if (g_cfg.setupScene == "squad") {
-            // Bidirectional presence (Phase 3.5) BAKE: build a SECOND player squad tab
-            // so host (tab 0) and join (tab 1) each own a tab. User SAVEs e.g. 'squad1'.
-            bool ok = coop::engine::setupSquadScene(gw);
-            coopLog(ok ? "SETUP(squad): second squad tab built - SAVE your two-tab save now"
-                       : "SETUP(squad): squad-tab build FAILED");
-        } else if (g_cfg.setupScene == "bedcage") {
-            // Bed+cage occupancy (protocol 19) BAKE: spawn a bed and a prison
-            // cage near the leader so both clients load save-stable furniture
-            // hands. With KENSHICOOP_BAKESAVE set the save is written
-            // automatically a few seconds later (no manual menu round-trip).
-            bool ok = coop::engine::setupBedCageScene(gw);
-            coopLog(ok ? "SETUP(bedcage): bed + cage spawned - SAVE 'bedcage1' now"
-                       : "SETUP(bedcage): spawn FAILED");
-            if (ok && !g_cfg.bakeSave.empty())
-                g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
-        } else if (g_cfg.setupScene == "pole") {
-            // Prisoner-pole occupancy (protocol 19 kind=4) BAKE: spawn one
-            // standing prisoner POLE in front of the leader so both clients load
-            // a save-stable pole hand. The pole_put controlled test then KOs a PC
-            // and setPrisonMode's it onto the pole (visibly a body ON A POLE, not
-            // in a cage). With KENSHICOOP_BAKESAVE the save writes automatically.
-            bool ok = coop::engine::setupPoleScene(gw);
-            coopLog(ok ? "SETUP(pole): prisoner pole spawned - SAVE 'pole1' now"
-                       : "SETUP(pole): spawn FAILED (no pole template? see candidates)");
-            if (ok && !g_cfg.bakeSave.empty())
-                g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
-        } else if (g_cfg.setupScene == "buffpc") {
-            // Stat buff BAKE (single client): raise EVERY player-squad PC to 120 in
-            // all stats, then leave the game running so the user can SAVE manually
-            // (or auto-bake if KENSHICOOP_BAKESAVE is set). No coop peer required.
-            unsigned int nb = coop::engine::buffAllPlayerStats(gw, 120.0f);
-            char b[128];
-            _snprintf(b, sizeof(b) - 1,
-                      "SETUP(buffpc): buffed %u PC(s) to 120 in every stat - SAVE now", nb);
-            b[sizeof(b) - 1] = '\0'; coopLog(b);
-            if (nb > 0 && !g_cfg.bakeSave.empty())
-                g_bakeSaveTick = GetTickCount() + 4000; // let the recalc settle
-        } else if (g_cfg.setupScene == "inventory") {
-            // Inventory (Phase 4a) BAKE: spawn a save-stable storage container in front
-            // of the leader + seed it with items so both clients load an identical
-            // container with a resolvable hand. User SAVEs e.g. 'inv1'.
-            unsigned int ch[5] = { 0, 0, 0, 0, 0 };
-            bool ok = coop::engine::setupInventoryScene(gw, ch);
-            if (ok) { char b[160]; _snprintf(b, sizeof(b) - 1,
-                "SETUP(inventory): container hand=%u,%u,%u,%u,%u - SAVE 'inv1' now",
-                ch[0], ch[1], ch[2], ch[3], ch[4]); b[sizeof(b) - 1] = '\0'; coopLog(b); }
-            else coopLog("SETUP(inventory): container prep FAILED");
-        } else {
-            RootObject* seat = 0;
-            bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);
-            if (ok && seat) {
-                unsigned int h[5];
-                if (coop::engine::readObjectHand(seat, h))
-                    { char b[160]; _snprintf(b, sizeof(b)-1,
-                        "SETUP: spawned seat hand=%u,%u,%u,%u,%u",
-                        h[3], h[4], h[0], h[1], h[2]); b[sizeof(b)-1]='\0'; coopLog(b); }
-                else coopLog("SETUP: spawned seat (hand unread)");
-            } else {
-                coopLog("SETUP: seat spawn FAILED (no seat template or createBuilding faulted)");
-            }
-            if (g_cfg.setupScene == "npc") {
-                Character* npc = coop::engine::spawnNpcInFront(gw, 2.5f, 1.0f);
-                coopLog(npc ? "SETUP: spawned world NPC" : "SETUP: NPC spawn FAILED");
-            }
-        }
-        coopLog("SETUP: scene ready - arrange the pose and SAVE the game now");
-    }
+    // Test-scene setup: host spawns the controlled scene ONCE, a few seconds
+    // after gameplay starts, then leaves the game running so the user can arrange
+    // the pose and SAVE (baking save-stable hands that resolve on both clients).
+    tickSetupScene(gw);
 
     // Deferred auto-bake: write the fixture save once the armed settle window
-    // elapses. One-shot; the self-exit timer (KENSHICOOP_TEST_SECONDS) then
-    // ends the bake run.
-    if (g_bakeSaveTick != 0 && GetTickCount() >= g_bakeSaveTick) {
-        g_bakeSaveTick = 0;
-        bool ok = coop::engine::saveGameAs(g_cfg.bakeSave);
-        char b[128];
-        _snprintf(b, sizeof(b) - 1, "SETUP: auto-bake save '%s' %s",
-                  g_cfg.bakeSave.c_str(), ok ? "ISSUED" : "FAILED");
-        b[sizeof(b) - 1] = '\0'; coopLog(b);
-    }
+    // elapses (one-shot); the self-exit timer then ends the bake run.
+    tickAutoBake();
 
-    // Craft re-arm (host): a baked work goal does not persist across save/load, and a
-    // world worker's own AI can drift off-station. Re-issue the work goal on an
-    // interval so the host keeps streaming the work task throughout the scene. The
-    // call is throttled and no-ops when the worker is already on task, so it never
-    // thrashes the worker's pathing. Only the 'craft' scene arms this.
-    if (g_cfg.setupScene == "craft" && g_cfg.isHost && gw && g_gameStarted &&
-        (GetTickCount() - g_lastCraftRearmTick) >= CRAFT_REARM_MS) {
-        g_lastCraftRearmTick = GetTickCount();
-        coop::engine::rearmCraftScene(gw);
-    }
-
-    // Down re-arm (host): a healthy ragdolled body recovers and stands back up, and
-    // ragdoll state does not survive save/load. Re-knock the nearby non-squad bodies
-    // on an interval so they stay on the ground throughout the scene. Both the bake
-    // ('down') and the spawn-free validation ('downhold') arm this.
-    if ((g_cfg.setupScene == "down" || g_cfg.setupScene == "downhold") &&
-        g_cfg.isHost && gw && g_gameStarted &&
-        (GetTickCount() - g_lastCraftRearmTick) >= CRAFT_REARM_MS) {
-        g_lastCraftRearmTick = GetTickCount();
-        coop::engine::rearmDownScene(gw);
-    }
-
-    // Inventory owner registration (host, Phase 4a): when inventory sync is active,
-    // (re)resolve the baked storage container nearest the leader (else the leader's own
-    // inventory) and register it as the owned container so publishInventories streams
-    // its contents. Re-resolved on an interval because the container hand only resolves
-    // once the world block has loaded. The join never registers (it reconciles).
-    if (g_cfg.invSync && g_cfg.isHost && gw && g_gameStarted) {
-        static DWORD lastInvReg = 0;
-        if (GetTickCount() - lastInvReg >= (DWORD)CRAFT_REARM_MS) {
-            lastInvReg = GetTickCount();
-            unsigned int ch[5];
-            if (coop::engine::pickInventoryContainer(gw, ch))
-                g_repl.setOwnedContainerHand(ch);
-        }
-    }
+    // Host re-arm + inventory-owner registration: keep craft/down scenes on task
+    // across save/load drift and (re)resolve the owned container for invSync.
+    tickHostRearm(gw);
 
     // Scenario completion hold: once a verdict is logged, keep driving the synced
-    // bodies on screen for the capture window, then self-exit cleanly.
-    if (g_scenario && g_scenarioDoneTick != 0) {
-        if (GetTickCount() - g_scenarioDoneTick >= SCENARIO_HOLD_MS) {
-            coop::logClose();
-            TerminateProcess(GetCurrentProcess(), 0);
-        }
-    }
+    // bodies on screen for the capture window, then self-exit cleanly. (harness)
+    tickScenarioHold();
 
     // Coordinated load (protocol 32): while a world swap is in progress the
     // OLD world is being torn down under us - every cached Character*/
@@ -993,364 +1435,33 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // packets + file IO + loadSave, never cached world pointers.
     const bool worldLive = g_gameStarted && coop::engine::gameplayLive(gw);
 
-    // --- Replication: BIDIRECTIONAL presence. Both clients stream their OWNED squad
-    // subset (partitioned by hand-rank) and drive the peer's; the host additionally
-    // streams world NPCs. Ingest received targets BEFORE the engine tick so apply
-    // targets are current.
-    if (worldLive) {
-        g_repl.ingest(g_inbound);
-        // Phase 4a: drain received container-contents snapshots into the per-container
-        // cache (reconciled after the engine tick by applyInventories).
-        g_repl.ingestInv(g_inbound);
-        // Both clients latch reliable transition events (KO/death/revive) for the bodies
-        // they drive, before apply (a side can emit an event for its own owned body and
-        // the peer that drives that body must honour it).
-        g_repl.applyEvents(gw, g_inbound);
-    }
-    if (worldLive) {
-        g_repl.publishOwned(gw, g_net, g_net.localId());
-        // Both clients stream the contents of every squad member they OWN (host tab 0,
-        // join tab 1) on content-change - bidirectional, disjoint by the same tab
-        // partition as positional sync. Gated on invSync so ordinary co-op sessions add
-        // no inventory traffic; the peer reconciles via applyInventories (skips own).
-        if (g_cfg.invSync)
-            g_repl.publishInventories(gw, g_net, g_net.localId());
-        // Protocol 37: BOTH clients diff every tracked container (own + received)
-        // against its baseline to catch a completed cross-owner UI drag - the one
-        // inventory write the single-writer snapshots cannot represent - and author
-        // a reliable PKT_INV_XFER so the peer relocates its own copy (conservation).
-        // RETIRED by the trade veto (blockXfer): a refused drag can never complete,
-        // so there is nothing to detect/replicate - Config forces xferSync off when
-        // blockXfer is on, making this (and applyTransfers below) a no-op. The
-        // xferLatch_/xferDefer_ reconcile-race machinery then stays dormant (never
-        // populated). KENSHICOOP_BLOCK_XFER=0 restores this replicate-the-trade path.
-        if (g_cfg.xferSync)
-            g_repl.detectAndPublishTransfers(gw, g_net, g_net.localId());
-        // Phase W1 (bidirectional): BOTH clients stream the free ground items they
-        // author in their interest sphere - owner-scoped netId spaces, peer items
-        // filtered by the proxy echo guard - so a join-side drop of materials/food
-        // finally appears on the host. Proxies reconcile after the engine tick
-        // (applyWorldItems, also both sides now).
-        if (g_cfg.worldSync)
-            g_repl.publishWorldItems(gw, g_net, g_net.localId());
-        // Phase W2: BOTH clients watch their OWNED characters for a WEAPON drop and author a
-        // reliable conservation intent so the peer relocates its own copy of that weapon (a
-        // weapon can't be rebuilt via the W1 proxy path). Bidirectional; gated on worldSync.
-        if (g_cfg.worldSync)
-            g_repl.detectAndPublishWeaponDrops(gw, g_net, g_net.localId());
-        // Phase 2 (player combat + medical): owner-authoritative vitals sync for
-        // player-squad members, both directions. publishMedical streams OUR
-        // members' medical model (change-gated, reliable); applyMedical writes
-        // received snapshots onto the peer copies we drive AND forwards any
-        // local first aid administered on those copies back to their owner;
-        // applyTreatments lands forwarded first aid on the bodies we own.
-        // Ordered after publishOwned (they use the ownHands_ set it refreshes).
-        if (g_cfg.medSync) {
-            g_repl.publishMedical(gw, g_net, g_net.localId());
-            g_repl.applyMedical(gw, g_inbound, g_net, g_net.localId());
-            g_repl.applyTreatments(gw, g_inbound);
-        }
-        // Character stats sync (protocol 17): owner-authoritative CharStats
-        // stream for player-squad members, both directions. publishStats
-        // streams OUR members' stats (change-gated, reliable); applyStats
-        // writes received snapshots onto the peer copies we drive. Ordered
-        // after publishOwned (they use the ownHands_ set it refreshes).
-        if (g_cfg.statsSync) {
-            g_repl.publishStats(gw, g_net, g_net.localId());
-            g_repl.applyStats(gw, g_inbound);
-        }
-        // Per-tab wallet sync (protocol 22): each client streams the money of
-        // the squad tabs it OWNS (change-gated reliable, keyed by tab rank);
-        // received snapshots land on the peer tabs via Ownerships::setMoney.
-        // Ordered after publishOwned (ownership ranks are the partition rule).
-        if (g_cfg.moneySync) {
-            g_repl.publishMoney(gw, g_net, g_net.localId());
-            g_repl.applyMoney(gw, g_inbound);
-        }
-        // Recruitment sync (protocol 23): drain the recruit detour's edge queue
-        // into reliable EVT_RECRUIT events (subject = old hand, actor = new
-        // hand) and pin recruited hands to their recruiter's ownership. The
-        // receive half (re-key) lives in applyEvents above. Ordered after
-        // publishOwned so this tick's recruits pin BEFORE next tick's census.
-    if (g_cfg.recruitSync)
-        g_repl.publishRecruits(gw, g_net, g_net.localId());
+    // Replication publish (pre-engine, worldLive-gated): ingest received targets,
+    // then stream every owned channel so applied state is current this tick.
+    tickReplicatePublish(gw, worldLive);
 
-    // Squad management sync (protocol 35): poll the roster's pointer->hand
-    // baseline (~2 Hz; a squad-tab move re-containers the body but the
-    // Character* survives) and author reliable EVT_SQUAD_MOVE re-key edges,
-    // pinning moved hands to the mover's ownership. The receive half (shared
-    // EVT_RECRUIT re-key path) lives in applyEvents above.
-    if (g_cfg.squadSync)
-        g_repl.publishSquadMoves(gw, g_net, g_net.localId());
+    // Coordinated save + load (protocols 31/32): run under g_gameStarted (NOT
+    // worldLive) so they keep pumping DURING a world swap - they only touch net
+    // packets, file IO and the load/save ENTRY points, never a cached world ptr.
+    tickCoordinatedSaveLoad(gw);
 
-    // Faction-relation sync (protocol 24): stream player-faction relation rows
-    // that moved locally (change-gated reliable, sampled ~1 Hz or immediately
-    // on a detoured affectRelations mutation) and apply received rows onto
-    // both local table directions. Both clients run the same detector; the
-    // applied-row baseline update keeps the channel echo-free.
-    if (g_cfg.factionSync) {
-        g_repl.publishFactions(gw, g_net, g_net.localId());
-        g_repl.applyFactions(gw, g_inbound);
-    }
-    // Door-state sync (protocol 26): stream baked-door rows whose (open,
-    // locked) moved locally (change-gated reliable, ~1 Hz sample) and apply
-    // received rows through the engine's own door actions. Both clients run
-    // the same detector; the applied-row baseline update keeps it echo-free.
-    if (g_cfg.doorSync) {
-        g_repl.publishDoors(gw, g_net, g_net.localId());
-        g_repl.applyDoors(gw, g_inbound);
-    }
-    // Placed-building sync (protocol 27): announce local placements (UI
-    // detour edges + programmatic scenario places) as describe/mint keys,
-    // stream change-gated construction-progress rows for buildings WE placed,
-    // and mint + progress-apply the peer's. Placer-authoritative; a mint
-    // never re-announces (echo-free by construction).
-    if (g_cfg.buildSync) {
-        g_repl.publishBuilds(gw, g_net, g_net.localId());
-        g_repl.applyBuilds(gw, g_inbound);
-    }
-    // Placed-building doors (protocol 28): sample the session build maps'
-    // doors and stream change-gated rows on the translated (placer key +
-    // door index) identity; apply received rows through the same maps. The
-    // removal half lives inside publishBuilds/applyBuilds (it shares the
-    // build-edge drain); everything is gated by KENSHICOOP_BDOOR_SYNC.
-    if (g_cfg.buildSync && g_cfg.bdoorSync) {
-        g_repl.publishBuildDoors(gw, g_net, g_net.localId());
-        g_repl.applyBuildDoors(gw, g_inbound);
-    }
-    // Production machine sync (protocol 33): the HOST is the machine
-    // authority - it samples machine-class buildings in the interest
-    // spheres (~1 Hz) and streams change-gated PKT_PROD rows; the join
-    // applies received rows through the engine's own levers. Host-only
-    // direction (world-simulation precedent), so there is no echo path.
-    if (g_cfg.prodSync) {
-        if (g_cfg.isHost)
-            g_repl.publishProd(gw, g_net, g_net.localId());
-        else
-            g_repl.applyProd(gw, g_inbound);
-    }
-    // Research tech-tree sync (protocol 38): the HOST is the tech-tree
-    // authority - it samples its Research store's known set ~1 Hz and streams
-    // one reliable PKT_RESEARCH row per known sid; the join applies via
-    // Research::startResearch (idempotent). Host-only direction, no echo path.
-    if (g_cfg.researchSync) {
-        if (g_cfg.isHost)
-            g_repl.publishResearch(gw, g_net, g_net.localId());
-        else
-            g_repl.applyResearch(gw, g_inbound);
-    }
-        // Stealth sync (protocol 20): the HOST is the world-detection authority
-        // - it streams each DRIVEN sneaker's whoSeesMeSneaking back to the
-        // sneaker's owner; every client replays received snapshots onto the
-        // bodies it OWNS (the indicators render on the owner's screen). The
-        // posture half lives inside applyTargets (continuous BODY_SNEAK apply).
-        if (g_cfg.stealthSync) {
-            if (g_cfg.isHost)
-                g_repl.publishStealth(gw, g_net, g_net.localId());
-            g_repl.applyStealthFeedback(gw, g_inbound);
-        }
-        // Consensus game-speed sync: detect local speed clicks as REQUESTS,
-        // host arbitrates effective = min(requests) (capped at 1x while either
-        // player squad fights) and broadcasts; the join applies the SET. Runs
-        // after publishOwned (the combat flag samples the ownHands_ set).
-        if (g_cfg.speedSync)
-            g_repl.syncSpeed(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
-        // Phase 6 (6a evidence spike): env-gated ([shackledbg]) per-character
-        // shackle/lock trace. No-op unless KENSHICOOP_DEBUG_SHACKLE=1, so it is
-        // free to leave in the tick for manual-session characterization.
-        coop::engine::shackleDbgTick(gw, g_cfg.isHost);
-        // Game-clock sync (protocol 25): the host broadcasts its absolute
-        // in-game clock ~1 Hz; the join measures the offset and SLEWS - a
-        // multiplier the speed layer's quiet writes fold in on top of the
-        // arbitrated consensus effective. AFTER syncSpeed so a slew change
-        // applies against this tick's consensus state.
-        if (g_cfg.timeSync)
-            g_repl.syncTime(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
-        // Runtime-spawn proxy replication (protocol 21): the join asks about
-        // streamed hands it couldn't resolve last tick (host RUNTIME spawns)
-        // and mints local proxy bodies from the host's replies; the host
-        // answers requests. BEFORE the engine tick so a proxy bound this
-        // frame is driven by this frame's applyTargets.
-        if (g_cfg.spawnSync)
-            g_repl.syncSpawns(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
-    }
-
-    // Coordinated save + load (protocols 31/32) run under g_gameStarted, NOT
-    // worldLive: they must keep pumping DURING a world swap (the join drains
-    // the host's LOAD_GO and issues its own load; the host's fallback
-    // transfer and the deferred-signal state advance) and they only touch net
-    // packets, file IO and the load/save ENTRY points - never a cached world
-    // pointer that the swap invalidates.
-    if (g_gameStarted) {
-        // Coordinated save + session resume (protocol 31): host-arbitrated
-        // save edges, folder-quiescence completion, paced in-band folder
-        // transfer, staged+verified commit on the join.
-        if (g_cfg.saveSync)
-            driveSaveSync();
-        // Coordinated load (protocol 32): host-arbitrated load edges,
-        // fingerprint-verified join follow, SaveXfer fallback on divergence.
-        if (g_cfg.loadSync)
-            driveLoadSync(gw);
-    }
-
-    // Scenario onStart fires once, BEFORE the engine tick, so a host-issued move
-    // order takes effect this frame.
-    //
-    // PEER-READY ARMING: the scenario clock does NOT start at gameplay start - it
-    // starts when this client first receives a peer's owned-entity batch
-    // (Inbound::sawRemoteEntity). On the HOST that flips true exactly when the
-    // JOIN is loaded + streaming, so every scripted host action (orders, kills,
-    // item adds - all timed off ctx.elapsedMs) happens with the join watching,
-    // instead of racing its load screen. On the JOIN the host's stream is already
-    // arriving by the time it reaches gameplay, so it arms ~immediately - which
-    // also aligns both clients' scenario clocks to roughly the same wall moment.
-    // Fallback: arm anyway after scenarioArmTimeoutMs of gameplay (peer never
-    // connected / host-only diagnostics); 0 = arm immediately (spike runs).
-    if (g_scenario && g_gameStarted && gw && !g_scenarioStarted) {
-        bool  peerReady = g_inbound.sawRemoteEntity();
-        DWORD waitedMs  = GetTickCount() - g_gameStartTick;
-        bool  fallback  = (g_cfg.scenarioArmTimeoutMs == 0) ||
-                          (waitedMs >= (DWORD)g_cfg.scenarioArmTimeoutMs);
-        // Pre-arm phase: every tick until arming, let the scenario pin/hold its
-        // subjects while the freshly-loaded world is still in its baked pose
-        // (waiting a join-load before pinning loses wandering NPCs).
-        {
-            coop::ScenarioContext pctx;
-            pctx.gw = gw; pctx.isHost = g_cfg.isHost; pctx.localId = g_net.localId();
-            pctx.elapsedMs = waitedMs; pctx.tick = g_scenarioTick;
-            pctx.peerReady = peerReady;
-            g_scenario->onGameplay(pctx);
-        }
-        if (peerReady || fallback) {
-            g_scenarioStarted   = true;
-            g_scenarioStartTick = GetTickCount();
-            coop::ScenarioContext ctx;
-            ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
-            ctx.elapsedMs = 0; ctx.tick = g_scenarioTick;
-            ctx.peerReady = peerReady;
-            char m[200];
-            _snprintf(m, sizeof(m) - 1, "SCENARIO arm trigger=%s waitedMs=%lu",
-                      peerReady ? "peer-ready" : "timeout", (unsigned long)waitedMs);
-            m[sizeof(m) - 1] = '\0';
-            coopLog(m);
-            _snprintf(m, sizeof(m) - 1, "SCENARIO %s start", g_scenario->name());
-            m[sizeof(m) - 1] = '\0';
-            coopLog(m);
-            g_scenario->onStart(ctx);
-        }
-    }
+    // Scenario onStart (harness): pre-arm hold + peer-ready/timeout arm, fired
+    // once BEFORE the engine tick so a host-issued order takes effect this frame.
+    tickScenarioStart(gw);
 
     g_mainLoop_orig(gw, dt); // run the engine (incl. local AI)
 
-    // Apply AFTER the engine so our transform is the last word the renderer samples
-    // (the local AI re-decides at the start of the next tick). Both clients drive the
-    // PEER's owned bodies: the host drives the join's squad, the join drives the
-    // host's squad + world NPCs. applyTargets skips our OWN owned hands.
-    // Re-sample live: the engine tick above may have STARTED a swap (gameplay
-    // just went non-live), in which case the caches are now stale - skip apply
-    // this tick too (the reset runs next tick's top on the reload edge).
-    if (worldLive && coop::engine::gameplayLive(gw)) {
-        g_repl.applyTargets(gw);
-        // Phase W2: relocate our own copy of any DROPPED weapon to the ground BEFORE the
-        // inventory reconcile runs, so the conservation move beats the (debounced) removal
-        // reconcile that would otherwise DESTROY the weapon we cannot refabricate.
-        if (g_cfg.worldSync) {
-            g_repl.applyWeaponDrops(gw, g_inbound);
-            // Phase W3: re-home tracked ground copies into the picking character's bag, also
-            // before the inventory reconcile (which can't refabricate a weapon into the proxy).
-            g_repl.applyWeaponPickups(gw, g_inbound);
-        }
-        // Protocol 37: relocate our copy of any cross-owner TRADED item between the
-        // two containers BEFORE the inventory reconcile, so the conservation move
-        // beats the stale-snapshot dupe/wipe (and traded gear survives - no
-        // fabrication on this path).
-        if (g_cfg.xferSync)
-            g_repl.applyTransfers(gw, g_inbound, g_net.localId());
-        // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
-        // for (the join applies the host's container; the host skips its own).
-        g_repl.applyInventories(gw);
-        // Phase W1 (bidirectional): BOTH clients spawn/update/cull local proxies for
-        // the peer's streamed ground items, keyed (ownerId, netId) so the per-sender
-        // netId spaces never collide.
-        if (g_cfg.worldSync)
-            g_repl.applyWorldItems(gw, g_inbound);
-        // Host-authoritative world: only the JOIN hides/freezes any local NPC the
-        // host isn't streaming (so the join can't run a divergent copy). The host IS
-        // the world authority, so it never suppresses.
-        // NPC existence census (protocol 36): the host broadcasts its 1 Hz
-        // wide-radius hand list; the join drains it and lets the wide-radius
-        // pass in enforceHostAuthority cull local-only ghosts at render range.
-        if (!g_cfg.isHost) {
-            g_repl.applyNpcCensus(g_inbound);
-            g_repl.enforceHostAuthority(gw);
-        } else {
-            g_repl.publishNpcCensus(gw, g_net, g_net.localId());
-        }
-        // Camera-anchored interest (protocol 43): both sides publish their
-        // LOCAL camera to the engine's anchor store; the join additionally
-        // ships its center to the host at ~1 Hz, and the host folds a fresh
-        // peer hint into interestCenters. Runs even with CAM_INTEREST off
-        // (the engine-side knob makes interestCenters ignore the anchors)
-        // so an A/B toggle needs no session restart logic.
-        g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
-    }
+    // Replication apply (post-engine): our transform is the last word the renderer
+    // samples. Re-checks gameplayLive so a swap STARTED by this engine tick skips
+    // apply (its caches are now stale; the reset runs next tick's reload edge).
+    tickReplicateApply(gw, worldLive);
 
-    // Coordinated load (protocol 32): deferred-signal backstop. The engine
-    // usually consumes the LOADGAME signal on its own within ~0.5 s
-    // (load_probe run 2), but run 1 saw it sit forever - if the swap hasn't
-    // begun after the grace window, pump SaveManager::execute() once from
-    // this end-of-tick context (the engine tick above is done with the world).
-    if (g_loadPumpArmTick != 0 && g_cfg.loadSync) {
-        if (g_swapStartTick != 0) {
-            g_loadPumpArmTick = 0; // the swap started on its own
-        } else if (GetTickCount() - g_loadPumpArmTick >= LOAD_PUMP_GRACE_MS) {
-            g_loadPumpArmTick = 0;
-            int delay = -1;
-            int sig = coop::engine::saveMgrSignal(&delay);
-            if (sig == 2 /*LOADGAME*/) {
-                bool ok = coop::engine::saveMgrExecute();
-                int sigAfter = coop::engine::saveMgrSignal(0);
-                char b[144];
-                _snprintf(b, sizeof(b) - 1,
-                          "[load] EXEC pumped (deferred LOADGAME stalled) ok=%d sigAfter=%d",
-                          ok ? 1 : 0, sigAfter);
-                b[sizeof(b) - 1] = '\0'; coopLog(b);
-                // If execute() swapped the world SYNCHRONOUSLY (signal consumed
-                // and we're still live), the reload-edge detector never saw a
-                // non-live frame, so it won't run the session reset - force it
-                // here. The caches from the OLD world are dangling right now.
-                if (ok && sigAfter != 2 && g_swapStartTick == 0 &&
-                    coop::engine::gameplayLive(gw)) {
-                    coopLog("[load] synchronous execute swap - forcing session reset");
-                    g_repl.resetSession();
-                    g_inbound.flushWorldState();
-                    coopLog("[load] inbound world-state queues flushed");
-                }
-            }
-        }
-    } else if (g_loadPumpArmTick != 0) {
-        g_loadPumpArmTick = 0;
-    }
+    // Coordinated load deferred-signal backstop: if the LOADGAME signal stalls
+    // past the grace window, pump SaveManager::execute() once from end-of-tick.
+    tickLoadPumpBackstop(gw);
 
-    // Scenario onTick AFTER apply, so a join's RECV line reflects the applied pos.
-    if (g_scenario && g_gameStarted && gw && g_scenarioStarted && g_scenarioDoneTick == 0) {
-        coop::ScenarioContext ctx;
-        ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
-        ctx.elapsedMs = GetTickCount() - g_scenarioStartTick;
-        ctx.tick = ++g_scenarioTick;
-        ctx.peerReady = g_inbound.sawRemoteEntity();
-        if (g_scenario->onTick(ctx)) {
-            // Stage 2: the receiver emits its interpolation smoothness summary
-            // alongside the verdict so the runner can assert per-frame gliding.
-            if (!g_cfg.isHost) g_repl.logSmoothSummary();
-            bool ok = g_scenario->passed();
-            char m[48];
-            _snprintf(m, sizeof(m) - 1, "SCENARIO RESULT %s", ok ? "PASS" : "FAIL");
-            m[sizeof(m) - 1] = '\0';
-            coopLog(m);
-            g_scenarioDoneTick = GetTickCount(); // begin the capture hold
-        }
-    }
+    // Scenario onTick (harness) AFTER apply, so a join's RECV line reflects the
+    // applied pos; latches the verdict + begins the capture hold on completion.
+    tickScenarioTick(gw);
 }
 
 // Title-screen update hook: a safe main-thread point every frame the menu is up.
@@ -1486,14 +1597,9 @@ void startNetworking() {
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     if (g_net.isRunning()) g_net.stop();
     coop::steamp2p::shutdown();
-    g_peerPresent = false;
     // World is live here (reconnect from within a running game): despawn minted
-    // NPC + world-item proxies before clearing the maps so a re-connect doesn't
-    // leave orphaned duplicates (and doesn't bake them into a save). Falls back
-    // to a plain map reset if no world has ticked yet.
-    if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
-    else          g_repl.resetSession();
-    g_inbound.flushWorldState();
+    // proxies before clearing maps so a re-connect leaves no orphaned duplicates.
+    sessionResetForUi();
 
     g_cfg.isHost    = isHost;
     g_cfg.transport = useSteam ? "steam" : "udp";
@@ -1537,26 +1643,24 @@ void coopUiDisconnect() {
     if (g_net.isRunning()) g_net.stop();
     coop::steaminvite::reset(); // leave any Steam lobby
     coop::steamp2p::shutdown();
-    g_peerPresent = false;
-    // World stays live on a manual disconnect: despawn minted NPC + world-item
-    // proxies before clearing maps so nothing lingers as a duplicate or gets
-    // baked into the next save.
-    if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
-    else          g_repl.resetSession();
-    g_inbound.flushWorldState();
+    // World stays live on a manual disconnect: despawn minted proxies before
+    // clearing maps so nothing lingers as a duplicate or gets baked into a save.
+    sessionResetForUi();
 }
 
 } // namespace
 
 // RE_Kenshi resolves the entry by its C++-mangled name (?startPlugin@@YAXXZ), so
 // this must NOT be extern "C".
-__declspec(dllexport) void startPlugin() {
-    coop::loadConfig(g_cfg);
-    // The fake clock skew must be armed BEFORE the first log line so every
-    // timestamp in this run (and every time-sync packet) shares the skewed clock.
-    coop::logSetFakeSkewMs(g_cfg.fakeClockSkewMs);
-    coop::logInit(g_cfg.logPath.c_str(), g_cfg.isHost ? "HOST" : "JOIN");
+// ---------------------------------------------------------------------------
+// PluginHooks (Phase 3): startPlugin's install wall, split into named phases.
+// Each was lifted VERBATIM from startPlugin, so load-time behavior + ordering
+// are unchanged; startPlugin now reads as loadConfig -> banner -> hook -> wire.
+// ---------------------------------------------------------------------------
 
+// Startup log roster: load banner, fake-skew notice, build stamp, role line,
+// and the effective (resolved) config summary. Answerable from the log alone.
+void logStartupBanner() {
     coopLog("KenshiCoop loaded! (clean rebuild)");
     if (g_cfg.fakeClockSkewMs != 0) {
         char b[96];
@@ -1582,18 +1686,30 @@ __declspec(dllexport) void startPlugin() {
         b[sizeof(b) - 1] = '\0';
         coopLog(b);
     }
+    // Effective (resolved) config roster: which sync channels are actually on/off
+    // for THIS run + the key tuning knobs. Answerable from the log alone.
+    coopLog(coop::describeConfig(g_cfg).c_str());
+}
 
-    // Hook the main-thread tick. GameWorld exposes both the virtual and the
-    // non-virtual _NV_mainLoop_GPUSensitiveStuff (same RVA); GetRealAddress only
-    // works on the _NV_ variant.
+// Main-thread tick hook. GameWorld exposes both the virtual and the non-virtual
+// _NV_mainLoop_GPUSensitiveStuff (same RVA); GetRealAddress only works on the
+// _NV_ variant. Returns false (caller aborts startup) if the hook can't install.
+bool installMainLoopHook() {
     if (KenshiLib::SUCCESS !=
         KenshiLib::AddHook(
             KenshiLib::GetRealAddress(&GameWorld::_NV_mainLoop_GPUSensitiveStuff),
             &mainLoop_hook, &g_mainLoop_orig)) {
         coopErr("KenshiCoop: could not install main-loop hook!");
-        return;
+        return false;
     }
+    return true;
+}
 
+// Resolve engine symbols and apply every replicator configuration knob (stream
+// scope, ownership ranks, interp/drive/combat tuning, audit rows, and the
+// channel enables that are pure config - the detour-backed channels are wired in
+// installEngineDetours).
+void configureReplicator() {
     coop::engine::resolve();
 
     // Stage 4: the host streams nearby world NPCs (host-authoritative) in addition
@@ -1689,7 +1805,12 @@ __declspec(dllexport) void startPlugin() {
 
     // AI-gating probe (join side): recruit diverged NPCs to test the inhabit lever.
     if (!g_cfg.isHost && g_cfg.probeRecruit) g_repl.setProbeRecruit(true);
+}
 
+// Install every engine detour + set the detour-backed channel enables (AI
+// suspend, task-select spike, jail probes, damage guard, shop, trade veto, item
+// drop, recruit/squad/faction/build/dismantle, coordinated save/load).
+void installEngineDetours() {
     // AI-suspend (BOTH roles, DEFAULT ON): detour Character::periodicUpdate so
     // any body a client DRIVES from the peer's stream stops self-tasking (decision
     // layer off) while still animating. Faction is untouched - we hold the body's
@@ -1904,16 +2025,18 @@ __declspec(dllexport) void startPlugin() {
         else
             coopLog("[load] FAILED to install load detour; coordinated load degraded");
     }
+}
 
-    // Title-screen hook. It drives THREE things at the main menu: the config
-    // auto-load (only when a save is set), the F2 co-op panel (go ONLINE / paste
-    // a Steam ID before loading), and the push-save-on-connect bootstrap (a join
-    // with NO save receives + loads the host's world). So install it whenever a
-    // save is configured OR this is an interactive session - NOT only when a save
-    // is present, which was the old behavior that left a join-from-menu with no
-    // title hook (the panel and bootstrap never ran). The scenario/test harness
-    // always sets a save, so its behavior is unchanged. titleUpdate_hook itself
-    // self-gates each of the three concerns.
+// Title-screen hook. It drives THREE things at the main menu: the config
+// auto-load (only when a save is set), the F2 co-op panel (go ONLINE / paste
+// a Steam ID before loading), and the push-save-on-connect bootstrap (a join
+// with NO save receives + loads the host's world). So install it whenever a
+// save is configured OR this is an interactive session - NOT only when a save
+// is present, which was the old behavior that left a join-from-menu with no
+// title hook (the panel and bootstrap never ran). The scenario/test harness
+// always sets a save, so its behavior is unchanged. titleUpdate_hook itself
+// self-gates each of the three concerns.
+void installTitleHook() {
     bool interactive = g_cfg.scenario.empty() && g_cfg.testSeconds == 0;
     if (!g_cfg.save.empty() || interactive) {
         if (KenshiLib::SUCCESS !=
@@ -1928,6 +2051,27 @@ __declspec(dllexport) void startPlugin() {
             coopLog("KenshiCoop: title hook armed (F2 panel + push-on-connect at menu; no auto-load save)");
         }
     }
+}
+
+__declspec(dllexport) void startPlugin() {
+    coop::loadConfig(g_cfg);
+    // The fake clock skew must be armed BEFORE the first log line so every
+    // timestamp in this run (and every time-sync packet) shares the skewed clock.
+    coop::logSetFakeSkewMs(g_cfg.fakeClockSkewMs);
+    coop::logInit(g_cfg.logPath.c_str(), g_cfg.isHost ? "HOST" : "JOIN");
+
+    logStartupBanner();
+
+    // Hook the main-thread tick FIRST (early-return on failure), then wire the
+    // replicator, engine detours and UI hooks as named install phases.
+    if (!installMainLoopHook())
+        return;
+
+    configureReplicator();
+
+    installEngineDetours();
+
+    installTitleHook();
 
     if (g_cfg.testSeconds > 0) {
         char b[96];
@@ -1940,6 +2084,8 @@ __declspec(dllexport) void startPlugin() {
 
     // Scenario harness: build the selected scenario (both host & join run it; it
     // branches on host/join internally). Unknown names are logged and ignored.
+    // Harness/Debug only - the shipped Release DLL has no scenario runner.
+#ifdef KENSHICOOP_HARNESS
     if (!g_cfg.scenario.empty()) {
         g_scenario = coop::makeScenario(g_cfg.scenario);
         if (g_scenario) {
@@ -1950,6 +2096,7 @@ __declspec(dllexport) void startPlugin() {
             coopErr(m.c_str());
         }
     }
+#endif
 
     // Session start policy (in-game panel, 2026-07-14): the unattended harness
     // (a scenario or a self-exit timer) ALWAYS auto-starts - it never touches the

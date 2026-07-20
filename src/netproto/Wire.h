@@ -1,9 +1,9 @@
 // KenshiCoop unified wire protocol (clean rebuild, v1).
 //
-// Compiled by the VS2010 (v100) plugin only (the legacy nettest still uses the
-// old Protocol.h). Keep it plain C++03: no <cstdint> reliance, no constexpr,
-// no scoped enums, no STL on the wire. Wire format is packed, little-endian;
-// x86-64 is little-endian on both ends so we send the struct bytes directly.
+// Compiled by the VS2010 (v100) plugin only. Keep it plain C++03: no <cstdint>
+// reliance, no constexpr, no scoped enums, no STL on the wire. Wire format is
+// packed, little-endian; x86-64 is little-endian on both ends so we send the
+// struct bytes directly.
 
 #ifndef KENSHICOOP_WIRE_H
 #define KENSHICOOP_WIRE_H
@@ -19,349 +19,12 @@ typedef unsigned int   u32;
 typedef float          f32;
 typedef double         f64;
 
-// Protocol version. Bumped to 2 when EntityState gained the bodyState field
-// (Stage 2 down/dead/ragdoll replication); to 3 when the reliable event channel
-// (PKT_EVENT: KO/death/revive transitions) was added; to 4 when the combat intent
-// (TASK_COMBAT_MELEE) began riding the existing task+subject fields (Stage 3c); to
-// 5 when the inventory/container-contents snapshot (PKT_INV_SNAPSHOT, Phase 4a) was
-// added; to 6 when InvItemEntry gained the equipped flag + slot (equipped armour/
-// weapon sync); to 7 when the spare pad became `section` (a section-name hash so the
-// two weapon slots - both AttachSlot ATTACH_WEAPON, indistinguishable by `slot` - are
-// told apart and Weapon I/II placement replicates); to 8 when the world-item channel
-// (PKT_WORLD_ITEM snapshot + PKT_WORLD_ITEM_REMOVE, Phase W1) was added - host-
-// authoritative, interest-scoped, netId-keyed ground items; to 9 when InvItemEntry gained
-// manufacturer + material stringIDs (WEAPONS cannot be reconstructed by the engine factory
-// without their manufacturer/mesh GameData - createItem returns null - so a picked-up or
-// looted weapon silently failed to appear on the peer; armour/loose items never needed it);
-// to 10 when the CONSERVATION drop channel (PKT_WORLD_DROP, Phase W2) was added - a weapon
-// can't be fabricated on a peer, so instead of streaming a template the dropper authors a
-// reliable DROP intent and each client RELOCATES its own real copy of that weapon to the
-// ground (bag -> world). Bidirectional (host or join may drop). Checked during handshake;
-// a mismatch is rejected (no back-compat);
-// to 11 when the conservation PICKUP channel (PKT_WORLD_PICKUP, Phase W3) was added - the
-// mirror of a drop: when a character picks a dropped weapon up, its owner authors a reliable
-// PICKUP intent and each peer relocates the REAL ground copy it has been tracking back into
-// that character's bag (world -> bag). Because the engine's spatial item query is unreliable
-// in towns, each client tracks the actual dropped Item* handle rather than re-finding it;
-// to 12 when the wall-clock TIME-SYNC channel (PKT_TIME_PING/PKT_TIME_PONG) was added -
-// the join periodically pings with its wall clock, the host echoes with its own, and the
-// join estimates the host-relative clock OFFSET (NTP-style, min-RTT filtered), logging
-// CLOCKSYNC lines the validation oracles use to time-align host/join logs across two
-// machines whose wall clocks disagree (a remote-play prerequisite);
-// to 13 when the owner-authoritative MEDICAL channel was added (phase 2 of the
-// player-combat/medical plan): PKT_MEDICAL streams an owned PLAYER-SQUAD
-// character's local-only medical model (blood, bleed, per-limb flesh+bandaging,
-// unc/dead flags) to the peer, change-gated + throttled, so driven copies render
-// true vitals instead of diverging forever (spikes 21-23); and PKT_TREATMENT
-// carries first aid administered ON a driven copy back to the body's OWNER
-// (per-limb bandage levels, raise-only apply) so cross-player healing lands on
-// the authoritative body. World NPCs stay on the events-only model;
-// to 14 when the CONSENSUS GAME-SPEED channel was added: each client's UI speed
-// (pause/1x/2x/3x) is a REQUEST (PKT_SPEED_REQ, join -> host; the host consumes
-// its own locally), the host arbitrates effective = min(requests) capped at 1x
-// while either player squad is in combat, and broadcasts PKT_SPEED_SET which
-// both sides apply. Divergent speeds would diverge every rate-based local
-// simulation (medical, hunger, cosmetic fights), so speed is consensus state;
-// to 15 when the combat intent split into ACTIVE vs WAITING stances
-// (TASK_COMBAT_WAIT): Kenshi's attack-slot system keeps most of a crowd
-// "engaged but queued", and driving those copies with the active-attack
-// re-issue loop reset their AI every throttle tick (clearGoals) and teleported
-// them around. The host now classifies its combatState (sword state) and the
-// join leaves waiting copies holding their goal in a menace ring;
-// to 16 when the medical channel grew to FULL anatomy + limb loss (full
-// medical/limb sync plan): MedicalPacket now carries every body part (head/
-// chest/stomach + limbs; humans have 7, MED_PARTS_MAX slots) with flesh AND
-// fleshStun AND bandaging AND juryRigging per part (keyed by anatomy index -
-// deterministic across clients loading the same save), plus the 4 LimbStates
-// (stump/crushed/replaced) and the robotic replacement template stringIDs;
-// TreatmentPacket forwards per-PART bandage levels; EVT_AMPUTATE/EVT_CRUSH
-// reliable events carry the limb-loss transitions (medical packet states are
-// the self-heal). Combat-scoped world NPCs now stream vitals too (host-
-// authoritative), so a battered NPC no longer renders pristine on the join;
-// to 17 when the owner-authoritative CHARACTER-STATS channel (PKT_STATS) was
-// added: CharStats (strength..smithing, xp) is local-only like medical, so a
-// character leveled mid-session stayed stale on the peer - and the peer's
-// engine RESOLVES real fights with that stale copy (a join character vs a
-// world NPC resolves on the HOST). Owned player-squad members only,
-// change-gated + throttled; the stream also self-heals the junk XP a driven
-// copy's cosmetic fights accumulate locally;
-// to 18 when CARRIED-BODY sync was added: picking up / carrying / dropping a
-// KO'd player-squad member. The CARRIER's owner authors reliable
-// EVT_PICKUP_BODY/EVT_DROP_BODY edges (subject = carried, actor = carrier);
-// continuous state self-heals them (synthetic TASK_CARRY_BODY on the carrier
-// + a BODY_CARRIED bodyState bit on the carried). Each machine executes the
-// SAME pickup between its LOCAL pair via the engine's own pickupObject, so
-// the shoulder attach / carry animation / transform-follow are engine-native
-// on both sides; a carried copy is exempt from the down-enforcement hold and
-// all position driving (the local attach owns its transform);
-// to 19 when FURNITURE OCCUPANCY sync was added (beds + prison cages): the
-// carry shape applied to a stateful attach. The OCCUPANT's owner authors
-// reliable EVT_ENTER_FURNITURE/EVT_EXIT_FURNITURE edges (subject = occupant,
-// actor = the furniture's save-stable hand, arg = 1 bed / 2 cage) off
-// Character::inSomething transitions; continuous BODY_IN_BED/BODY_IN_CAGE
-// bodyState bits self-heal them. Each machine executes the SAME placement
-// between its LOCAL pair via the engine's own setBedMode/setPrisonMode, so
-// the in-bed/in-cage pose and transform are engine-native on both sides; an
-// occupied copy is exempt from down-enforcement and position driving (the
-// furniture owns its transform).
-// to 20 when STEALTH sync was added: a BODY_SNEAK bodyState bit streams
-// Character::stealthMode exactly (BODY_CRAWL stays isStealthModeOrCrawling -
-// it includes injured crawl, which must never trigger setStealthMode), and
-// the receiver applies the engine's own setStealthMode to its driven copy so
-// the sneak-walk is engine-native. PKT_STEALTH streams the DETECTION map
-// (whoSeesMeSneaking: per-seer YesNoMaybe + progress) of a driven sneaker
-// back to its OWNER - the first owner-directed FEEDBACK channel: the host's
-// authoritative world computes who notices the sneaker (spike: detection DOES
-// fire against driven copies), and the owner replays each entry between its
-// LOCAL pair via notifyICanSeeYouSneaking so the marker arrows render
-// natively on the player's own screen.
-// to 21 when RUNTIME-SPAWN proxy replication was added: NPC sync resolves
-// bodies by save-stable hand, so a squad the host's spawn manager mints at
-// RUNTIME (roaming bandits, dialog ambushes) has a host-only hand the join
-// can never resolve - the host fought enemies the join couldn't see (spike
-// 01, field report 2026-07-07). PULL-based: the join sends PKT_SPAWN_REQ
-// (reliable, debounced per hand) for any streamed hand it cannot resolve;
-// the host resolves it locally and replies PKT_SPAWN_INFO (character
-// template stringID + faction stringID + transform + alive flag); the join
-// spawns a local PROXY body from that description and drives it through the
-// SAME world-NPC path as a baked NPC (AI-suspend, damage guard, combat
-// rendering all inherit - the hand->proxy translation happens at the single
-// applyTargets resolve choke point);
-// to 22 when the MONEY channel (PKT_MONEY) was added: Kenshi's wallet is
-// per-Platoon (Ownerships::money - no global player wallet, spike 29) and
-// nothing about it was on the wire (shop_probe run 104watch: sentinel writes
-// never crossed), so any purchase/sale/bounty changed cats on ONE client only.
-// Owner-authoritative by squad-tab RANK (the same partition positional/
-// inventory sync own): each client publishes the wallet of every tab it OWNS,
-// change-gated on the reliable channel with a safety resend; the receiver
-// writes the peer tab's wallet via Ownerships::setMoney;
-// to 23 when RECRUITMENT sync was added: recruiting re-containers the subject
-// into a player platoon (a NEW hand the peer can never resolve), so a recruit
-// existed on the recruiting client only (recruit_probe run 114151: the peer
-// either minted a DUPLICATE proxy next to its still-standing baked copy, or -
-// join -> host - saw nothing at all, the describe channel being join-pull
-// only). Three changes: a reliable EVT_RECRUIT edge (subject = the OLD hand,
-// actor = the NEW hand) lets the peer RE-KEY its existing local body to the
-// recruiter's new stream key instead of duplicating; the describe/mint spawn
-// channel (PKT_SPAWN_REQ/INFO) runs BIDIRECTIONALLY so a runtime-born recruit
-// resolves in either direction; and recruited hands are owned by their
-// RECRUITER regardless of which local tab rank they land in (the probe showed
-// a join recruit landing in the HOST-owned rank-0 container);
-// to 24 when FACTION-RELATION sync was added (PKT_FACTION): relation state is
-// per-client `FactionRelations` and nothing crossed (faction_probe run
-// 132239: sentinel setRelation writes stuck locally, never moved the peer),
-// so attacking a faction flipped hostility on ONE machine only. The probe
-// showed faction GameData stringIDs are cross-client stable, the engine keeps
-// the two tables MIRRORED (player->them == them->player in every row), and
-// the enemy/ally flags DERIVE from the value - so ONE float per faction sid
-// is the whole state. SYMMETRIC change detection: both clients sample their
-// player-faction table (~1 Hz, immediately on a detoured affectRelations
-// mutation), stream rows that moved vs the seeded shared-save baseline
-// (change-gated reliable), and apply received rows onto both local table
-// directions - updating the baseline BEFORE the write keeps it echo-free;
-// to 25 when GAME-CLOCK sync was added (PKT_TIME): each client integrates its
-// own in-game clock from its own load/pause moments, so day/night (NPC
-// schedules, shop hours, stealth vision) diverges. time_probe (run 141509)
-// showed the clock is ABSOLUTE campaign time (save-derived; the host-join
-// offset was exactly the load-moment skew), hour length is identical on both
-// clients, and the clock rate tracks frameSpeedMult exactly (2x burst -> 2.00
-// rate ratio) - so the correction lever is a SLEW, not a memory write: the
-// host broadcasts its clock ~1 Hz and the join scales its local sim speed
-// quietly (on top of the arbitrated consensus speed) until the offset closes;
-// to 26 when DOOR-STATE sync was added (PKT_DOOR): door/gate open+lock state
-// on BAKED buildings is per-client (door_probe run 160041: sentinel toggles
-// through the engine's own openDoor/closeDoor stuck locally, never moved the
-// peer), so one player walks through a gate the other sees closed. The probe
-// showed baked-door hands are cross-client stable (census intersection on
-// the shared save) and the polite write lever works (state animates
-// OPENING->OPEN; `open` on the wire is the collapsed DESTINATION state).
-// SYMMETRIC change detection, the faction shape: both clients sample nearby
-// doors ~1 Hz, stream rows whose (open, locked) moved vs a seeded per-hand
-// baseline, and apply received rows via the same engine actions - updating
-// the baseline BEFORE the write keeps it echo-free; per-sender seq drops
-// stale rows; rows for hands that fail to resolve locally are skipped
-// (out-of-interest or runtime door - accepted edge);
-// to 27 when PLACED-BUILDING sync was added (PKT_BUILD_PLACE +
-// PKT_BUILD_STATE): a player-placed building is a RUNTIME object - its hand
-// exists only in the placer's session (build_probe run 174550: census hand
-// intersection was ZERO for minted sites; the protocol-21 identity problem
-// for structures), so a building one player places does not exist at all for
-// the other, and construction progress has no channel. PLACER-AUTHORITATIVE
-// describe/mint: a local placement (UI commit detour on placeFinalPreview-
-// Building, or a programmatic scenario place) announces template sid +
-// transform keyed by the PLACER's local hand; the receiver mints a local
-// construction site via the same createBuilding factory (probe-proven to
-// bypass the UI's town-placement rules) and keeps a key -> local-hand
-// translation map. Progress then streams as change-gated PKT_BUILD_STATE
-// rows (~1 Hz sample, 10 s safety resend while incomplete) applied through
-// the engine's own setConstructionProgress (probe: 0..1 scale, engine
-// self-completes at >= 1.0 natively). The receiver's mint never re-announces
-// (it does not pass through the placement detour) - echo-free by
-// construction;
-// to 28 when PLACED-BUILDING DOOR + DISMANTLE sync was added
-// (PKT_BUILD_DOOR + PKT_BUILD_REMOVE): a placed building's doors are
-// runtime objects too, so the protocol-26 door channel skips them (bdoor_probe
-// run 195513: toggles stayed local), and a dismantled/destroyed placed
-// building left a GHOST proxy on the peer (11 census samples after the
-// placer's destroy). The probe proved the translation identity: a minted
-// proxy mints its own DoorStuff children in the same template order
-// (parent->doors index 0 on both sides), so a placed door's wire key is
-// (PLACER's building hand, door index) resolved through the protocol-27
-// build maps on both ends - the raw door hand never crosses. Door rows are
-// the symmetric protocol-26 shape on the translated key; removal is
-// placer-authoritative (dismantle detour edge or programmatic destroy ->
-// PKT_BUILD_REMOVE -> the peer destroys its mapped proxy via the engine's
-// own GameWorld::destroy and tombstones the map entry);
-// to 29 when HUNGER sync was added (MedicalPacket grew hunger + fed):
-// hunger is a per-client local simulation - each engine decays EVERY
-// character's hunger and eating happens only on the owner's client, so a
-// driven copy starves in the peer's view (hunger_probe run 213751: the
-// engine's scale is ~0..3, the ACTIVE leader decayed ~0.024/s while its
-// idle driven copy decayed ~0.0002/s - a 40% owner-vs-copy gap opened in
-// one 50 s run; sentinel writes stick and stay local). The owner's
-// hunger/fed ride the existing owner-authoritative medical snapshot
-// (change-gated by the quantized fingerprint; -1 = field not carried, the
-// KENSHICOOP_HUNGER_SYNC A/B hatch);
-// to 30 when COORDINATED SAVE + SESSION RESUME was added (protocol 31):
-// the HOST's save is authoritative - on a coordinated save (any local save
-// edge on the host, or a join save request forwarded as PKT_SAVE_REQ with
-// the join's local write suppressed) the host writes its native save, waits
-// for the save folder to QUIESCE (the save is deferred + multi-file), then
-// streams the whole folder to the join over CH_RELIABLE in ~4 KB chunks
-// (PKT_SAVE_BEGIN / PKT_SAVE_FILE / PKT_SAVE_DONE with per-file FNV CRCs);
-// the join stages into save/<name>__incoming/, verifies, commits atomically
-// over save/<name>/ and PKT_SAVE_ACKs. Resume = both clients load the
-// identical file, re-running the shared-save-lineage guarantee all the
-// hand-keyed replication rests on (no sidecar; session-placed buildings and
-// recruits bake into ONE save with ONE hand, identical on both sides);
-// to 31 when COORDINATED LOAD was added (protocol 32): the HOST is
-// load-authoritative, mirroring the save arbitration. A host load edge
-// broadcasts PKT_LOAD_GO (name + folder fingerprint + loadId); the join
-// fingerprint-verifies its on-disk copy and loads the identical save, or
-// answers PKT_LOAD_NACK (missing/diverged copy) so the host streams the
-// folder via the existing protocol-31 SaveXfer after its own reload, the
-// join loading after commit. A load initiated on the JOIN is suppressed
-// locally and forwarded as PKT_LOAD_REQ (the host arbitrates). Both sides
-// run a full session reset on their own world-reload edge; loadId guards
-// stale GO/NACK pairs across the swap;
-// to 32 when PRODUCTION MACHINE sync was added (protocol 33): machines
-// (production / crafting / furnace / farm / research) simulate per-client -
-// prod_probe run 152730 measured the owner's bench output moving under
-// operate() while the peer's copy stayed flat, and a power toggle never
-// crossing. The HOST is the machine authority (world-simulation precedent):
-// it samples machine-class buildings in the interest spheres ~1 Hz and
-// streams change-gated PKT_PROD rows (power bit, production state, output
-// buffer item+amount, input amounts, farm growth floats; -1 = field not
-// carried); the join applies through the probe-validated engine levers
-// (switchPowerOn / setProductionItem - which also MATERIALIZES a null
-// output buffer - / direct ConsumptionItem::amount + farm-float writes).
-// BAKED machines key by their save-stable hand; session-placed ones by the
-// protocol-27 placer key (keyKind disambiguates), translated through the
-// build maps on both ends.
-//
-// v33 (protocol 34): InvSnapshotHeader gains a keyKind byte - the PKT_PROD
-// identity approach applied to the container-inventory channel, so the host's
-// container census can author SESSION-PLACED chests/machines under their
-// protocol-27 placer key (0 = raw hand, the previous implicit behaviour).
-//
-// v34 (protocol 35): EVT_SQUAD_MOVE on the existing EventPacket - a squad-tab
-// move re-containers the body (squad_probe: container AND index/serial all
-// change, every move mints a fresh hand), so the mover streams the re-key
-// edge exactly like EVT_RECRUIT. No struct change; the version gates the
-// event id.
-//
-// v35 (protocol 36): sendMs on EntityBatchHeader (+ PKT_NPC_CENSUS). Interp
-// buffers were indexed by ARRIVAL time, so real-path jitter (Steam relay)
-// smeared straight into the snapshot spacing - the walk-drive consumed
-// bursts and starved (the jumpy remote-player movement of the 2026-07-09
-// session). The sender's millisecond stamp restores the true 20 Hz spacing;
-// the receiver maps it into its own clock with a min-offset tracker.
-// ENTITY_BATCH_MAX drops 18 -> 17 to keep a full batch inside the datagram
-// budget with the wider header.
-//
-// v36 (protocol 37): CROSS-OWNER TRANSFER intents (PKT_INV_XFER). Inventory
-// sync is single-writer per container (Doctrine 8), but the UI lets a player
-// drag items straight between squads - a direct mutation of a PEER-authored
-// container the owner never sees. The owner's next snapshot then reconciled
-// the drag AWAY: an item dragged OUT was re-fabricated on the dragger (a
-// dupe, since the dragger's own container also kept the moved item) while
-// the owner never lost its copy; an item dragged IN was destroyed by the
-// same reconcile; and a dragged WEAPON - which createItem cannot rebuild -
-// vanished on the dragger's screen while the owner-side surplus was
-// destroyed via removeItemAutoDestroy (trade_probe run 133142 baselined all
-// three signatures). The fix is the conservation model applied to bags: the
-// dragging client detects the completed cross-owner move by diffing each
-// tracked container against its last-known baseline, PAIRS the loss with
-// the matching gain, and authors ONE reliable transfer intent (src + dst
-// container hands + item identity + qty). The receiver relocates the REAL
-// Item* between its own copies of those containers (removeItemDontDestroy +
-// tryAddItem - never fabricates or destroys, so weapons survive), while the
-// sender latches the pending transfer so the owner's stale snapshots cannot
-// reconcile it back in the interim. Gear transfers also suppress the W2
-// weapon-census drop/pickup interpretation for that sid on both ends (a
-// bag-to-bag trade is not a ground drop).
-//
-// v37 (protocol 38): RESEARCH TECH-TREE sync (PKT_RESEARCH). The unlock store
-// (PlayerInterface::technology, a per-client Research object) never crossed:
-// a tech the host researched stayed un-known on the join forever (spike 401 -
-// host isKnown(subject) 0->1 after startResearch while the join read 0 for
-// the whole run). Host-authoritative snapshot rows (the world-simulation
-// precedent): the host samples its known set ~1 Hz through the engine's own
-// Research::isKnown over the shared RESEARCH GameData enumeration and streams
-// one reliable row per known stringID (first sight sends the whole set as the
-// baseline, then a lost-row safety resend); the join applies each row through
-// Research::startResearch - the exact lever a research-UI click commits, which
-// flips isKnown in the same tick and is idempotent against already-known sids.
-// The engine levers are located at runtime by unique prologue scan (the
-// running image is base-skewed from the on-disk exe, spike 401).
-//
-// v38 (pack-hidden investigation, 2026-07-11): NPC census rows carry the
-// host's POSITION alongside each hand (5xu32 -> 5xu32 + 3xf32 per NPC). The
-// existence census answered only "does this NPC exist"; two locally-simulated
-// copies of the SAME census-present NPC could wander arbitrarily far apart at
-// render range (the join's copy visible somewhere the host's copy isn't).
-// With positions on the wire the join can PARK a census-present local copy
-// that diverged past a threshold back onto the host's authoritative spot.
-//
-// v39 (creature-size sync, 2026-07-12): SpawnInfoPacket carries the host
-// body's AGE. Animals scale body size by age; minting proxies with a fixed
-// adult age made every join-side creature full-grown regardless of the
-// host's actual (often juvenile) animal.
-//
-// v40 (ground-weapon identity, 2026-07-13): WorldPickupPacket carries the
-// originating DROP's shared identity (refDropOwnerId, refDropId). Ground
-// weapons were tracked FIFO-by-stringID, so picking up one of two same-sid
-// weapons on the ground (one dropped by each client) re-homed the peer's
-// front-of-queue copy - the WRONG instance. The picker now correlates the
-// exact Item* that re-entered its bag to the drop it tracked and names that
-// instance; the peer re-homes precisely that (owner,id)-keyed copy.
-//
-// v41 (chained/pole prisoner sync, 2026-07-16): a NEW bodyState bit
-// BODY_CHAINED (Character::isChained) rides the furniture-occupancy pipeline
-// as kind=3. Kenshi puts a captive on a prisoner POLE via the chained/slave
-// mechanism (isChained + slaveOwner + setChainedMode/slaveAttachToBoneMode),
-// which is a DIFFERENT engine system from a cage (inSomething==IN_PRISON /
-// setPrisonMode). Cages were the only prison state synced, so a unit shackled
-// to a pole never crossed the wire - the join left it at the last carried/KO
-// stage. The furniture reliable enter/exit edges reuse the SAME shape for
-// chain: arg=3, and the actor hand carries the OWNER (setChainedMode needs an
-// owner, and the pole position rides the continuous transform).
-// Protocol 42 (shackle lock-state sync): InvItemEntry gains a `locked` bit
-// (equipped LockedArmour with a live lock). Cage occupancy (IN_PRISON) masks the
-// chained furniture kind on the drive side, so a caged prisoner's shackle
-// unlock never crossed; the locked bit is an occupancy-independent lock signal
-// (feeds the content hash so a lock toggle triggers a resend), paired with a
-// non-owner unlock guard that re-asserts the owner-authoritative chained state.
-//
-// Protocol 43 (camera-anchored interest, PKT_CAM_HINT): the join sends its
-// CAMERA world center to the host at ~1 Hz (unreliable, latest wins). Interest
-// anchors were squad-tab leaders only, so NPCs where a player is LOOKING (but
-// its PC is not standing) fell outside the stream bubble - the manual camp
-// finding of host-visible units missing on the join near the streamed edge.
-// The host folds a fresh hint into interestCenters (up to 4 anchors: 2 tab
-// leaders + own camera + peer camera); the host camera never crosses the wire
-// (read locally).
-const u16 PROTOCOL_VERSION = 43;
+// Protocol version. The full version-by-version history (what each bump added
+// and why) lives in resources/PROTOCOL_HISTORY.md - keep it there, not here, so
+// this header stays a definition file. When you bump PROTOCOL_VERSION, add the
+// matching entry at the bottom of that doc. The version is checked at handshake
+// and a mismatch is rejected (no back-compat).
+const u16 PROTOCOL_VERSION = 44;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -497,6 +160,63 @@ struct EventPacket {
     f32 arg;     // event-specific payload (damage, etc.); 0 for KO/death
 };
 
+// ObjectHand - the canonical identity of a Kenshi engine object (the game's
+// `hand` 5-tuple: an itemType + a container ref + a per-object index/serial),
+// stable across machines that loaded the same save. This is the ONE typed
+// representation the plugin should pass around; it exists to retire the "dual
+// hand[5] layout" footgun, where the same five values were packed into a raw
+// u32[5] in TWO different orders a call site had to remember by position:
+//   * OBJECT order   = {type, container, containerSerial, index, serial}
+//       the dominant "readObjectHand layout" - EntityState's hand fields,
+//       CombatRead::target[5], and every subj/c/m/itemHand[5] use it.
+//   * CHAR-KEY order = {index, serial, type, container, containerSerial}
+//       the older "SCENARIO hand-key" layout produced by readHand().
+// The engine's own 5-arg hand ctor takes (index, serial, type, container,
+// containerSerial) = CHAR-KEY order; the adapter (engine::resolveChar /
+// resolveObject) owns that mapping in one place so no caller repeats it.
+// Field NAMES (not positions) are the contract: fill/read them by name and the
+// order stops mattering. The from*/to* helpers convert to/from the two legacy
+// raw-array orders at the few boundaries that still speak u32[5] (the wire and
+// not-yet-migrated call sites). Plain C++03 POD - safe to pass by value/copy.
+struct ObjectHand {
+    u32 type;
+    u32 container;
+    u32 containerSerial;
+    u32 index;
+    u32 serial;
+
+    // OBJECT order: a[0..4] = {type, container, containerSerial, index, serial}.
+    static ObjectHand fromObjOrder(const u32 a[5]) {
+        ObjectHand h;
+        h.type = a[0]; h.container = a[1]; h.containerSerial = a[2];
+        h.index = a[3]; h.serial = a[4];
+        return h;
+    }
+    void toObjOrder(u32 a[5]) const {
+        a[0] = type; a[1] = container; a[2] = containerSerial;
+        a[3] = index; a[4] = serial;
+    }
+    // CHAR-KEY order: a[0..4] = {index, serial, type, container, containerSerial}.
+    static ObjectHand fromCharKey(const u32 a[5]) {
+        ObjectHand h;
+        h.index = a[0]; h.serial = a[1]; h.type = a[2];
+        h.container = a[3]; h.containerSerial = a[4];
+        return h;
+    }
+    void toCharKey(u32 a[5]) const {
+        a[0] = index; a[1] = serial; a[2] = type;
+        a[3] = container; a[4] = containerSerial;
+    }
+    // A resolvable hand has a non-zero index/serial pair (the engine's null
+    // handle is all-zero; type/container alone never identify a live object).
+    bool resolvable() const { return index != 0 || serial != 0; }
+    bool equals(const ObjectHand& o) const {
+        return type == o.type && container == o.container &&
+               containerSerial == o.containerSerial &&
+               index == o.index && serial == o.serial;
+    }
+};
+
 // One replicated entity: save-stable hand identity + transform + locomotion +
 // task/pose. Identity is the Kenshi `hand` (5 u32 fields), identical across
 // machines that load the same save, so the receiver resolves it to its own
@@ -619,19 +339,24 @@ struct EntityBatchHeader {
     u8  type;    // = PKT_ENTITY_BATCH
     u32 ownerId; // network player id of the batch's owner
     u32 sendMs;  // sender's monotonic ms clock when the batch was captured
+    u32 epoch;   // sender session epoch (v44): the receiver drops a batch whose
+                 // epoch is older than the newest it accepted from this owner,
+                 // so a network-delayed batch from the session that existed
+                 // BEFORE a coordinated world reload (it describes a world that
+                 // no longer exists) cannot mint a phantom proxy in the new one.
     u8  count;   // number of EntityState that follow
 };
 
 // 17 * sizeof(EntityState) + header stays comfortably under a 1400 B datagram
-// (v35: one entity of headroom traded for the sendMs stamp). This is the HARD
-// receive-side bound and the raw-UDP sender chunk size.
+// (v35: one entity of headroom traded for the sendMs stamp; v44: +epoch). This
+// is the HARD receive-side bound and the raw-UDP sender chunk size.
 const unsigned int ENTITY_BATCH_MAX = 17;
 
 // Steam sender chunk size: the Steam P2P transport clamps ENet's MTU to
 // 1200 B, and ENet sends an oversized UNRELIABLE packet as RELIABLE
 // fragments - retransmits and ordering stalls on the 20 Hz motion stream,
 // on exactly the transport real sessions use (architecture review
-// 2026-07-10). 14 * 79 B + 10 B header = 1116 B, inside 1200 with ENet's
+// 2026-07-10). 14 * 79 B + 14 B header = 1120 B, inside 1200 with ENet's
 // per-packet overhead. Sender-side only - the receiver validates by
 // len >= need against the header count, so mixed caps interoperate.
 const unsigned int ENTITY_BATCH_MAX_STEAM = 14;

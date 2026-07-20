@@ -87,6 +87,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot  = Split-Path -Parent $scriptDir
 
 Import-Module (Join-Path $scriptDir "CoopOracles.psm1") -Force
+Import-Module (Join-Path $scriptDir "CoopHarness.psm1") -Force
 $manifest = Get-ScenarioManifest
 
 # ---- Resolve manifest defaults ------------------------------------------------
@@ -151,6 +152,7 @@ $joinPng = Join-Path $OutDir "join.png"
 
 # ---- WAN relay proxy (below-ENet delay/jitter/loss) -----------------------------
 $wanProc = $null
+$wanSeed  = $null
 $joinIp   = $Ip
 $joinPort = $Port
 if ($Wan -ne "") {
@@ -169,7 +171,9 @@ if ($Wan -ne "") {
     $wanArgs = @("$proxyPort", $Ip, "$Port", "$($wp.DelayMs)", "$($wp.JitterMs)", "$($wp.LossPct)")
     if ($wp.ContainsKey('StallForS') -and [int]$wp.StallForS -gt 0) {
         # Scripted total outage (starved-replica validation): seed + stall window.
-        $wanArgs += @("$(Get-Random -Maximum 1000000)", "$($wp.StallAtS)", "$($wp.StallForS)")
+        # The seed is recorded in run.json so a flaky stall run is reproducible.
+        $wanSeed = Get-Random -Maximum 1000000
+        $wanArgs += @("$wanSeed", "$($wp.StallAtS)", "$($wp.StallForS)")
         Write-Host "  (scripted stall: $($wp.StallForS)s total outage at +$($wp.StallAtS)s after first join datagram)"
     }
     $wanProc = Start-Process -FilePath $netsimExe -PassThru -WindowStyle Hidden `
@@ -191,6 +195,50 @@ if ($NetSimDelayMs -or $NetSimJitterMs -or $NetSimLossPct) {
     Write-Host "  net sim:  delay ${NetSimDelayMs}ms +/-${NetSimJitterMs}ms, loss ${NetSimLossPct}% (legacy in-plugin, entities only)"
 }
 Write-Host "  out dir:  $OutDir"
+
+# ---- run.json provenance --------------------------------------------------------
+# One machine-readable record of exactly WHAT this run exercised: scenario +
+# resolved save/setup, the manifest DiagEnv knobs actually applied, the WAN/skew
+# regime (with the stall seed for reproducibility), and the build under test
+# (git commit + PROTOCOL_VERSION). Written before launch so it survives a crash.
+try {
+    $gitCommit = (& git -C $repoRoot rev-parse --short HEAD 2>$null)
+    $gitDirty  = [bool]((& git -C $repoRoot status --porcelain 2>$null) )
+} catch { $gitCommit = ""; $gitDirty = $false }
+$protoVer = ""
+try {
+    $wireH = Join-Path $repoRoot "src\netproto\Wire.h"
+    $pv = Select-String -Path $wireH -Pattern 'PROTOCOL_VERSION\s*=\s*(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pv) { $protoVer = $pv.Matches[0].Groups[1].Value }
+} catch {}
+$variant = "clean"
+if ($Wan -ne "" -and $FakeClockSkewMs -ne 0) { $variant = "wanskew" }
+elseif ($Wan -ne "") { $variant = "wan" }
+elseif ($FakeClockSkewMs -ne 0) { $variant = "skew" }
+$runJson = [ordered]@{
+    timestamp     = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+    scenario      = $Scenario
+    variant       = $variant
+    save          = $Save
+    setup         = $Setup
+    tolerance     = $Tolerance
+    seconds       = $Seconds
+    port          = $Port
+    profile       = $Profile
+    diagEnv       = $(if ($null -ne $manifestEntry -and $manifestEntry.ContainsKey('DiagEnv')) { $manifestEntry.DiagEnv } else { @{} })
+    wan           = $Wan
+    wanProfile    = $(if ($Wan -ne "") { $manifest.WanProfiles[$Wan] } else { $null })
+    wanSeed       = $wanSeed
+    fakeSkewMs    = $FakeClockSkewMs
+    netSimDelayMs = $NetSimDelayMs
+    netSimJitterMs= $NetSimJitterMs
+    netSimLossPct = $NetSimLossPct
+    gitCommit     = $gitCommit
+    gitDirty      = $gitDirty
+    protocolVersion = $protoVer
+    outDir        = $OutDir
+}
+$runJson | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $OutDir "run.json") -Encoding UTF8
 
 # Clear any leftover Kenshi instances from a previous (possibly crashed) run.
 if (-not $NoKill) {
@@ -227,32 +275,14 @@ function Set-CoopEnv {
     $env:KENSHICOOP_TEST_SECONDS = "$Seconds"
     $env:KENSHICOOP_LOG          = $Log
     $env:KENSHICOOP_SCENARIO     = $Scenario
-    # Reconcile/world-item trace gate (diagnostic scenarios need the [recon]/[wi] traces).
-    $env:KENSHICOOP_INV_DUMP     = if ($Scenario -eq "inv_wpnseq" -or $Scenario -eq "inv_addequip" -or $Scenario -eq "wpn_relocate" -or $Scenario -eq "world_weapon_drop" -or $Scenario -eq "world_armor_drop" -or $Scenario -eq "trade_probe" -or $Scenario -eq "trade_peer" -or $Scenario -like "world_item_*" -or $Scenario -eq "rejoin_items") { "1" } else { "" }
-    # Join-only AI-suspend probe.
+    # Join-only AI-suspend probe (mode+flag specific, so NOT a manifest knob).
     $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
-    # Phase 5 speed-path diagnostics ([speeddbg] setter/poll trace); on for the
-    # speed scenarios so combat-cap / forced-change attribution is captured.
-    $env:KENSHICOOP_DEBUG_SPEED = if ($Scenario -like "speed*") { "1" } else { "" }
-    # Phase 6 shackle diagnostics ([shackledbg] per-body chained/lock trace); on
-    # for the shackle scenarios so the [shackledbg] series is captured alongside
-    # the SCENARIO SHACKLE lines (same trace the manual camp session relies on).
-    $env:KENSHICOOP_DEBUG_SHACKLE = if ($Scenario -like "shackle*") { "1" } else { "" }
-    # Jail put-to-work desync spike: [jail] STATE captive-state traces (own vs
-    # drv) + the [spike] SELECT task-selection trace, so the twitch timeline is
-    # captured on both sides. Both are read-only and default OFF everywhere else.
-    # jail_soak (spike 58) is the long-play variant and arms the STATE/SNAP +
-    # task probes. NOTE: JAIL_OBSERVE is deliberately NOT armed for jail_soak -
-    # observe mode makes the host run the captive UNOPPOSED (skips the self-heal),
-    # which suppresses the very [jail] SNAP re-seat metric the soak measures. Use
-    # jail_probe (spike 57) for the observe trajectory instead.
-    $jailSpike = ($Scenario -eq "jail_probe" -or $Scenario -eq "jail_soak")
-    $env:KENSHICOOP_JAIL_PROBE = if ($jailSpike) { "1" } else { "" }
-    $env:KENSHICOOP_TASK_SPIKE = if ($jailSpike) { "1" } else { "" }
-    # Phase A observation: host runs the captive unopposed and logs its
-    # trajectory ([jail] OBSERVE) so we can classify the guard's put-to-work
-    # intent (relocate vs walk-round). Read-only; jail_probe ONLY (see above).
-    $env:KENSHICOOP_JAIL_OBSERVE = if ($Scenario -eq "jail_probe") { "1" } else { "" }
+    # Per-scenario channel A/B knobs (invSync/worldSync ON, probe channels OFF)
+    # and log-only diagnostic traces ([recon]/[wi]/[speeddbg]/[shackledbg]/[jail]
+    # /[spike]) come from the manifest DiagEnv - the single source of truth the
+    # plugin's Config.cpp no longer hard-codes. Applied hermetically (the whole
+    # managed keyset is cleared first) and MODE-AGNOSTIC (host + join match).
+    [void](Set-CoopDiagEnv -Entry $manifestEntry)
     # Host-only setup/re-arm scene.
     $env:KENSHICOOP_SETUP = if ($Mode -eq "host") { $Setup } else { "" }
     # Legacy in-plugin WAN sim (both clients; entities only).

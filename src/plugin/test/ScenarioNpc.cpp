@@ -18,11 +18,9 @@ namespace {
 // leader and logs MEMBER (host, authoritative) / RECV (join, driven copy) per
 // hand. The runner cross-checks positions per hand (ratio-based: stationary
 // sitters match tightly, the occasional patroller may lag by interp/catch-up).
-class NpcSyncScenario : public Scenario {
+class NpcSyncScenario : public TimedScenario {
 public:
-    NpcSyncScenario() : passed_(false), recvCount_(0), lastLogMs_(0) {}
-
-    virtual const char* name() const { return "npc_sync"; }
+    NpcSyncScenario() : TimedScenario("npc_sync", 0), recvCount_(0), lastLogMs_(0) {}
 
     virtual void onStart(const ScenarioContext&) {}
 
@@ -58,8 +56,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // 24/44 s -> 62/82 s (2026-07-10, same reasoning as leader_move): the
     // join's clock catch-up slews its sim at up to 2x for the first ~35-40 s,
@@ -70,7 +66,6 @@ private:
     static const unsigned long HOST_DURATION_MS = 82000; // outlive the join's window
     static const unsigned long JOIN_DURATION_MS = 62000;
     static const unsigned int  MAX_LOG          = 40;     // cap NPCs logged per tick
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
 };
@@ -83,13 +78,11 @@ private:
 // streams the new task; the join must transition its driven copy idle -> operating.
 // Logs an "SCENARIO ORDER" marker (machine-timestamped) so the runner can split the
 // join's per-hand task series into before/after and assert the live transition.
-class CraftOrderScenario : public Scenario {
+class CraftOrderScenario : public TimedScenario {
 public:
     CraftOrderScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), orderLogged_(false),
+        : TimedScenario("craft_order", 0), recvCount_(0), lastLogMs_(0), orderLogged_(false),
           haveWorker_(false), task_(0), lastOrderMs_(0) {}
-
-    virtual const char* name() const { return "craft_order"; }
 
     // PIN the worker at LOCAL GAMEPLAY START (pre-arm), while the baked worker is
     // still parked at the prop and is unambiguously the nearest non-squad NPC -
@@ -162,8 +155,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long ORDER_AT_MS     = 18000; // issue after join logs idle baseline
     static const unsigned long HOST_DURATION_MS = 52000; // outlive the join (cover post-order)
@@ -184,7 +175,6 @@ private:
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          orderLogged_;
@@ -201,13 +191,11 @@ private:
 // down; the join must transition its driven copy upright -> down. Logs a "SCENARIO
 // DOWN" marker so the runner can split the join's per-hand bodyState series and assert
 // the live transition (vs npc_sync, which only validates boot-time down state).
-class DownOrderScenario : public Scenario {
+class DownOrderScenario : public TimedScenario {
 public:
     DownOrderScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), downLogged_(false),
+        : TimedScenario("down_order", 0), recvCount_(0), lastLogMs_(0), downLogged_(false),
           haveSubject_(false), lastDownMs_(0) {}
-
-    virtual const char* name() const { return "down_order"; }
 
     // PIN the subject at local gameplay start (pre-arm) while it is still where
     // the save baked it, and HOLD it upright until the armed clock begins - the
@@ -270,8 +258,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long ORDER_AT_MS      = 18000;
     static const unsigned long HOST_DURATION_MS = 52000;
@@ -291,7 +277,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          downLogged_;
@@ -306,13 +291,11 @@ private:
 // matching "[event] RECV ev=2" for that hand. The point is reliability: run this under
 // -NetSimLossPct and the unreliable bodyState batches drop, but the death event still
 // arrives (it rides the reliable channel). Reuses the down_order pin/hold baseline.
-class DeathOrderScenario : public Scenario {
+class DeathOrderScenario : public TimedScenario {
 public:
     DeathOrderScenario()
-        : passed_(false), recvCount_(0), lastLogMs_(0), deathLogged_(false),
+        : TimedScenario("death_order", 0), recvCount_(0), lastLogMs_(0), deathLogged_(false),
           haveSubject_(false), lastKillMs_(0) {}
-
-    virtual const char* name() const { return "death_order"; }
 
     // Same pre-arm pin+hold as down_order (see there for rationale).
     virtual void onGameplay(const ScenarioContext& ctx) {
@@ -372,8 +355,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long ORDER_AT_MS      = 18000;
     static const unsigned long HOST_DURATION_MS = 52000;
@@ -393,7 +374,6 @@ private:
         }
     }
 
-    bool          passed_;
     unsigned int  recvCount_;
     unsigned long lastLogMs_;
     bool          deathLogged_;
@@ -421,16 +401,15 @@ private:
 // Script (join):  t=20s  spawn 4 runtime NPCs LOCALLY (the suppression leg)
 //                        + log per-second JVIS visibility for those hands
 // Both sides: MEMBER/RECV NPC series (npc_sync pattern) + 1 Hz CENSUS counts.
-class SpawnSyncScenario : public Scenario {
+class SpawnSyncScenario : public TimedScenario {
 public:
     SpawnSyncScenario(bool probe)
-        : probe_(probe), passed_(false), lastLogMs_(0), lastCensusMs_(0),
+        : TimedScenario(probe ? "spawn_probe" : "spawn_sync", 0),
+          probe_(probe), lastLogMs_(0), lastCensusMs_(0),
           lastJvisMs_(0), nearSpawned_(false), farMoved_(false),
           farSpawned_(false), joinSpawned_(false),
           nNear_(0), nFar_(0), nJoin_(0),
           haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
-
-    virtual const char* name() const { return probe_ ? "spawn_probe" : "spawn_sync"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         Character* ld = engine::leader(ctx.gw);
@@ -526,8 +505,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // One "SCENARIO SPAWN leg=<leg> hand=t,c,cs,i,s" line per spawned body.
     // Hand order matches readObjectHand (and the replicator's [spawn] logs),
@@ -576,7 +553,6 @@ private:
     static const float         FAR_DIST; // rank-0 relocation distance (units)
 
     bool          probe_;
-    bool          passed_;
     unsigned long lastLogMs_;
     unsigned long lastCensusMs_;
     unsigned long lastJvisMs_;
@@ -606,13 +582,11 @@ const float SpawnSyncScenario::FAR_DIST = 600.0f;
 //                "[census] sent" lines prove the channel is live).
 // The Test-NpcCensus oracle gates: census flowing both ends, every ghost
 // hand culled, and no mass-suppression of legitimate census NPCs.
-class NpcCensusScenario : public Scenario {
+class NpcCensusScenario : public TimedScenario {
 public:
     NpcCensusScenario()
-        : passed_(false), spawned_(false), lastGvisMs_(0), nGhost_(0),
+        : TimedScenario("npc_census", 0), spawned_(false), lastGvisMs_(0), nGhost_(0),
           haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
-
-    virtual const char* name() const { return "npc_census"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         Character* ld = engine::leader(ctx.gw);
@@ -680,8 +654,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long SPAWN_AT_MS     = 10000;
     static const unsigned long JOIN_DURATION_MS = 45000;
@@ -689,7 +661,6 @@ private:
     static const unsigned int  GHOST_N          = 4;
     static const float         GHOST_DIST; // ghost park distance (units)
 
-    bool          passed_;
     bool          spawned_;
     unsigned long lastGvisMs_;
     unsigned int  nGhost_;
@@ -719,14 +690,12 @@ const float NpcCensusScenario::GHOST_DIST = 600.0f;
 // standard MEMBER/RECV NPC series. Test-SpawnFarBind gates: every far hand
 // binds exactly once (no duplicate mints) and while still >= 400 u from the
 // join anchor (no more on-top materialization).
-class SpawnFarScenario : public Scenario {
+class SpawnFarScenario : public TimedScenario {
 public:
     SpawnFarScenario()
-        : passed_(false), lastLogMs_(0), lastOrderMs_(0),
+        : TimedScenario("spawn_far", 0), lastLogMs_(0), lastOrderMs_(0),
           spawned_(false), nFar_(0),
           haveAnchor_(false), ax_(0), ay_(0), az_(0) {}
-
-    virtual const char* name() const { return "spawn_far"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         Character* ld = engine::leader(ctx.gw);
@@ -805,8 +774,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long SPAWN_AT_MS      = 6000;
     static const unsigned long ORDER_EVERY_MS   = 5000;
@@ -822,7 +789,6 @@ private:
     static const float         WALK_SPEED;  // commanded approach speed (u/s)
     static const float         ARRIVE_DIST; // stop re-ordering inside this
 
-    bool          passed_;
     unsigned long lastLogMs_;
     unsigned long lastOrderMs_;
     bool          spawned_;

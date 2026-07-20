@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <map>
 #include <enet/enet.h>
 
 #include "../../netproto/Wire.h"
@@ -168,8 +169,22 @@ public:
     // unreliable ceiling). Must be called before startHost/startClient. 0 = UDP.
     void setSteamTransport(unsigned long long peerSteamId);
 
+    // MAIN thread: advance this peer's session epoch (protocol 44). Called on
+    // every session-reset edge (coordinated world reload, connect/disconnect
+    // teardown). Subsequent entity batches carry the new epoch, so the peer
+    // drops any still-in-flight batch from the prior session; the pending owned-
+    // entity snapshot is also dropped so a stale one is not re-stamped with the
+    // new epoch and mistaken for fresh. Thread-safe (InterlockedIncrement + the
+    // publish lock for the snapshot clear).
+    void bumpSessionEpoch();
+
     bool isRunning() const { return running_ != 0; }
-    u32  localId()   const { return myId_; } // host = 0; client = id from WELCOME
+    // host = 0; client = id from WELCOME. myId_ is written by the NET thread when
+    // the WELCOME arrives and read here on the MAIN thread, so it is a volatile
+    // LONG written via InterlockedExchange; an aligned 32-bit volatile read is
+    // atomic on x86/x64 and the volatile bars the compiler from caching a stale
+    // value (Phase 4: myId_ cross-thread safety).
+    u32  localId()   const { return (u32)myId_; }
 
 private:
     static DWORD WINAPI threadEntry(LPVOID self);
@@ -180,6 +195,13 @@ private:
     // enabled, else deliver immediately. flushDelayed() releases matured entries.
     void deliverEntity(u32 ownerId, u32 sendMs, const EntityState& e);
     void flushDelayed();
+
+    // Net-thread-only (protocol 44): gate an incoming entity batch by its session
+    // epoch. Returns false (drop) if 'epoch' is older than the newest accepted
+    // from 'ownerId'; otherwise records it and returns true. epochSeen_ is reset
+    // at every connection edge so a reconnecting peer restarting at epoch 0 is
+    // never locked out.
+    bool acceptEpoch(u32 ownerId, u32 epoch);
 
     bool        isHost_;
     std::string ip_;
@@ -267,7 +289,17 @@ private:
     HANDLE        thread_;
     volatile LONG running_;
     volatile LONG stopFlag_;
-    u32           myId_;
+    // Written by the NET thread on WELCOME (InterlockedExchange) and read on the
+    // MAIN thread via localId(); volatile LONG so the read is atomic + uncached.
+    volatile LONG myId_;
+
+    // Session epoch (protocol 44). sendEpoch_ is bumped by the MAIN thread
+    // (InterlockedIncrement in bumpSessionEpoch) and read by the NET thread when
+    // it stamps an outgoing entity batch - a volatile LONG, so the read is atomic
+    // + uncached. epochSeen_ is NET-thread-only (touched only in the receive
+    // ladder + connect/disconnect handlers), so it needs no lock.
+    volatile LONG        sendEpoch_;
+    std::map<u32, u32>   epochSeen_; // newest accepted epoch per ownerId
 
     // Steam P2P transport (set before launch; read-only on the net thread
     // thereafter). 0 = stock UDP transport.

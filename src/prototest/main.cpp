@@ -17,6 +17,8 @@
 // Build: cmd /c scripts\build_prototest.cmd  ->  dist\prototest.exe
 
 #define _CRT_SECURE_NO_WARNINGS 1
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 
 #include <cstdio>
 #include <cstring>
@@ -28,6 +30,10 @@
 #include "../plugin/core/SteamId.h"
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
+#include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
+#include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
+#include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
+#include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
 
 #include <set>
 
@@ -58,7 +64,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(WelcomePacket)",           sizeof(WelcomePacket),           7);
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             54);
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
-    CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       10); // v35: +sendMs
+    CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
     CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            158); // v42: +locked+lockReserved
     CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       27); // v33: +keyKind
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
@@ -201,7 +207,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v43: camera hint / PKT_CAM_HINT)", (int)PROTOCOL_VERSION, 43);
+    CHECK_EQ("PROTOCOL_VERSION (v44: bulk channel + session epoch)", (int)PROTOCOL_VERSION, 44);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -299,7 +305,8 @@ static void testFraming() {
     const unsigned N = 3;
     unsigned char buf[sizeof(EntityBatchHeader) + 3 * sizeof(EntityState)];
     EntityBatchHeader hdr;
-    hdr.type = (u8)PKT_ENTITY_BATCH; hdr.ownerId = 42; hdr.sendMs = 123456u; hdr.count = (u8)N;
+    hdr.type = (u8)PKT_ENTITY_BATCH; hdr.ownerId = 42; hdr.sendMs = 123456u;
+    hdr.epoch = 7u; hdr.count = (u8)N;
     std::memcpy(buf, &hdr, sizeof(hdr));
     EntityState src[N];
     for (unsigned i = 0; i < N; ++i) {
@@ -311,7 +318,8 @@ static void testFraming() {
     std::memcpy(&rh, buf, sizeof(rh));
     unsigned need = (unsigned)sizeof(EntityBatchHeader) + (unsigned)rh.count * (unsigned)sizeof(EntityState);
     CHECK("entity batch: full payload accepted",
-          len >= need && rh.count == N && rh.ownerId == 42 && rh.sendMs == 123456u);
+          len >= need && rh.count == N && rh.ownerId == 42 && rh.sendMs == 123456u
+          && rh.epoch == 7u);
     bool all = true;
     for (unsigned i = 0; i < N; ++i) {
         EntityState e;
@@ -625,6 +633,25 @@ static void testInterp() {
         CHECK("teleport does not smear", ok && !smeared);
     }
 
+    // Dead-reckon past a teleport: when the LAST segment is a jump (a park /
+    // fast-travel) and the render time runs past the newest sample, the buffer
+    // must HOLD the newest pose - never dead-reckon ALONG the jump vector, which
+    // multiplies the delta by ahead/seg and flings the body thousands of units
+    // past its real position (the roaming/fast-travel warp fixed 2026-07-20).
+    {
+        EntityInterp it;
+        it.push(entAt(0.0f), 1000);
+        it.push(entAt(1000.0f), 1050); // last segment = 1000u jump >> 50u snap
+        EntityState out;
+        // nowMs=1350 -> renderTime = 1350 - delay(<=200) >= 1150, past newest
+        // (1050) but < staleMs, so we hit the extrapolation branch.
+        bool ok = it.sample(1350, cfg, &out);
+        CHECK("dead-reckon past teleport returns", ok);
+        // Without the guard this overshoots to ~3000u; the guard holds newest.
+        CHECK("dead-reckon past teleport holds newest (no overshoot)",
+              ok && out.x <= 1000.5f && out.x >= 999.5f);
+    }
+
     // Single snapshot: returns that pose verbatim.
     {
         EntityInterp it;
@@ -871,10 +898,471 @@ static void testDeathRekey() {
     CHECK("merge keeps new ko",    r5.ko);
 }
 
+// ---- 11. Inbound queue lifecycle (Inbound.h) ------------------------------------
+// Locks the Phase 0 correctness fixes against regression:
+//  (a) flushWorldState() drops a queued cross-owner invXfer intent - the bug was
+//      that a transfer enqueued before a world reload SURVIVED it (invXfer_ was
+//      missing from the clear list), applying against the fresh world.
+//  (b) sawRemote_ (peer-readiness) clears on the session-reset edge, so a new
+//      scenario cannot arm on a departed peer's stale readiness.
+//  (c) the internal session generation advances on every flush (the Phase 0 seed
+//      for the Phase 4 wire epoch).
+// It also proves the world-state vs session-preserving split: a world-state queue
+// is dropped while a coordinated-load queue survives the same flush.
+static void testInboundLifecycle() {
+    std::printf("== inbound queue lifecycle (Inbound.h) ==\n");
+    Inbound in;
+
+    CHECK_EQ("initial session generation", in.sessionGeneration(), 0);
+    CHECK("sawRemote false before any entity", !in.sawRemoteEntity());
+
+    EntityState e; std::memset(&e, 0, sizeof(e));
+    in.pushEntity(1, 1000, e);
+    CHECK("sawRemote true after owned-entity batch", in.sawRemoteEntity());
+
+    // (a) THE FIX: a cross-owner transfer intent must not survive a reload.
+    InvXferPacket xf; std::memset(&xf, 0, sizeof(xf));
+    xf.type = (u8)PKT_INV_XFER; xf.ownerId = 1;
+    in.pushInvXfer(1, xf);
+    {
+        std::deque<InboundInvXfer> peek;
+        in.drainInvXfers(peek);
+        CHECK("invXfer enqueues normally", peek.size() == 1);
+    }
+    in.pushInvXfer(1, xf);          // re-enqueue, then hit the reload edge
+    in.flushWorldState();
+    {
+        std::deque<InboundInvXfer> after;
+        in.drainInvXfers(after);
+        CHECK("invXfer dropped by flushWorldState (was the bug)", after.empty());
+    }
+
+    // (b) + (c): the same flush cleared readiness and advanced the generation.
+    CHECK("sawRemote cleared by flushWorldState", !in.sawRemoteEntity());
+    CHECK_EQ("generation advanced by flush", in.sessionGeneration(), 1);
+
+    // world-state vs session-preserving: a world event drops, a LOAD_GO survives.
+    EventPacket ev; std::memset(&ev, 0, sizeof(ev)); ev.type = (u8)PKT_EVENT; ev.ownerId = 1;
+    in.pushEvent(1, ev);
+    LoadGoPacket lg; std::memset(&lg, 0, sizeof(lg)); lg.type = (u8)PKT_LOAD_GO; lg.ownerId = 0;
+    in.pushLoadGo(0, lg);
+    in.flushWorldState();
+    {
+        std::deque<InboundEvent> evOut; in.drainEvents(evOut);
+        std::deque<InboundLoadGo> lgOut; in.drainLoadGos(lgOut);
+        CHECK("world-state event dropped by flush", evOut.empty());
+        CHECK("coordinated-load GO survives flush (session-preserving)", lgOut.size() == 1);
+    }
+    CHECK_EQ("generation advanced again", in.sessionGeneration(), 2);
+}
+
+// ---- 11b. flushWorldState() full-coverage contract (Inbound.h) ------------------
+// The invXfer_ bug (a world-state queue silently missing from the clear list) is a
+// CLASS of bug: every queue Inbound owns must be classified as either WORLD-STATE
+// (dropped on the reload/reconnect/disconnect edge) or SESSION-PRESERVING (kept
+// because the connection outlives the world swap). This test pushes a sentinel
+// into EVERY queue, hits one flush, and asserts the split for all of them, so a
+// queue added later without being classified in flushWorldState() fails here.
+//
+// WHEN YOU ADD A NEW INBOUND QUEUE: add its push here and assert it in the correct
+// group. A queue absent from both groups is unverified - that is the bug.
+static void testFlushWorldStateContract() {
+    std::printf("== flushWorldState full-coverage contract (Inbound.h) ==\n");
+    Inbound in;
+
+    // Zeroed payloads - the flush contract is about queue membership, not content.
+    EntityState     e;   std::memset(&e,   0, sizeof(e));
+    EventPacket     ev;  std::memset(&ev,  0, sizeof(ev));
+    u32             cKey[5]; std::memset(cKey, 0, sizeof(cKey));
+    WorldDropPacket wdp; std::memset(&wdp, 0, sizeof(wdp));
+    WorldPickupPacket wpp; std::memset(&wpp, 0, sizeof(wpp));
+    InvXferPacket   xf;  std::memset(&xf,  0, sizeof(xf));
+    MedicalPacket   mp;  std::memset(&mp,  0, sizeof(mp));
+    TreatmentPacket tp;  std::memset(&tp,  0, sizeof(tp));
+    SpeedPacket     sp;  std::memset(&sp,  0, sizeof(sp));
+    StatsPacket     stp; std::memset(&stp, 0, sizeof(stp));
+    MoneyPacket     mo;  std::memset(&mo,  0, sizeof(mo));
+    FactionPacket   fa;  std::memset(&fa,  0, sizeof(fa));
+    TimePacket      ti;  std::memset(&ti,  0, sizeof(ti));
+    DoorPacket      dp;  std::memset(&dp,  0, sizeof(dp));
+    ProdPacket      pr;  std::memset(&pr,  0, sizeof(pr));
+    ResearchPacket  rp;  std::memset(&rp,  0, sizeof(rp));
+    BuildPlacePacket  bp; std::memset(&bp,  0, sizeof(bp));
+    BuildStatePacket  bs; std::memset(&bs,  0, sizeof(bs));
+    BuildDoorPacket   bd; std::memset(&bd,  0, sizeof(bd));
+    BuildRemovePacket br; std::memset(&br,  0, sizeof(br));
+    StealthPacket   sl;  std::memset(&sl,  0, sizeof(sl));
+    SpawnReqPacket  sq;  std::memset(&sq,  0, sizeof(sq));
+    SpawnInfoPacket si;  std::memset(&si,  0, sizeof(si));
+    CamHintPacket   ch;  std::memset(&ch,  0, sizeof(ch));
+    // Session-preserving payloads.
+    SaveReqPacket   srq; std::memset(&srq, 0, sizeof(srq));
+    SaveBeginPacket sbg; std::memset(&sbg, 0, sizeof(sbg));
+    SaveFileHeader  sfh; std::memset(&sfh, 0, sizeof(sfh)); // pathLen/dataLen = 0
+    SaveDoneHeader  sdh; std::memset(&sdh, 0, sizeof(sdh)); // fileCount = 0
+    SaveAckPacket   sak; std::memset(&sak, 0, sizeof(sak));
+    LoadGoPacket    lg;  std::memset(&lg,  0, sizeof(lg));
+    LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
+    LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
+
+    // --- Push one sentinel into every WORLD-STATE queue (27).
+    in.pushEntity(1, 0, e);
+    in.pushEvent(1, ev);
+    in.pushInv(1, 0, cKey, 0, 0);
+    in.pushWorldItems(1, 0, 0);
+    in.pushWorldRemove(1, 0, 0);
+    in.pushNpcCensus(1, 0, 0, 0);
+    in.pushWorldDrop(1, wdp);
+    in.pushWorldPickup(1, wpp);
+    in.pushInvXfer(1, xf);
+    in.pushMedical(1, mp);
+    in.pushTreatment(1, tp);
+    in.pushSpeed(1, sp);
+    in.pushStats(1, stp);
+    in.pushMoney(1, mo);
+    in.pushFaction(1, fa);
+    in.pushTime(1, ti);
+    in.pushDoor(1, dp);
+    in.pushProd(1, pr);
+    in.pushResearch(1, rp);
+    in.pushBuildPlace(1, bp);
+    in.pushBuildState(1, bs);
+    in.pushBuildDoor(1, bd);
+    in.pushBuildRemove(1, br);
+    in.pushStealth(1, sl);
+    in.pushSpawnReq(1, sq);
+    in.pushSpawnInfo(1, si);
+    in.pushCamHint(1, ch);
+
+    // --- Push one sentinel into every SESSION-PRESERVING queue (10).
+    in.pushConnect(0);
+    in.pushLeave(0);
+    in.pushSaveReq(1, srq);
+    in.pushSaveBegin(1, sbg);
+    in.pushSaveFile(1, sfh, "", 0);
+    in.pushSaveDone(1, sdh, 0);
+    in.pushSaveAck(1, sak);
+    in.pushLoadGo(0, lg);
+    in.pushLoadReq(1, lrq);
+    in.pushLoadNack(1, lnk);
+
+    in.flushWorldState();
+
+    // --- Every WORLD-STATE queue must now be empty.
+    #define WS_EMPTY(name, type, drain) do { \
+        std::deque<type> out; in.drain(out); \
+        CHECK("world-state dropped: " name, out.empty()); } while (0)
+    WS_EMPTY("entity",      InboundEntity,      drainEntities);
+    WS_EMPTY("event",       InboundEvent,       drainEvents);
+    WS_EMPTY("inv",         InboundInv,         drainInv);
+    WS_EMPTY("worldItems",  InboundWorldItems,  drainWorldItems);
+    WS_EMPTY("worldRemove", InboundWorldRemove, drainWorldRemove);
+    WS_EMPTY("npcCensus",   InboundNpcCensus,   drainNpcCensus);
+    WS_EMPTY("worldDrop",   InboundWorldDrop,   drainWorldDrops);
+    WS_EMPTY("worldPickup", InboundWorldPickup, drainWorldPickups);
+    WS_EMPTY("invXfer",     InboundInvXfer,     drainInvXfers);
+    WS_EMPTY("medical",     InboundMedical,     drainMedical);
+    WS_EMPTY("treatment",   InboundTreatment,   drainTreatments);
+    WS_EMPTY("speed",       InboundSpeed,       drainSpeed);
+    WS_EMPTY("stats",       InboundStats,       drainStats);
+    WS_EMPTY("money",       InboundMoney,       drainMoney);
+    WS_EMPTY("faction",     InboundFaction,     drainFaction);
+    WS_EMPTY("time",        InboundTime,        drainTime);
+    WS_EMPTY("door",        InboundDoor,        drainDoor);
+    WS_EMPTY("prod",        InboundProd,        drainProd);
+    WS_EMPTY("research",    InboundResearch,    drainResearch);
+    WS_EMPTY("buildPlace",  InboundBuildPlace,  drainBuildPlace);
+    WS_EMPTY("buildState",  InboundBuildState,  drainBuildState);
+    WS_EMPTY("buildDoor",   InboundBuildDoor,   drainBuildDoor);
+    WS_EMPTY("buildRemove", InboundBuildRemove, drainBuildRemove);
+    WS_EMPTY("stealth",     InboundStealth,     drainStealth);
+    WS_EMPTY("spawnReq",    InboundSpawnReq,    drainSpawnReqs);
+    WS_EMPTY("spawnInfo",   InboundSpawnInfo,   drainSpawnInfos);
+    WS_EMPTY("camHint",     InboundCamHint,     drainCamHints);
+    #undef WS_EMPTY
+
+    // --- Every SESSION-PRESERVING queue must still hold its sentinel.
+    #define SP_KEPT(name, type, drain) do { \
+        std::deque<type> out; in.drain(out); \
+        CHECK("session-preserving kept: " name, out.size() == 1); } while (0)
+    { std::deque<u32> out; in.drainConnects(out);
+      CHECK("session-preserving kept: connect", out.size() == 1); }
+    { std::deque<u32> out; in.drainLeaves(out);
+      CHECK("session-preserving kept: leave", out.size() == 1); }
+    SP_KEPT("saveReq",   InboundSaveReq,   drainSaveReqs);
+    SP_KEPT("saveBegin", InboundSaveBegin, drainSaveBegins);
+    SP_KEPT("saveFile",  InboundSaveFile,  drainSaveFiles);
+    SP_KEPT("saveDone",  InboundSaveDone,  drainSaveDones);
+    SP_KEPT("saveAck",   InboundSaveAck,   drainSaveAcks);
+    SP_KEPT("loadGo",    InboundLoadGo,    drainLoadGos);
+    SP_KEPT("loadReq",   InboundLoadReq,   drainLoadReqs);
+    SP_KEPT("loadNack",  InboundLoadNack,  drainLoadNacks);
+    #undef SP_KEPT
+}
+
+// ---- 12. Worker-teardown ordering (models NetLink::stop()) -----------------------
+// The NetLink::stop() fix: ENet teardown (enet_deinitialize + CloseHandle) must
+// happen ONLY after the net worker has fully exited - the worker owns transport
+// cleanup, so deinitializing while it still runs is a use-after-free / double
+// free. The old code tore down unconditionally on a 2 s wait TIMEOUT. This locks
+// the ordering invariant with a bare Win32 worker (no ENet dependency in the unit
+// layer): stop() waits for the thread to exit FIRST, and the worker's cleanup
+// strictly precedes the post-wait teardown.
+static volatile LONG g_teardownSeq   = 0;
+static LONG          g_workerCleanup = 0;
+static LONG          g_teardown      = 0;
+static DWORD WINAPI teardownWorker(LPVOID) {
+    Sleep(40); // simulate the service loop draining + transport cleanup
+    g_workerCleanup = InterlockedIncrement(&g_teardownSeq);
+    return 0;
+}
+static void testTeardownOrdering() {
+    std::printf("== worker-teardown ordering (NetLink::stop contract) ==\n");
+    g_teardownSeq = 0; g_workerCleanup = 0; g_teardown = 0;
+    HANDLE th = CreateThread(0, 0, &teardownWorker, 0, 0, 0);
+    CHECK("worker thread created", th != 0);
+    if (th) {
+        DWORD wr = WaitForSingleObject(th, INFINITE); // stop(): wait for full exit
+        CHECK("wait returns signalled (worker exited)", wr == WAIT_OBJECT_0);
+        CloseHandle(th);
+        g_teardown = InterlockedIncrement(&g_teardownSeq); // "enet_deinitialize" AFTER
+        CHECK("worker cleanup precedes teardown", g_workerCleanup < g_teardown);
+    }
+}
+
+// ---- ObjectHand: dual-layout unification contract (Phase 5b) ----------------
+// Locks the ONE typed identity's two legacy array orders so a future edit can't
+// silently reorder a field (the exact "dual hand[5] layout" desync footgun).
+static void testObjectHandLayout() {
+    std::printf("\n== ObjectHand layout (Phase 5b) ==\n");
+    ObjectHand h;
+    h.type = 11; h.container = 22; h.containerSerial = 33; h.index = 44; h.serial = 55;
+
+    // OBJECT order  = {type, container, containerSerial, index, serial}
+    u32 obj[5];
+    h.toObjOrder(obj);
+    CHECK("objOrder[0]=type",            obj[0] == 11);
+    CHECK("objOrder[1]=container",       obj[1] == 22);
+    CHECK("objOrder[2]=containerSerial", obj[2] == 33);
+    CHECK("objOrder[3]=index",           obj[3] == 44);
+    CHECK("objOrder[4]=serial",          obj[4] == 55);
+
+    // CHAR-KEY order = {index, serial, type, container, containerSerial}
+    u32 ck[5];
+    h.toCharKey(ck);
+    CHECK("charKey[0]=index",           ck[0] == 44);
+    CHECK("charKey[1]=serial",          ck[1] == 55);
+    CHECK("charKey[2]=type",            ck[2] == 11);
+    CHECK("charKey[3]=container",       ck[3] == 22);
+    CHECK("charKey[4]=containerSerial", ck[4] == 33);
+
+    // The two legacy orders are genuinely different layouts (the footgun itself).
+    CHECK("obj order != char-key order", std::memcmp(obj, ck, sizeof(obj)) != 0);
+
+    // Round-trips: from*(to*(h)) == h for both orders.
+    CHECK("fromObjOrder round-trips",  ObjectHand::fromObjOrder(obj).equals(h));
+    CHECK("fromCharKey round-trips",   ObjectHand::fromCharKey(ck).equals(h));
+
+    // Cross-order remap through the POD reproduces the manual [3][4][0][1][2]
+    // char-key remap of an object-order array (the exact call-site footgun).
+    u32 remap[5];
+    ObjectHand::fromObjOrder(obj).toCharKey(remap);
+    CHECK("obj->charkey remap [0]=obj[3]", remap[0] == obj[3]);
+    CHECK("obj->charkey remap [1]=obj[4]", remap[1] == obj[4]);
+    CHECK("obj->charkey remap [2]=obj[0]", remap[2] == obj[0]);
+    CHECK("obj->charkey remap [3]=obj[1]", remap[3] == obj[1]);
+    CHECK("obj->charkey remap [4]=obj[2]", remap[4] == obj[2]);
+
+    // EntityState's named hand fields ARE object order: an ObjectHand built from
+    // them must serialize to the same object-order array.
+    EntityState e;
+    std::memset(&e, 0, sizeof(e));
+    e.hType = 11; e.hContainer = 22; e.hContainerSerial = 33; e.hIndex = 44; e.hSerial = 55;
+    ObjectHand eh;
+    eh.type = e.hType; eh.container = e.hContainer; eh.containerSerial = e.hContainerSerial;
+    eh.index = e.hIndex; eh.serial = e.hSerial;
+    CHECK("EntityState hand == object order", eh.equals(h));
+
+    // resolvable(): the engine's null handle is all-zero; a non-zero index or
+    // serial names a live object, type/container alone never do.
+    ObjectHand z; z.type = z.container = z.containerSerial = z.index = z.serial = 0;
+    CHECK("all-zero hand not resolvable",       !z.resolvable());
+    ObjectHand idxOnly = z; idxOnly.index = 1;
+    CHECK("index-only hand resolvable",          idxOnly.resolvable());
+    ObjectHand serOnly = z; serOnly.serial = 1;
+    CHECK("serial-only hand resolvable",         serOnly.resolvable());
+    ObjectHand tcOnly = z; tcOnly.type = 7; tcOnly.container = 9;
+    CHECK("type/container-only NOT resolvable", !tcOnly.resolvable());
+
+    // equals() is field-sensitive on every one of the five fields.
+    ObjectHand d;
+    d = h; d.type++;            CHECK("equals detects type diff",      !d.equals(h));
+    d = h; d.container++;       CHECK("equals detects container diff", !d.equals(h));
+    d = h; d.containerSerial++; CHECK("equals detects cser diff",      !d.equals(h));
+    d = h; d.index++;           CHECK("equals detects index diff",     !d.equals(h));
+    d = h; d.serial++;          CHECK("equals detects serial diff",    !d.equals(h));
+}
+
+// ---- Engine fault throttle contract (Phase 5c) ------------------------------
+// Locks the pure throttle decision that gates the "[engine] FAULT" oracle line:
+// always emit the first hit, then at most once per interval, tolerating the
+// wall-clock midnight wrap by erring toward an extra emit (never silent forever).
+static void testEngineFaults() {
+    std::printf("\n== engine fault throttle (Phase 5c) ==\n");
+    using coop::engine::faultShouldLog;
+    using coop::engine::FAULT_OP_COUNT;
+    using coop::engine::FAULT_RESOLVE_CHAR;
+    using coop::engine::FAULT_RESOLVE_OBJECT;
+
+    CHECK("FAULT_OP_COUNT > 0",   (int)FAULT_OP_COUNT > 0);
+    CHECK("resolve ops ordered",  FAULT_RESOLVE_CHAR == 0 && FAULT_RESOLVE_OBJECT == 1);
+
+    unsigned long last = 0;
+    CHECK("first hit logs",             faultShouldLog(1, 5000, &last, 1000));
+    CHECK("first hit stamps lastMs",    last == 5000);
+    CHECK("hit within interval quiet",  !faultShouldLog(2, 5500, &last, 1000));
+    CHECK("lastMs unchanged in quiet",  last == 5000);
+    CHECK("hit at interval logs",       faultShouldLog(3, 6000, &last, 1000));
+    CHECK("lastMs advanced",            last == 6000);
+    CHECK("just-before-boundary quiet", !faultShouldLog(4, 6999, &last, 1000));
+
+    // Midnight wrap of wallClockMs: unsigned delta stays huge -> emit (never
+    // permanently suppress across the wrap).
+    unsigned long wrapLast = 86399000UL;
+    CHECK("wrap boundary logs", faultShouldLog(5, 1000, &wrapLast, 1000));
+
+    // Null lastMs (defensive): only the very first hit logs.
+    CHECK("null lastMs first logs",  faultShouldLog(1, 0, 0, 1000));
+    CHECK("null lastMs later quiet", !faultShouldLog(2, 0, 0, 1000));
+}
+
+static void testEngineCaps() {
+    std::printf("\n== engine capability registry (Phase 5d) ==\n");
+    using namespace coop::engine;
+
+    // capName tokens are the oracle contract: stable, in enum order, guarded.
+    CHECK("CAP_COUNT > 0",          (int)CAP_COUNT > 0);
+    CHECK("cap core is hand",       std::strcmp(capName(CAP_HAND_RESOLVE), "hand_resolve") == 0);
+    CHECK("cap saveload token",     std::strcmp(capName(CAP_SAVELOAD), "saveload") == 0);
+    CHECK("cap faction token",      std::strcmp(capName(CAP_FACTION), "faction") == 0);
+    CHECK("cap out-of-range low",   std::strcmp(capName((Capability)-1), "unknown") == 0);
+    CHECK("cap out-of-range high",  std::strcmp(capName(CAP_COUNT), "unknown") == 0);
+
+    // Synthetic resolved slots: two caps, one with a redundant required row.
+    void* pA = (void*)1;  // saveload row 1
+    void* pB = (void*)1;  // saveload row 2
+    void* pH = (void*)1;  // hand_resolve (core)
+    void* pF = (void*)1;  // faction (unrelated)
+    const CapRow rows[] = {
+        { &pA, "SaveManager::get",  CAP_SAVELOAD,     true },
+        { &pB, "SaveManager::load", CAP_SAVELOAD,     true },
+        { &pH, "hand::getCharacter",CAP_HAND_RESOLVE, true },
+        { &pF, "FactionRelations",  CAP_FACTION,      true }
+    };
+    const int n = (int)(sizeof(rows) / sizeof(rows[0]));
+    bool avail[CAP_COUNT];
+
+    // (1) Everything resolved -> the three exercised caps are available; every
+    // untouched cap (no rows) stays fail-closed false; core is OK.
+    capEvaluate(rows, n, avail);
+    CHECK("all-resolved saveload on",   avail[CAP_SAVELOAD]);
+    CHECK("all-resolved hand on",       avail[CAP_HAND_RESOLVE]);
+    CHECK("all-resolved faction on",    avail[CAP_FACTION]);
+    CHECK("untouched cap fail-closed",  !avail[CAP_DOOR]);
+    CHECK("core ok when hand resolved", capCoreOk(avail));
+
+    // (2) One of saveload's two required rows drops -> the WHOLE cap fails, but
+    // the other caps are untouched (no cross-contamination).
+    pB = 0;
+    capEvaluate(rows, n, avail);
+    CHECK("partial-miss fails cap",     !avail[CAP_SAVELOAD]);
+    CHECK("sibling cap unaffected",     avail[CAP_HAND_RESOLVE]);
+    CHECK("unrelated cap unaffected",   avail[CAP_FACTION]);
+    pB = (void*)1;
+
+    // (3) Core hand-resolve missing -> capCoreOk trips (unsupported image),
+    // while an unrelated cap can still be up.
+    pH = 0;
+    capEvaluate(rows, n, avail);
+    CHECK("core down when hand missing", !capCoreOk(avail));
+    CHECK("hand cap off",                !avail[CAP_HAND_RESOLVE]);
+    CHECK("faction still up",            avail[CAP_FACTION]);
+    pH = (void*)1;
+
+    // (4) capRowResolved: null slot and null pointer both read as unresolved.
+    void* live = (void*)1;
+    void* dead = 0;
+    CapRow rLive = { &live, "x", CAP_SAVELOAD, true };
+    CapRow rDead = { &dead, "y", CAP_SAVELOAD, true };
+    CapRow rNoSlot = { 0, "z", CAP_SAVELOAD, true };
+    CHECK("row resolved (live ptr)",  capRowResolved(rLive));
+    CHECK("row unresolved (null ptr)", !capRowResolved(rDead));
+    CHECK("row unresolved (no slot)",  !capRowResolved(rNoSlot));
+}
+
+// Phase 6: the shared change-gated send/accept policy (ChangeGate.h). This
+// locks the exact decisions the money + door channels used to inline by hand,
+// so a future consolidation can't silently drift the wire cadence.
+static void testChangeGate() {
+    std::printf("\n== change-gate policy (Phase 6) ==\n");
+    using namespace coop::sync;
+
+    // --- gateSampleDue: first pass always samples, then once per sampleMs. ----
+    CHECK("sample due first pass",      gateSampleDue(50000, 0, 1000));
+    CHECK("sample not due within win", !gateSampleDue(50500, 50000, 1000));
+    CHECK("sample due at interval",     gateSampleDue(51000, 50000, 1000));
+    CHECK("sample due past interval",   gateSampleDue(52000, 50000, 1000));
+
+    // --- gateSeqAccept: monotonic per-sender, first sight always accepted. ---
+    CHECK("seq accept first sight",   gateSeqAccept(0, 1));
+    CHECK("seq accept first sight hi",gateSeqAccept(0, 999));
+    CHECK("seq accept newer",         gateSeqAccept(5, 6));
+    CHECK("seq drop equal",          !gateSeqAccept(5, 5));
+    CHECK("seq drop older",          !gateSeqAccept(5, 4));
+
+    // --- gateShouldSend, MONEY flavor (minSend=1000, resend=5000, unsent=1) ---
+    // A never-sent row streams once even unchanged (no silent seed).
+    CHECK("money unsent unchanged sends",
+          gateShouldSend(false, 90000, 0, 1000, 5000, true));
+    // A change always crosses (row sent long ago, past the throttle).
+    CHECK("money change sends",
+          gateShouldSend(true, 90000, 80000, 1000, 5000, true));
+    // ...but not within the min-send throttle window after a send.
+    CHECK("money change throttled",
+          !gateShouldSend(true, 80500, 80000, 1000, 5000, true));
+    // Unchanged + sent recently (past throttle, before resend) holds.
+    CHECK("money unchanged holds pre-resend",
+          !gateShouldSend(false, 82000, 80000, 1000, 5000, true));
+    // Unchanged + resend window elapsed -> safety resend.
+    CHECK("money unchanged resends",
+          gateShouldSend(false, 86000, 80000, 1000, 5000, true));
+
+    // --- gateShouldSend, DOOR flavor (minSend=0, resend=10000, unsent=0) -----
+    // A silently-seeded, never-sent, unchanged row HOLDS (no first-sight send).
+    CHECK("door unsent unchanged holds",
+          !gateShouldSend(false, 90000, 0, 0, 10000, false));
+    // A real change crosses immediately (no throttle).
+    CHECK("door change sends",
+          gateShouldSend(true, 90000, 0, 0, 10000, false));
+    // Unchanged, sent within resend window -> hold.
+    CHECK("door unchanged holds pre-resend",
+          !gateShouldSend(false, 85000, 80000, 0, 10000, false));
+    // Unchanged, resend window elapsed -> safety resend.
+    CHECK("door unchanged resends",
+          gateShouldSend(false, 90000, 80000, 0, 10000, false));
+    // A change sent 1ms ago still crosses under a zero throttle.
+    CHECK("door change no throttle",
+          gateShouldSend(true, 80001, 80000, 0, 10000, false));
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
     testSizes();
+    testObjectHandLayout();
+    testEngineFaults();
+    testEngineCaps();
+    testChangeGate();
     testRoundTrips();
     testFraming();
     testSaveCrc();
@@ -886,6 +1374,9 @@ int main() {
     testWorkPoseMatch();
     testTaskClear();
     testDeathRekey();
+    testInboundLifecycle();
+    testFlushWorldStateContract();
+    testTeardownOrdering();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

@@ -17,16 +17,14 @@ namespace {
 // join must (a) observe a content CHANGE (>=2 distinct hashes - proving it wasn't a
 // static loaded state) and (b) end with MORE items than its own baseline. The runner
 // additionally cross-checks the host's and join's FINAL hashes match (same multiset).
-class InventorySyncScenario : public Scenario {
+class InventorySyncScenario : public TimedScenario {
 public:
     InventorySyncScenario()
-        : passed_(false), haveContainer_(false), added_(false), lastLogMs_(0),
+        : TimedScenario("inv_order", 0), haveContainer_(false), added_(false), lastLogMs_(0),
           samples_(0), distinct_(0), firstCount_(0), lastCount_(0),
           firstHash_(0), lastHash_(0), prevHash_(0) {
         for (int i = 0; i < 5; ++i) cHand_[i] = 0;
     }
-
-    virtual const char* name() const { return "inv_order"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         haveContainer_ = engine::pickInventoryContainer(ctx.gw, cHand_);
@@ -85,14 +83,11 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned long HOST_DURATION_MS = 40000; // outlive the join's window
     static const unsigned long JOIN_DURATION_MS = 24000;
     static const unsigned long ADD_MS           = 8000;  // baseline, then add live
 
-    bool          passed_;
     bool          haveContainer_;
     bool          added_;
     unsigned long lastLogMs_;
@@ -116,16 +111,14 @@ private:
 // converged to the author's FINAL contents - proving inventory flows both ways with no
 // loss/dupe on the supported (owned-container) path. Requires a shared save with >=2
 // squad tabs (rank 0 and rank 1).
-class InventoryBidirScenario : public Scenario {
+class InventoryBidirScenario : public TimedScenario {
 public:
     InventoryBidirScenario()
-        : passed_(false), haveOwn_(false), added_(false), removed_(false),
+        : TimedScenario("inv_bidir", 0), haveOwn_(false), added_(false), removed_(false),
           lastLogMs_(0), samples_(0), ownRank_(0),
           firstOwnCount_(0), lastOwnCount_(0), prevOwnHash_(0), distinctOwn_(0) {
         for (int i = 0; i < 5; ++i) ownHand_[i] = 0;
     }
-
-    virtual const char* name() const { return "inv_bidir"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         ownRank_ = ctx.isHost ? 0u : 1u;
@@ -200,8 +193,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Resolve the lowest-hand squad member whose squad-tab CONTAINER has the given rank
     // (distinct hand-containers, sorted - the SAME key the Replicator partitions on) and
@@ -258,7 +249,6 @@ private:
 
     static const unsigned int  MAX_SQUAD        = 32;
 
-    bool          passed_;
     bool          haveOwn_;
     bool          added_;
     bool          removed_;
@@ -286,17 +276,20 @@ private:
 // plus the tracked probe-item and weapon quantities. The runner's Test-TradeProbe
 // reads the series from both logs and reports the conservation outcome per move
 // (dupe / loss / clean) - the log IS the deliverable; nothing here gates sync quality.
-class TradeProbeScenario : public Scenario {
+class TradeScenario : public TimedScenario {
 public:
-    TradeProbeScenario()
-        : passed_(false), lastLogMs_(0), samples_(0),
+    explicit TradeScenario(bool peer)
+        : TimedScenario(peer ? "trade_peer" : "trade_probe", 0),
+          peer_(peer), tag_(peer ? "TRDE" : "TRDP"),
+          hostDur_(peer ? 70000UL : 68000UL), joinDur_(peer ? 56000UL : 52000UL),
+          lastLogMs_(0), samples_(0),
           seedDone_(false), takeDone_(false), giveDone_(false), wpnDone_(false),
-          probeType_(0), wpnType_(0), wpnLatched_(false) {
+          probeType_(0), wpnType_(0), wpnLatched_(false),
+          firstDone_(false), firstWpn0_(0), firstWpn1_(0),
+          lastWpn0_(0), lastWpn1_(0) {
         probeSid_[0] = '\0'; wpnSid_[0] = '\0';
         for (int r = 0; r < 2; ++r) { rankHave_[r] = false; for (int k = 0; k < 5; ++k) rankHand_[r][k] = 0; }
     }
-
-    virtual const char* name() const { return "trade_probe"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         for (unsigned int r = 0; r < 2; ++r)
@@ -304,8 +297,8 @@ public:
         engine::commonTestItemSid(ctx.gw, probeSid_, sizeof(probeSid_), &probeType_);
         char b[200];
         _snprintf(b, sizeof(b) - 1,
-            "SCENARIO TRDP anchor host=%d r0=%d r1=%d probeSid='%s' probeType=%u",
-            ctx.isHost ? 1 : 0, rankHave_[0] ? 1 : 0, rankHave_[1] ? 1 : 0,
+            "SCENARIO %s anchor host=%d r0=%d r1=%d probeSid='%s' probeType=%u",
+            tag_, ctx.isHost ? 1 : 0, rankHave_[0] ? 1 : 0, rankHave_[1] ? 1 : 0,
             probeSid_[0] ? probeSid_ : "(none)", probeType_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
@@ -318,12 +311,15 @@ public:
             // container at first sample. Same save -> same pick on each side, so
             // the two logs track the same item without exchanging anything.
             if (!wpnLatched_ && rankHave_[1]) latchWeapon(ctx.gw);
+            int wpnNow[2] = { 0, 0 };
+            bool sampledBoth = true;
             for (unsigned int rank = 0; rank < 2; ++rank) {
-                if (!rankHave_[rank]) continue;
+                if (!rankHave_[rank]) { sampledBoth = false; continue; }
                 InvItemEntry items[INV_ITEMS_MAX];
                 unsigned int hash = 0;
                 unsigned int n = engine::captureContainerContents(
                     ctx.gw, rankHand_[rank], items, INV_ITEMS_MAX, &hash);
+                if (n == 0) sampledBoth = false;
                 int probeQty = 0, wpnQty = 0;
                 for (unsigned int i = 0; i < n; ++i) {
                     if (probeSid_[0] && items[i].itemType == probeType_ &&
@@ -333,13 +329,22 @@ public:
                         strcmp(items[i].stringID, wpnSid_) == 0)
                         wpnQty += (int)items[i].quantity;
                 }
+                wpnNow[rank] = wpnQty;
                 char b[200];
                 _snprintf(b, sizeof(b) - 1,
-                    "SCENARIO TRDP r=%u %s t=%lu count=%u hash=%u probe=%d wpn=%d",
-                    rank, (ctx.isHost == (rank == 0)) ? "OWN" : "PEER",
+                    "SCENARIO %s r=%u %s t=%lu count=%u hash=%u probe=%d wpn=%d",
+                    tag_, rank, (ctx.isHost == (rank == 0)) ? "OWN" : "PEER",
                     (unsigned long)ctx.elapsedMs, n, hash, probeQty, wpnQty);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 ++samples_;
+            }
+            // trade_peer conservation tracking; inert in probe mode (emits nothing).
+            if (sampledBoth) {
+                if (!firstDone_ && wpnLatched_) {
+                    firstDone_ = true;
+                    firstWpn0_ = wpnNow[0]; firstWpn1_ = wpnNow[1];
+                }
+                lastWpn0_ = wpnNow[0]; lastWpn1_ = wpnNow[1];
             }
 
             // Seed material into the container each side OWNS (ordinary, supported
@@ -352,8 +357,8 @@ public:
                     int got = engine::addTestItemsToContainer(
                         ctx.gw, rankHand_[ownRank], ctx.isHost ? 2 : 3, sid, sizeof(sid));
                     char m[200];
-                    _snprintf(m, sizeof(m) - 1, "SCENARIO TRDP SEED r=%u n=%d sid='%s'",
-                              ownRank, got, sid[0] ? sid : "(none)");
+                    _snprintf(m, sizeof(m) - 1, "SCENARIO %s SEED r=%u n=%d sid='%s'",
+                              tag_, ownRank, got, sid[0] ? sid : "(none)");
                     m[sizeof(m) - 1] = '\0'; coop::logLine(m);
                 }
             }
@@ -383,19 +388,36 @@ public:
             }
         }
 
-        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        unsigned long dur = ctx.isHost ? hostDur_ : joinDur_;
         if (ctx.elapsedMs >= dur) {
-            // Verdict = the probe EXECUTED (containers resolved, sampled, and - on the
-            // host - all three cross-owner drags fired). The BEHAVIOR it recorded is
-            // judged by the runner's evidence report, not here.
-            passed_ = rankHave_[0] && rankHave_[1] && samples_ > 0 && seedDone_ &&
-                      (!ctx.isHost || (takeDone_ && giveDone_ && wpnDone_));
+            bool executed = rankHave_[0] && rankHave_[1] && samples_ > 0 && seedDone_ &&
+                            (!ctx.isHost || (takeDone_ && giveDone_ && wpnDone_));
+            if (!peer_) {
+                // trade_probe: verdict = the probe EXECUTED (containers resolved,
+                // sampled, and - on the host - all three cross-owner drags fired). The
+                // BEHAVIOR it recorded is judged by the runner's evidence report.
+                passed_ = executed;
+                return true;
+            }
+            // trade_peer: additionally gate LOCAL weapon conservation - total
+            // unchanged (no vanish, no dupe) and, once a weapon was actually tracked,
+            // it ended up in rank 0 (moved, not vanished).
+            bool wpnOk = true;
+            if (firstDone_ && wpnSid_[0]) {
+                wpnOk = (lastWpn0_ + lastWpn1_) == (firstWpn0_ + firstWpn1_) &&
+                        lastWpn0_ == firstWpn0_ + 1 && lastWpn1_ == firstWpn1_ - 1;
+            }
+            char m[220];
+            _snprintf(m, sizeof(m) - 1,
+                "SCENARIO TRDE verdict executed=%d wpnOk=%d wpn r0 %d->%d r1 %d->%d sid='%s'",
+                executed ? 1 : 0, wpnOk ? 1 : 0, firstWpn0_, lastWpn0_,
+                firstWpn1_, lastWpn1_, wpnSid_[0] ? wpnSid_ : "(none)");
+            m[sizeof(m) - 1] = '\0'; coop::logLine(m);
+            passed_ = executed && wpnOk;
             return true;
         }
         return false;
     }
-
-    virtual bool passed() const { return passed_; }
 
 private:
     void latchWeapon(GameWorld* gw) {
@@ -414,13 +436,13 @@ private:
             }
         }
         char b[160];
-        _snprintf(b, sizeof(b) - 1, "SCENARIO TRDP wpn latched sid='%s'",
-                  wpnSid_[0] ? wpnSid_ : "(none)");
+        _snprintf(b, sizeof(b) - 1, "SCENARIO %s wpn latched sid='%s'",
+                  tag_, wpnSid_[0] ? wpnSid_ : "(none)");
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     void logMove(const char* what, int got, const char* sid) {
         char m[200];
-        _snprintf(m, sizeof(m) - 1, "SCENARIO TRDP %s n=%d sid='%s'", what, got, sid);
+        _snprintf(m, sizeof(m) - 1, "SCENARIO %s %s n=%d sid='%s'", tag_, what, got, sid);
         m[sizeof(m) - 1] = '\0'; coop::logLine(m);
     }
     // Same squad-tab -> rank partition the Replicator / inv_bidir use.
@@ -469,259 +491,11 @@ private:
         return -1;
     }
 
-    // The last drag fires @36s and the slowest downstream machinery it can trip is the
-    // W2 weapon census (30-tick debounce) + the 1.8 s removal settle + snapshot travel,
-    // so the join samples ~16 s past it; the host outlives the join's window.
-    static const unsigned long HOST_DURATION_MS = 68000;
-    static const unsigned long JOIN_DURATION_MS = 52000;
-    static const unsigned long SEED_MS          = 6000;
-    static const unsigned long TAKE_MS          = 16000;
-    static const unsigned long GIVE_MS          = 26000;
-    static const unsigned long WPN_MS           = 36000;
-
-    static const unsigned int  MAX_SQUAD  = 32;
-    static const unsigned int  WEAPON_CAT = 2;
-
-    bool          passed_;
-    unsigned long lastLogMs_;
-    unsigned int  samples_;
-    bool          seedDone_;
-    bool          takeDone_;
-    bool          giveDone_;
-    bool          wpnDone_;
-    char          probeSid_[48];
-    unsigned int  probeType_;
-    char          wpnSid_[48];
-    unsigned int  wpnType_;
-    bool          wpnLatched_;
-    bool          rankHave_[2];
-    unsigned int  rankHand_[2][5];
-};
-
-// trade_peer (protocol 37 VALIDATION): the same three cross-owner drags trade_probe
-// used to baseline the dupe / wipe / weapon-vanish - but with the transfer-intent
-// channel (PKT_INV_XFER) live. The HOST drags:
-//   TAKE  @16s: 1 common item  rank1 -> rank0  (out of the join-owned bag)
-//   GIVE  @26s: 1 common item  rank0 -> rank1  (into the join-owned bag)
-//   WTAKE @36s: 1 WEAPON       rank1 -> rank0  (the vanish case: no fabrication path)
-// The detector must pair each drag's loss/gain, author ONE intent, the join must
-// relocate its own real copies, and the reconcile-suppression latch must kill the
-// re-add/wipe windows. Both clients sample both containers every 500 ms (same TRDE
-// series the oracle cross-checks for final-state agreement + conservation). The
-// scenario's own verdict gates what each client can see LOCALLY: the drags executed
-// and the tracked WEAPON was conserved (total unchanged; on the host it must sit in
-// rank 0 at the end - moved, not vanished). Cross-client agreement is the oracle's.
-class TradePeerScenario : public Scenario {
-public:
-    TradePeerScenario()
-        : passed_(false), lastLogMs_(0), samples_(0),
-          seedDone_(false), takeDone_(false), giveDone_(false), wpnDone_(false),
-          probeType_(0), wpnType_(0), wpnLatched_(false),
-          firstDone_(false), firstWpn0_(0), firstWpn1_(0),
-          lastWpn0_(0), lastWpn1_(0) {
-        probeSid_[0] = '\0'; wpnSid_[0] = '\0';
-        for (int r = 0; r < 2; ++r) { rankHave_[r] = false; for (int k = 0; k < 5; ++k) rankHand_[r][k] = 0; }
-    }
-
-    virtual const char* name() const { return "trade_peer"; }
-
-    virtual void onStart(const ScenarioContext& ctx) {
-        for (unsigned int r = 0; r < 2; ++r)
-            rankHave_[r] = resolveRankContainer(ctx.gw, r, rankHand_[r]);
-        engine::commonTestItemSid(ctx.gw, probeSid_, sizeof(probeSid_), &probeType_);
-        char b[200];
-        _snprintf(b, sizeof(b) - 1,
-            "SCENARIO TRDE anchor host=%d r0=%d r1=%d probeSid='%s' probeType=%u",
-            ctx.isHost ? 1 : 0, rankHave_[0] ? 1 : 0, rankHave_[1] ? 1 : 0,
-            probeSid_[0] ? probeSid_ : "(none)", probeType_);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-    }
-
-    virtual bool onTick(const ScenarioContext& ctx) {
-        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
-            lastLogMs_ = ctx.elapsedMs;
-            // Deterministic weapon latch (same rule as trade_probe: smallest weapon
-            // sid in the join-owned container; shared save -> same pick both sides).
-            if (!wpnLatched_ && rankHave_[1]) latchWeapon(ctx.gw);
-            int wpnNow[2] = { 0, 0 };
-            bool sampledBoth = true;
-            for (unsigned int rank = 0; rank < 2; ++rank) {
-                if (!rankHave_[rank]) { sampledBoth = false; continue; }
-                InvItemEntry items[INV_ITEMS_MAX];
-                unsigned int hash = 0;
-                unsigned int n = engine::captureContainerContents(
-                    ctx.gw, rankHand_[rank], items, INV_ITEMS_MAX, &hash);
-                if (n == 0) sampledBoth = false;
-                int probeQty = 0, wpnQty = 0;
-                for (unsigned int i = 0; i < n; ++i) {
-                    if (probeSid_[0] && items[i].itemType == probeType_ &&
-                        strcmp(items[i].stringID, probeSid_) == 0)
-                        probeQty += (int)items[i].quantity;
-                    if (wpnSid_[0] && items[i].itemType == WEAPON_CAT &&
-                        strcmp(items[i].stringID, wpnSid_) == 0)
-                        wpnQty += (int)items[i].quantity;
-                }
-                wpnNow[rank] = wpnQty;
-                char b[200];
-                _snprintf(b, sizeof(b) - 1,
-                    "SCENARIO TRDE r=%u %s t=%lu count=%u hash=%u probe=%d wpn=%d",
-                    rank, (ctx.isHost == (rank == 0)) ? "OWN" : "PEER",
-                    (unsigned long)ctx.elapsedMs, n, hash, probeQty, wpnQty);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-                ++samples_;
-            }
-            if (sampledBoth) {
-                // First full sample after the weapon latch = the conservation baseline.
-                if (!firstDone_ && wpnLatched_) {
-                    firstDone_ = true;
-                    firstWpn0_ = wpnNow[0]; firstWpn1_ = wpnNow[1];
-                }
-                lastWpn0_ = wpnNow[0]; lastWpn1_ = wpnNow[1];
-            }
-
-            // Seed material into the container each side OWNS (baseline sync liveness).
-            if (!seedDone_ && ctx.elapsedMs >= SEED_MS) {
-                seedDone_ = true;
-                unsigned int ownRank = ctx.isHost ? 0u : 1u;
-                if (rankHave_[ownRank]) {
-                    char sid[48]; sid[0] = '\0';
-                    int got = engine::addTestItemsToContainer(
-                        ctx.gw, rankHand_[ownRank], ctx.isHost ? 2 : 3, sid, sizeof(sid));
-                    char m[200];
-                    _snprintf(m, sizeof(m) - 1, "SCENARIO TRDE SEED r=%u n=%d sid='%s'",
-                              ownRank, got, sid[0] ? sid : "(none)");
-                    m[sizeof(m) - 1] = '\0'; coop::logLine(m);
-                }
-            }
-
-            // The cross-owner drags: HOST only (the "player A" of the field report).
-            if (ctx.isHost && probeSid_[0] && rankHave_[0] && rankHave_[1]) {
-                if (!takeDone_ && ctx.elapsedMs >= TAKE_MS) {
-                    takeDone_ = true;
-                    int got = engine::moveItemBetweenContainers(
-                        ctx.gw, rankHand_[1], rankHand_[0], probeSid_, probeType_, 1);
-                    logMove("TAKE", got, probeSid_);
-                }
-                if (!giveDone_ && ctx.elapsedMs >= GIVE_MS) {
-                    giveDone_ = true;
-                    int got = engine::moveItemBetweenContainers(
-                        ctx.gw, rankHand_[0], rankHand_[1], probeSid_, probeType_, 1);
-                    logMove("GIVE", got, probeSid_);
-                }
-                if (!wpnDone_ && ctx.elapsedMs >= WPN_MS) {
-                    wpnDone_ = true;
-                    int got = wpnSid_[0]
-                        ? engine::moveItemBetweenContainers(
-                              ctx.gw, rankHand_[1], rankHand_[0], wpnSid_, WEAPON_CAT, 1)
-                        : -1; // no weapon found in the join-owned container
-                    logMove("WTAKE", got, wpnSid_[0] ? wpnSid_ : "(none)");
-                }
-            }
-        }
-
-        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
-        if (ctx.elapsedMs >= dur) {
-            bool executed = rankHave_[0] && rankHave_[1] && samples_ > 0 && seedDone_ &&
-                            (!ctx.isHost || (takeDone_ && giveDone_ && wpnDone_));
-            // LOCAL weapon conservation: total unchanged (no vanish, no dupe) and -
-            // once a weapon was actually tracked - it ended up in rank 0 (moved).
-            bool wpnOk = true;
-            if (firstDone_ && wpnSid_[0]) {
-                wpnOk = (lastWpn0_ + lastWpn1_) == (firstWpn0_ + firstWpn1_) &&
-                        lastWpn0_ == firstWpn0_ + 1 && lastWpn1_ == firstWpn1_ - 1;
-            }
-            char m[220];
-            _snprintf(m, sizeof(m) - 1,
-                "SCENARIO TRDE verdict executed=%d wpnOk=%d wpn r0 %d->%d r1 %d->%d sid='%s'",
-                executed ? 1 : 0, wpnOk ? 1 : 0, firstWpn0_, lastWpn0_,
-                firstWpn1_, lastWpn1_, wpnSid_[0] ? wpnSid_ : "(none)");
-            m[sizeof(m) - 1] = '\0'; coop::logLine(m);
-            passed_ = executed && wpnOk;
-            return true;
-        }
-        return false;
-    }
-
-    virtual bool passed() const { return passed_; }
-
-private:
-    void latchWeapon(GameWorld* gw) {
-        InvItemEntry items[INV_ITEMS_MAX];
-        unsigned int hash = 0;
-        unsigned int n = engine::captureContainerContents(
-            gw, rankHand_[1], items, INV_ITEMS_MAX, &hash);
-        if (n == 0) return;          // container not readable yet - retry next sample
-        wpnLatched_ = true;          // readable: latch now even if it holds no weapon
-        for (unsigned int i = 0; i < n; ++i) {
-            if (items[i].itemType != WEAPON_CAT) continue;
-            if (!wpnSid_[0] || strcmp(items[i].stringID, wpnSid_) < 0) {
-                strncpy(wpnSid_, items[i].stringID, sizeof(wpnSid_) - 1);
-                wpnSid_[sizeof(wpnSid_) - 1] = '\0';
-                wpnType_ = items[i].itemType;
-            }
-        }
-        char b[160];
-        _snprintf(b, sizeof(b) - 1, "SCENARIO TRDE wpn latched sid='%s'",
-                  wpnSid_[0] ? wpnSid_ : "(none)");
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-    }
-    void logMove(const char* what, int got, const char* sid) {
-        char m[200];
-        _snprintf(m, sizeof(m) - 1, "SCENARIO TRDE %s n=%d sid='%s'", what, got, sid);
-        m[sizeof(m) - 1] = '\0'; coop::logLine(m);
-    }
-    // Same squad-tab -> rank partition the Replicator / trade_probe use.
-    static bool resolveRankContainer(GameWorld* gw, unsigned int rank, unsigned int out[5]) {
-        for (int i = 0; i < 5; ++i) out[i] = 0;
-        EntityState sq[MAX_SQUAD];
-        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ false, sq, MAX_SQUAD);
-        if (n == 0) return false;
-        int best = -1;
-        for (unsigned int i = 0; i < n; ++i) {
-            int cr = containerRankOf(sq, n, i);
-            if (cr < 0 || (unsigned int)cr != rank) continue;
-            if (best < 0 || handLess(sq[i], sq[best])) best = (int)i;
-        }
-        if (best < 0) return false;
-        out[0] = sq[best].hType; out[1] = sq[best].hContainer;
-        out[2] = sq[best].hContainerSerial; out[3] = sq[best].hIndex; out[4] = sq[best].hSerial;
-        return true;
-    }
-    static bool handLess(const EntityState& a, const EntityState& b) {
-        if (a.hType != b.hType) return a.hType < b.hType;
-        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
-        if (a.hContainerSerial != b.hContainerSerial) return a.hContainerSerial < b.hContainerSerial;
-        if (a.hIndex != b.hIndex) return a.hIndex < b.hIndex;
-        return a.hSerial < b.hSerial;
-    }
-    static bool ctnrLess(const EntityState& a, const EntityState& b) {
-        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
-        return a.hContainerSerial < b.hContainerSerial;
-    }
-    static bool ctnrEq(const EntityState& a, const EntityState& b) {
-        return a.hContainer == b.hContainer && a.hContainerSerial == b.hContainerSerial;
-    }
-    static int containerRankOf(const EntityState* sq, unsigned int n, unsigned int i) {
-        EntityState distinct[MAX_SQUAD]; unsigned int dn = 0;
-        for (unsigned int a = 0; a < n; ++a) {
-            bool seen = false;
-            for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[a])) { seen = true; break; }
-            if (!seen && dn < MAX_SQUAD) distinct[dn++] = sq[a];
-        }
-        for (unsigned int a = 1; a < dn; ++a)
-            for (unsigned int b = a; b > 0 && ctnrLess(distinct[b], distinct[b-1]); --b) {
-                EntityState t = distinct[b]; distinct[b] = distinct[b-1]; distinct[b-1] = t;
-            }
-        for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[i])) return (int)b;
-        return -1;
-    }
-
-    // Same drag times as trade_probe. The join outlives the last drag by ~20 s: the
-    // detector settle (~1 s) + reliable intent + the owner republish that clears the
-    // 10 s reconcile-suppression latch all land well inside that window; the host
+    // The last drag fires @36s; the slowest downstream machinery (W2 weapon census
+    // 30-tick debounce + 1.8 s removal settle + snapshot travel) lands well inside
+    // each mode's window. trade_peer runs ~2 s longer - the owner republish that
+    // clears the 10 s reconcile-suppression latch must land - and the host always
     // outlives the join's window.
-    static const unsigned long HOST_DURATION_MS = 70000;
-    static const unsigned long JOIN_DURATION_MS = 56000;
     static const unsigned long SEED_MS          = 6000;
     static const unsigned long TAKE_MS          = 16000;
     static const unsigned long GIVE_MS          = 26000;
@@ -730,7 +504,10 @@ private:
     static const unsigned int  MAX_SQUAD  = 32;
     static const unsigned int  WEAPON_CAT = 2;
 
-    bool          passed_;
+    bool          peer_;      // false = trade_probe (baseline), true = trade_peer (xfer)
+    const char*   tag_;       // "TRDP" (probe) / "TRDE" (peer) - the oracle log tag
+    unsigned long hostDur_;
+    unsigned long joinDur_;
     unsigned long lastLogMs_;
     unsigned int  samples_;
     bool          seedDone_;
@@ -742,9 +519,9 @@ private:
     char          wpnSid_[48];
     unsigned int  wpnType_;
     bool          wpnLatched_;
-    bool          firstDone_;
-    int           firstWpn0_, firstWpn1_;
-    int           lastWpn0_,  lastWpn1_;
+    bool          firstDone_;             // trade_peer: conservation baseline latched
+    int           firstWpn0_, firstWpn1_; // trade_peer: tracked-weapon counts at baseline
+    int           lastWpn0_,  lastWpn1_;  // trade_peer: latest tracked-weapon counts
     bool          rankHave_[2];
     unsigned int  rankHand_[2][5];
 };
@@ -761,10 +538,10 @@ private:
 // are UNCHANGED after it (nothing crossed), and - when a second host-tab member exists
 // - the same-owner move succeeded. Protocol 37 is retired under the veto, so no
 // PKT_INV_XFER is emitted (the runner cross-checks the logs for the absence).
-class XferBlockScenario : public Scenario {
+class XferBlockScenario : public TimedScenario {
 public:
     XferBlockScenario()
-        : passed_(false), lastLogMs_(0), samples_(0), seedDone_(false),
+        : TimedScenario("xfer_block", 0), lastLogMs_(0), samples_(0), seedDone_(false),
           giveDone_(false), selfDone_(false), probeType_(0), haveSelfDst_(false),
           giveMoved_(-2), selfMoved_(-2),
           r0BeforeGive_(-1), r1BeforeGive_(-1), r0AfterGive_(-1), r1AfterGive_(-1) {
@@ -772,8 +549,6 @@ public:
         for (int r = 0; r < 2; ++r) { rankHave_[r] = false; for (int k = 0; k < 5; ++k) rankHand_[r][k] = 0; }
         for (int k = 0; k < 5; ++k) selfDst_[k] = 0;
     }
-
-    virtual const char* name() const { return "xfer_block"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         for (unsigned int r = 0; r < 2; ++r)
@@ -876,8 +651,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     // Resolve the ordinal-th lowest-hand member of the squad TAB with the given rank
     // (the same tab->rank partition the Replicator and the sibling scenarios use).
@@ -938,7 +711,6 @@ private:
     static const unsigned long SELF_MS          = 26000; // same-owner drag (allowed)
     static const unsigned int  MAX_SQUAD        = 32;
 
-    bool          passed_;
     unsigned long lastLogMs_;
     unsigned int  samples_;
     bool          seedDone_;
@@ -967,10 +739,11 @@ private:
 // to the author's FINAL worn state (count + equipped-count + content hash). Fabricated
 // re-equips don't persist in the engine, so the equip (up) path is intentionally out of
 // scope here. Requires a shared save with >=2 squad tabs whose members wear gear.
-class InventoryEquipScenario : public Scenario {
+class InventoryEquipScenario : public TimedScenario {
 public:
     explicit InventoryEquipScenario(bool reequipMode = false)
-        : passed_(false), haveOwn_(false), haveEq_(false), unequipped_(false),
+        : TimedScenario(reequipMode ? "inv_reequip" : "inv_equip", 0),
+          haveOwn_(false), haveEq_(false), unequipped_(false),
           reequipped_(false), reequipMode_(reequipMode),
           lastLogMs_(0), samples_(0), ownRank_(0),
           baseEqCount_(0), baseType_(0), lastOwnEq_(0) {
@@ -978,8 +751,6 @@ public:
         for (int r = 0; r < 2; ++r) { rankHave_[r] = false; for (int i = 0; i < 5; ++i) rankHand_[r][i] = 0; }
         baseSid_[0] = '\0';
     }
-
-    virtual const char* name() const { return reequipMode_ ? "inv_reequip" : "inv_equip"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         ownRank_ = ctx.isHost ? 0u : 1u;
@@ -1077,8 +848,6 @@ public:
         return false;
     }
 
-    virtual bool passed() const { return passed_; }
-
 private:
     void logStep(const ScenarioContext& ctx, const char* what, int got) {
         char m[200];
@@ -1161,7 +930,6 @@ private:
 
     static const unsigned int  MAX_SQUAD        = 32;
 
-    bool          passed_;
     bool          haveOwn_;
     bool          haveEq_;
     bool          unequipped_;
@@ -1186,12 +954,11 @@ private:
 // traces inside applyContainerContents show precisely which primitive loses the weapon.
 // No network/invSync needed: the scenario's own applyContainerContents calls are the only
 // inventory mutation, so the result is deterministic and reproducible from one instance.
-class WeaponSeqScenario : public Scenario {
+class WeaponSeqScenario : public TimedScenario {
 public:
-    WeaponSeqScenario() : passed_(false), have_(false), nbase_(0), wIdx_(-1), step_(0) {
+    WeaponSeqScenario() : TimedScenario("inv_wpnseq", 0), have_(false), nbase_(0), wIdx_(-1), step_(0) {
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
     }
-    virtual const char* name() const { return "inv_wpnseq"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         have_ = firstGeared(ctx.gw, hand_);
@@ -1250,8 +1017,6 @@ public:
         if (ctx.elapsedMs >= 20000) { passed_ = (step_ == 4); return true; }
         return false;
     }
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned int MAX_SQUAD = 32;
     static bool firstGeared(GameWorld* gw, unsigned int out[5]) {
@@ -1268,7 +1033,6 @@ private:
         }
         return false;
     }
-    bool         passed_;
     bool         have_;
     unsigned int hand_[5];
     InvItemEntry base_[INV_ITEMS_MAX];
@@ -1287,15 +1051,14 @@ private:
 // sequence on one client with NO network: remove a worn item (so there is no copy), then
 // re-apply the worn baseline repeatedly, and asserts the slot fills back in AND stays
 // filled when we STOP re-applying (the persistence proof the old fabricate path failed).
-class InventoryAddEquipScenario : public Scenario {
+class InventoryAddEquipScenario : public TimedScenario {
 public:
     InventoryAddEquipScenario()
-        : passed_(false), have_(false), nbase_(0), eIdx_(-1), baseType_(0), baseWorn_(0),
+        : TimedScenario("inv_addequip", 0), have_(false), nbase_(0), eIdx_(-1), baseType_(0), baseWorn_(0),
           step_(0), eqAfterCreate_(-1), eqAfterEquip_(-1), eqPersist_(-1) {
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
         baseSid_[0] = '\0';
     }
-    virtual const char* name() const { return "inv_addequip"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         have_ = firstGeared(ctx.gw, hand_);
@@ -1377,8 +1140,6 @@ public:
         }
         return false;
     }
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned int MAX_SQUAD = 32;
     void logEq(const ScenarioContext& ctx, const char* what, int eq) {
@@ -1409,7 +1170,6 @@ private:
         }
         return false;
     }
-    bool         passed_;
     bool         have_;
     unsigned int hand_[5];
     InvItemEntry base_[INV_ITEMS_MAX];
@@ -1431,16 +1191,15 @@ private:
 // save), so a drop/pickup is a relocation of each side's real copy, never a create/destroy.
 // Single-client + deterministic (no network): unequip the weapon to loose, DROP it (real
 // ground item), confirm it survives ticks, then PICK IT UP by re-homing the real object.
-class WeaponRelocateScenario : public Scenario {
+class WeaponRelocateScenario : public TimedScenario {
 public:
     WeaponRelocateScenario()
-        : passed_(false), have_(false), baseType_(0), step_(0),
+        : TimedScenario("wpn_relocate", 0), have_(false), baseType_(0), step_(0),
           invBase_(0), invAfterDrop_(-1), grndAfterDrop_(-1), grndPersist_(-1),
           invAfterPick_(-1), grndAfterPick_(-1), invPersist_(-1) {
         for (int i = 0; i < 5; ++i) hand_[i] = 0;
         baseSid_[0] = '\0';
     }
-    virtual const char* name() const { return "wpn_relocate"; }
 
     virtual void onStart(const ScenarioContext& ctx) {
         have_ = findWeaponHolder(ctx.gw, hand_, baseSid_, sizeof(baseSid_), &baseType_);
@@ -1510,8 +1269,6 @@ public:
         }
         return false;
     }
-    virtual bool passed() const { return passed_; }
-
 private:
     static const unsigned int MAX_SQUAD = 32;
     static float radius() { return 18.0f; } // ground search radius (drops land at feet)
@@ -1554,7 +1311,6 @@ private:
         return false;
     }
 
-    bool         passed_;
     bool         have_;
     unsigned int hand_[5];
     char         baseSid_[48];
@@ -1569,8 +1325,8 @@ private:
 Scenario* makeInventoryScenario(const std::string& name) {
     if (name == "inv_order")    return new InventorySyncScenario();
     if (name == "inv_bidir")    return new InventoryBidirScenario();
-    if (name == "trade_probe")  return new TradeProbeScenario();
-    if (name == "trade_peer")   return new TradePeerScenario();
+    if (name == "trade_probe")  return new TradeScenario(/*peer=*/false);
+    if (name == "trade_peer")   return new TradeScenario(/*peer=*/true);
     if (name == "xfer_block")   return new XferBlockScenario();
     if (name == "inv_equip")    return new InventoryEquipScenario(/*reequip=*/false);
     if (name == "inv_reequip")  return new InventoryEquipScenario(/*reequip=*/true);

@@ -69,7 +69,7 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw "build failed ($LASTEXITCODE)" }
 }
 
-$dll  = Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"
+$dll  = Join-Path $repoRoot "src\plugin\x64\Harness\KenshiCoop.dll"
 $json = Join-Path $repoRoot "dist\mods\KenshiCoop\RE_Kenshi.json"
 if (-not (Test-Path $dll))  { throw "DLL not built: $dll" }
 if (-not (Test-Path $json)) { throw "RE_Kenshi.json missing: $json" }

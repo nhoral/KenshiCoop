@@ -89,7 +89,7 @@ if ($LASTEXITCODE -ne 0) { throw "scp of runner scripts failed" }
 Write-Host "  runner scripts: pushed -> $($cfg.dropDir)"
 
 # ---- 3. Mod deploy --------------------------------------------------------------------
-$dll  = Join-Path $repoRoot "src\plugin\x64\Release\KenshiCoop.dll"
+$dll  = Join-Path $repoRoot "src\plugin\x64\Harness\KenshiCoop.dll"
 $json = Join-Path $repoRoot "dist\mods\KenshiCoop\RE_Kenshi.json"
 $mod  = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi\mods\KenshiCoop\KenshiCoop.mod"
 if (-not (Test-Path $dll)) { throw "Build the plugin first (scripts\build_plugin.cmd): $dll" }
