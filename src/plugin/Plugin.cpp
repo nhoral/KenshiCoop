@@ -1377,6 +1377,40 @@ void mainLoop_hook(GameWorld* gw, float dt) {
         }
     }
 
+    // Manual-validation helper (host only): KENSHICOOP_AUTOCRIME=N seconds -
+    // ONCE, N s after gameplay settles, programmatically assign a test bounty to
+    // a player-squad character (index = KENSHICOOP_AUTOCRIME_INDEX, default 1) via
+    // the engine's own unfairAddToBounty lever. On the host in inhabit mode a
+    // non-zero index is a JOIN-owned character's driven copy, so this reproduces
+    // the exact H2 witness-local state (a bounty on the host's copy of a join-owned
+    // PC) the protocol-45 channel must then carry to the owner - deterministic
+    // evidence without a hand-driven witnessed crime. OFF by default (0 = no-op).
+    if (g_cfg.isHost && g_gameStarted) {
+        static int  autoCrimeS    = -1;
+        static int  autoCrimeIdx  = -1;
+        static bool autoCrimeDone = false;
+        if (autoCrimeS < 0) {
+            const char* e = std::getenv("KENSHICOOP_AUTOCRIME");
+            autoCrimeS = e ? std::atoi(e) : 0;
+            const char* ei = std::getenv("KENSHICOOP_AUTOCRIME_INDEX");
+            autoCrimeIdx = ei ? std::atoi(ei) : 1;
+            if (autoCrimeIdx < 0) autoCrimeIdx = 1;
+        }
+        if (autoCrimeS > 0 && !autoCrimeDone &&
+            (GetTickCount() - g_gameStartTick) >= (DWORD)autoCrimeS * 1000u) {
+            autoCrimeDone = true;
+            unsigned int hand[5]; char sid[64];
+            bool ok = coop::engine::injectTestBounty(gw, (unsigned)autoCrimeIdx,
+                                                     500, hand, sid, sizeof(sid));
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                "[bounty] AUTOCRIME ok=%d idx=%d hand=%u,%u,%u,%u,%u fac='%s' amount=500",
+                ok ? 1 : 0, autoCrimeIdx, hand[0], hand[1], hand[2], hand[3], hand[4],
+                sid[0] ? sid : "-");
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+        }
+    }
+
     // Test-runner self-exit: quit cleanly after the configured duration so
     // unattended runs terminate on their own and flush their logs. Also a hard
     // backstop for a scenario that never reports completion.

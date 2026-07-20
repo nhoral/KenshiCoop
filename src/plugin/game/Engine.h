@@ -1135,6 +1135,17 @@ struct BountyPubRow {
 // BountyManager::me sentinel is checked per body before any parse. Returns the
 // count written (rows only, bodies with no live bounty contribute none).
 unsigned int enumBountyRows(GameWorld* gw, BountyPubRow* out, unsigned int maxOut);
+// Manual-validation helper (host only, KENSHICOOP_AUTOCRIME): programmatically
+// assign a test bounty to the player-squad character at playerIndex via the
+// engine's OWN unfairAddToBounty lever, against the first real world faction.
+// On the host in inhabit mode a non-zero index is a JOIN-owned character's
+// DRIVEN copy, so this reproduces the exact H2 state (a bounty on the host's
+// copy of a join-owned PC) the replication channel must then carry to the owner
+// WITHOUT relying on a hand-driven witnessed crime. Fills outHand (readObjectHand
+// layout) + outSid (the enforcer faction). Returns true when the bounty landed.
+bool injectTestBounty(GameWorld* gw, unsigned int playerIndex, int amount,
+                      unsigned int outHand[5], char* outSid, unsigned int sidLen);
+
 // SEH-guarded: apply one received bounty row onto the local (owning) copy of
 // the character at hand, for the faction sid, via the engine's OWN levers -
 // unfairAddToBounty for a raise, clearBounty for a drop to zero (never a raw

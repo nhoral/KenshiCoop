@@ -611,6 +611,94 @@ bool applyBountyRow(GameWorld* gw, const unsigned int hand[5], const char* sid,
     }
 }
 
+// SEH shims for injectTestBounty (each lever call in its own frame; the map-
+// touching read stays in readBountyState's own SEH). std::string forbids C2712,
+// so no such object shares these frames.
+static bool addBountySEH(Character* c, Faction* f, int amount) {
+    __try {
+        if (c->crimes.me != c) return false; // sentinel before poking Character+0xF0
+        g_bountyAddFn(&c->crimes, f, amount);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static void clearBountySEH(Character* c, Faction* f) {
+    __try { if (c->crimes.me == c) g_bountyClearFn(&c->crimes, f); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+// Collect REAL world factions (not the player's, not notARealFaction) that carry
+// a readable GameData sid. Returns the count written.
+static unsigned int collectRealFactions(GameWorld* gw, Faction** out, unsigned int maxOut) {
+    unsigned int n = 0;
+    __try {
+        if (!gw->player || !gw->factionMgr) return 0;
+        Faction* pf = gw->player->getFaction();
+        lektor<Faction*>& all = gw->factionMgr->participants;
+        unsigned int total = all.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            Faction* f = all[i];
+            if (!f || f == pf || f->notARealFaction) continue;
+            char sidTmp[64]; sidTmp[0] = '\0';
+            facSidOf(f, sidTmp, sizeof(sidTmp));
+            if (sidTmp[0] == '\0') continue;
+            out[n++] = f;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return n;
+}
+// Resolve the player-squad character at idx + its hand (readObjectHand layout).
+static Character* playerCharAt(GameWorld* gw, unsigned int idx, unsigned int outHand[5]) {
+    Character* c = 0;
+    if (outHand) for (int i = 0; i < 5; ++i) outHand[i] = 0;
+    __try {
+        if (!gw->player) return 0;
+        unsigned int pc = (unsigned int)gw->player->playerCharacters.size();
+        if (idx >= pc) return 0;
+        c = gw->player->playerCharacters[idx];
+        if (!c || c->crimes.me != c) return 0;
+        unsigned int h[5];
+        if (readObjectHand(static_cast<RootObject*>(c), h) && outHand)
+            for (int i = 0; i < 5; ++i) outHand[i] = h[i];
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return c;
+}
+
+bool injectTestBounty(GameWorld* gw, unsigned int playerIndex, int amount,
+                      unsigned int outHand[5], char* outSid, unsigned int sidLen) {
+    if (outHand) { for (int i = 0; i < 5; ++i) outHand[i] = 0; }
+    if (outSid && sidLen) outSid[0] = '\0';
+    if (!gw || !g_bountyAddFn || !g_bountyClearFn) return false;
+    unsigned int handTmp[5];
+    Character* c = playerCharAt(gw, playerIndex, handTmp);
+    if (!c) return false;
+    if (outHand) for (int i = 0; i < 5; ++i) outHand[i] = handTmp[i];
+
+    // The stored bounty faction is _getBountyFaction(enforcer), which can remap an
+    // arbitrary enforcer onto a sid-LESS internal faction - a row the channel
+    // rightly refuses to replicate (the peer can't name it). A real witnessed
+    // crime always lands on a proper law faction. So try real factions until the
+    // resulting row is ADDRESSABLE (readBountyState fills the sid via facSidOf),
+    // clearing the sid-less misses; report the actual stored sid.
+    Faction* cand[64];
+    unsigned int nf = collectRealFactions(gw, cand, 64);
+    for (unsigned int i = 0; i < nf; ++i) {
+        if (!addBountySEH(c, cand[i], amount)) continue;
+        BountyRead br;
+        if (readBountyState(c, &br) && br.valid) {
+            for (unsigned int r = 0; r < br.nRows; ++r) {
+                if (br.rows[r].sid[0]) {
+                    if (outSid && sidLen) {
+                        strncpy(outSid, br.rows[r].sid, sidLen - 1);
+                        outSid[sidLen - 1] = '\0';
+                    }
+                    return true; // an addressable bounty landed
+                }
+            }
+        }
+        clearBountySEH(c, cand[i]); // sid-less row: undo and try the next faction
+    }
+    return false;
+}
+
 bool applyFurniture(GameWorld* gw, Character* occupant,
                     const unsigned int furnHand[5], int kind, bool on) {
     (void)gw;

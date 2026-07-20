@@ -43,6 +43,14 @@ param(
     # "join me" hits. Use to validate recruit sync on a populated save that has
     # no dialog-hireable NPC (camp/squad1). 0 = off.
     [int]$AutoRecruit = 0,
+    # Host-only bounty helper (KENSHICOOP_AUTOCRIME=N seconds): N s after gameplay
+    # settles, the host ONCE programmatically assigns a test bounty (500) to the
+    # player-squad member at -AutoCrimeIndex via unfairAddToBounty. In -Inhabit
+    # mode a non-zero index is a JOIN-owned character's driven copy, so this
+    # reproduces the H2 witness-local state and validates protocol-44 sync
+    # deterministically (host publishes, join applies). 0 = off.
+    [int]$AutoCrime = 0,
+    [int]$AutoCrimeIndex = 1,
     # Inhabit mode: both clients load the SAME save (so NPC sync works) but each
     # OWNS a different subset of the shared squad. Default split: host owns the
     # leader (index 0), join inhabits everyone else (~0). Overridable via
@@ -295,6 +303,10 @@ function Set-CoopEnv {
     $env:KENSHICOOP_SETUP        = if ($Mode -eq "join") { "" } else { $SetupScene }
     # Host-only auto-recruit (N s after gameplay): recruit nearest world NPC.
     $env:KENSHICOOP_AUTORECRUIT  = if ($Mode -eq "join") { "" } else { "$AutoRecruit" }
+    # Host-only auto-crime (protocol 44 validation): inject a test bounty on a
+    # driven join-owned PC N s in, so the channel carries it to the owner.
+    $env:KENSHICOOP_AUTOCRIME       = if ($Mode -eq "join") { "" } else { "$AutoCrime" }
+    $env:KENSHICOOP_AUTOCRIME_INDEX = if ($Mode -eq "join") { "" } else { "$AutoCrimeIndex" }
     $env:KENSHICOOP_PROBE_RECRUIT = if ($Mode -eq "join" -and $ProbeRecruit) { "1" } else { "" }
     $env:KENSHICOOP_PROBE_AISUSPEND = if ($Mode -eq "join" -and $ProbeAiSuspend) { "1" } else { "" }
     # Inventory sync is bidirectional, so enable it on BOTH clients.

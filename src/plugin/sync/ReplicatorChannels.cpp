@@ -1018,11 +1018,23 @@ void Replicator::publishBounties(const SyncContext& ctx) {
         known.crimes = br.knownCrimes; known.claimed = br.knownClaimed;
         BountyVal cur; cur.amount = r.amount; cur.crimes = r.crimes; cur.claimed = r.claimed;
         if (!br.seeded) {
-            // Both clients loaded the same save, so a bounty already present at
-            // load is the SHARED baseline: seed silently, stream only movement.
             br.seeded = true;
-            br.knownAmount = r.amount; br.knownCrimes = r.crimes; br.knownClaimed = r.claimed;
-            continue;
+            if (!bountyBaseline_) {
+                // FIRST channel sample: a bounty already present at (or near) load
+                // is the SHARED baseline (both clients loaded the same save), so
+                // seed it silently and stream only later movement.
+                br.knownAmount = r.amount; br.knownCrimes = r.crimes; br.knownClaimed = r.claimed;
+                continue;
+            }
+            // The baseline pass already ran, so this key APPEARED mid-session -
+            // a crime just created a bounty row where there was none (0 rows -> 1).
+            // That is exactly the movement H2 must carry, NOT a load-time seed:
+            // treat the implicit baseline as zero and fall through to the send
+            // path. (A row that instead existed at load but only now entered
+            // interest range still converges harmlessly - the receiver's apply is
+            // convergence-first against getActualBounty.)
+            br.knownAmount = 0; br.knownCrimes = 0; br.knownClaimed = 0;
+            known.amount = 0; known.crimes = 0; known.claimed = 0;
         }
         int resendDue = (br.lastSendMs != 0 && (now - br.lastSendMs) >= RESEND_MS) ? 1 : 0;
         // Host-authoritative publish gate (the exact rule prototest locks): the
@@ -1084,6 +1096,11 @@ void Replicator::publishBounties(const SyncContext& ctx) {
                   k.i, k.s, it->first.second.c_str(), pkt.seq);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
+
+    // The first sample has now captured every load-time bounty row as the shared
+    // baseline. From here on, a newly-seen (char, faction) key is a genuine
+    // mid-session appearance (a fresh crime), streamed from an implicit zero.
+    bountyBaseline_ = true;
 }
 
 void Replicator::applyBounties(const SyncContext& ctx) {
