@@ -414,38 +414,55 @@ public:
     // BEFORE engine (protocol 33, HOST only - the world-simulation
     // authority): sample machine-class buildings near the interest centers
     // (~1 Hz) and stream a PKT_PROD row per machine - the first sight of a
-    // machine SENDS (the host's state IS the baseline, unlike the symmetric
-    // door channel), then change-gated on the quantized fields with a 10 s
-    // safety resend (which is also what keeps a join whose own engine
+    // machine SENDS, then change-gated on the quantized fields with a 10 s
+    // safety resend (which is also what keeps a peer whose own engine
     // drifted converging). Identity: baked hand (keyKind=0) or protocol-27
     // placer key through the build maps (keyKind=1).
+    //
+    // AUTORIDAD POR-OBJETO (ProdAuthority.h): ambos lados llaman a publishProd,
+    // pero cada uno publica SOLO las maquinas de las que es autoridad -> maquina
+    // baked la publica el host; maquina placed la publica quien la coloco. Asi
+    // el JOIN conduce sus propias maquinas de crafteo. ctx.isHost decide la
+    // propiedad de las maquinas baked.
     void publishProd(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 33, join side): drain received machine rows;
-    // resolve the key (baked hand directly; placer key through ownBuilds_/
-    // peerBuilds_), read the local machine, and apply only what actually
-    // diverged through the engine's own levers (switchPowerOn / direct
-    // amount + farm-float writes; a still-null output buffer is first
-    // MATERIALIZED via the native setProductionItem). Per-key seq guard
-    // drops stale rows; unresolvable keys skip silently (out-of-interest).
+    // BEFORE engine (protocol 33): drain received machine rows; resolve the
+    // key (baked hand directly; placer key through ownBuilds_/peerBuilds_),
+    // read the local machine, and apply only what actually diverged through
+    // the engine's own levers (switchPowerOn / direct amount + farm-float
+    // writes; a still-null output buffer is first MATERIALIZED via the native
+    // setProductionItem). Per-key seq guard drops stale rows; unresolvable
+    // keys skip silently (out-of-interest).
+    //
+    // AUTORIDAD POR-OBJETO: aplica SOLO las maquinas de las que este cliente NO
+    // es autoridad -> una fila para una maquina propia (baked siendo host, o
+    // placed que colocamos nosotros) se ignora, evitando que el peer pise
+    // nuestro estado (ese era el bug del join-espectador). ctx.isHost decide.
     void applyProd(const SyncContext& ctx);
 
     // Production machine sync master enable (KENSHICOOP_PROD_SYNC).
     void setProdSync(bool v) { prodSync_ = v; }
 
-    // BEFORE engine (protocol 38, HOST only - the tech-tree authority):
-    // sample the Research store's known set ~1 Hz (Research::isKnown over
-    // the shared RESEARCH GameData enumeration) and stream one PKT_RESEARCH
-    // row per known sid - first sight sends (the host's known set IS the
-    // session baseline), then a safety resend covers a lost row / a join
-    // whose apply lever needed prerequisites that arrived later.
+    // BEFORE engine (protocol 38): sample the Research store's known set ~1 Hz
+    // (Research::isKnown over the shared RESEARCH GameData enumeration) and
+    // stream one PKT_RESEARCH row per known sid - first sight sends, then a
+    // safety resend covers a lost row / a peer whose apply lever needed
+    // prerequisites that arrived later.
+    //
+    // UNION SIMETRICA (CRDT grow-only set): AMBOS lados publican Y aplican. El
+    // conjunto de investigaciones conocidas solo CRECE (startResearch nunca
+    // des-conoce, applyResearch salta lo ya conocido), asi que la union de los
+    // dos conjuntos es libre de conflicto por construccion - no hace falta
+    // arbitraje ni autoridad. Antes era host->join en un solo sentido, por lo
+    // que una investigacion completada por el JOIN nunca llegaba al host; ahora
+    // se propaga en ambos sentidos.
     void publishResearch(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 38, join side): drain received known-research
-    // rows; sids already known locally are skipped (idempotent), the rest
-    // apply through Research::startResearch - the exact lever a research-UI
-    // click commits (flips isKnown in the same tick, spike 401). Per-sid
-    // seq guard drops stale rows.
+    // BEFORE engine (protocol 38): drain received known-research rows; sids
+    // already known locally are skipped (idempotent), the rest apply through
+    // Research::startResearch - the exact lever a research-UI click commits
+    // (flips isKnown in the same tick, spike 401). Per-sid seq guard drops
+    // stale rows. Corre en ambos lados (ver publishResearch: union simetrica).
     void applyResearch(const SyncContext& ctx);
 
     // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).

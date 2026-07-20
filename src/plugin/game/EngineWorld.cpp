@@ -966,26 +966,60 @@ static GameData* findProdTemplate(GameWorld* gw, int kind, int skip) {
     g_dataScratch.clear();
     g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, BUILDING);
     unsigned int n = g_dataScratch.size();
+    // Diagnostico de una sola vez: vuelca los primeros edificios (name+sid) para
+    // caracterizar el juego real. Kenshi de Zero corre en es_ES, asi que el
+    // name de DISPLAY esta traducido; por eso ademas del name emparejamos por
+    // stringID (el ID interno de FCS, estable e independiente del idioma).
+    static bool s_dumped = false;
+    if (!s_dumped) {
+        s_dumped = true;
+        char h[96];
+        _snprintf(h, sizeof(h) - 1, "[prod] tmpl-dump BUILDING count=%u", n);
+        h[sizeof(h) - 1] = '\0'; coop::logLine(h);
+        unsigned int cap = n < 60 ? n : 60;
+        for (unsigned int i = 0; i < cap; ++i) {
+            GameData* gd = g_dataScratch[i];
+            if (!gd) continue;
+            char b[224];
+            _snprintf(b, sizeof(b) - 1, "[prod] tmpl[%u] name='%s' sid='%s'",
+                      i, gd->name.c_str(), gd->stringID.c_str());
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    // Prefijos en INGLES (casan por stringID) + ESPANOL (casan por name de
+    // display). ciContains es case-insensitive y de subcadena, asi que cada
+    // termino cubre variantes ("Pequeno generador eolico" contiene "generador").
     const char* genPrefs[]   = { "small wind generator", "wind generator",
-                                 "small generator", "generator" };
+                                 "small generator", "generator",
+                                 "generador" };
     const char* craftPrefs[] = { "armour crafting bench", "weapon smithing bench",
-                                 "weapon smith", "engineering bench" };
+                                 "weapon smith", "engineering bench",
+                                 "herreria", "herrer", "armadura",
+                                 "ingenieria", "ingenier", "fabricaci",
+                                 "banco de" };
     const char* storePrefs[] = { "general storage", "storage box", "storage chest",
-                                 "chest", "storage" };
+                                 "chest", "storage",
+                                 "almacen", "caja", "cofre" };
     const char* resPrefs[]   = { "small research bench", "research bench",
-                                 "research" };
+                                 "research",
+                                 "investigaci" };
     const char** prefs;
     unsigned int nPrefs;
-    if (kind == 0)      { prefs = genPrefs;   nPrefs = 4; }
-    else if (kind == 2) { prefs = storePrefs; nPrefs = 5; }
-    else if (kind == 3) { prefs = resPrefs;   nPrefs = 3; }
-    else                { prefs = craftPrefs; nPrefs = 4; }
+    if (kind == 0)      { prefs = genPrefs;   nPrefs = sizeof(genPrefs)/sizeof(genPrefs[0]); }
+    else if (kind == 2) { prefs = storePrefs; nPrefs = sizeof(storePrefs)/sizeof(storePrefs[0]); }
+    else if (kind == 3) { prefs = resPrefs;   nPrefs = sizeof(resPrefs)/sizeof(resPrefs[0]); }
+    else                { prefs = craftPrefs; nPrefs = sizeof(craftPrefs)/sizeof(craftPrefs[0]); }
     GameData* seen[16];
     unsigned int nSeen = 0;
     for (unsigned int k = 0; k < nPrefs; ++k) {
         for (unsigned int i = 0; i < n; ++i) {
             GameData* gd = g_dataScratch[i];
-            if (!gd || !ciContains(gd->name.c_str(), prefs[k])) continue;
+            // Empareja por name (display, puede estar traducido) O por stringID
+            // (interno, estable). Esto arregla el fallo "no template" en es_ES.
+            if (!gd) continue;
+            if (!ciContains(gd->name.c_str(), prefs[k]) &&
+                !ciContains(gd->stringID.c_str(), prefs[k]))
+                continue;
             bool dup = false; // a name can match several prefs
             for (unsigned int s = 0; s < nSeen; ++s)
                 if (seen[s] == gd) { dup = true; break; }

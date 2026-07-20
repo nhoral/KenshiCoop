@@ -961,6 +961,22 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # prod_sync_join: MISMO script que prod_sync pero conduce el JOIN (coloca
+        # + opera el banco de crafteo); el host observa. Prueba la AUTORIDAD
+        # POR-OBJETO del protocolo 33: una maquina placed la conduce quien la
+        # coloco, asi que el JOIN debe poder craftear y el HOST verlo sin
+        # revertirlo. El oraculo (Test-ProdSyncJoin) es el espejo de prod_sync
+        # con los roles host/join intercambiados: gate que el JOIN coloco+envio
+        # [prod] rows, el HOST los recibio+aplico, y el banco minteado en el host
+        # convergio al outAmt operado por el join (gap <= 1.0).
+        prod_sync_join = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'prod_sync_join'
+            Gating   = @('prod_sync_join', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # research_probe: tech-tree phase-0 diagnostic (protocol 38 -
         # researchSync forced OFF). Both sides pick the deterministic
         # not-known-researchable RESEARCH subject at t=8s and poll

@@ -1862,6 +1862,92 @@ function Test-ProdSync {
                 -Metrics @{ outGap = $outGap; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
 }
 
+# prod_sync_join (protocolo 33, AUTORIDAD POR-OBJETO): ESPEJO de Test-ProdSync
+# con los roles host/join intercambiados. Aqui conduce el JOIN (coloca+opera el
+# banco de crafteo que EL coloco) y el HOST observa. Prueba que:
+#   * el JOIN coloco las maquinas y corrio las patas locales (place/ramp/power/
+#     setitem/operate) - todo en el log del JOIN;
+#   * el WIRE cruzo en sentido JOIN->HOST: el join emitio [prod] SEND y el host
+#     los aplico ([prod] RECV) - IMPOSIBLE antes de este fix (el join no
+#     publicaba);
+#   * el banco que el host MINTEO del join convergio al outAmt operado por el
+#     join (gap <= 1.0) => el host ve el crafteo del join y NO lo revierte.
+# Un PASS aqui es la evidencia directa de que el join deja de ser espectador.
+function Test-ProdSyncJoin {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    # El CONDUCTOR es el JOIN: su log lleva PRODPLACE y las patas locales.
+    $joinP = Select-String -Path $JoinFile -Pattern $script:ProdPlaceRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $joinP) { $why += "join never logged its PRODPLACE (no condujo)" }
+    elseif ($joinP.Matches[0].Groups[3].Value -ne '1' -or $joinP.Matches[0].Groups[7].Value -ne '1') {
+        $why += "join machine placement failed (genOk=$($joinP.Matches[0].Groups[3].Value) benchOk=$($joinP.Matches[0].Groups[7].Value))"
+    }
+    $hSeries = Get-ProdSeries -File $HostFile
+    $jSeries = Get-ProdSeries -File $JoinFile
+    if ($hSeries.Keys.Count -eq 0) { $why += "host machine census empty" }
+    if ($jSeries.Keys.Count -eq 0) { $why += "join machine census empty" }
+
+    # Patas locales del CONDUCTOR (join): power write, setProductionItem, operate.
+    $pw = @(Select-String -Path $JoinFile -Pattern $script:ProdPowerRegex -ErrorAction SilentlyContinue)
+    $pwOk = @($pw | Where-Object { $_.Matches[0].Groups[3].Value -eq '1' -and $_.Matches[0].Groups[2].Value -eq $_.Matches[0].Groups[5].Value })
+    if ($pwOk.Count -eq 0) { $why += "join power writes missing/never applied" }
+    $ow = @(Select-String -Path $JoinFile -Pattern $script:ProdOutWriteRegex -ErrorAction SilentlyContinue)
+    $setItem = @($ow | Where-Object { $_.Matches[0].Groups[2].Value -eq 'setitem' }) | Select-Object -Last 1
+    if ($null -eq $setItem -or $setItem.Matches[0].Groups[4].Value -ne '1') { $why += "join native setProductionItem write missing/failed" }
+    $ops = @(Select-String -Path $JoinFile -Pattern $script:ProdOpRegex -ErrorAction SilentlyContinue)
+    if ($ops.Count -eq 0) { $why += "join operate loop never ran" }
+
+    # El WIRE cruzo JOIN->HOST (el nucleo del fix): el join emitio, el host aplico.
+    $sent = @(Select-String -Path $JoinFile -Pattern '\[prod\] SEND key=' -ErrorAction SilentlyContinue)
+    $recv = @(Select-String -Path $HostFile -Pattern '\[prod\] RECV key=' -ErrorAction SilentlyContinue)
+    if ($sent.Count -eq 0) { $why += "join never sent a [prod] row (sigue siendo espectador)" }
+    if ($recv.Count -eq 0) { $why += "host never received/applied a [prod] row del join" }
+    Write-Host "    FINDING: [prod] rows join sent=$($sent.Count) host applied=$($recv.Count)"
+
+    $outGap = -1.0
+    if ($null -ne $joinP) {
+        # Convergencia del banco: el HOST minteo el banco que el join coloco.
+        $benchKey = $joinP.Matches[0].Groups[9].Value
+        $benchLocal = Get-MintLocalHand -PeerFile $HostFile -PlacerKey $benchKey
+        if ($null -eq $benchLocal) { $why += "host never minted the join bench (key=$benchKey)" }
+        elseif (-not $hSeries.ContainsKey($benchLocal)) { $why += "host bench copy (local=$benchLocal) absent from its census" }
+        elseif (-not $jSeries.ContainsKey($benchKey)) { $why += "join bench absent from its own census" }
+        else {
+            $js = $jSeries[$benchKey]; $hs = $hSeries[$benchLocal]
+            $jLast = $js[$js.Count-1].outAmt; $hLast = $hs[$hs.Count-1].outAmt
+            $outGap = [math]::Abs($jLast - $hLast)
+            Write-Host ("    FINDING: bench outAmt join first={0:N3} last={1:N3} host copy first={2:N3} last={3:N3} gap={4:N3}" -f `
+                $js[0].outAmt, $jLast, $hs[0].outAmt, $hLast, $outGap)
+            if ($outGap -gt 1.0) { $why += "bench output diverged (gap $([math]::Round($outGap,3)) > 1.0)" }
+        }
+        # Cruce de energia del generador sobre la copia minteada en el host.
+        $genKey = $joinP.Matches[0].Groups[5].Value
+        $genLocal = Get-MintLocalHand -PeerFile $HostFile -PlacerKey $genKey
+        if ($null -eq $genLocal) { $why += "host never minted the join generator (key=$genKey)" }
+        elseif (-not $hSeries.ContainsKey($genLocal)) { $why += "host generator copy (local=$genLocal) absent from its census" }
+        else {
+            $gs = $hSeries[$genLocal]
+            $offW = @($pw | Where-Object { $_.Matches[0].Groups[2].Value -eq '0' }) | Select-Object -Last 1
+            if ($null -ne $offW) {
+                $wt = [long]$offW.Matches[0].Groups[7].Value
+                $hit = @($gs | Where-Object { $_.t -ge $wt -and $_.t -le ($wt + 6000) -and $_.power -eq 0 })
+                if ($hit.Count -eq 0) { $why += "join power OFF never crossed onto the host generator copy" }
+                else { Write-Host "    FINDING: join power OFF CROSSED ($($hit.Count) host samples within 6 s)" }
+            }
+            $hFinalPwr = $gs[$gs.Count-1].power
+            $jFinalPwr = if ($jSeries.ContainsKey($genKey)) { $jSeries[$genKey][$jSeries[$genKey].Count-1].power } else { -1 }
+            Write-Host "    FINDING: final generator power join=$jFinalPwr host=$hFinalPwr"
+            if ($jFinalPwr -ge 0 -and $hFinalPwr -ne $jFinalPwr) { $why += "final generator power disagrees (join=$jFinalPwr host=$hFinalPwr)" }
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  PROD-SYNC-JOIN $v - outGap=$([math]::Round($outGap,3)) sent=$($sent.Count) applied=$($recv.Count) $detail"
+    return (Add-GateResult -Name "prod_sync_join" -Status $v `
+                -Metrics @{ outGap = $outGap; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
+}
+
 # Parse the 1 Hz SCENARIO RESEARCH subject poll into ordered samples
 # @{known; can; t} (protocol 38).
 function Get-ResearchSeries {
