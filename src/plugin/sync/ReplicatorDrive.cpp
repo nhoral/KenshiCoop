@@ -1493,6 +1493,11 @@ void Replicator::applyTargets(GameWorld* gw) {
         }
         if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
     }
+    // Owner-side carried self-heal (SYNC_GAPS 16b): reconcile each OWN member's
+    // local carry against the peer's streamed claim. Runs right after the drive
+    // loop (needs gw + the captured squad still in scope) before the telemetry
+    // epilogue phases.
+    healOwnCarried(gw, oracleSquad, oracleSquadN, now);
     pruneDriveGrace(now);
     logDriveTelemetry(now);
     ageOutStaleTargets(now);
@@ -1601,6 +1606,123 @@ void Replicator::logDriveTelemetry(unsigned long now) {
                   trusted, (unsigned)targets_.size() - trusted, trustGrants_, trustRevokes_);
         b[sizeof(b) - 1] = '\0';
         coop::logLine(b);
+    }
+}
+
+
+// --- Drive-tick epilogue phase: owner-side carried self-heal (SYNC_GAPS 16b) --
+// Split out of applyTargets' post-loop tail like the other epilogue phases, but
+// this one also reconciles LOCAL carry state, so it needs gw + the already
+// captured squad (oracleSquad/oracleSquadN) - passed in rather than read from
+// Replicator members alone. Body is verbatim the original applyTargets hook.
+void Replicator::healOwnCarried(GameWorld* gw, const EntityState* oracleSquad,
+                                unsigned int oracleSquadN, unsigned long now) {
+    // ---- Carried-body sync (SYNC_GAPS 16b): owner-side carried self-heal ----
+    // Carry edges are CARRIER-authored (EVT_PICKUP_BODY/EVT_DROP_BODY; the host
+    // authors them for world-NPC carriers, doctrine 28), and the loop above
+    // skips ownHands_ - so an OWNED body on someone's shoulder had NO reconcile
+    // path of its own: when the host's EVT_DROP_BODY failed to apply on the
+    // local carrier copy (resolve fail, carrier re-containered, or the local
+    // sim never executed the pickup) the owner stayed carried indefinitely
+    // (2026-07-11 field report: the join PC, KO'd + hauled by an enemy pack,
+    // was put down in the host's world but stayed carried on the join). Heal
+    // the owner side: an own squad member whose LOCAL isBeingCarried is set
+    // while NO live streamed row claims it as its carry subject
+    // (TASK_CARRY_BODY + subject hand) gets a debounced local release through
+    // the ordinary engine drop chain on its LOCAL carrier. The heal only ever
+    // judges carries whose truth lives on the PEER: a carrier we own, and a
+    // world-NPC carrier when WE are the world authority (streamNpcs_), are
+    // local sim facts with no stream to reconcile against - never touched.
+    // Debounced like the carrier-side carryNoSeeTick (stance samples ride the
+    // lossy batch), and a row only stops "claiming" once it either streams a
+    // non-carry task or ages past the claim horizon - a WAN stall alone must
+    // never rip a genuine carry apart.
+    if (carrySync_) {
+        for (unsigned int i = 0; i < oracleSquadN; ++i) {
+            const EntityState& m = oracleSquad[i];
+            Key mk; mk.t = m.hType; mk.c = m.hContainer;
+            mk.cs = m.hContainerSerial; mk.i = m.hIndex; mk.s = m.hSerial;
+            // Owner-scope only: the PEER's tab members are its owner's job
+            // (this heal running on both machines covers both directions).
+            if (ownHands_.find(mk) == ownHands_.end()) continue;
+            Character* mc = engine::resolveCharByHand(m.hIndex, m.hSerial, m.hType,
+                                                      m.hContainer, m.hContainerSerial);
+            engine::CarryRead mcr;
+            if (!mc || !engine::readCarry(mc, &mcr) || !mcr.beingCarried) {
+                ownCarriedNoSee_.erase(mk); // not carried (or unreadable): disarm
+                continue;
+            }
+            // Find the LOCAL carrier and classify its authority. Squad pass
+            // first (a player hauling a player); world-NPC scan only where an
+            // NPC carrier could ever be healed (the join - on the host a world
+            // NPC IS the authority, and an unfound carrier is indistinguishable
+            // from one, so the host judges peer-squad carriers only). Scans by
+            // live local state, not the streamed hand: carrier re-container is
+            // one of the very failure modes this heals.
+            Character* carrier = 0;
+            bool carrierLocal = false; // carrier's truth is OUR local sim
+            unsigned int cIdx = 0, cSer = 0;
+            for (unsigned int j = 0; j < oracleSquadN && !carrier; ++j) {
+                if (j == i) continue;
+                const EntityState& q = oracleSquad[j];
+                Character* qc = engine::resolveCharByHand(q.hIndex, q.hSerial,
+                                    q.hType, q.hContainer, q.hContainerSerial);
+                engine::CarryRead qcr;
+                if (qc && engine::readCarry(qc, &qcr) && qcr.carrying &&
+                    qcr.carried[3] == m.hIndex && qcr.carried[4] == m.hSerial) {
+                    carrier = qc; cIdx = q.hIndex; cSer = q.hSerial;
+                    Key qk; qk.t = q.hType; qk.c = q.hContainer;
+                    qk.cs = q.hContainerSerial; qk.i = q.hIndex; qk.s = q.hSerial;
+                    carrierLocal = (ownHands_.find(qk) != ownHands_.end());
+                }
+            }
+            if (!carrier && !streamNpcs_) {
+                static Character*  healChars[96];  // main-thread only
+                static EntityState healStates[96];
+                unsigned int nn = engine::listNpcs(gw, healChars, healStates, 96);
+                for (unsigned int j = 0; j < nn && !carrier; ++j) {
+                    engine::CarryRead ccr;
+                    if (engine::readCarry(healChars[j], &ccr) && ccr.carrying &&
+                        ccr.carried[3] == m.hIndex && ccr.carried[4] == m.hSerial) {
+                        carrier = healChars[j];
+                        cIdx = healStates[j].hIndex; cSer = healStates[j].hSerial;
+                    }
+                }
+            }
+            if (carrierLocal || (!carrier && streamNpcs_)) {
+                ownCarriedNoSee_.erase(mk); // locally-authoritative carry: believe it
+                continue;
+            }
+            // Does any live streamed row still claim this member as its carry
+            // subject? latest() (not this tick's sample) so a between-batches
+            // gap on a slow-streamed carrier does not read as a drop.
+            bool claimed = false;
+            for (std::map<Key, Driven>::iterator ct = targets_.begin();
+                 !claimed && ct != targets_.end(); ++ct) {
+                if (ownHands_.find(ct->first) != ownHands_.end()) continue;
+                if (ct->second.lastSeenMs == 0 ||
+                    (now - ct->second.lastSeenMs) > CARRY_CLAIM_STALE_MS) continue;
+                EntityState ls;
+                if (!ct->second.interp.latest(&ls, 0, 0, 0)) continue;
+                claimed = coop::taskIsCarry(ls.task) &&
+                          ls.sIndex == m.hIndex && ls.sSerial == m.hSerial;
+            }
+            unsigned long& tick = ownCarriedNoSee_[mk];
+            if (coop::carriedHealStep(true, claimed, now, CARRY_DROP_MS,
+                                      &tick) == coop::CARRIED_HEAL_FIRE) {
+                // No carrier found at all: nothing to drop - the fired log line
+                // is the triage evidence (and the window re-arms, so a body
+                // stuck this way reports once per window, not per tick).
+                bool ok = carrier ? engine::applyDrop(carrier, /*ragdoll*/true)
+                                  : false;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[carry] OWNER HEAL DROP subj=%u,%u carrier=%u,%u ok=%d",
+                    m.hIndex, m.hSerial, cIdx, cSer, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                // drop refused / carrier missing: carriedHealStep re-armed the
+                // window, so a still-stuck body retries a full window later.
+            }
+        }
     }
 }
 
