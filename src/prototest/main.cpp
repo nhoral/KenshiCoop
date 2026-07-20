@@ -574,6 +574,16 @@ static EntityState entAt(float x) {
     return e;
 }
 
+// Same base body, but with an explicit locomotion state (the fields the
+// foot-slide fix time-aligns): moving flag, speed, and world-space motion.
+static EntityState entLoco(float x, unsigned char moving, float speed) {
+    EntityState e = entAt(x);
+    e.cMoving = moving;
+    e.cSpeed  = speed;
+    e.cMotionX = speed; e.cMotionY = 0.0f; e.cMotionZ = 0.0f;
+    return e;
+}
+
 static void testInterp() {
     std::printf("== interpolation buffer (Interp.cpp) ==\n");
     InterpConfig cfg; // min 50 / max 200 delay, extrap 250, snap 50u, stale 2000
@@ -670,6 +680,39 @@ static void testInterp() {
         EntityState out;
         bool ok = it.sample(1030, cfg, &out);
         CHECK("identity+state passthrough", ok && out.bodyState == BODY_DOWN && out.cMoving == 1 && out.task == 42 && out.hIndex == 1);
+    }
+
+    // Time-aligned locomotion (foot-slide fix, commit 0191d73): the moving FLAG
+    // and speed sample() returns must match the RENDER-DELAY position, not the
+    // newest snapshot. Feed a body walking x=0->3 over 1000..1150ms that is
+    // STOPPED at the newest snapshot. With a one-interval (50ms) render delay the
+    // buffer is still gliding through the last MOVING segment while the newest
+    // snapshot already reads idle - the exact on-stop foot-slide case. Loco must
+    // come from the segment START (still moving), not the newest (already idle).
+    // These CHECKs go RED if commit 0191d73 is reverted (loco falls back to the
+    // newest snapshot): mid.cMoving reads 0 and mid.cSpeed reads 0.
+    {
+        EntityInterp it;
+        it.push(entLoco(0.0f, 1, 10.0f), 1000); // moving
+        it.push(entLoco(1.0f, 1, 10.0f), 1050); // moving
+        it.push(entLoco(2.0f, 1, 10.0f), 1100); // moving: START of the stopping segment
+        it.push(entLoco(3.0f, 0,  0.0f), 1150); // STOPPED (newest): flag idle, speed 0
+
+        // nowMs=1175 -> renderTime=1125: mid of the [1100,1150] segment. Position
+        // still gliding (x~2.5); read s0 (moving,10) lerped toward s1 (idle,0).
+        EntityState mid;
+        bool okMid = it.sample(1175, cfg, &mid);
+        CHECK("stopping LERP still reads moving", okMid && mid.cMoving == 1);
+        CHECK("stopping LERP speed interpolated (not the stopped newest)",
+              okMid && mid.cSpeed > 4.9f && mid.cSpeed < 5.1f);
+        CHECK("stopping LERP position still gliding", okMid && mid.x > 2.4f && mid.x < 2.6f);
+
+        // nowMs=1225 -> renderTime=1175 >= newest.t: render has crossed onto the
+        // already-stopped newest, so the flag now correctly reads idle.
+        EntityState done;
+        bool okDone = it.sample(1225, cfg, &done);
+        CHECK("crossed onto stopped newest reads idle", okDone && done.cMoving == 0);
+        CHECK("crossed onto stopped newest speed zero", okDone && done.cSpeed < 0.1f);
     }
 }
 

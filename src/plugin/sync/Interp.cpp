@@ -251,6 +251,14 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
             // (matching its still-gliding position) and only flips to idle once
             // render time crosses into the already-stopped segment. This is the
             // time alignment that removes foot-slide on stopping.
+            // Trade-off (start of motion, symmetric): a body that BEGINS moving
+            // mid-segment (s0.cMoving=0, s1.cMoving=1) reads idle for that whole
+            // segment even as its position starts translating - a one-segment
+            // idle-slide mirroring the stop-slide this fixes. Accepted because the
+            // consumer (ReplicatorDrive.cpp:242) gates on cMoving!=0 || cSpeed>
+            // MOVE_EPS, and cSpeed interpolates up from 0 here, so the start case
+            // still animates 'moving' almost immediately. Do NOT 'fix' the start by
+            // interpolating the flag or ORing s1's - that reintroduces stop-slide.
             out->cSpeed  = lerpf(s0.cSpeed,  s1.cSpeed,  a);
             out->cMotionX = lerpf(s0.cMotionX, s1.cMotionX, a);
             out->cMotionY = lerpf(s0.cMotionY, s1.cMotionY, a);
