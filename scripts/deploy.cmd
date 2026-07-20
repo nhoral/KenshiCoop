@@ -21,6 +21,7 @@ if "%CONFIG%"=="" set "CONFIG=Harness"
 
 set "DLL=%REPO%\src\plugin\x64\%CONFIG%\KenshiCoop.dll"
 set "JSON=%REPO%\dist\mods\KenshiCoop\RE_Kenshi.json"
+set "MOD=%REPO%\dist\mods\KenshiCoop\KenshiCoop.mod"
 set "DST=%KENSHI%\mods\KenshiCoop"
 
 if not exist "%DLL%" (
@@ -49,19 +50,19 @@ if errorlevel 1 (
 )
 echo Copied RE_Kenshi.json
 
-REM A .mod file is required for Kenshi to list the mod so it can be enabled.
-REM It is a binary FCS file and cannot be generated here. If missing, copy any
-REM existing .mod as a placeholder, otherwise make an empty one in the FCS.
-if not exist "%DST%\KenshiCoop.mod" (
-    set "TEMPLATE="
-    for /f "delims=" %%m in ('dir /b /s "%KENSHI%\mods\*.mod" 2^>nul') do if not defined TEMPLATE set "TEMPLATE=%%m"
-    if defined TEMPLATE (
-        copy /Y "!TEMPLATE!" "%DST%\KenshiCoop.mod" >nul
-        echo Created KenshiCoop.mod from template
-    ) else (
-        echo NOTE: no .mod found to copy. Create an empty KenshiCoop.mod via the FCS
-        echo       and place it in "%DST%".
+REM KenshiCoop.mod is a real FCS data mod now: it carries the "Multiplayer
+REM (Wanderer x2)" co-op game start. The repo owns it, so always overwrite the
+REM install's copy with the repo's (a stale placeholder would hide the start).
+if exist "%MOD%" (
+    copy /Y "%MOD%" "%DST%\KenshiCoop.mod" >nul
+    if errorlevel 1 (
+        echo ERROR: could not copy KenshiCoop.mod to "%DST%" ^(locked?^).
+        exit /b 1
     )
+    echo Copied KenshiCoop.mod
+) else (
+    echo ERROR: %MOD% not found in the repo.
+    exit /b 1
 )
 
 echo.
@@ -82,8 +83,8 @@ if not "%KENSHI%"=="%JOINDIR%" if exist "%JOINDIR%\kenshi_x64.exe" (
     )
     echo Copied KenshiCoop.dll  -^> join install
     copy /Y "%JSON%" "!JDST!\RE_Kenshi.json" >nul && echo Copied RE_Kenshi.json  -^> join install
-    if not exist "!JDST!\KenshiCoop.mod" if exist "%DST%\KenshiCoop.mod" (
-        copy /Y "%DST%\KenshiCoop.mod" "!JDST!\KenshiCoop.mod" >nul
+    if exist "%MOD%" (
+        copy /Y "%MOD%" "!JDST!\KenshiCoop.mod" >nul
         echo Copied KenshiCoop.mod   -^> join install
     )
 )

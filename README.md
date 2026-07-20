@@ -104,6 +104,11 @@ is needed after an edit.
   runs squad 1 and the joining player squad 2. Your friend's squad is visible
   and synced on your screen, but answers only to them. If your save has only
   one squad, move some units into a second squad tab in-game to give them a crew.
+- **Two-player start included.** The KenshiCoop mod ships a **"Multiplayer
+  (Wanderer x2)"** game start (New Game -> pick it from the list): the vanilla
+  Wanderer start, but with two wanderers already split into separate squads, so
+  the host gets squad 1 and the joining player squad 2 with no manual tab-splitting.
+  It's part of the one KenshiCoop mod - no second mod to install.
 - **The joining player doesn't need the host's save.** The host picks the save
   (or starts a new game); when the join connects from the menu, the host's world
   is streamed over automatically. Already having an identical copy on disk just
@@ -161,6 +166,8 @@ scenario, and produces a numeric PASS/FAIL verdict from the two logs.
 - [BFrizzleFoShizzle](https://github.com/BFrizzleFoShizzle) - RE_Kenshi and
   KenshiLib, which make plugins like this possible
 - [lsalzman/enet](https://github.com/lsalzman/enet) - UDP networking library
+- [zeroit789](https://github.com/zeroit789) - the "Multiplayer (Wanderer x2)"
+  co-op game start ([#15](https://github.com/nhoral/KenshiCoop/pull/15))
 - Lo-Fi Games - Kenshi
 
 ## License
