@@ -83,6 +83,12 @@ public:
     // prior one-directional behaviour is preserved.
     void setOwnRanks(const std::set<unsigned int>& r) { ownRanks_ = r; }
 
+    // Remote-player display name for the DRV body nametag (KENSHICOOP_DEBUG_MARKERS).
+    // The plugin root resolves the peer's Steam persona name (net layer) and pushes
+    // it in here each tick so the sync layer stays free of Steam/net dependencies.
+    // Empty -> the label falls back to the legacy "DRV <charName>" form.
+    void setRemoteName(const char* name) { remoteName_ = name ? name : ""; }
+
     // Cross-owner trade veto classifier (engine InvOwnerClassFn). Given a
     // save-stable owner hand (readObjectHand layout [type,container,
     // containerSerial,index,serial]) returns 0 = not a player-squad member,
@@ -1519,8 +1525,12 @@ private:
     // LOC = local-sim copy that exists in the host census. No-op (single env
     // check) unless the flag is set. Labels are created once per body and
     // re-captioned only on state change.
-    struct DebugMarker { void* label; int color; };
+    struct DebugMarker { void* label; int color; std::string caption; };
     std::map<Character*, DebugMarker> debugMarkers_;
+    // Remote player's display name (Steam persona), pushed in via setRemoteName.
+    // Used to caption DRV (host-driven = remote-controlled) bodies with WHOSE
+    // unit it is; empty falls back to the legacy "DRV <charName>" caption.
+    std::string remoteName_;
     void debugMark(Character* c, int colorId, const char* tag);
     // Lifetime guard (2026-07-11 join crash): the map is keyed by raw
     // Character* the engine can free (and REUSE for a new body, silently

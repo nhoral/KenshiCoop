@@ -744,6 +744,18 @@ void coopPanelDrive(GameWorld* gw) {
     // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
     coop::steaminvite::tick();
 
+    // Remote-player nametag: resolve the co-op peer's Steam persona name and push
+    // it to the replicator so DRV (host-driven = remote-controlled) bodies show
+    // WHOSE unit it is under KENSHICOOP_DEBUG_MARKERS. Steam transport only - a
+    // LAN/UDP session has no SteamID, so the label keeps its "DRV <charName>"
+    // fallback. personaName() caches and resolves asynchronously via the pump
+    // above, so this is cheap to call every tick and self-heals once info lands.
+    unsigned long long nametagPeer = (unsigned long long)coop::steamp2p::peerId();
+    if (nametagPeer == 0) nametagPeer = g_cfg.steamPeer;
+    const char* peerPersona = (g_cfg.transport == "steam" && nametagPeer != 0)
+        ? coop::steaminvite::personaName(nametagPeer) : "";
+    g_repl.setRemoteName(peerPersona);
+
     coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
     coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
 }

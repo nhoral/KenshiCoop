@@ -10,6 +10,8 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/Nametag.h" // remoteNametagCaption (DRV body nametag)
+#include <cstring>           // std::strcmp (DRV tag test)
 
 namespace coop {
 
@@ -20,21 +22,40 @@ void Replicator::debugMark(Character* c, int colorId, const char* tag) {
         en = (e && e[0] == '1') ? 1 : 0;
     }
     if (en != 1 || !c) return;
-    std::map<Character*, DebugMarker>::iterator it = debugMarkers_.find(c);
-    if (it != debugMarkers_.end() && it->second.color == colorId) return;
     char nm[40];
     engine::charName(c, nm, sizeof(nm));
     char cap[64];
-    _snprintf(cap, sizeof(cap) - 1, "%s %s", tag, nm);
+    // DRV = a body the host stream DRIVES here = the OTHER player's unit. Caption
+    // it with the remote player's Steam persona name (pushed in via setRemoteName)
+    // so you can see whose unit it is at a glance; fall back to the legacy
+    // "DRV <charName>" form when the name is unknown (non-friend / LAN / API down).
+    if (tag && std::strcmp(tag, "DRV") == 0) {
+        char fb[64];
+        _snprintf(fb, sizeof(fb) - 1, "DRV %s", nm);
+        fb[sizeof(fb) - 1] = '\0';
+        std::string label = coop::remoteNametagCaption(
+            remoteName_.empty() ? 0 : remoteName_.c_str(), fb);
+        _snprintf(cap, sizeof(cap) - 1, "%s", label.c_str());
+    } else {
+        _snprintf(cap, sizeof(cap) - 1, "%s %s", tag, nm);
+    }
     cap[sizeof(cap) - 1] = '\0';
+    // Re-caption not only on color change but on caption change too: the DRV
+    // nametag starts as the fallback and switches to the real persona name once
+    // Steam resolves it asynchronously (a color-only guard would freeze the old
+    // caption forever).
+    std::map<Character*, DebugMarker>::iterator it = debugMarkers_.find(c);
+    if (it != debugMarkers_.end() && it->second.color == colorId &&
+        it->second.caption == cap) return;
     if (it == debugMarkers_.end()) {
         void* l = engine::markerCreate(c, cap, colorId);
         if (l) {
-            DebugMarker m; m.label = l; m.color = colorId;
+            DebugMarker m; m.label = l; m.color = colorId; m.caption = cap;
             debugMarkers_[c] = m;
         }
     } else if (engine::markerUpdate(it->second.label, cap, colorId)) {
         it->second.color = colorId;
+        it->second.caption = cap;
     }
 }
 

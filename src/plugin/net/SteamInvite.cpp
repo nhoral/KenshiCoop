@@ -87,6 +87,9 @@ typedef int   (*FrGetCountFn)(void* friends, int eFriendFlags);
 typedef unsigned long long (*FrGetByIndexFn)(void* friends, int i, int eFriendFlags);
 typedef const char* (*FrGetNameFn)(void* friends, unsigned long long id);
 typedef int   (*FrGetStateFn)(void* friends, unsigned long long id);
+// RequestUserInformation(steamID, bRequireNameOnly): asks Steam to download a
+// non-friend's persona info so GetFriendPersonaName stops returning "[unknown]".
+typedef bool  (*FrReqUserInfoFn)(void* friends, unsigned long long id, bool nameOnly);
 
 #pragma pack(push, 8)
 struct FriendGameInfo_t {
@@ -122,6 +125,7 @@ FrGetByIndexFn        g_frByIndex   = 0;
 FrGetNameFn           g_frName      = 0;
 FrGetStateFn          g_frState     = 0;
 FrGetGamePlayedFn     g_frGame      = 0;
+FrReqUserInfoFn       g_frReqInfo   = 0; // optional (older DLLs may lack it)
 RegisterCbFn          g_regCb       = 0;
 RegisterCrFn          g_regCr       = 0;
 UnregisterCbFn        g_unregCb     = 0;
@@ -359,6 +363,7 @@ bool init(ConnectFn onConnect) {
     g_frName      = (FrGetNameFn)          GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendPersonaName");
     g_frState     = (FrGetStateFn)         GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendPersonaState");
     g_frGame      = (FrGetGamePlayedFn)    GetProcAddress(mod, "SteamAPI_ISteamFriends_GetFriendGamePlayed");
+    g_frReqInfo   = (FrReqUserInfoFn)      GetProcAddress(mod, "SteamAPI_ISteamFriends_RequestUserInformation");
     g_regCb       = (RegisterCbFn)         GetProcAddress(mod, "SteamAPI_RegisterCallback");
     g_regCr       = (RegisterCrFn)         GetProcAddress(mod, "SteamAPI_RegisterCallResult");
     g_unregCb     = (UnregisterCbFn)       GetProcAddress(mod, "SteamAPI_UnregisterCallback");
@@ -461,6 +466,47 @@ int  friendCount()             { return g_friendN; }
 SteamId friendId(int i)        { return (i >= 0 && i < g_friendN) ? g_friendRows[i].id : 0; }
 const char* friendName(int i)  { return (i >= 0 && i < g_friendN) ? g_friendRows[i].name : ""; }
 int  friendState(int i)        { return (i >= 0 && i < g_friendN) ? g_friendRows[i].state : 0; }
+
+namespace {
+// Tiny persona-name cache. GetFriendPersonaName hands back a Steam-owned pointer
+// only valid until its next call, so we copy the name into our own storage.
+// A handful of slots is plenty (a co-op session has one peer; reconnects to a
+// different friend reuse the oldest slot). "resolved" flags that Steam gave us a
+// real name (not "[unknown]") so we stop re-requesting.
+struct PersonaRow { unsigned long long id; char name[64]; bool resolved; };
+const int   MAX_PERSONA = 4;
+PersonaRow  g_personaRows[MAX_PERSONA] = {{0,{0},false}};
+int         g_personaNext = 0;
+
+// Find the cache slot for 'id', or claim/reuse one (round-robin) if absent.
+PersonaRow& personaSlot(unsigned long long id) {
+    for (int i = 0; i < MAX_PERSONA; ++i)
+        if (g_personaRows[i].id == id) return g_personaRows[i];
+    PersonaRow& row = g_personaRows[g_personaNext];
+    g_personaNext = (g_personaNext + 1) % MAX_PERSONA;
+    row.id = id; row.name[0] = '\0'; row.resolved = false;
+    return row;
+}
+} // namespace
+
+const char* personaName(SteamId id) {
+    if (!g_ready || !g_frName || !g_friends || id == 0) return "";
+    PersonaRow& row = personaSlot(id);
+    // Already resolved to a real name: return the cached copy.
+    if (row.resolved) return row.name;
+
+    // Ask Steam for the current name. Non-friends read "[unknown]" until their
+    // info downloads, so kick off RequestUserInformation and try again later.
+    const char* nm = g_frName(g_friends, id);
+    if (nm && nm[0] != '\0' && std::strcmp(nm, "[unknown]") != 0) {
+        _snprintf(row.name, sizeof(row.name) - 1, "%s", nm);
+        row.name[sizeof(row.name) - 1] = '\0';
+        row.resolved = true;
+        return row.name;
+    }
+    if (g_frReqInfo) g_frReqInfo(g_friends, id, /*nameOnly*/true);
+    return "[unknown]";
+}
 
 void tick() {
     if (!g_ready) return;

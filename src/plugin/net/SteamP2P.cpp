@@ -322,6 +322,7 @@ bool init() {
 
 bool ready()      { return g_ready; }
 SteamId selfId()  { return g_selfId; }
+SteamId peerId()  { return g_peer; }
 
 void setPeer(SteamId id) {
     g_peer = id;

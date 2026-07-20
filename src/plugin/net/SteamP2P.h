@@ -35,6 +35,10 @@ bool init();
 bool ready();
 SteamId selfId();
 
+// The single configured tunnel peer (the other player), or 0 if not set yet.
+// Used by the remote-player nametag to resolve the peer's Steam persona name.
+SteamId peerId();
+
 // Configure the single tunnel peer. Proactively accepts its inbound session
 // and allows Valve-relay fallback. Call before the net thread starts.
 void setPeer(SteamId id);
