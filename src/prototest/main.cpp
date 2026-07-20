@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/core/StaleGuard.h"   // per-sender stale-row guard (symmetric channels)
 
 #include <set>
 
@@ -1355,6 +1356,80 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 12. Per-sender stale-row guard (StaleGuard.h staleRowAccept) ----------------
+// Guards the symmetric-channel fix (2026-07-19): the faction (24), door (26)
+// and placed-building-door (28) channels are published by BOTH clients, each
+// stamping its own independent seq counter on rows for the SAME key. The old
+// guard kept ONE shared high-water mark per row, so once the faster sender
+// pushed seq=N, every packet from the other sender with seq <= N was dropped
+// as "stale" - one player silently stopped seeing the other's changes on that
+// row. staleRowAccept keys the mark by the packet's ownerId; this locks that
+// contract (and the unchanged single-sender discipline around it).
+static void testStaleGuard() {
+    std::printf("== per-sender stale-row guard (StaleGuard.h) ==\n");
+    const unsigned int A = 1, B = 2; // two peers publishing the SAME row
+
+    // Single-sender semantics unchanged: first row lands, duplicates (safety
+    // resends) and reordered stragglers drop, newer seqs land, loss-gaps jump.
+    {
+        std::map<unsigned int, unsigned int> row;
+        CHECK("first row from a sender applies",      staleRowAccept(row, A, 1));
+        CHECK("duplicate seq drops (safety resend)", !staleRowAccept(row, A, 1));
+        CHECK("newer seq applies",                    staleRowAccept(row, A, 2));
+        CHECK("reordered straggler drops",           !staleRowAccept(row, A, 1));
+        CHECK("gap jump applies (loss tolerated)",    staleRowAccept(row, A, 9));
+        CHECK("straggler behind the gap drops",      !staleRowAccept(row, A, 5));
+    }
+
+    // THE FIX: two senders write the SAME row with independent counters. A's
+    // counter is far ahead (seq 500); B's fresh seq=1 must still land. The
+    // pre-fix shared mark rejected exactly this packet (1 <= 500 -> "stale").
+    {
+        std::map<unsigned int, unsigned int> row;
+        CHECK("fast sender A seq=500 applies",  staleRowAccept(row, A, 500));
+        CHECK("slow sender B seq=1 still applies (the fix)",
+              staleRowAccept(row, B, 1));
+        // Per-sender discipline holds independently on both counters.
+        CHECK("B duplicate seq=1 drops",       !staleRowAccept(row, B, 1));
+        CHECK("B seq=2 applies",                staleRowAccept(row, B, 2));
+        CHECK("A straggler seq=499 drops",     !staleRowAccept(row, A, 499));
+        CHECK("A seq=501 applies",              staleRowAccept(row, A, 501));
+    }
+
+    // Regression documentation (the RED half): the pre-fix shared-counter
+    // guard, replayed on the same trace, drops B's fresh packet - proof this
+    // scenario detects the bug the per-sender map removes.
+    {
+        unsigned int sharedSeen = 0;   // pre-fix FacRow::seqSeen (one u32)
+        sharedSeen = 500;              // A's seq=500 row applied
+        bool bDropped = (sharedSeen != 0 && 1u <= sharedSeen); // B's seq=1 arrives
+        CHECK("shared counter would drop B's row (the bug)", bDropped);
+    }
+
+    // Interleaving: both sides toggling the same door alternately - every
+    // fresh packet from either side lands, every safety resend drops, and
+    // neither counter ever disturbs the other's progress.
+    {
+        std::map<unsigned int, unsigned int> row;
+        bool ok = true;
+        for (unsigned int s = 1; s <= 10; ++s) {
+            ok = ok &&  staleRowAccept(row, A, s);  // A's fresh row
+            ok = ok &&  staleRowAccept(row, B, s);  // B's fresh row, same key
+            ok = ok && !staleRowAccept(row, A, s);  // A's safety resend
+            ok = ok && !staleRowAccept(row, B, s);  // B's safety resend
+        }
+        CHECK("alternating same-row writes all land, resends all drop", ok);
+    }
+
+    // The guard state is per ROW: a second row's counters start clean, so a
+    // sender's high counter on one door never stales its rows on another.
+    {
+        std::map<unsigned int, unsigned int> door1, door2;
+        CHECK("row1 A seq=3 applies",                    staleRowAccept(door1, A, 3));
+        CHECK("row2 A seq=1 applies (rows independent)", staleRowAccept(door2, A, 1));
+    }
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1377,6 +1452,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testStaleGuard();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;
