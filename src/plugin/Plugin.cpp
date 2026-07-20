@@ -616,6 +616,20 @@ void driveLoadSync(GameWorld* gw) {
         if (!g_cfg.saveSync && coop::savexfer::sending())
             coop::savexfer::tickSend(g_net, g_net.localId());
     } else {
+        // Test-only (KENSHICOOP_FORCE_STREAM=1, join): force the missing/diverged
+        // NACK branch even when our on-disk fingerprint MATCHES the host's, so a
+        // single-machine run (where both installs share %LOCALAPPDATA%\kenshi\save
+        // and would otherwise MATCH + load from disk) still exercises the REAL
+        // folder-transfer + post-transfer load path. Default OFF; read once.
+        static int s_forceStream = -1;
+        if (s_forceStream < 0) {
+            const char* e = getenv("KENSHICOOP_FORCE_STREAM");
+            s_forceStream = (e && e[0] == '1') ? 1 : 0;
+            if (s_forceStream)
+                coopLog("[load] FORCE-STREAM armed (test): join NACKs matching "
+                        "saves to exercise the transfer");
+        }
+
         // LOAD_GOs: verify our on-disk copy and follow the host.
         std::deque<coop::InboundLoadGo> gos;
         g_inbound.drainLoadGos(gos);
@@ -629,7 +643,7 @@ void driveLoadSync(GameWorld* gw) {
             if (!name[0]) continue;
             coop::u32 fp = coop::savexfer::folderFingerprint(name);
             char b[192];
-            if (fp != 0 && fp == it->pkt.fingerprint) {
+            if (!s_forceStream && fp != 0 && fp == it->pkt.fingerprint) {
                 // Already in this exact save? A connect-triggered push (host
                 // bakes its current save and announces it) would otherwise
                 // reload the join into the world it is already in - a pointless
@@ -740,6 +754,32 @@ void coopPanelDrive(GameWorld* gw) {
         ostate = 0;
     }
     ps.detail = detail.c_str();
+
+    // Join save-transfer status for the panel: while a join streams the host's
+    // world at the menu (no leader -> no screen overlay), show live progress on
+    // the F2 panel. The percent is whole-number so the panel only rebuilds ~100x
+    // over a transfer, not every chunk. Null when not streaming.
+    std::string transfer;
+    if (!g_cfg.isHost && g_net.isRunning() && !g_gameStarted) {
+        if (coop::savexfer::receiving()) {
+            unsigned __int64 got = coop::savexfer::recvBytes();
+            unsigned __int64 tot = coop::savexfer::recvTotalBytes();
+            int pct = (tot > 0) ? (int)((got * 100) / tot) : 0;
+            if (pct > 100) pct = 100;
+            char tb[96];
+            _snprintf(tb, sizeof(tb) - 1,
+                      "Streaming host world... %d%% (%.1f/%.1f MB)", pct,
+                      (double)got / (1024.0 * 1024.0),
+                      (double)tot / (1024.0 * 1024.0));
+            tb[sizeof(tb) - 1] = '\0';
+            transfer = tb;
+        } else if (!g_loadAfterCommit.empty()) {
+            // NACK sent (host baking/streaming) or committed + about to load.
+            transfer = "Preparing host world...";
+        }
+    }
+    ps.transferDetail = transfer.empty() ? (const char*)0 : transfer.c_str();
+
     // Still pump Steam callbacks so an inbound "Join Game" (a friend inviting
     // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
     coop::steaminvite::tick();

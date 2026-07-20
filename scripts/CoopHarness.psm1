@@ -52,6 +52,10 @@ $script:CoopDiagEnvKeys = @(
     'KENSHICOOP_JAIL_PROBE'
     'KENSHICOOP_TASK_SPIKE'
     'KENSHICOOP_JAIL_OBSERVE'
+    # --- test-only load-path knob (read in Plugin.cpp, not Config) --------------
+    # Forces the join to NACK a MATCHing LOAD_GO so the real folder-transfer path
+    # runs on one machine (bootstrap_stream / stream_test.ps1).
+    'KENSHICOOP_FORCE_STREAM'
 )
 
 function Get-CoopDiagEnvKeys {

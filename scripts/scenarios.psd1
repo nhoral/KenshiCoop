@@ -922,6 +922,26 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # bootstrap_stream: the missing-save "seamless join" proof (protocol
+        # 31/32). NOT a run_test tier member and NOT run_test-drivable - it needs
+        # the join-from-MENU launch (join has NO save, goes ONLINE, host bakes +
+        # streams its live world on connect), which scripts\stream_test.ps1
+        # provides. On one machine both installs share %LOCALAPPDATA%\kenshi\save
+        # so a join would normally MATCH + load from disk; stream_test sets
+        # KENSHICOOP_FORCE_STREAM=1 on the JOIN so it NACKs the LOAD_GO and the
+        # real folder transfer runs. The connect_stream gate REQUIRES the transfer
+        # edges (NACK -> XFER-SENT -> XFER-COMMIT badCrc=0 -> XFER-ACK ok=1 ->
+        # transfer-committed load -> gameplay), so a run that quietly MATCH-loaded
+        # FAILS. DiagEnv here is documentation (stream_test sets it join-only).
+        bootstrap_stream = @{
+            DiagEnv = @{ KENSHICOOP_FORCE_STREAM = '1' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'connect_stream'
+            Gating   = @('connect_stream')
+            Advisory = @()
+            Tier = 'none'; WanVariant = $false
+        }
+
         # prod_probe: production machine phase-0 diagnostic (protocol 33 -
         # prodSync forced OFF, the protocol-27 mint channel ON). The HOST
         # places a generator + crafting bench leader-relative and ramps both

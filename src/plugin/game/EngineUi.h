@@ -34,6 +34,11 @@ struct CoopPanelState {
     bool               isHost;      // current armed role (seeds the Host toggle)
     int                transportSel;// current armed transport (0 steam, 1 udp)
     const char*        detail;      // one-line status string for the panel/overlay
+    // Join-side save-transfer status (null when not streaming): while a join
+    // receives the host's world at the menu it has no leader for the overlay, so
+    // the F2 panel's status line shows this instead (e.g. "Streaming host
+    // world... 42% (3.1/7.4 MB)"). Set by coopPanelDrive, rendered in dbgVal.
+    const char*        transferDetail;
 };
 // The panel's role/transport selections at the moment Connect is hit. peerId is the
 // Steam ID pasted in-panel this session (0 if none), and overrides the config

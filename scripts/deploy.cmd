@@ -53,17 +53,16 @@ echo Copied RE_Kenshi.json
 REM KenshiCoop.mod is a real FCS data mod now: it carries the "Multiplayer
 REM (Wanderer x2)" co-op game start. The repo owns it, so always overwrite the
 REM install's copy with the repo's (a stale placeholder would hide the start).
-if exist "%MOD%" (
-    copy /Y "%MOD%" "%DST%\KenshiCoop.mod" >nul
-    if errorlevel 1 (
-        echo ERROR: could not copy KenshiCoop.mod to "%DST%" ^(locked?^).
-        exit /b 1
-    )
-    echo Copied KenshiCoop.mod
-) else (
+if not exist "%MOD%" (
     echo ERROR: %MOD% not found in the repo.
     exit /b 1
 )
+copy /Y "%MOD%" "%DST%\KenshiCoop.mod"   >nul
+if errorlevel 1 (
+    echo ERROR: could not copy KenshiCoop.mod to "%DST%" ^(locked?^).
+    exit /b 1
+)
+echo Copied KenshiCoop.mod
 
 echo.
 echo Deployed to: %DST%
@@ -83,10 +82,7 @@ if not "%KENSHI%"=="%JOINDIR%" if exist "%JOINDIR%\kenshi_x64.exe" (
     )
     echo Copied KenshiCoop.dll  -^> join install
     copy /Y "%JSON%" "!JDST!\RE_Kenshi.json" >nul && echo Copied RE_Kenshi.json  -^> join install
-    if exist "%MOD%" (
-        copy /Y "%MOD%" "!JDST!\KenshiCoop.mod" >nul
-        echo Copied KenshiCoop.mod   -^> join install
-    )
+    copy /Y "%MOD%"  "!JDST!\KenshiCoop.mod" >nul && echo Copied KenshiCoop.mod   -^> join install
 )
 
 echo.

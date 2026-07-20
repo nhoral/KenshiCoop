@@ -4,8 +4,10 @@
 
 #include "SaveXfer.h"
 #include "../CoopLog.h"
+#ifndef KENSHICOOP_PROTOTEST
 #include "../game/Engine.h" // engine::saveInfo (runtime save-path resolution)
 #include "../net/NetLink.h"
+#endif
 #include "../../netproto/ContentHash.h" // fnv1aInit/Update (per-file CRC)
 
 #include <windows.h>
@@ -148,6 +150,7 @@ bool relPathSafe(const char* p, unsigned int len) {
 }
 
 // ---- Sender state (host, main thread only) ------------------------------------
+#ifndef KENSHICOOP_PROTOTEST
 
 bool                  g_sendActive = false;
 u32                   g_sendXferId = 0;      // monotonic per-host
@@ -180,6 +183,8 @@ void sendAbort(const char* why) {
     g_sendFiles.clear();
     g_sendCrcs.clear();
 }
+
+#endif // !KENSHICOOP_PROTOTEST (sender state)
 
 // ---- Receiver state (join, main thread only) -----------------------------------
 
@@ -225,9 +230,24 @@ unsigned __int64 g_watchCurBytes = 0;
 
 } // namespace
 
+#ifdef KENSHICOOP_PROTOTEST
+// Prototest seam: redirect the staging/commit root to a caller-owned temp dir
+// so the receiver round-trip test never touches the user's real save folder.
+static std::string g_testSaveRoot;
+void setSaveRootForTest(const std::string& root) { g_testSaveRoot = root; }
+#endif
+
 std::string saveFolderFor(const std::string& name) {
-    char curGame[96], savePath[512];
     std::string root;
+#ifdef KENSHICOOP_PROTOTEST
+    if (!g_testSaveRoot.empty()) {
+        root = g_testSaveRoot;
+    } else {
+        const char* lad = getenv("LOCALAPPDATA");
+        root = pathJoin(lad ? lad : "", "kenshi\\save");
+    }
+#else
+    char curGame[96], savePath[512];
     if (engine::saveInfo(curGame, sizeof(curGame), savePath, sizeof(savePath)) &&
         savePath[0] != '\0') {
         root = savePath;
@@ -235,6 +255,7 @@ std::string saveFolderFor(const std::string& name) {
         const char* lad = getenv("LOCALAPPDATA");
         root = pathJoin(lad ? lad : "", "kenshi\\save");
     }
+#endif
     return pathJoin(root, name);
 }
 
@@ -370,6 +391,7 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 }
 
 // ---- Sender (host) -------------------------------------------------------------
+#ifndef KENSHICOOP_PROTOTEST
 
 bool beginSend(NetLink& net, u32 localId, const std::string& name) {
     sendCloseFile();
@@ -503,10 +525,18 @@ bool tickSend(NetLink& net, u32 localId) {
     return false;
 }
 
+#endif // !KENSHICOOP_PROTOTEST (sender)
+
 u32 lastSentXferId()  { return g_lastSentXferId; }
 int lastCommitResult() { return g_lastCommitResult; }
 u32 commitSeq()        { return g_commitSeq; }
 std::string lastCommitName() { return g_recvName; }
+
+// Receive progress (join, for the F2 loading indicator).
+bool             receiving()      { return g_recvActive; }
+unsigned __int64 recvBytes()      { return g_recvBytes; }
+unsigned __int64 recvTotalBytes() { return g_recvTotalBytes; }
+u16              recvFileCount()  { return g_recvFileCount; }
 
 static u32 g_lastAckXferId = 0;
 static int g_lastAckOk     = -1;
@@ -514,6 +544,7 @@ void noteAck(u32 xferId, int ok) { g_lastAckXferId = xferId; g_lastAckOk = ok; }
 u32  lastAckXferId() { return g_lastAckXferId; }
 int  lastAckOk()     { return g_lastAckOk; }
 
+#ifndef KENSHICOOP_PROTOTEST
 void abortAll() {
     if (g_watchArmed) {
         g_watchArmed = false;
@@ -521,6 +552,7 @@ void abortAll() {
     }
     if (g_sendActive) sendAbort("superseded by coordinated load");
 }
+#endif
 
 // ---- Receiver (join) -------------------------------------------------------------
 

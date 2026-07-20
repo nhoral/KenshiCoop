@@ -196,6 +196,7 @@ struct CoopPanelUi {
     bool          needsRebuild;
     bool          f2Down;        // F2 held last tick (rising-edge toggle)
     std::string   lastStatus;    // last status text shown (refresh gate)
+    std::string   lastTransfer;  // last save-transfer line shown (refresh gate)
     CoopPanelUi()
         : panel(0), open(false), built(false), hostFlag(true), steamFlag(true),
           connectedFlag(false), lastConnected(false), lastChkVal(false),
@@ -307,15 +308,18 @@ void panelBuildSeh(DatapanelGUI* p, const PanelStrings* s) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-// Colour a line's key + value TextBoxes white for readability. Runs AFTER
+// Colour a line's key + value TextBoxes for readability. Runs AFTER
 // panelBuildSeh's _NV_update (the w1/w2 widgets exist by then). MyGUI::Colour is a
 // trivial 4-float struct (no destructor), so it may live in the SEH frame.
-void dbgColourSeh(DataPanelLine* line) {
+// yellow=true tints the value column amber - used for the join's live
+// "Streaming host world..." transfer line so it reads as in-progress activity.
+void dbgColourSeh(DataPanelLine* line, bool yellow) {
     if (!line) return;
     __try {
         MyGUI::Colour white(1.0f, 1.0f, 1.0f, 1.0f);
+        MyGUI::Colour amber(1.0f, 0.82f, 0.20f, 1.0f);
         if (line->w1) line->w1->setTextColour(white);
-        if (line->w2) line->w2->setTextColour(white);
+        if (line->w2) line->w2->setTextColour(yellow ? amber : white);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -404,6 +408,12 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
     std::string detail = st->detail ? std::string(st->detail) : std::string();
     if (detail != g_panel.lastStatus) g_panel.needsRebuild = true;
 
+    // Join save-transfer line (throttled to whole-percent by the caller): rebuild
+    // when it changes so the "Streaming host world... NN%" line advances live.
+    std::string transfer = st->transferDetail ? std::string(st->transferDetail)
+                                               : std::string();
+    if (transfer != g_panel.lastTransfer) g_panel.needsRebuild = true;
+
     // Create the window once (outside SEH - see the header note on C2712).
     // Layer MUST be "Info": spike 48 proved createFloatingLabel renders non-null
     // there. "Windows" is not a visible MyGUI layer here - the panel is minted
@@ -446,6 +456,9 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
             dbgVal = std::string("Offline - will ") + (g_panel.hostFlag ? "host" : "join") +
                      " over " + (g_panel.steamFlag ? "Steam" : "UDP") + " on Connect";
         }
+        // A join streaming the host's world at the menu has no leader for the
+        // screen overlay, so surface the live progress here instead (amber).
+        if (!transfer.empty()) { dbgVal = transfer; dbgKey = "World transfer"; }
 
         // Friend's SteamID: prefer the value pasted in-panel this session; fall
         // back to the config (steamPeer, mainly for advanced/back-compat use).
@@ -499,13 +512,14 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         if (g_connBtn)    g_connBtn->callback    = MyGUI::newDelegate(&onConnBtn);
         if (g_copyIdBtn)  g_copyIdBtn->callback  = MyGUI::newDelegate(&onCopyIdBtn);
         if (g_pasteIdBtn) g_pasteIdBtn->callback = MyGUI::newDelegate(&onPasteIdBtn);
-        dbgColourSeh(g_debugLine);
-        dbgColourSeh(g_peerLine);
-        dbgColourSeh(g_selfLine);
+        dbgColourSeh(g_debugLine, !transfer.empty()); // amber while streaming
+        dbgColourSeh(g_peerLine, false);
+        dbgColourSeh(g_selfLine, false);
 
         g_panel.built = true;
         g_panel.needsRebuild = false;
         g_panel.lastStatus = detail;
+        g_panel.lastTransfer = transfer;
     }
 
     // Connect / disconnect on the Online/Offline toggle edge (edge, not level, so

@@ -25,11 +25,16 @@ if not exist "%REPO%\dist" mkdir "%REPO%\dist"
 if not exist "%REPO%\build\prototest" mkdir "%REPO%\build\prototest"
 
 echo === Building prototest.exe (Release^|x64, v100) ===
-cl.exe /nologo /O2 /EHsc /W3 ^
+REM KENSHICOOP_PROTOTEST keeps SaveXfer.cpp CRT-only (its NetLink/engine-coupled
+REM sender + quiescence watch are #ifdef'd out) so the real save-transfer RECEIVER
+REM (onSaveBegin/onSaveFile/onSaveDone -> stage/verify/commit) can be exercised
+REM end-to-end here without pulling in ENet/KenshiLib.
+cl.exe /nologo /O2 /EHsc /W3 /D KENSHICOOP_PROTOTEST ^
     /Fo"%REPO%\build\prototest\\" ^
     /Fe"%REPO%\dist\prototest.exe" ^
     "%REPO%\src\prototest\main.cpp" ^
-    "%REPO%\src\plugin\sync\Interp.cpp"
+    "%REPO%\src\plugin\sync\Interp.cpp" ^
+    "%REPO%\src\plugin\sync\SaveXfer.cpp"
 if errorlevel 1 (
     echo prototest build FAILED
     exit /b 1

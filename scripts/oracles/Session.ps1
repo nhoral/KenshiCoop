@@ -490,6 +490,90 @@ function Test-ConnectBootstrap {
     return (Add-GateResult -Name "connect_bootstrap" -Status $v -Detail $detail)
 }
 
+# connect_stream (protocol 31/32, stream_test.ps1): the STRICT missing-save
+# bootstrap proof. Unlike connect_bootstrap (which also passes on a direct MATCH
+# load), this REQUIRES the real folder transfer, so it is the gate for a run that
+# FORCED the stream (KENSHICOOP_FORCE_STREAM=1) - a run that quietly fell back to
+# a MATCH load FAILS here. The pushed save name is dynamic (the host's current
+# game), so every edge matches the name generically. Gated on:
+#   1. host: connect-push armed   ([boot] baking save '<name>');
+#   2. host: the save announced    ([boot] GO->join ... name='<name>');
+#   3. join: it NACKed             ([load] GO ... MISSING|DIVERGED -> NACK);
+#   4. host: fallback transfer     ([load] starting fallback transfer);
+#   5. host: transfer completed    ([save] XFER-SENT files/bytes);
+#   6. join: staged + committed    ([save] XFER-COMMIT badCrc=0, files/bytes == sent);
+#   7. host: ACK closed the loop   ([save] XFER-ACK ok=1);
+#   8. join: loaded the transfer   ([load] transfer committed -> loading);
+#   9. join: entered the world     (KenshiCoop: gameplay started).
+function Test-ConnectStream {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    # 1. host armed a connect-push (capture the pushed save name).
+    $bake = Select-String -Path $HostFile -Pattern "\[boot\] baking save '([^']*)' to push to join on connect" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $pushName = ''
+    if ($null -eq $bake) { $why += "host never armed a connect-push ([boot] baking save)" }
+    else { $pushName = $bake.Matches[0].Groups[1].Value }
+
+    # 2. host announced it.
+    $go = Select-String -Path $HostFile -Pattern "\[boot\] GO->join id=\d+ name='([^']*)' fp=[0-9a-fA-F]+" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $go) { $why += "host never announced the baked save ([boot] GO->join)" }
+
+    # 3. join NACKed (missing/diverged) - the transfer trigger. If this is absent
+    #    the join MATCH-loaded from disk, i.e. the stream was NOT exercised.
+    $nack = Select-String -Path $JoinFile -Pattern "\[load\] GO id=\d+ name='([^']*)' hostFp=[0-9a-fA-F]+ localFp=[0-9a-fA-F]+ (MISSING|DIVERGED) -> NACK" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $nack) { $why += "join never NACKed (MATCH-loaded from disk? the transfer was not exercised)" }
+    else { Write-Host "    FINDING: join copy was $($nack.Matches[0].Groups[2].Value) -> streamed" }
+
+    # 4. host started the fallback transfer.
+    $fb = Select-String -Path $HostFile -Pattern "\[load\] starting fallback transfer name='([^']*)'" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $fb) { $why += "host never started the fallback transfer" }
+
+    # 5. transfer sent (host).
+    $sent = Select-String -Path $HostFile -Pattern "\[save\] XFER-SENT id=(\d+) files=(\d+) bytes=(\d+) ms=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $sFiles = 0; $sBytes = [long]0; $xferMs = -1
+    if ($null -eq $sent) { $why += "host never logged XFER-SENT (transfer incomplete)" }
+    else {
+        $g = $sent.Matches[0].Groups
+        $sFiles = [int]$g[2].Value; $sBytes = [long]$g[3].Value; $xferMs = [int]$g[4].Value
+        Write-Host "    FINDING: streamed $sFiles files / $sBytes bytes in ${xferMs}ms"
+    }
+
+    # 6. join committed badCrc=0 with equal files/bytes (the integrity proof).
+    $commit = Select-String -Path $JoinFile -Pattern "\[save\] XFER-(COMMIT|FAILED) id=(\d+) name='([^']*)' files=(\d+) bytes=(\d+) badCrc=(\d+) ms=(\d+)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $cFiles = 0; $cBytes = [long]0
+    if ($null -eq $commit) { $why += "join never logged a commit/fail (transfer never finished on the join)" }
+    else {
+        $g = $commit.Matches[0].Groups
+        $cFiles = [int]$g[4].Value; $cBytes = [long]$g[5].Value
+        if ($g[1].Value -ne 'COMMIT') { $why += "join commit FAILED (badCrc=$($g[6].Value))" }
+        elseif ($g[6].Value -ne '0') { $why += "join committed with badCrc=$($g[6].Value)" }
+        if ($null -ne $sent -and $g[1].Value -eq 'COMMIT') {
+            if ($cFiles -ne $sFiles) { $why += "file count mismatch (host sent $sFiles, join committed $cFiles)" }
+            if ($cBytes -ne $sBytes) { $why += "byte count mismatch (host sent $sBytes, join committed $cBytes)" }
+        }
+    }
+
+    # 7. ACK ok=1 on the host.
+    $ack = Select-String -Path $HostFile -Pattern "\[save\] XFER-ACK id=(\d+) ok=(\d)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $ack) { $why += "host never received the join's ACK" }
+    elseif ($ack.Matches[0].Groups[2].Value -ne '1') { $why += "join ACKed ok=0" }
+
+    # 8. join loaded the transferred save.
+    $xferLoad = Select-String -Path $JoinFile -Pattern "\[load\] transfer committed -> loading '([^']*)'" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $xferLoad) { $why += "join never loaded the streamed save ([load] transfer committed -> loading)" }
+
+    # 9. join actually entered the world.
+    $live = Select-String -Path $JoinFile -Pattern "KenshiCoop: gameplay started" -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $live) { $why += "join never reached gameplay after the transfer" }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  CONNECT-STREAM $v - pushName='$pushName' sent=$sFiles/$sBytes committed=$cFiles/$cBytes xferMs=$xferMs $detail"
+    return (Add-GateResult -Name "connect_stream" -Status $v `
+                -Metrics @{ sentFiles = $sFiles; sentBytes = $sBytes; commitFiles = $cFiles; commitBytes = $cBytes; xferMs = $xferMs } -Detail $detail)
+}
+
 # save_resume (protocol 31 phase 12c, resume_test.ps1 stage 2): the identity-
 # reset proof. Both clients were relaunched on 'coopresume' - the save the
 # stage-1 coordinated transfer delivered to the join (stage 2 runs with NO

@@ -81,6 +81,12 @@ function Get-CppScenarioNames {
 # name-check, so it is no longer allowlisted.)
 $manifestlessCpp = @('world_item_drop')
 
+# The reverse allowlist: manifest scenarios that are RUNNER-ONLY - judged by a
+# gate but driven by a bespoke script (a normal co-op tick, NOT a compiled
+# KENSHICOOP_SCENARIO), so they intentionally have no C++ maker. bootstrap_stream
+# is the missing-save streaming proof, run by scripts\stream_test.ps1.
+$manifestRunnerOnly = @('bootstrap_stream')
+
 # Return a list of schema problems for one scenario entry (empty = valid).
 function Get-SchemaProblems {
     param([string]$Name, $Entry)
@@ -159,6 +165,7 @@ Check "parsed C++ scenario names" ($cppNames.Count -gt 0)
 # 3a. Every manifest scenario MUST be constructible by the factory.
 $manifestNoMaker = @()
 foreach ($name in $scenarios.Keys) {
+    if ($manifestRunnerOnly -contains $name) { continue } # bespoke-runner, no maker
     if (-not $cppNames.Contains($name)) { $manifestNoMaker += $name }
 }
 if ($manifestNoMaker.Count -gt 0) { Write-Host ("      manifest names with no C++ maker: " + ($manifestNoMaker -join ', ')) }
