@@ -66,6 +66,11 @@
            empty body, so defining it as plain /D (implicit value 1) trips C4005 in every TU.
            An empty definition makes the redefinition identical and silences the warning. -->
       <PreprocessorDefinitions>_DEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- C4091: mygui/common/baselayout/BaseLayout.h(261) in the vendored KenshiLib deps
+           says "__declspec(dllimport) class BaseLayout" (declspec before the class keyword,
+           so it is ignored). The deps are not part of this repo, so the header text cannot
+           be patched here; suppressing the known-benign noise (21x per build) instead. -->
+      <DisableSpecificWarnings>4091;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -79,6 +84,8 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <!-- WIN32_LEAN_AND_MEAN=: see Debug config note (avoids C4005 vs PerfTimer.h). -->
       <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;KENSHICOOP_HARNESS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- C4091: benign defect in vendored BaseLayout.h - see Debug config note. -->
+      <DisableSpecificWarnings>4091;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <!-- PDB for post-mortem minidump triage (2026-07-11 join crash). No codegen impact. -->
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
@@ -98,6 +105,8 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <!-- WIN32_LEAN_AND_MEAN=: see Debug config note (avoids C4005 vs PerfTimer.h). -->
       <PreprocessorDefinitions>NDEBUG;KENSHICOOP_EXPORTS;_WINDOWS;_USRDLL;WIN32_LEAN_AND_MEAN=;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- C4091: benign defect in vendored BaseLayout.h - see Debug config note. -->
+      <DisableSpecificWarnings>4091;%(DisableSpecificWarnings)</DisableSpecificWarnings>
       <!-- PDB for post-mortem minidump triage (2026-07-11 join crash). No codegen impact. -->
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
