@@ -206,6 +206,14 @@ struct InboundResearch {
     ResearchPacket pkt;
 };
 
+// One received bounty/crime row (protocol 45): the HOST's authoritative durable
+// bounty for a (character, faction) pair; the owning client applies it onto its
+// own (clean) copy via the BountyManager levers (unfairAddToBounty/clearBounty).
+struct InboundBounty {
+    u32          ownerId;
+    BountyPacket pkt;
+};
+
 // One received stealth detection-map snapshot (protocol 20): the detection
 // AUTHORITY (the host's world, where the sneaker is a driven copy) streams who
 // notices the sneaker; the sneaker's OWNER replays the entries between its
@@ -368,7 +376,7 @@ public:
         med_(worldReset_),        treat_(worldReset_),      speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
-        research_(worldReset_),   buildPlace_(worldReset_), buildState_(worldReset_),
+        research_(worldReset_),   bounty_(worldReset_),     buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64) {
         InitializeCriticalSection(&cs_);
@@ -508,6 +516,11 @@ public:
     void pushResearch(u32 ownerId, const ResearchPacket& pkt) {
         InboundResearch ir; ir.ownerId = ownerId; ir.pkt = pkt;
         EnterCriticalSection(&cs_); research_.push_back(ir); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received bounty/crime row (protocol 45), owner-tagged.
+    void pushBounty(u32 ownerId, const BountyPacket& pkt) {
+        InboundBounty ib; ib.ownerId = ownerId; ib.pkt = pkt;
+        EnterCriticalSection(&cs_); bounty_.push_back(ib); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
     void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
@@ -653,6 +666,9 @@ public:
     void drainResearch(std::deque<InboundResearch>& out) {
         EnterCriticalSection(&cs_); out.swap(research_); LeaveCriticalSection(&cs_);
     }
+    void drainBounty(std::deque<InboundBounty>& out) {
+        EnterCriticalSection(&cs_); out.swap(bounty_); LeaveCriticalSection(&cs_);
+    }
     void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
         EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
     }
@@ -762,6 +778,9 @@ private:
     WorldQ<InboundDoor>            door_;
     WorldQ<InboundProd>            prod_;
     WorldQ<InboundResearch>        research_;
+    // Bounty/crime rows (protocol 45): reliable, so unbounded; world-state, so
+    // auto-cleared on a session reset (a bounty describes the CURRENT world).
+    WorldQ<InboundBounty>          bounty_;
     WorldQ<InboundBuildPlace>      buildPlace_;
     WorldQ<InboundBuildState>      buildState_;
     WorldQ<InboundBuildDoor>       buildDoor_;

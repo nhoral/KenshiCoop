@@ -113,6 +113,9 @@ public:
     // MAIN thread: queue a reliable host-authoritative known-research row
     // (protocol 38). First-sight sent + safety-resent by the caller.
     void queueResearch(const ResearchPacket& pkt);
+    // MAIN thread: queue a reliable host-authoritative bounty/crime row
+    // (protocol 45). Change-gated + safety-resent by the caller (host only).
+    void queueBounty(const BountyPacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -260,6 +263,8 @@ private:
     std::vector<ProdPacket>      outProd_;
     // Reliable known-research rows (protocol 38). Guarded by outCs_.
     std::vector<ResearchPacket>  outResearch_;
+    // Reliable bounty/crime rows (protocol 45). Guarded by outCs_.
+    std::vector<BountyPacket>    outBounty_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;

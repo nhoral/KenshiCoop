@@ -1115,6 +1115,36 @@ bool shackleDbgOn();
 // when the env var is unset; SEH-guarded per body; zero behavior change.
 void bountyProbeTick(GameWorld* gw, bool isHost);
 bool bountyProbeOn();
+
+// Protocol 45: bounty/crime sync engine shims (the SEH-guarded read/write
+// levers the host-authoritative PKT_BOUNTY channel rides on).
+// ONE durable bounty row a host-side character carries (its own hand + the
+// faction sid + the Bounty value). Emitted per (character, faction) pair by the
+// enumeration below; the publisher keys the wire packet by these.
+struct BountyPubRow {
+    unsigned int hand[5];  // owning character hand (readObjectHand layout)
+    char         sid[48];  // faction GameData stringID (cross-client identity)
+    int          amount;   // Bounty::amount (cats)
+    unsigned int crimes;   // Bounty::crimes bitmask (CrimeEnum bits)
+    int          claimed;  // Bounty::bountyHasBeenClaimedOnce (0/1)
+};
+// SEH-guarded: enumerate every durable bounty row on the characters this engine
+// carries (the same subject set the probe scans - local player squad + nearby
+// world NPCs, which on the host includes its DRIVEN copies of join-owned PCs
+// where the H2 row lives). One BountyPubRow per (character, faction). The
+// BountyManager::me sentinel is checked per body before any parse. Returns the
+// count written (rows only, bodies with no live bounty contribute none).
+unsigned int enumBountyRows(GameWorld* gw, BountyPubRow* out, unsigned int maxOut);
+// SEH-guarded: apply one received bounty row onto the local (owning) copy of
+// the character at hand, for the faction sid, via the engine's OWN levers -
+// unfairAddToBounty for a raise, clearBounty for a drop to zero (never a raw
+// map poke, so derived expiry/GUI stay consistent). Convergence-first: a row
+// already equal to getActualBounty is a no-op. outBefore/outAfter capture the
+// (char, faction) amount around the write for the RECV log. Returns true when
+// the character + faction resolved locally and the lever ran (or was a no-op).
+bool applyBountyRow(GameWorld* gw, const unsigned int hand[5], const char* sid,
+                    int amount, unsigned int crimes, int claimed,
+                    int* outBefore, int* outAfter);
 // Place the local occupant into / remove it from the furniture at furnHand via
 // the engine's own setBedMode/setPrisonMode (kind: 1 bed, 2 cage) - pose,
 // attach and transform are engine-native. Idempotent: already in the desired

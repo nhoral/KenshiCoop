@@ -452,7 +452,7 @@ public:
     void setResearchSync(bool v) { researchSync_ = v; }
 
     // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
-    // buildings, placed-building doors, production, research) from one
+    // buildings, placed-building doors, production, research, bounty) from one
     // channel-descriptor registry. Replaces the per-channel if-blocks the tick
     // used to inline: the table owns each channel's master enable, direction
     // (symmetric vs host-authoritative), and cadence ORDER (which must match the
@@ -461,6 +461,27 @@ public:
     // liveness. Money/recruit/squad/stealth/speed/time stay explicit (different
     // cadence positions / patterns).
     void driveSampledChannels(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 45, HOST only - the witness authority settled by
+    // the H2 live run): enumerate every durable bounty row on the bodies this
+    // engine carries (its driven copies of remote PCs, where a join-owned PC's
+    // bounty lives, PLUS host-owned PCs), diff each (char hand, faction sid)
+    // row's {amount, crimes, claimed} against a silently-seeded shared-save
+    // baseline, and stream change-gated PKT_BOUNTY rows (per-sid safety resend).
+    // The join NEVER calls this (host-authoritative, unidirectional host->clients).
+    // Driven from the kCh[] registry (hostAuth row), like publishResearch.
+    void publishBounties(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 45, client side): drain received bounty rows;
+    // each one that resolves to a local character + faction is applied onto the
+    // owning client's (clean) copy through the engine's own levers
+    // (unfairAddToBounty raise / clearBounty drop). The baseline updates BEFORE
+    // the write (echo-free); stale rows (per-key seq guard) and already-converged
+    // rows are skipped; unresolvable hands skip silently (out of interest).
+    void applyBounties(const SyncContext& ctx);
+
+    // Bounty/crime sync master enable (KENSHICOOP_BOUNTY_SYNC).
+    void setBountySync(bool v) { bountySync_ = v; }
 
     // Storage/machine container sync (protocol 34, KENSHICOOP_STORE_SYNC):
     // when set (HOST only - host-authoritative world containers), a ~1 Hz
@@ -1412,6 +1433,30 @@ private:
     u32           researchSeqOut_;
     unsigned long researchSampleMs_;
     bool          researchSync_;
+    // Protocol 45 bounty/crime rows, keyed by (owning-character hand, faction
+    // sid) - BountyManager is inline per-Character, so the key is per-character,
+    // NOT per-squad. HOST (the only publisher): known = the shared-save baseline
+    // (seeded silently on first sight, updated on every row we send - so a
+    // resend is not re-detected); lastSendMs = change gate + safety resend.
+    // CLIENT: seqSeen = stale-row guard (the client never publishes, so the send
+    // fields stay idle). The value triple mirrors the wire row.
+    struct BountyRow {
+        int knownAmount; u32 knownCrimes; int knownClaimed;
+        unsigned long lastSendMs;
+        u32 seqSeen; bool seeded;
+        BountyRow() : knownAmount(0), knownCrimes(0), knownClaimed(0),
+                      lastSendMs(0), seqSeen(0), seeded(false) {}
+    };
+    std::map<std::pair<Key, std::string>, BountyRow> bountyRows_;
+    u32           bountySeqOut_;
+    unsigned long bountySampleMs_;
+    bool          bountySync_;
+    // False until the first publishBounties sample has seeded every load-time
+    // bounty row as the shared-save baseline. After that, a newly-seen (char,
+    // faction) key is a genuine mid-session appearance (a fresh crime), streamed
+    // from an implicit zero instead of silently re-seeded (a bounty ROW can go
+    // from not-existing to existing, unlike the always-present faction/door rows).
+    bool          bountyBaseline_;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the

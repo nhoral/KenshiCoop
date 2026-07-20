@@ -422,6 +422,18 @@ struct Config {
     // escape hatch.
     bool          researchSync;
 
+    // KENSHICOOP_BOUNTY_SYNC (default ON): bounty/crime sync (protocol 45) -
+    // the HOST is the witness authority (H2, settled by the 2026-07-20 live
+    // run): it samples every durable bounty row on the bodies it carries (its
+    // driven copies of remote PCs, where a join-owned PC's bounty lives, plus
+    // host-owned PCs) ~1 Hz and streams change-gated PKT_BOUNTY rows keyed
+    // per-(character hand, faction sid); the owning client applies each row onto
+    // its own clean copy via the engine's own levers (unfairAddToBounty raise /
+    // clearBounty drop). Without it a character's wanted level is per-client:
+    // a crime one player commits leaves the peer's copy unwanted (spikes 59/60).
+    // Unidirectional host->clients (no echo path). "0" is the A/B escape hatch.
+    bool          bountySync;
+
     // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
     // (protocol 34) - the HOST censuses container-bearing buildings (storage
     // chests + the machine classes) in the interest spheres ~1 Hz and

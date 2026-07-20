@@ -987,6 +987,137 @@ void Replicator::applyResearch(const SyncContext& ctx) {
     }
 }
 
+void Replicator::publishBounties(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    if (!bountySync_) return;
+    const unsigned long SAMPLE_MS = 1000;  // crimes resolve over seconds; 1 Hz is plenty
+    const unsigned long RESEND_MS = 15000; // safety resend for rows we ever sent
+    unsigned long now = nowMs();
+    if (bountySampleMs_ != 0 && (now - bountySampleMs_) < SAMPLE_MS) return;
+    bountySampleMs_ = now;
+
+    // Snapshot every durable bounty row this engine carries (host-side driven
+    // copies of remote PCs + host-owned PCs - the H2 subject set).
+    const unsigned int MAX_ROWS = 128;
+    static engine::BountyPubRow rows[MAX_ROWS]; // main-thread only
+    unsigned int n = engine::enumBountyRows(gw, rows, MAX_ROWS);
+
+    // Track which (char, faction) keys are live this sample so a row that
+    // VANISHED (host paid off / served the sentence -> clearBounty removed the
+    // map entry, so it no longer enumerates) can stream a one-shot clear.
+    std::set<std::pair<Key, std::string> > seen;
+
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::BountyPubRow& r = rows[i];
+        Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
+        k.i = r.hand[3]; k.s = r.hand[4];
+        std::pair<Key, std::string> key(k, std::string(r.sid));
+        seen.insert(key);
+        BountyRow& br = bountyRows_[key];
+        BountyVal known; known.amount = br.knownAmount;
+        known.crimes = br.knownCrimes; known.claimed = br.knownClaimed;
+        BountyVal cur; cur.amount = r.amount; cur.crimes = r.crimes; cur.claimed = r.claimed;
+        if (!br.seeded) {
+            // Both clients loaded the same save, so a bounty already present at
+            // load is the SHARED baseline: seed silently, stream only movement.
+            br.seeded = true;
+            br.knownAmount = r.amount; br.knownCrimes = r.crimes; br.knownClaimed = r.claimed;
+            continue;
+        }
+        int resendDue = (br.lastSendMs != 0 && (now - br.lastSendMs) >= RESEND_MS) ? 1 : 0;
+        // Host-authoritative publish gate (the exact rule prototest locks): the
+        // host streams a seeded row that moved or is due a resend; a join never
+        // reaches here (Plugin.cpp calls this on the host only).
+        if (!bountyShouldSend(/*isHost*/1, /*seeded*/1, &known, &cur, resendDue)) continue;
+        bool changed = (known.amount != cur.amount) || (known.crimes != cur.crimes) ||
+                       (known.claimed != cur.claimed);
+        br.knownAmount = r.amount; br.knownCrimes = r.crimes; br.knownClaimed = r.claimed;
+        br.lastSendMs = now;
+        BountyPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_BOUNTY;
+        pkt.ownerId = ownerId;
+        pkt.seq     = bountySeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
+        strncpy(pkt.sid, r.sid, sizeof(pkt.sid) - 1);
+        pkt.sid[sizeof(pkt.sid) - 1] = '\0';
+        pkt.amount  = r.amount;
+        pkt.crimes  = r.crimes;
+        pkt.claimed = (u8)(r.claimed ? 1 : 0);
+        net.queueBounty(pkt);
+        if (changed) { // resends stay silent; the movement is the signal
+            char b[200];
+            _snprintf(b, sizeof(b) - 1,
+                      "[bounty] SEND hand=%u,%u fac='%s' amount=%d crimes=0x%X claimed=%d seq=%u",
+                      r.hand[3], r.hand[4], r.sid, r.amount, r.crimes, r.claimed, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // Disappearance -> clear: a previously-positive seeded row absent from this
+    // sample means the host CLEARED it (paid off / sentence served). Stream one
+    // amount=0 row so the client drops its copy, and reset the baseline to 0 (NOT
+    // erase - if the subject merely went out of interest range and re-appears
+    // still-wanted, the next sample re-detects 0->amount and re-streams it).
+    for (std::map<std::pair<Key, std::string>, BountyRow>::iterator it = bountyRows_.begin();
+         it != bountyRows_.end(); ++it) {
+        BountyRow& br = it->second;
+        if (!br.seeded || br.knownAmount == 0) continue;
+        if (seen.find(it->first) != seen.end()) continue; // still live this sample
+        br.knownAmount = 0; br.knownCrimes = 0; br.knownClaimed = 0;
+        br.lastSendMs = now;
+        const Key& k = it->first.first;
+        BountyPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_BOUNTY;
+        pkt.ownerId = ownerId;
+        pkt.seq     = bountySeqOut_++;
+        pkt.hand[0] = k.t; pkt.hand[1] = k.c; pkt.hand[2] = k.cs;
+        pkt.hand[3] = k.i; pkt.hand[4] = k.s;
+        strncpy(pkt.sid, it->first.second.c_str(), sizeof(pkt.sid) - 1);
+        pkt.sid[sizeof(pkt.sid) - 1] = '\0';
+        pkt.amount = 0; pkt.crimes = 0; pkt.claimed = 0;
+        net.queueBounty(pkt);
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+                  "[bounty] SEND-CLEAR hand=%u,%u fac='%s' seq=%u",
+                  k.i, k.s, it->first.second.c_str(), pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyBounties(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    std::deque<InboundBounty> got;
+    in.drainBounty(got);
+    if (got.empty()) return;
+    if (!bountySync_) return;
+    for (std::deque<InboundBounty>::iterator it = got.begin(); it != got.end(); ++it) {
+        const BountyPacket& p = it->pkt;
+        if (p.sid[0] == '\0') continue;
+        Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
+        k.i = p.hand[3]; k.s = p.hand[4];
+        std::pair<Key, std::string> key(k, std::string(p.sid));
+        BountyRow& br = bountyRows_[key];
+        if (br.seqSeen != 0 && p.seq <= br.seqSeen) continue; // stale row (bountyApplyDecision SKIP_STALE)
+        br.seqSeen = p.seq;
+        // Echo guard: update the baseline BEFORE the write so the mutation this
+        // apply causes is never re-detected as local movement (the client does
+        // not publish, but the guard keeps the row's known state coherent).
+        br.knownAmount = p.amount; br.knownCrimes = p.crimes;
+        br.knownClaimed = p.claimed ? 1 : 0; br.seeded = true;
+        int before = -1, after = -1;
+        bool ok = engine::applyBountyRow(gw, p.hand, p.sid, p.amount, p.crimes,
+                                         p.claimed ? 1 : 0, &before, &after);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[bounty] RECV hand=%u,%u fac='%s' amount=%d was=%d now=%d crimes=0x%X ok=%d seq=%u",
+                  p.hand[3], p.hand[4], p.sid, p.amount, before, after,
+                  p.crimes, ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishBuilds(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
@@ -1227,7 +1358,11 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
         { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  }
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
+        // Bounty/crime (protocol 45): host-authoritative, unidirectional
+        // host->clients (the join NEVER publishes its bounty state) - so hostAuth
+        // = true, exactly like prod/research. After research, as the old tick had.
+        { &Replicator::bountySync_,   0,                     &Replicator::publishBounties,   &Replicator::applyBounties,   true  }
     };
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
     for (int i = 0; i < n; ++i) {

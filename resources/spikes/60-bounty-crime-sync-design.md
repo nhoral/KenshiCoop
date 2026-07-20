@@ -1,7 +1,10 @@
 # Spike 60 - Bounty/crime sync: authority model & channel design
 
 - Type: DESIGN (no runtime behavior; specifies the follow-up channel)
-- Status: DESIGN READY - blocked on the spike-59 live run before implementation
+- Status: AUTHORITY SETTLED - **H2 witness-local CONFIRMED** by the 2026-07-20
+  live run (two runs: host-owned Flashbox, then join-owned PC). Channel shape is
+  now fixed to the H2 reconciliation (host-authoritative row, published to the
+  owner); ready to implement.
 - Depends on: spike 59 (`59-bounty-crime-probe.md`, the read-only observer)
 - Precedent: protocol 24 (faction relations, `PKT_FACTION`) - the closest
   working detour+sample+apply channel; this design is that pattern re-keyed
@@ -98,7 +101,49 @@ host.log vs join.log for the SAME PC hand while that PC commits a witnessed
 crime, and watch which side's rows move first and whether `committingCrime`
 pulses on the owner or the witness. **Read the run before choosing H1 vs H2.**
 
-## Recommended channel (assuming H1; fall back to H2's reconciliation if the run shows the split)
+## LIVE RUN RESULT (2026-07-20) - H2 witness-local CONFIRMED
+
+Two live host+join sessions, `KENSHICOOP_BOUNTY_PROBE=1` on both clients.
+
+**Run A (control, host-owned Flashbox).** A HOST-owned PC committed the crime.
+Bounty row appeared on the host. Non-discriminating by construction: owner =
+witness = host, so it cannot separate H1 from H2 (documented in spike 59).
+
+**Run B (the discriminator, JOIN-owned PC).** The other PC - hand
+`1,3332275456`, **confirmed JOIN-owned**: the JOIN emits its `[stats] SEND`
+(`[13:28:40.872] [JOIN] [stats] SEND hand=1,3332275456 ...`) while the HOST
+never sends stats for it (host only sends `1,2637329152` and `2,3587646464`).
+This PC committed the on-screen crime ("Cometiendo un Crimen (20)", 0x20). The
+`[bounty]` timelines for that exact hand:
+
+- **HOST** (`E:\SteamLibrary\steamapps\common\Kenshi\KenshiCoop_host.log`) - the
+  row EXISTS and persists, from first sight to end of capture:
+  - `[13:27:58.894] [HOST] [bounty] STATE host=1 hand=1,3332275456 crime=5 vs=11624-Dialogue (10).mod expiry=20.0 had=1 rows=1/1`
+  - `[13:29:40.894] [HOST] [bounty] ROW host=1 hand=1,3332275456 fac=11624-Dialogue (10).mod amount=500 crimes=0x20 claimed=0`
+  - crime state field is `crime=5` on every one of the 186 host samples for this hand.
+- **JOIN** (`C:\Users\Zero\Kenshi-Join\KenshiCoop_join.log`) - the OWNER stays
+  completely clean for the whole >3.5 min the crime is active:
+  - `[13:31:56.428] [JOIN] [bounty] STATE host=0 hand=1,3332275456 crime=3 vs=11624-Dialogue (10).mod expiry=20.0 had=0 rows=0/0`
+  - `had=0 rows=0/0` on every one of the 185 join samples for this hand; **zero
+    `[bounty] ROW` lines were ever emitted on the join for `1,3332275456`.**
+  - crime state field is `crime=3` on every join sample (the transient FSM also
+    forks: host sees `crime=5`, owner sees `crime=3`).
+
+**Verdict: H2.** The durable bounty row materialises SOLELY on the HOST's driven
+copy of a JOIN-owned character and never on the owner. Ownership does not move
+the row; the witness/guard simulation - which is host-side in this coop world -
+does. This is the same host-only outcome as the host-owned Flashbox run, but now
+with the owner on the OTHER side, which is exactly the discrimination Run A could
+not provide.
+
+*Red herring ruled out:* the join log also shows a durable row for hand
+`1,169067376` (`fac=defaultEmpireFactionSID amount=2910 crimes=0x0 crime=0`).
+That is NOT a counter-example to H2: it is a purely join-local NPC - the HOST log
+has **no record of that hand at all** and neither client emits `[stats] SEND`
+for it, so it is an ambient NPC in the join's local world, not a player-owned PC
+and not evidence of any owner-side crime->assign pipeline.
+
+## Recommended channel - H2 reconciliation (confirmed; the H1 owner-authoritative variant is NOT applicable)
 
 Re-key the protocol-24 pattern from per-player-faction to
 **per-(owner-character, faction)**.
@@ -128,12 +173,26 @@ cross-client stable); character by hand (index,serial), the key every other
 per-character channel uses. Both are already resolvable in `Engine.h`
 (`facSidOf`, `resolveCharByHand`, `readObjectHand`).
 
-### Publish (owner side) - mirror `Replicator::publishFactions`
+### Publish - HOST-authoritative, NOT owner-authoritative (settled by the H2 run)
 
-- New `Replicator::publishBounties(gw, net, ownerId)`, gated by a
-  `bountySync_` flag, called from the same tick site as `publishFactions`.
-- Subjects: the local player squad (`gw->player->playerCharacters`) - the
-  owner's own PCs only, exactly the probe's first subject set.
+**Direct answer to the design question:** `publishBounties` must be
+**host/witness-authoritative**, the OPPOSITE of the faction channel. Factions
+are owner-authoritative because the owning client's engine produces the relation
+delta; bounty is not - the H2 run proved the owner's engine never produces the
+bounty row at all (join stayed `had=0 rows=0/0` while its own PC was wanted). The
+HOST is the only engine that runs witness->`assignBountyForCrimes`, so the HOST
+must be the source of the row and publish it DOWN to the owning client (and any
+client that must display/enforce it). The channel is therefore host->clients,
+keyed per-character - reconciliation, not the one-directional protocol-24 mirror.
+
+- New `Replicator::publishBounties(gw, net)`, gated by a `bountySync_` flag,
+  called from the same tick site as `publishFactions`, but running **on the
+  host**.
+- Subjects: every character whose host-side `BountyManager` holds a row - i.e.
+  the host's driven copies of remote-owned PCs (this is where join-owned PCs'
+  bounties live) PLUS host-owned PCs. The per-character `ownerId`/hand in the
+  packet tells the receiver which of its characters the row belongs to; the
+  owning client applies it to its own (currently-clean) copy.
 - Sample ~1 Hz, plus an immediate sample when a **detour** flags a real
   mutation this tick (see below). Diff each (char hand, faction sid) row's
   `{amount, crimes, claimed}` against a silently-seeded baseline (both clients
