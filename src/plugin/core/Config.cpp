@@ -231,6 +231,12 @@ void loadConfig(Config& c) {
     c.prodSync    = envOr("KENSHICOOP_PROD_SYNC", "1") != "0";
     c.researchSync = envOr("KENSHICOOP_RESEARCH_SYNC", "1") != "0";
     c.storeSync   = envOr("KENSHICOOP_STORE_SYNC", "1") != "0";
+
+    // Remote-player nametag: normal-play name label over the peer's driven
+    // bodies. DEFAULT ON (Zero wants it visible by default); the F2 panel
+    // "Show player names" toggle flips it live. "0" starts hidden.
+    c.showRemoteNametag = envOr("KENSHICOOP_SHOW_NAMETAG", "1") != "0";
+
     c.squadSync   = envOr("KENSHICOOP_SQUAD_SYNC", "1") != "0";
     c.latejoinSync = envOr("KENSHICOOP_LATEJOIN_SYNC", "1") != "0";
     // NOTE: every channel above DEFAULTS ON for real sessions; the diagnostic

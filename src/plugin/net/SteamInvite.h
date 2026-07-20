@@ -65,6 +65,15 @@ int         friendState(int i);
 // polls host-side lobby membership for the arriving friend. Call every frame.
 void tick();
 
+// Resolve the Steam persona (display) name for an arbitrary SteamID (typically
+// the co-op peer, who may or may not be in our friends list). Returns a pointer
+// into an internal cache valid until the next call; returns "" when Steam is
+// unavailable or the id is 0. When the name is not yet known (a non-friend whose
+// info Steam hasn't downloaded), this kicks off an async RequestUserInformation
+// and returns "[unknown]" for now - a later call resolves the real name once the
+// Steam callback pump (tick()) has delivered it. Main thread only.
+const char* personaName(SteamId id);
+
 // One-line human status for the panel/overlay (never null; "" when idle).
 const char* status();
 

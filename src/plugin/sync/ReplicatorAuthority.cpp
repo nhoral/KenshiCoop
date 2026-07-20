@@ -10,6 +10,8 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/Nametag.h" // remoteNametagCaption (DRV body nametag)
+#include <cstring>           // std::strcmp (DRV tag test)
 
 namespace coop {
 
@@ -20,21 +22,40 @@ void Replicator::debugMark(Character* c, int colorId, const char* tag) {
         en = (e && e[0] == '1') ? 1 : 0;
     }
     if (en != 1 || !c) return;
-    std::map<Character*, DebugMarker>::iterator it = debugMarkers_.find(c);
-    if (it != debugMarkers_.end() && it->second.color == colorId) return;
     char nm[40];
     engine::charName(c, nm, sizeof(nm));
     char cap[64];
-    _snprintf(cap, sizeof(cap) - 1, "%s %s", tag, nm);
+    // DRV = a body the host stream DRIVES here = the OTHER player's unit. Caption
+    // it with the remote player's Steam persona name (pushed in via setRemoteName)
+    // so you can see whose unit it is at a glance; fall back to the legacy
+    // "DRV <charName>" form when the name is unknown (non-friend / LAN / API down).
+    if (tag && std::strcmp(tag, "DRV") == 0) {
+        char fb[64];
+        _snprintf(fb, sizeof(fb) - 1, "DRV %s", nm);
+        fb[sizeof(fb) - 1] = '\0';
+        std::string label = coop::remoteNametagCaption(
+            remoteName_.empty() ? 0 : remoteName_.c_str(), fb);
+        _snprintf(cap, sizeof(cap) - 1, "%s", label.c_str());
+    } else {
+        _snprintf(cap, sizeof(cap) - 1, "%s %s", tag, nm);
+    }
     cap[sizeof(cap) - 1] = '\0';
+    // Re-caption not only on color change but on caption change too: the DRV
+    // nametag starts as the fallback and switches to the real persona name once
+    // Steam resolves it asynchronously (a color-only guard would freeze the old
+    // caption forever).
+    std::map<Character*, DebugMarker>::iterator it = debugMarkers_.find(c);
+    if (it != debugMarkers_.end() && it->second.color == colorId &&
+        it->second.caption == cap) return;
     if (it == debugMarkers_.end()) {
         void* l = engine::markerCreate(c, cap, colorId);
         if (l) {
-            DebugMarker m; m.label = l; m.color = colorId;
+            DebugMarker m; m.label = l; m.color = colorId; m.caption = cap;
             debugMarkers_[c] = m;
         }
     } else if (engine::markerUpdate(it->second.label, cap, colorId)) {
         it->second.color = colorId;
+        it->second.caption = cap;
     }
 }
 
@@ -422,7 +443,10 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
         // wasn't vouched live this pass (this tick's enumerations, driven and
         // proxy sets, plus the just-validated suppressed bodies). A pruned
         // body that comes back into judgment simply gets a fresh label.
-        if (!debugMarkers_.empty()) {
+        // Build the live-body set once and reuse it for BOTH label maps (debug
+        // markers and the normal-play nametags). The nametag prune runs whenever
+        // it has labels - it is independent of the debug-marker overlay.
+        if (!debugMarkers_.empty() || !nametagMarkers_.empty()) {
             std::set<Character*> vouched;
             for (unsigned int i = 0; i < n; ++i)  vouched.insert(chars[i]);
             for (unsigned int i = 0; i < wn; ++i) vouched.insert(wChars[i]);
@@ -430,7 +454,8 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
             vouched.insert(proxyChars.begin(), proxyChars.end());
             for (std::map<Key, Character*>::iterator it = suppressed_.begin();
                  it != suppressed_.end(); ++it) vouched.insert(it->second);
-            pruneDebugMarkers(vouched);
+            if (!debugMarkers_.empty())   pruneDebugMarkers(vouched);
+            if (!nametagMarkers_.empty()) pruneNametags(vouched);
         }
     }
 
@@ -697,6 +722,57 @@ void Replicator::pruneDebugMarkers(const std::set<Character*>& live) {
         if (live.find(it->first) == live.end()) {
             engine::markerDestroy(it->second.label);
             debugMarkers_.erase(it++);
+        } else ++it;
+    }
+}
+
+// Normal-play remote-player nametag. Called once per PEER-driven body per tick
+// from the drive loop (applyTargets). Unlike debugMark this has NO env gate: it
+// is a first-class HUD element, gated only by showNametag_ (the F2/config
+// toggle) and isSquad (only the peer's OWN units earn a name; world NPCs the
+// host merely drives do not). Kept in a SEPARATE label map from debugMarkers_
+// so the life-state re-captions there can't clobber the persona name.
+void Replicator::nametagMark(Character* c, bool isSquad) {
+    if (!c) return;
+    std::map<Character*, NametagMarker>::iterator it = nametagMarkers_.find(c);
+    // Feature off, or this body isn't the peer's own unit: make sure no label
+    // lingers (this is how the F2 toggle hides names live - next tick every
+    // driven squad body's mark call tears its own label down).
+    if (!showNametag_ || !isSquad) {
+        if (it != nametagMarkers_.end()) {
+            engine::markerDestroy(it->second.label);
+            nametagMarkers_.erase(it);
+        }
+        return;
+    }
+    // Caption = the peer's Steam persona name when known, else "[Remote Player]".
+    // Empty fallback (no "DRV"/charName): this is player-facing, not diagnostics.
+    // remoteNametagCaption is the same pure, unit-tested builder the debug DRV
+    // caption uses (fallback chain + 63-char cap).
+    std::string cap = coop::remoteNametagCaption(
+        remoteName_.empty() ? 0 : remoteName_.c_str(), "");
+    if (it != nametagMarkers_.end()) {
+        // Re-caption only when it actually changed (the persona name resolves
+        // asynchronously, so the label starts "[Remote Player]" then flips to the
+        // real name once Steam delivers it via the callback pump).
+        if (it->second.caption == cap) return;
+        if (engine::markerUpdate(it->second.label, cap.c_str(), 4))
+            it->second.caption = cap;
+        return;
+    }
+    void* l = engine::markerCreate(c, cap.c_str(), 4); // colorId 4 = cyan nametag
+    if (l) {
+        NametagMarker m; m.label = l; m.caption = cap;
+        nametagMarkers_[c] = m;
+    }
+}
+
+void Replicator::pruneNametags(const std::set<Character*>& live) {
+    for (std::map<Character*, NametagMarker>::iterator it = nametagMarkers_.begin();
+         it != nametagMarkers_.end(); ) {
+        if (live.find(it->first) == live.end()) {
+            engine::markerDestroy(it->second.label);
+            nametagMarkers_.erase(it++);
         } else ++it;
     }
 }

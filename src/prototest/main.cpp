@@ -28,6 +28,7 @@
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
+#include "../plugin/core/Nametag.h"
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
@@ -781,6 +782,49 @@ static void testSteamIdParse() {
           !coop::parseSteamId64("12345678901234567", id) && id == 123ull);
 }
 
+// ---- 7b. Remote-player nametag caption (Nametag.h) ------------------------------
+// Guards the DRV body nametag: the caption shows the remote player's Steam persona
+// name when known, and falls back honestly ("DRV <charName>", then "[Remote Player]")
+// when Steam can't give a name (non-friend not yet resolved, LAN/UDP, API down).
+// Steam returns the literal "[unknown]" for unresolved users, which must NOT be
+// shown as a name. Names are trimmed and capped to the 63-char marker buffer.
+
+static void testNametag() {
+    std::printf("== remote-player nametag caption (Nametag.h) ==\n");
+
+    // A real persona name wins over the fallback.
+    CHECK("persona name used when valid",
+          coop::remoteNametagCaption("Zero", "DRV Beep") == "Zero");
+    // Steam's "[unknown]" placeholder is rejected -> fallback used.
+    CHECK("[unknown] rejected -> fallback",
+          coop::remoteNametagCaption("[unknown]", "DRV Beep") == "DRV Beep");
+    // Null / empty persona -> fallback used.
+    CHECK("null persona -> fallback",
+          coop::remoteNametagCaption(0, "DRV Beep") == "DRV Beep");
+    CHECK("empty persona -> fallback",
+          coop::remoteNametagCaption("", "DRV Beep") == "DRV Beep");
+    // Whitespace-only persona is not a name -> fallback used.
+    CHECK("blank persona -> fallback",
+          coop::remoteNametagCaption("   ", "DRV Beep") == "DRV Beep");
+    // No persona and no fallback -> generic label (never empty).
+    CHECK("no persona + no fallback -> generic",
+          coop::remoteNametagCaption(0, 0) == "[Remote Player]");
+    CHECK("no persona + empty fallback -> generic",
+          coop::remoteNametagCaption("", "") == "[Remote Player]");
+    // Persona names are trimmed at the ends (spaces a friend may have around it).
+    CHECK("persona trimmed",
+          coop::remoteNametagCaption("  Zero  ", "DRV Beep") == "Zero");
+    // Names longer than the marker buffer are capped to 63 chars.
+    {
+        std::string longName(80, 'x');
+        std::string out = coop::remoteNametagCaption(longName.c_str(), "DRV Beep");
+        CHECK("long persona capped to 63", out.size() == 63);
+    }
+    // A persona name containing internal spaces is preserved verbatim.
+    CHECK("internal spaces preserved",
+          coop::remoteNametagCaption("Dark Zero", "DRV Beep") == "Dark Zero");
+}
+
 // ---- 8. Pose-fixture acceptance (WorkPose.h) ------------------------------------
 // Guards the mining-sync fix (2026-07-14): a player mining an ore node operates a
 // mine building. A single 6 m seat gate rejected the CORRECT mine as "far"
@@ -1371,6 +1415,7 @@ int main() {
     testInterp();
     testOwnRanks();
     testSteamIdParse();
+    testNametag();
     testWorkPoseMatch();
     testTaskClear();
     testDeathRekey();
