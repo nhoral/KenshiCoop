@@ -130,6 +130,58 @@ bool writeWalletByHand(const unsigned int mHand[5], int money) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// ---- Protocol 22b: la cartera REAL del jugador (fuente de verdad) ------------
+//
+// Hallazgo de ingenieria inversa en vivo (2026-07-20, kenshi_x64 1.0.65, CE +
+// disassembler contra el proceso host): el dinero que la UI muestra ("Dinero:
+// c.1.000") y que las tiendas mutan NO vive en Platoon::ownerships.money (la
+// cartera per-squad-tab que readWalletByHand/writeWalletByHand tocan - esa esta
+// a 0 y sin uso). Character::getMoney desensamblado hace la cadena:
+//     PlayerInterface (singleton) -> participant (Faction*, +0x2A0)
+//        -> factionOwnerships (Ownerships*, +0x80) -> money (+0x88)
+// Es decir: el dinero del jugador es UNA sola cartera POR FACCION, compartida
+// por todo el squad (todos los tabs). Prueba dura: escribir 31337 en ese
+// Ownerships::money cambio el texto de la UI en el acto; escribir el campo
+// per-Platoon no lo movio. walletOf() (Platoon) es por tanto el campo MUERTO
+// que el canal PKT_MONEY sincronizaba - de ahi que el dinero "no se comparta".
+//
+// playerFactionWallet: el Ownerships de la faccion del jugador local, via el
+// PlayerInterface que cuelga del GameWorld (gw->player, +0x580). Todos los
+// punteros son propiedad del engine; el caller mantiene SEH.
+namespace {
+Ownerships* playerFactionWallet(GameWorld* gw) {
+    if (!gw || !gw->player) return 0;
+    Faction* f = gw->player->participant;  // 0x2A0: la faccion que el jugador controla
+    if (!f) return 0;
+    return f->factionOwnerships;           // 0x80: la cartera compartida del squad
+}
+} // namespace
+
+// SEH-guarded: lee la cartera REAL del jugador (Faction::factionOwnerships).
+// *outMoney = -1 en fallo. Devuelve true si pudo leer.
+bool readPlayerWallet(GameWorld* gw, int* outMoney) {
+    if (outMoney) *outMoney = -1;
+    if (!gw || !outMoney || !g_ownGetMoneyFn) return false;
+    __try {
+        Ownerships* ow = playerFactionWallet(gw);
+        if (!ow) return false;
+        *outMoney = g_ownGetMoneyFn(ow);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// SEH-guarded: escribe la cartera REAL del jugador via Ownerships::setMoney (el
+// mismo accesor que la UI/tiendas usan). money < 0 se rechaza. Devuelve true ok.
+bool writePlayerWallet(GameWorld* gw, int money) {
+    if (!gw || money < 0 || !g_ownSetMoneyFn) return false;
+    __try {
+        Ownerships* ow = playerFactionWallet(gw);
+        if (!ow) return false;
+        g_ownSetMoneyFn(ow, money);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // ---- Protocol 23 phase 0: recruitment probe ---------------------------------
 
 int probeRecruit(GameWorld* gw, bool runtimeSubject,

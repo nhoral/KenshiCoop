@@ -428,49 +428,35 @@ private:
         c[sizeof(c) - 1] = '\0'; coop::logLine(c);
     }
 
-    // One WALLET line per distinct squad tab (keyed by RANK, the cross-client
-    // stable tab identity): the money series the oracle diffs host-vs-join.
+    // ONE WALLET line for the SHARED player-faction wallet (the real UI/shop
+    // wallet). It is per-faction, not per-tab, so rank is always 0 - kept in the
+    // log format the oracle already parses. This is the series host-vs-join must
+    // CONVERGE on (protocol 22b: a shared pool, both sides end equal).
     void logWallets(const ScenarioContext& ctx) {
-        EntityState sq[MAX_SQUAD];
-        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
-        for (unsigned int rank = 0; rank < 4; ++rank) {
-            int li = tabLeaderIdx(sq, n, rank);
-            if (li < 0) continue;
-            unsigned int h[5];
-            handFromEntity(sq[li], h);
-            int money = -1;
-            if (engine::readWalletByHand(h, &money)) ++walletReads_;
-            char b[96];
-            _snprintf(b, sizeof(b) - 1, "SCENARIO WALLET rank=%u money=%d t=%lu",
-                      rank, money, ctx.elapsedMs);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
+        int money = -1;
+        if (engine::readPlayerWallet(ctx.gw, &money)) ++walletReads_;
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO WALLET rank=0 money=%d t=%lu",
+                  money, ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // Wallet-write leg: set the OWNED tab's wallet to a side-distinct sentinel
-    // via the engine accessor (host 5000, join 7000). Proves writeWallet works
-    // (the 1b apply primitive) and, on the peer's WALLET series, whether ANY
-    // wallet state crosses today (expected: it does not - the 1b gap evidence).
+    // Wallet-write leg: each side ADDS a side-distinct amount to the SHARED
+    // faction wallet (host +HOST_ADD, join +JOIN_ADD) via the real engine
+    // accessor. On the peer, protocol 22b must carry the delta across, so BOTH
+    // sides' pools converge to base + HOST_ADD + JOIN_ADD (the shared-pool proof;
+    // with money sync OFF - shop_probe - neither delta crosses, the baseline).
     void doWalletSet(const ScenarioContext& ctx) {
-        EntityState sq[MAX_SQUAD];
-        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
-        unsigned int rank = ctx.isHost ? 0u : 1u;
-        int li = tabLeaderIdx(sq, n, rank);
-        if (li < 0) { li = tabLeaderIdx(sq, n, 0u); rank = 0u; }
         int before = -1, after = -1, ok = 0;
-        int target = ctx.isHost ? 5000 : 7000;
-        if (li >= 0) {
-            unsigned int h[5];
-            handFromEntity(sq[li], h);
-            engine::readWalletByHand(h, &before);
-            ok = engine::writeWalletByHand(h, target) ? 1 : 0;
-            engine::readWalletByHand(h, &after);
+        int add = ctx.isHost ? HOST_ADD : JOIN_ADD;
+        if (engine::readPlayerWallet(ctx.gw, &before) && before >= 0) {
+            ok = engine::writePlayerWallet(ctx.gw, before + add) ? 1 : 0;
+            engine::readPlayerWallet(ctx.gw, &after);
         }
-        char b[144];
+        char b[160];
         _snprintf(b, sizeof(b) - 1,
-                  "SCENARIO WALLETSET who=%s rank=%u target=%d ok=%d before=%d after=%d t=%lu",
-                  ctx.isHost ? "host" : "join", rank, target, ok, before, after,
-                  ctx.elapsedMs);
+                  "SCENARIO WALLETSET who=%s rank=0 add=%d ok=%d before=%d after=%d t=%lu",
+                  ctx.isHost ? "host" : "join", add, ok, before, after, ctx.elapsedMs);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
@@ -521,6 +507,8 @@ private:
     static const unsigned long DURATION_MS    = 40000;
     static const unsigned int  MAX_VENDORS    = 8;
     static const unsigned int  MAX_SQUAD      = 32;
+    static const int           HOST_ADD       = 4000; // host adds to the shared pool
+    static const int           JOIN_ADD       = 6000; // join adds to the shared pool
     static const float         VENDOR_RADIUS;
 
     bool          probe_;
@@ -580,8 +568,16 @@ public:
     }
 
 private:
-    // One WALLET + one TINV line per distinct squad tab (keyed by rank).
+    // The SHARED faction WALLET (rank 0, one pool) + one TINV line per distinct
+    // squad tab. The wallet is the buyer-side debit's target; the inventory is
+    // where the bought item lands.
     void logSeries(const ScenarioContext& ctx) {
+        int money = -1;
+        if (engine::readPlayerWallet(ctx.gw, &money)) ++walletReads_;
+        char w[96];
+        _snprintf(w, sizeof(w) - 1, "SCENARIO WALLET rank=0 money=%d t=%lu",
+                  money, ctx.elapsedMs);
+        w[sizeof(w) - 1] = '\0'; coop::logLine(w);
         EntityState sq[MAX_SQUAD];
         unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
         for (unsigned int rank = 0; rank < 4; ++rank) {
@@ -589,12 +585,6 @@ private:
             if (li < 0) continue;
             unsigned int h[5];
             handFromEntity(sq[li], h);
-            int money = -1;
-            if (engine::readWalletByHand(h, &money)) ++walletReads_;
-            char b[96];
-            _snprintf(b, sizeof(b) - 1, "SCENARIO WALLET rank=%u money=%d t=%lu",
-                      rank, money, ctx.elapsedMs);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             InvItemEntry items[INV_ITEMS_MAX];
             unsigned int hash = 0;
             unsigned int cnt = engine::captureContainerContents(
@@ -606,7 +596,8 @@ private:
         }
     }
 
-    // The tab this side owns: host rank 0, join rank 1 (leader fallback).
+    // The tab this side owns: host rank 0, join rank 1 (leader fallback). Used
+    // for the INVENTORY leg (the bought item lands in this tab leader's bag).
     bool ownLeaderHand(const ScenarioContext& ctx, unsigned int h[5],
                        unsigned int* outRank) {
         EntityState sq[MAX_SQUAD];
@@ -621,13 +612,17 @@ private:
     }
 
     void doSeed(const ScenarioContext& ctx) {
-        unsigned int h[5]; unsigned int rank = 0;
-        int ok = 0, target = ctx.isHost ? SEED_HOST : SEED_JOIN;
-        if (ownLeaderHand(ctx, h, &rank))
-            ok = engine::writeWalletByHand(h, target) ? 1 : 0;
-        char b[112];
-        _snprintf(b, sizeof(b) - 1, "SCENARIO TRADESEED who=%s rank=%u target=%d ok=%d t=%lu",
-                  ctx.isHost ? "host" : "join", rank, target, ok, ctx.elapsedMs);
+        // Seed the SHARED faction wallet by ADDING a side-distinct amount (host
+        // +SEED_HOST_ADD, join +SEED_JOIN_ADD); protocol 22b carries each delta.
+        int add = ctx.isHost ? SEED_HOST_ADD : SEED_JOIN_ADD;
+        int before = -1, after = -1, ok = 0;
+        if (engine::readPlayerWallet(ctx.gw, &before) && before >= 0) {
+            ok = engine::writePlayerWallet(ctx.gw, before + add) ? 1 : 0;
+            engine::readPlayerWallet(ctx.gw, &after);
+        }
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO TRADESEED who=%s rank=0 add=%d ok=%d before=%d after=%d t=%lu",
+                  ctx.isHost ? "host" : "join", add, ok, before, after, ctx.elapsedMs);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
@@ -636,14 +631,16 @@ private:
         int w0 = -1, w1 = -1, added = 0;
         unsigned int cnt0 = 0, cnt1 = 0, hash = 0;
         char sid[48]; sid[0] = '\0';
+        // Wallet debit hits the SHARED faction pool; the item lands in this
+        // side's owned tab-leader bag (inventory leg).
+        engine::readPlayerWallet(ctx.gw, &w0);
         if (ownLeaderHand(ctx, h, &rank)) {
             InvItemEntry items[INV_ITEMS_MAX];
-            engine::readWalletByHand(h, &w0);
             cnt0 = engine::captureContainerContents(ctx.gw, h, items, INV_ITEMS_MAX, &hash);
             // The two buyer-side mutations of one purchase, same tick.
             added = engine::addTestItemsToContainer(ctx.gw, h, 1, sid, sizeof(sid));
-            if (w0 >= PRICE) engine::writeWalletByHand(h, w0 - PRICE);
-            engine::readWalletByHand(h, &w1);
+            if (w0 >= PRICE) engine::writePlayerWallet(ctx.gw, w0 - PRICE);
+            engine::readPlayerWallet(ctx.gw, &w1);
             cnt1 = engine::captureContainerContents(ctx.gw, h, items, INV_ITEMS_MAX, &hash);
         }
         tradeOk_ = (added > 0) && (w1 >= 0) && (w0 - w1 == PRICE);
@@ -662,8 +659,8 @@ private:
     static const unsigned long JOIN_TRADE_AT_MS = 22000;
     static const unsigned long DURATION_MS      = 40000;
     static const unsigned int  MAX_SQUAD        = 32;
-    static const int           SEED_HOST        = 5000;
-    static const int           SEED_JOIN        = 7000;
+    static const int           SEED_HOST_ADD    = 4000; // host adds to the shared pool
+    static const int           SEED_JOIN_ADD    = 6000; // join adds to the shared pool
     static const int           PRICE            = 250;
 
     bool          seeded_;

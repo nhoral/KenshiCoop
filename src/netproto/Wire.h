@@ -755,19 +755,23 @@ struct StatsPacket {
     f32 freeAttributePoints;   // CharStats::freeAttributePoints (int on wire as f32; -1 = unreadable)
 };
 
-// ---- Protocol 22: per-tab wallet snapshot -----------------------------------
-// Owner-authoritative money for ONE player squad tab, keyed by the tab's RANK
-// among the distinct sorted member containers - the same cross-client-stable
-// tab identity the ownership partition uses (a hand key would also work, but
-// rank is what both sides already agree on for "whose tab is whose"). Change-
-// gated with a floor + safety resend (the PKT_STATS pacing); the receiver
-// writes the value via Ownerships::setMoney onto the platoon of that rank's
-// tab leader. money is signed on the wire because the engine field is an int.
+// ---- Protocol 22b: shared player-wallet DELTA -------------------------------
+// The player's real money is ONE per-faction wallet (Faction::factionOwnerships,
+// what the UI shows and shops mutate; confirmed by live RE 2026-07-20 - see
+// engine::readPlayerWallet), shared by the whole squad and by BOTH co-op players
+// (they drive the same save faction). The pre-44 channel replicated the DEAD
+// per-Platoon field by tab RANK, so real money never crossed. Now the channel
+// replicates the shared wallet: each side sends the DELTA of its own local
+// change and the receiver ADDS it (moneyApplyDelta), so concurrent spends from
+// both players sum correctly (1000 - 250 - 100 = 650 on both). Reliable+ordered
+// delivery makes each delta apply exactly once (no safety resend - resending a
+// delta would double-apply). tabRank is unused (kept 0) - the wallet is not
+// per-tab. money is the signed delta (engine field is int).
 struct MoneyPacket {
     u8  type;    // = PKT_MONEY
-    u32 ownerId; // network player id of the sender (the tab's owner)
-    u32 tabRank; // squad-tab rank (0 = host-owned tab, 1 = join-owned, ...)
-    int money;   // Ownerships::money for that tab's platoon
+    u32 ownerId; // network player id of the sender
+    u32 tabRank; // unused (0) - the shared faction wallet is not per-tab
+    int money;   // signed DELTA to apply to the shared faction wallet
 };
 
 // ---- Protocol 24: player-faction relation row --------------------------------
