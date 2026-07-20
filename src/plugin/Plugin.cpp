@@ -30,6 +30,7 @@
 #include "core/Config.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
+#include "core/StatusAutohide.h" // persistent status-banner auto-hide policy
 #include "net/NetLink.h"
 #include "net/SteamP2P.h"
 #include "net/SteamInvite.h"
@@ -745,7 +746,31 @@ void coopPanelDrive(GameWorld* gw) {
     coop::steaminvite::tick();
 
     coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
-    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
+
+    // Auto-hide the persistent status banner once it has sat in the connected
+    // ("green", ostate == 2) state for a sustained window, so a stable session stops
+    // showing "Connected - peer joined" forever. Leaving green (peer disconnects,
+    // session drops, or a reconnect cycles back through the waiting state) reappears
+    // the banner instantly and re-arms the timer when green settles again. The
+    // decision lives in the pure, unit-tested StatusAutohide.h; here we just own the
+    // clock + the green-streak start tick. KENSHICOOP_STATUS_AUTOHIDE_MS overrides the
+    // 10 s default; 0 disables it (banner stays up = the pre-autohide behavior).
+    static int          s_autohideMs = -1;    // ms; -1 = unread, 0 = disabled
+    static unsigned long s_greenSince = 0;    // tick the green state began (0 = not green)
+    if (s_autohideMs < 0) {                   // read the env override once (matches autoRecruit)
+        const char* e = std::getenv("KENSHICOOP_STATUS_AUTOHIDE_MS");
+        s_autohideMs = e ? std::atoi(e) : (int)coop::STATUS_AUTOHIDE_MS;
+        if (s_autohideMs < 0) s_autohideMs = 0; // clamp junk negatives to "disabled"
+    }
+    unsigned long nowMs = GetTickCount();
+    if (ostate == 2) {                        // connected/green
+        if (s_greenSince == 0) s_greenSince = nowMs; // arm on the rising edge into green
+    } else {
+        s_greenSince = 0;                     // left green: disarm so the banner reappears
+    }
+    bool showBanner = coop::statusOverlayShown(g_net.isRunning(), s_greenSince,
+                                               nowMs, (unsigned long)s_autohideMs);
+    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, showBanner);
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.

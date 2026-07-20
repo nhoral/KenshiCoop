@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/core/StatusAutohide.h" // status-banner auto-hide policy (pure inline)
 
 #include <set>
 
@@ -1355,6 +1356,46 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 13. Persistent status-banner auto-hide (StatusAutohide.h) ------------------
+// Guards the QoL auto-hide (2026-07-20): the green "Connected - peer joined" banner
+// floats over the leader for the whole session. Once the session has held the
+// connected/green state for a sustained window it auto-hides so it stops cluttering
+// the screen; leaving green (disconnect / peer leave / reconnect) reappears it
+// immediately and re-arms the timer. Same unsigned-wrap-safe shape as poseClearElapsed.
+static void testStatusAutohide() {
+    std::printf("== status banner auto-hide (StatusAutohide.h) ==\n");
+    const unsigned long ms = STATUS_AUTOHIDE_MS; // 10000 (default)
+
+    // Not green (stableSince == 0): never auto-hidden, banner keeps showing.
+    CHECK("not green never auto-hides",  !statusAutohideElapsed(0, 999999, ms));
+
+    // Green but still inside the window: banner holds (no premature hide).
+    CHECK("green 0 ms holds",            !statusAutohideElapsed(5000, 5000,  ms));
+    CHECK("green 9999 ms holds",         !statusAutohideElapsed(5000, 14999, ms));
+
+    // Green at/after the window: banner auto-hides.
+    CHECK("green 10000 ms hides",         statusAutohideElapsed(5000, 15000, ms));
+    CHECK("green 30 s hides",             statusAutohideElapsed(5000, 35000, ms));
+
+    // autohideMs == 0 disables the feature (banner never auto-hides).
+    CHECK("disabled never hides",        !statusAutohideElapsed(5000, 999999, 0));
+
+    // Unsigned GetTickCount wrap across the window still elapses correctly: the green
+    // streak started 100 ms before the 2^32 rollover; 'now' is written post-wrapped.
+    const unsigned long nearMax  = 0xFFFFFFFFul - 100; // green began 100 ms before wrap
+    const unsigned long preWrap  = nearMax + 50;       // 50 ms later, pre-wrap (holds)
+    const unsigned long postWrap = 9899UL;             // (nearMax + 10000) mod 2^32 = 10000 ms later
+    CHECK("wrap: 50 ms holds",           !statusAutohideElapsed(nearMax, preWrap,  ms));
+    CHECK("wrap: 10 s hides",             statusAutohideElapsed(nearMax, postWrap, ms));
+
+    // statusOverlayShown combiner: running gate + auto-hide decision together.
+    CHECK("offline never shows",         !statusOverlayShown(false, 0,    100,   ms));
+    CHECK("green fresh shows",            statusOverlayShown(true,  5000, 5000,  ms));
+    CHECK("green stale hides",           !statusOverlayShown(true,  5000, 20000, ms));
+    CHECK("running non-green shows",      statusOverlayShown(true,  0,    99999, ms)); // waiting
+    CHECK("disabled stays shown",         statusOverlayShown(true,  5000, 99999, 0));
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1377,6 +1418,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testStatusAutohide();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;
