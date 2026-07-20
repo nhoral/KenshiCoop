@@ -89,6 +89,12 @@ public:
     // Empty -> the label falls back to the legacy "DRV <charName>" form.
     void setRemoteName(const char* name) { remoteName_ = name ? name : ""; }
 
+    // Normal-play nametag visibility (KENSHICOOP_SHOW_NAMETAG / F2 panel toggle).
+    // Pushed from the plugin root each tick. When false, the per-tick nametag pass
+    // tears down any live name labels so the toggle takes effect immediately (no
+    // reconnect). Independent of KENSHICOOP_DEBUG_MARKERS.
+    void setShowNametag(bool on) { showNametag_ = on; }
+
     // Cross-owner trade veto classifier (engine InvOwnerClassFn). Given a
     // save-stable owner hand (readObjectHand layout [type,container,
     // containerSerial,index,serial]) returns 0 = not a player-squad member,
@@ -1532,6 +1538,24 @@ private:
     // unit it is; empty falls back to the legacy "DRV <charName>" caption.
     std::string remoteName_;
     void debugMark(Character* c, int colorId, const char* tag);
+
+    // ---- Normal-play remote-player nametag ----------------------------------
+    // A DEDICATED name-label layer, separate from the debugMarkers_ diagnostic
+    // overlay: one floating label per PEER-owned driven body (the other player's
+    // squad), captioned with their Steam persona name. Kept apart from the debug
+    // markers because those re-caption the same label with life-state names
+    // (HI/MID/PARKED) every tick, which would clobber the persona name. Always on
+    // in normal play (gated by showNametag_, not KENSHICOOP_DEBUG_MARKERS).
+    struct NametagMarker { void* label; std::string caption; };
+    std::map<Character*, NametagMarker> nametagMarkers_;
+    bool showNametag_;              // F2/config toggle; true = draw name labels
+    // Create/update (or, when off/non-squad, remove) the name label for body c.
+    // 'isSquad' = c is a player-faction (peer's own) unit, so it earns a name;
+    // world NPCs the host merely drives do not.
+    void nametagMark(Character* c, bool isSquad);
+    // Drop name labels whose Character* wasn't vouched live this pass (mirrors
+    // pruneDebugMarkers - same UAF-safe GC against freed/despawned bodies).
+    void pruneNametags(const std::set<Character*>& live);
     // Lifetime guard (2026-07-11 join crash): the map is keyed by raw
     // Character* the engine can free (and REUSE for a new body, silently
     // stealing the old label). enforceHostAuthority prunes entries whose

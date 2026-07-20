@@ -67,7 +67,7 @@ Replicator::Replicator()
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
-      lifeSweepMs_(0) {
+      lifeSweepMs_(0), showNametag_(true) {
     peerCam_[0] = peerCam_[1] = peerCam_[2] = 0.0f;
 }
 
@@ -172,6 +172,13 @@ void Replicator::resetSession() {
          mi != debugMarkers_.end(); ++mi)
         engine::markerDestroy(mi->second.label);
     debugMarkers_.clear();
+    // Same for the normal-play nametag labels: they too hold OLD-world raw
+    // Character* plus GUI label objects we own - destroy and drop before the
+    // pointers can dangle into the new session.
+    for (std::map<Character*, NametagMarker>::iterator ni = nametagMarkers_.begin();
+         ni != nametagMarkers_.end(); ++ni)
+        engine::markerDestroy(ni->second.label);
+    nametagMarkers_.clear();
     hostBody_.clear();
     attackerOf_.clear();
     combatCapMs_.clear();

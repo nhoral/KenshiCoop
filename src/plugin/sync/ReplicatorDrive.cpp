@@ -260,6 +260,14 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     sit/idle poses for NPCs arrive in Stage 5 (AI quiet-in-place).
         bool isSquad = engine::isLocalPlayerChar(gw, c);
 
+        // Normal-play remote-player nametag: put the peer's Steam name over THEIR
+        // own units (isSquad = a shared-faction body they control), so in a normal
+        // co-op game you can tell your friend's characters apart from world NPCs -
+        // no KENSHICOOP_DEBUG_MARKERS needed. Idempotent + cheap (map lookup +
+        // string compare); a world NPC (isSquad false) or the toggle being off
+        // makes this tear down any label it owns. GC'd by pruneNametags below.
+        nametagMark(c, isSquad);
+
         // ---- Phase A jail-observe (KENSHICOOP_JAIL_OBSERVE, read-only spike) ----
         // For a peer-owned captive (the join's jailed PC as driven on the host),
         // temporarily let the host's LOCAL sim run it unopposed: skip drive,

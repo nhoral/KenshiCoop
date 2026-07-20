@@ -34,14 +34,20 @@ struct CoopPanelState {
     bool               isHost;      // current armed role (seeds the Host toggle)
     int                transportSel;// current armed transport (0 steam, 1 udp)
     const char*        detail;      // one-line status string for the panel/overlay
+    bool               showNametag; // current "Show player names" state (seeds the toggle)
 };
 // The panel's role/transport selections at the moment Connect is hit. peerId is the
 // Steam ID pasted in-panel this session (0 if none), and overrides the config
 // steamPeer in coopUiConnect; the UDP endpoint is re-read from the config there.
 typedef void (*CoopConnectFn)(bool isHost, bool useSteam, unsigned long long peerId);
 typedef void (*CoopDisconnectFn)();
+// Fired when the "Show player names" panel button is toggled. 'show' is the new
+// desired state; the plugin writes it into the live config (Replicator picks it
+// up next tick via setShowNametag). Runtime-only (not persisted to disk).
+typedef void (*CoopNametagToggleFn)(bool show);
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect);
+                   CoopDisconnectFn onDisconnect,
+                   CoopNametagToggleFn onToggleNametag);
 
 // Persistent co-op connection-status overlay: a single ScreenLabel tracked to the
 // local leader (the spike-47/48 screenshot-proven render path) whose caption shows

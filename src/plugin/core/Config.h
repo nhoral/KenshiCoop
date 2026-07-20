@@ -448,6 +448,15 @@ struct Config {
     // the A/B escape hatch.
     bool          squadSync;
 
+    // KENSHICOOP_SHOW_NAMETAG (default ON): floating name label over the OTHER
+    // player's characters (the bodies the host stream DRIVES on this client).
+    // Shows the peer's Steam persona name when known, else "[Remote Player]".
+    // This is a normal-play HUD element (NOT the KENSHICOOP_DEBUG_MARKERS
+    // diagnostic overlay); the F2 panel toggles it live via setShowNametag.
+    // "0" hides it. Runtime-only: the F2 toggle changes the in-memory value,
+    // it is not written back to coop_config.json.
+    bool          showRemoteNametag;
+
     // KENSHICOOP_LATEJOIN_SYNC (default ON): late-join/reconnect resync
     // (protocol 30, no wire change) - on the peer-connect edge the
     // Replicator re-announces every live placed-building PLACE (+ REMOVE

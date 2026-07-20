@@ -273,8 +273,9 @@ void  markerDestroy(void* label);
 
 // ---- In-game co-op session panel ---------------------------------------------
 // Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
-// CoopDisconnectFn, coopPanelTick, coopOverlayTick. The UI root (Plugin.cpp)
-// includes EngineUi.h directly; the adapter (EngineInternal.h) re-includes it.
+// CoopDisconnectFn, CoopNametagToggleFn, coopPanelTick, coopOverlayTick. The UI
+// root (Plugin.cpp) includes EngineUi.h directly; the adapter (EngineInternal.h)
+// re-includes it.
 
 // ---- Deterministic test-scene setup (host-side; baked into a save) ---------
 // Moved to EngineScenario.h (Phase 5a domain split): spawnSeatInFront,
