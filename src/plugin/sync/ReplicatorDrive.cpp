@@ -714,10 +714,16 @@ void Replicator::applyTargets(GameWorld* gw) {
             // The host retargeted since our last order.
             bool tgtChanged = d.combatArmed &&
                 (d.combatTgtIdx != out.sIndex || d.combatTgtSer != out.sSerial);
+            // Attacker fidelity: a driven SQUAD puppet (the peer's PC) must stay
+            // visibly engaged while its owner streams combat - so it never backs
+            // off, never caps out, and never self-defends (those are for passive
+            // WORLD-NPC victims). World NPCs keep the backoff/cap that stops a
+            // template that can't engage here from being AI-reset forever.
+            const unsigned int reissueCap = isSquad ? 1000000u : COMBAT_REISSUE_CAP;
             // Backoff: 1.5 s base, doubling per re-issue in this episode, 6 s cap -
             // a copy that legitimately cannot engage is not AI-reset forever.
             unsigned long interval = COMBAT_REISSUE_MS;
-            if (d.combatOrders > 1) {
+            if (!isSquad && d.combatOrders > 1) {
                 unsigned int shift = d.combatOrders - 1;
                 if (shift > 2) shift = 2;
                 interval = COMBAT_REISSUE_MS << shift;
@@ -731,7 +737,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 reissue = true;     // retarget promptly (base throttle, no backoff)
             } else if ((wrongLocalTgt || (!hostWaiting && !localFighting)) &&
                        (now - d.combatTick) >= interval &&
-                       d.combatOrders <= COMBAT_REISSUE_CAP) {
+                       d.combatOrders <= reissueCap) {
                 // Active copy disengaged / fighting the wrong body - and the
                 // WAIT -> MELEE promotion case (the slot rotates every few
                 // seconds, so promotions recur: backoff applies, and after
@@ -744,6 +750,28 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // 30 orders/hand, every one at the base interval).
                 reissue = true;
             }
+            // Self-defend fallback: once the copy's OWN ordered attack has
+            // definitively failed (past the re-issue cap) while we are reciprocally
+            // provoking the victim, stop fighting the copy's AI. Ordering a driven
+            // copy to attack a passive victim never sustains (localFight=0, ~0
+            // blood - the "join does no damage" bug). Drop the dead attack goal ONCE
+            // and let the provoked enemy's incoming swings drive self-defense; a
+            // real fight (localFighting) clears the flag so a genuine engagement is
+            // never re-cleared. NEVER for a squad puppet (the peer PC) - it must
+            // keep pressing so its host-side combat state stays true (attacker
+            // fidelity: the "in combat on join, not host" churn).
+            bool provoking = (d.provokeTick != 0);
+            if (localFighting) d.selfDefend = false;
+            else if (!isSquad && provoking && !hostWaiting && !tgtChanged &&
+                     d.combatOrders > COMBAT_REISSUE_CAP && !d.selfDefend) {
+                d.selfDefend = true;
+                engine::clearGoals(c); // free the copy to self-defend (drop dead goal)
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[combat] selfdefend hand=%u,%u tgt=%u,%u n=%u",
+                    out.hIndex, out.hSerial, out.sIndex, out.sSerial, d.combatOrders);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (reissue && d.selfDefend) reissue = false; // don't re-order in self-defend
             if (reissue) {
                 // A seat-INJECTED copy (applyRest committed a player order at the
                 // stool) ignores the goal-path attack: player orders outrank AI
@@ -801,6 +829,33 @@ void Replicator::applyTargets(GameWorld* gw) {
                      (fr == 0 ? " forced=nofn" : " forced=fault"))));
                   b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             }
+            // Reciprocal provoke: a copy ordered onto a PASSIVE victim accepts the
+            // attack (r=2, even forced) but its AI drops the swing when the victim
+            // doesn't fight back - localFight=0, ~0 blood (the "join does no damage"
+            // bug). Order the victim to fight the copy so the brawl goes MUTUAL,
+            // which the sim DOES sustain. Runs on its OWN throttle, independent of
+            // the re-issue backoff cap, so a passive target is still provoked after
+            // the copy stops being re-armed; fires only while the copy isn't yet
+            // landing, and provokeReciprocal no-ops on an already-engaged target so
+            // it never thrashes a live fight. KENSHICOOP_NO_PROVOKE=1 disables it
+            // (and therefore self-defend, which keys off provokeTick) so the
+            // combat-parity diagnostic can attribute join-only churn to it.
+            static int s_noProvoke = -1;
+            if (s_noProvoke < 0) {
+                const char* npv = getenv("KENSHICOOP_NO_PROVOKE");
+                s_noProvoke = (npv && npv[0] == '1') ? 1 : 0;
+            }
+            if (!s_noProvoke && !hostWaiting && !localFighting &&
+                (d.provokeTick == 0 || (now - d.provokeTick) >= COMBAT_PROVOKE_MS)) {
+                d.provokeTick = now;
+                int pr = engine::provokeReciprocal(c, out);
+                if (pr == 2) {
+                    char b[128]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] provoke hand=%u,%u tgt=%u,%u r=%d",
+                        out.hIndex, out.hSerial, out.sIndex, out.sSerial, pr);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
             // Graded position correction (don't kill the gait): under the soft band
             // the fight owns the footwork; drifted past it, a WAITING copy converges
             // with a real walk (stance preserved, no AI reset); far gone, teleport
@@ -837,7 +892,11 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // source teleport, or a drift that SAT over the band for
                 // COMBAT_CONVERGE_MS on a moving source). Momentary interp/footwork
                 // spikes converge - they never warp.
-                bool correctFight = localFighting && !wrongLocalTgt;
+                // Self-defend also earns the loose (churn-ceiling) band: the copy
+                // needs footwork freedom to close on / circle the provoked enemy,
+                // else the puppet-drive yanks it back to the streamed pose each tick
+                // (that yank is what starved the self-defense when it ran here).
+                bool correctFight = (localFighting && !wrongLocalTgt) || d.selfDefend;
                 float softBand  = hostWaiting ? COMBAT_WAIT_DIST : combatSoftDist_;
                 float leaveBand = correctFight ? combatSnapDist_ : softBand;
                 if (drift > combatSnapDist_) {
@@ -924,6 +983,8 @@ void Replicator::applyTargets(GameWorld* gw) {
             d.combatArmed = false;
             d.combatOrders = 0;
             d.combatTgtIdx = 0; d.combatTgtSer = 0;
+            d.provokeTick = 0;    // re-arm the reciprocal provoke for the next episode
+            d.selfDefend = false; // exit self-defend fallback with the episode
             engine::clearGoals(c); // drop the stale attack goal before re-parking
         }
 

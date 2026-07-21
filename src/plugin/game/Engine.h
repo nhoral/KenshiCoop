@@ -398,6 +398,13 @@ int applyCombat(Character* c, const EntityState& e, bool breakOrder);
 // 2 forced / 1 target not loaded / 0 no-op / -1 fault.
 int forceAttack(Character* c, const EntityState& e);
 
+// Reciprocal provoke: order the VICTIM (subject hand of e) to fight attackerCopy
+// so a passive target's brawl goes MUTUAL and the sim sustains it - fixes the
+// "join PC does no damage" bug where an ordered copy accepts the attack but its
+// AI drops the swing against a non-fighting body. Returns 2 ordered / 3 already
+// engaged / 1 victim not loaded here / 0 not a combat intent / -1 fault.
+int provokeReciprocal(Character* attackerCopy, const EntityState& e);
+
 // duel test scene: spawn two mutually-hostile non-squad NPCs in front of the leader
 // from the SAME nearby faction so they are PEACEFUL on spawn (no attack issued here).
 // Hands are stashed so startDuel/rearmDuelScene can trigger/re-issue the fight at

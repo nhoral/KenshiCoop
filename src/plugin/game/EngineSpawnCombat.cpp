@@ -1421,6 +1421,35 @@ int forceAttack(Character* c, const EntityState& e) {
     }
 }
 
+// Reciprocal provoke (the "join does no damage" fix): a driven copy ordered onto
+// a PASSIVE victim accepts the attack but its AI drops the swing when the victim
+// never fights back (localFight=0, ~0 blood). Order the VICTIM to fight the copy
+// so the brawl goes MUTUAL, which the sim DOES sustain. attackerCopy is the driven
+// puppet (join PC's host-side body); e is its streamed EntityState (subject hand =
+// the victim). Returns 2 ordered / 3 already engaged (no thrash) / 1 victim not
+// loaded here / 0 not a combat intent / -1 fault.
+int provokeReciprocal(Character* attackerCopy, const EntityState& e) {
+    if (!attackerCopy || !coop::taskIsCombat(e.task)) return 0;
+    Character* target = resolveCharByHand(e.sIndex, e.sSerial, e.sType,
+                                          e.sContainer, e.sContainerSerial);
+    if (!target) return 1; // opponent not loaded here -> caller just holds
+    CombatRead tc;
+    if (readCombat(target, &tc) && (tc.inCombat || tc.modeActive))
+        return 3; // already engaged (mutual, or another fight) -> no thrash
+    // Order the victim to fight back. A plain attack goal is DROPPED by the
+    // victim's AI because the join PC is a player-owned, non-hostile body (the
+    // same validation that drops the copy's own swing). Escalate through
+    // Character::attackTarget, the engine's commit-attack entry that bypasses
+    // that re-decision - the victim is a full-AI host NPC (not a driven puppet),
+    // so this sticks and starts the mutual fight the sim sustains.
+    bool ordered = orderMeleeAttack(target, attackerCopy);
+    if (g_attackTargetFn) {
+        __try { g_attackTargetFn(target, attackerCopy); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return ordered ? 2 : -1;
+}
+
 // ---- Player-combat / medical validation primitives (spike 21 field map) ----
 
 bool readMedical(Character* c, MedicalRead* out) {

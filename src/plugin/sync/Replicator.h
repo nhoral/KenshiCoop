@@ -683,6 +683,14 @@ private:
         u32          combatTgtSer;    //   so a host-side retarget re-issues immediately
         unsigned long combatSeenTick; // last tick the host stream reported combat (the
                                       //   disarm DEBOUNCE: a 1-batch gap must not reset the AI)
+        unsigned long provokeTick;    // last reciprocal-provoke of the target (throttle): while
+                                      //   the copy isn't landing, order the victim to fight back
+                                      //   so a passive target's brawl goes mutual and sustains
+        bool         selfDefend;      // the copy's OWN ordered attack failed past the re-issue cap
+                                      //   while provoking: drop it and let the provoked enemy's
+                                      //   incoming swings drive NATURAL self-defense (the only path
+                                      //   that ever drew blood - ordered-attack + puppet-drive
+                                      //   together suppress it; this releases both)
         unsigned long combatSnapTick; // last hard snap (cooldown; a failed teleport must not
                                       //   re-fire every frame - walk-converge between snaps)
         unsigned long combatSnapCount;// cumulative combat hard-snaps on this hand (Phase 1 warp
@@ -764,7 +772,8 @@ private:
                    koLatched(false), deathLatched(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
-                   combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
+                   combatSeenTick(0), provokeTick(0), selfDefend(false),
+                   combatSnapTick(0), combatSnapCount(0),
                    combatOverTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
