@@ -29,6 +29,7 @@
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
 #include "../plugin/core/WorkPose.h"
+#include "../plugin/core/FreeCamMath.h" // cámara libre: matemática pura de movimiento/vista
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
@@ -1355,6 +1356,94 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- Free camera math (src/plugin/core/FreeCamMath.h) ------------------------
+// La misma lógica pura que FreeCamera.cpp vuelca en la Ogre::Camera real: vector
+// de vista desde yaw/pitch, ejes de movimiento y el paso de integración.
+static bool approx(float a, float b, float eps) {
+    float d = a - b; if (d < 0) d = -d; return d <= eps;
+}
+
+static void testFreeCamMath() {
+    std::printf("== free camera math (view vector + movement step) ==\n");
+
+    // 1. En reposo (yaw=0, pitch=0) la cámara mira a -Z (convención Ogre).
+    FcVec3 f0 = fcForward(0.0f, 0.0f);
+    CHECK("forward(0,0) mira a -Z",
+          approx(f0.x, 0.0f, 1e-5f) && approx(f0.y, 0.0f, 1e-5f) && approx(f0.z, -1.0f, 1e-5f));
+
+    // 2. El vector de vista es unitario para varios ángulos.
+    {
+        FcVec3 f = fcForward(0.7f, 0.3f);
+        float len = std::sqrt(f.x * f.x + f.y * f.y + f.z * f.z);
+        CHECK("forward es unitario", approx(len, 1.0f, 1e-4f));
+    }
+
+    // 3. forward (horizontal) y right son ortogonales -> strafe limpio.
+    {
+        FcVec3 fh = fcForward(1.1f, 0.0f); // pitch 0 => horizontal
+        FcVec3 r  = fcRight(1.1f);
+        float dot = fh.x * r.x + fh.y * r.y + fh.z * r.z;
+        CHECK("forward_h _|_ right", approx(dot, 0.0f, 1e-4f));
+        CHECK("right es horizontal (y=0)", approx(r.y, 0.0f, 1e-6f));
+    }
+
+    // 4. Avanzar (W) en reposo desplaza exactamente speed*dt hacia -Z.
+    {
+        FcInput in; std::memset(&in, 0, sizeof(in)); in.fwd = true;
+        FcVec3 o = { 0.0f, 0.0f, 0.0f };
+        FcVec3 p = fcStep(o, 0.0f, 0.0f, in, /*speed*/ 10.0f, /*turbo*/ 4.0f, /*dt*/ 0.5f);
+        CHECK("W avanza speed*dt hacia -Z",
+              approx(p.x, 0.0f, 1e-4f) && approx(p.y, 0.0f, 1e-4f) && approx(p.z, -5.0f, 1e-4f));
+    }
+
+    // 5. Subir (E) mueve +Y en world; el desplazamiento vale speed*dt.
+    {
+        FcInput in; std::memset(&in, 0, sizeof(in)); in.up = true;
+        FcVec3 o = { 1.0f, 2.0f, 3.0f };
+        FcVec3 p = fcStep(o, 2.0f, 0.5f, in, 8.0f, 4.0f, 0.25f);
+        CHECK("E sube +Y en world", approx(p.y, 2.0f + 2.0f, 1e-4f)); // 8*0.25 = 2
+        CHECK("E no cambia X/Z", approx(p.x, 1.0f, 1e-4f) && approx(p.z, 3.0f, 1e-4f));
+    }
+
+    // 6. Diagonal (W+D) NO va más rápido que recto: |desplazamiento| == speed*dt.
+    {
+        FcInput in; std::memset(&in, 0, sizeof(in)); in.fwd = true; in.right = true;
+        FcVec3 o = { 0.0f, 0.0f, 0.0f };
+        FcVec3 p = fcStep(o, 0.9f, 0.2f, in, 12.0f, 4.0f, 0.1f);
+        float dx = p.x - o.x, dy = p.y - o.y, dz = p.z - o.z;
+        float mag = std::sqrt(dx * dx + dy * dy + dz * dz);
+        CHECK("diagonal normalizada (|d|==speed*dt)", approx(mag, 12.0f * 0.1f, 1e-3f));
+    }
+
+    // 7. Turbo multiplica la velocidad por turboMul.
+    {
+        FcInput a; std::memset(&a, 0, sizeof(a)); a.fwd = true;
+        FcInput b = a; b.turbo = true;
+        FcVec3 o = { 0.0f, 0.0f, 0.0f };
+        FcVec3 pa = fcStep(o, 0.0f, 0.0f, a, 10.0f, 3.0f, 0.2f);
+        FcVec3 pb = fcStep(o, 0.0f, 0.0f, b, 10.0f, 3.0f, 0.2f);
+        CHECK("turbo x3", approx(pb.z, pa.z * 3.0f, 1e-4f));
+    }
+
+    // 8. Sin input, la posición no cambia.
+    {
+        FcInput in; std::memset(&in, 0, sizeof(in));
+        FcVec3 o = { 5.0f, 6.0f, 7.0f };
+        FcVec3 p = fcStep(o, 1.0f, 0.5f, in, 50.0f, 4.0f, 1.0f);
+        CHECK("sin input no se mueve",
+              approx(p.x, 5.0f, 1e-6f) && approx(p.y, 6.0f, 1e-6f) && approx(p.z, 7.0f, 1e-6f));
+    }
+
+    // 9. El pitch se clampa a ~±85° (no da la vuelta de campana).
+    {
+        float yaw = 0.0f, pitch = 0.0f;
+        fcApplyLook(&yaw, &pitch, 0.0f, 100.0f); // empuja el pitch muy arriba
+        CHECK("pitch clamp superior", pitch <= 1.4836f && pitch >= 1.4834f);
+        fcApplyLook(&yaw, &pitch, 0.0f, -100.0f);
+        CHECK("pitch clamp inferior", pitch >= -1.4836f && pitch <= -1.4834f);
+    }
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1372,6 +1461,7 @@ int main() {
     testOwnRanks();
     testSteamIdParse();
     testWorkPoseMatch();
+    testFreeCamMath();
     testTaskClear();
     testDeathRekey();
     testInboundLifecycle();
