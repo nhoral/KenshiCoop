@@ -49,6 +49,19 @@ void Replicator::applyTargets(GameWorld* gw) {
     // damage, so the join's cosmetic fights cannot diverge the local-only medical
     // model. A body we stop driving drops out and takes local damage again.
     if (dmgGuard_) engine::clearDamageGuard();
+    // Join-dealt damage report (protocol 45, JOIN only): keep the engine-side
+    // accumulator armed and refresh the ATTACKER set (our controllable squad) each
+    // tick, mirroring the guard-set rebuild. A guarded swing BY one of these bodies
+    // ON a driven copy is captured for publishCombatHits; the set rebuild handles
+    // recruit/roster churn. On the host reportCombat_ is false, so the accumulator
+    // stays disabled (host swings land natively on the NPCs it owns).
+    if (reportCombat_) {
+        engine::setCombatReport(true);
+        engine::clearReportAttackers();
+        Character* pcs[64];
+        unsigned int np = engine::listPlayerChars(gw, pcs, 64);
+        for (unsigned int i = 0; i < np; ++i) engine::addReportAttacker(pcs[i]);
+    }
     // Driven-body pointer set rebuilds per tick too: enforceHostAuthority uses it
     // to recognise a streamed body whose LOCAL hand key changed (combat detach
     // re-containers world NPCs) so it never hides a body we are driving.
@@ -259,6 +272,21 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     host locomotion so it still animates. Grounded engine-walk + real
         //     sit/idle poses for NPCs arrive in Stage 5 (AI quiet-in-place).
         bool isSquad = engine::isLocalPlayerChar(gw, c);
+
+        // Join-dealt authoritative damage (protocol 45). The guard suppressed our
+        // player-squad melee on this driven copy (cosmetic); drain the damage it
+        // WOULD have dealt and stage it under the copy's canonical hand for
+        // publishCombatHits to forward to the host (which owns the real body).
+        // World NPCs only - a squad copy is a peer PC (PvP, out of scope), but we
+        // still drain it so the engine-side accumulator stays bounded.
+        if (reportCombat_) {
+            float rf = 0.0f, rb = 0.0f;
+            if (engine::takeReportedDamage(c, &rf, &rb) && !isSquad &&
+                (rf > 0.0f || rb > 0.0f)) {
+                PendingHit& ph = pendingHits_[it->first];
+                ph.flesh += rf; ph.blood += rb;
+            }
+        }
 
         // ---- Phase A jail-observe (KENSHICOOP_JAIL_OBSERVE, read-only spike) ----
         // For a peer-owned captive (the join's jailed PC as driven on the host),
@@ -714,16 +742,17 @@ void Replicator::applyTargets(GameWorld* gw) {
             // The host retargeted since our last order.
             bool tgtChanged = d.combatArmed &&
                 (d.combatTgtIdx != out.sIndex || d.combatTgtSer != out.sSerial);
-            // Attacker fidelity: a driven SQUAD puppet (the peer's PC) must stay
-            // visibly engaged while its owner streams combat - so it never backs
-            // off, never caps out, and never self-defends (those are for passive
-            // WORLD-NPC victims). World NPCs keep the backoff/cap that stops a
-            // template that can't engage here from being AI-reset forever.
-            const unsigned int reissueCap = isSquad ? 1000000u : COMBAT_REISSUE_CAP;
             // Backoff: 1.5 s base, doubling per re-issue in this episode, 6 s cap -
             // a copy that legitimately cannot engage is not AI-reset forever.
+            // NOTE: this backoff/cap applies to the squad puppet (peer PC) too. An
+            // "attacker fidelity" variant that removed it (unlimited reissue) kept
+            // the copy's combat state perfectly true (joinOnly=0) BUT constant
+            // re-ordering interrupts its swing before it lands (localFight=1, ~0
+            // blood - the join-does-no-damage bug), so it is deliberately NOT used
+            // here; damage is prioritized and the residual cohesion churn is tuned
+            // separately.
             unsigned long interval = COMBAT_REISSUE_MS;
-            if (!isSquad && d.combatOrders > 1) {
+            if (d.combatOrders > 1) {
                 unsigned int shift = d.combatOrders - 1;
                 if (shift > 2) shift = 2;
                 interval = COMBAT_REISSUE_MS << shift;
@@ -733,11 +762,22 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (!d.combatArmed) {
                 reissue = true;
                 d.combatOrders = 0; // new episode: backoff restarts
-            } else if (tgtChanged && (now - d.combatTick) >= COMBAT_REISSUE_MS) {
-                reissue = true;     // retarget promptly (base throttle, no backoff)
-            } else if ((wrongLocalTgt || (!hostWaiting && !localFighting)) &&
+            } else if (tgtChanged && (now - d.combatTick) >= COMBAT_REISSUE_MS &&
+                       !(isSquad && localFighting)) {
+                // Retarget promptly (base throttle, no backoff) to follow the
+                // owner's live target - EXCEPT for a squad puppet that is already
+                // swinging. The join PC's live target flickers among a gang every
+                // ~1.5 s; re-ordering the copy on every flicker clearGoals-resets
+                // its swing before it lands (measured: 5 victims each -0.2..1.5
+                // blood, none past the 5-blood gate - the join-does-no-damage
+                // bug's true cause). While the peer-PC copy is fighting, let it
+                // COMMIT to its current victim and draw blood; the flicker is
+                // absorbed (a cohesion cost paid for real damage, the damage-first
+                // policy). A retarget while the copy is idle still re-engages below.
+                reissue = true;
+            } else if (((!isSquad && wrongLocalTgt) || (!hostWaiting && !localFighting)) &&
                        (now - d.combatTick) >= interval &&
-                       d.combatOrders <= reissueCap) {
+                       (isSquad || d.combatOrders <= COMBAT_REISSUE_CAP)) {
                 // Active copy disengaged / fighting the wrong body - and the
                 // WAIT -> MELEE promotion case (the slot rotates every few
                 // seconds, so promotions recur: backoff applies, and after
@@ -748,28 +788,44 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // never resets mid-episode: local engagement flickers (combo
                 // gaps), and a flicker-reset defeated the backoff (measured:
                 // 30 orders/hand, every one at the base interval).
+                //
+                // The SQUAD puppet (peer PC) is exempt from the cap AND from the
+                // wrongLocalTgt trigger: while it is FIGHTING (any real victim) it
+                // is left alone to draw blood; only a FULLY disengaged peer copy
+                // (localFight=0) is re-engaged, uncapped, so the join PC's fight is
+                // never abandoned the way a fearful town NPC is (damage-first). The
+                // backoff (6 s cap) still throttles the re-order.
                 reissue = true;
             }
-            // Self-defend fallback: once the copy's OWN ordered attack has
-            // definitively failed (past the re-issue cap) while we are reciprocally
-            // provoking the victim, stop fighting the copy's AI. Ordering a driven
-            // copy to attack a passive victim never sustains (localFight=0, ~0
-            // blood - the "join does no damage" bug). Drop the dead attack goal ONCE
-            // and let the provoked enemy's incoming swings drive self-defense; a
-            // real fight (localFighting) clears the flag so a genuine engagement is
-            // never re-cleared. NEVER for a squad puppet (the peer PC) - it must
-            // keep pressing so its host-side combat state stays true (attacker
-            // fidelity: the "in combat on join, not host" churn).
+            // Self-defend fallback (WORLD NPCs ONLY): an ordered world copy accepts
+            // an attack but its AI drops the swing against a passive/player-owned
+            // victim (localFight=0, ~0 blood), and every re-order clearGoals-resets
+            // the AI mid-swing. After the FULL cap of failed orders, latch
+            // selfDefend ONCE: drop the dead goal and let the reciprocally-provoked
+            // enemy's incoming swings drive natural self-defense. A real fight
+            // clears it - a template that legitimately declines to fight here (fear,
+            // blocked ring spot) must not be clearGoals-thrashed (the crowd artifact).
+            //
+            // The SQUAD puppet (peer PC) is DELIBERATELY EXCLUDED (damage-first
+            // policy, user call). Handing a peer PC off to self-defense made its
+            // copy a punching bag: measured it TOOK ~13 blood while dealing ~0 to
+            // the victims (selfdefend drops the attack goal, so it only blocks).
+            // The join PC must deal AUTHORITATIVE damage, so its copy keeps its
+            // attack goal and re-engages the owner's live target (uncapped, above);
+            // reissue fires only while disengaged, so sustained swings still land.
+            // This trades some combat-cohesion churn for real damage, by design.
             bool provoking = (d.provokeTick != 0);
-            if (localFighting) d.selfDefend = false;
-            else if (!isSquad && provoking && !hostWaiting && !tgtChanged &&
-                     d.combatOrders > COMBAT_REISSUE_CAP && !d.selfDefend) {
-                d.selfDefend = true;
-                engine::clearGoals(c); // free the copy to self-defend (drop dead goal)
-                char b[128]; _snprintf(b, sizeof(b) - 1,
-                    "[combat] selfdefend hand=%u,%u tgt=%u,%u n=%u",
-                    out.hIndex, out.hSerial, out.sIndex, out.sSerial, d.combatOrders);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            if (!isSquad) {
+                if (localFighting) d.selfDefend = false;
+                else if (provoking && !hostWaiting && !tgtChanged &&
+                         d.combatOrders > COMBAT_REISSUE_CAP && !d.selfDefend) {
+                    d.selfDefend = true;
+                    engine::clearGoals(c); // free the copy to self-defend (drop dead goal)
+                    char b[128]; _snprintf(b, sizeof(b) - 1,
+                        "[combat] selfdefend hand=%u,%u tgt=%u,%u n=%u",
+                        out.hIndex, out.hSerial, out.sIndex, out.sSerial, d.combatOrders);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
             }
             if (reissue && d.selfDefend) reissue = false; // don't re-order in self-defend
             if (reissue) {

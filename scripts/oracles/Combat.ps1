@@ -917,12 +917,14 @@ function Test-PcAssault {
     $ordMiss = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=1') -ErrorAction SilentlyContinue).Count
     $fight   = @(Select-String -Path $HostFile -Pattern 'SCENARIO PCASSAULT hostview fight=1' -ErrorAction SilentlyContinue).Count
 
-    # Damage = the biggest flesh-OR-blood drop after the assault. assign-then-
-    # filter: Get-VitalsSeries returns an ArrayList; piping it straight into
-    # Where-Object in one expression drops rows (PS array-wrap) - hence $V=@(...).
+    # Damage = the biggest flesh-OR-blood drop after the assault. Get-VitalsSeries
+    # returns its ArrayList via `,$list` (unrolls to the ArrayList on a bare
+    # assignment); wrapping it in @(...) instead yields a 1-element array HOLDING
+    # the ArrayList (Count=1, .blood broadcasts to nothing -> Measure finds no
+    # 'blood' property, drop reads 0). So assign directly, THEN filter with @().
     $dmgDrop = {
         param($file, $hand, $sinceMs)
-        $V = @(Get-VitalsSeries -File $file -HandIS $hand)
+        $V = Get-VitalsSeries -File $file -HandIS $hand
         if ($null -ne $sinceMs) { $V = @($V | Where-Object { $_.t -ge $sinceMs }) }
         if ($V.Count -lt 2) { return $null }
         $bloodD = [double]($V | Measure-Object -Property blood -Maximum).Maximum -
@@ -952,14 +954,19 @@ function Test-PcAssault {
     $probe = if ($hurtHand -ne '') { $hurtHand } else { $vic }
     $jd = & $dmgDrop $JoinFile $probe $T
     if ($null -ne $jd) { $joinDrop = $jd.dmg; $joinFlesh = $jd.flesh; $joinBlood = $jd.blood }
-    $Vh = @(Get-VitalsSeries -File $HostFile -HandIS $probe); $Vh = @($Vh | Where-Object { $_.t -ge $T })
-    $Vj = @(Get-VitalsSeries -File $JoinFile -HandIS $probe); $Vj = @($Vj | Where-Object { $_.t -ge $T })
+    $Vh = Get-VitalsSeries -File $HostFile -HandIS $probe; $Vh = @($Vh | Where-Object { $_.t -ge $T })
+    $Vj = Get-VitalsSeries -File $JoinFile -HandIS $probe; $Vj = @($Vj | Where-Object { $_.t -ge $T })
     if ($Vh.Count -ge 1 -and $Vj.Count -ge 1) {
-        $tEnd = [Math]::Min([double]$Vh[-1].t, [double]$Vj[-1].t)
-        $hAt = @($Vh | Where-Object { $_.t -le ($tEnd + 750) })
-        $jAt = @($Vj | Where-Object { $_.t -le ($tEnd + 750) })
+        # Coerce with @(...)[0]: a row's .t/.blood can occasionally arrive as a
+        # 1-element array (pipeline wrap upstream), and a bare [double] cast on an
+        # array throws (line ~958 InvalidCast). @(...)[0] yields the scalar safely.
+        $htEnd = [double](@($Vh[-1].t)[0]); $jtEnd = [double](@($Vj[-1].t)[0])
+        $tEnd = [Math]::Min($htEnd, $jtEnd)
+        $hAt = @($Vh | Where-Object { [double](@($_.t)[0]) -le ($tEnd + 750) })
+        $jAt = @($Vj | Where-Object { [double](@($_.t)[0]) -le ($tEnd + 750) })
         if ($hAt.Count -ge 1 -and $jAt.Count -ge 1) {
-            $endGap = [Math]::Abs([double]$hAt[-1].blood - [double]$jAt[-1].blood)
+            $hb = [double](@($hAt[-1].blood)[0]); $jb = [double](@($jAt[-1].blood)[0])
+            $endGap = [Math]::Abs($hb - $jb)
         }
     }
 

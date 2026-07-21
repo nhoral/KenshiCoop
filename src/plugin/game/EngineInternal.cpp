@@ -1119,12 +1119,31 @@ std::set<Character*>  g_damageGuarded;
 unsigned long         g_dmgGuardedHits = 0; // swings intercepted (conformance signal)
 unsigned long         g_dmgPassedHits  = 0; // swings passed through to the engine
 
+// Join-dealt authoritative damage report (protocol 45). When ON (join only), a
+// suppressed swing BY a report-attacker (owned player squad) ON a guarded NPC
+// copy accumulates the damage it would have dealt, keyed by the victim copy, for
+// the replicator to forward to the host (which owns the real NPC's health).
+struct ReportedDmg { float flesh; float blood; ReportedDmg() : flesh(0.0f), blood(0.0f) {} };
+std::map<Character*, ReportedDmg> g_reportedDmg;
+std::set<Character*>              g_reportAttackers;
+bool                              g_combatReport = false;
+
 HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
                                            Damages& damage, Character* who,
                                            CombatTechniqueData* attack, int comboID) {
     if (!g_damageGuarded.empty() &&
         g_damageGuarded.find(self) != g_damageGuarded.end()) {
         ++g_dmgGuardedHits;
+        // Report path (join): the local swing never lands here, but if a player-
+        // squad attacker dealt it, accumulate so the host wounds the real NPC.
+        // flesh ~ solid impact (cut+blunt+pierce+stun); blood ~ bleeding sources
+        // (cut+pierce, plus the bleed multiplier). Absolute deltas, host-applied.
+        if (g_combatReport && !g_reportAttackers.empty() && who &&
+            g_reportAttackers.find(who) != g_reportAttackers.end()) {
+            ReportedDmg& rd = g_reportedDmg[self];
+            rd.flesh += damage.cut + damage.blunt + damage.pierce + damage.extraStun;
+            rd.blood += (damage.cut + damage.pierce) * 0.5f + damage.bleedMult;
+        }
         return HIT_MISSED; // cosmetic fight: the local swing never lands
     }
     ++g_dmgPassedHits;
@@ -2197,6 +2216,21 @@ unsigned int damageGuardCount()   { return (unsigned int)g_damageGuarded.size();
 void damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed) {
     if (outGuarded) *outGuarded = g_dmgGuardedHits;
     if (outPassed)  *outPassed  = g_dmgPassedHits;
+}
+
+void setCombatReport(bool on) {
+    g_combatReport = on;
+    if (!on) g_reportedDmg.clear();
+}
+void clearReportAttackers()          { g_reportAttackers.clear(); }
+void addReportAttacker(Character* c)  { if (c) g_reportAttackers.insert(c); }
+bool takeReportedDamage(Character* c, float* outFlesh, float* outBlood) {
+    std::map<Character*, ReportedDmg>::iterator it = g_reportedDmg.find(c);
+    if (it == g_reportedDmg.end()) return false;
+    if (outFlesh) *outFlesh = it->second.flesh;
+    if (outBlood) *outBlood = it->second.blood;
+    g_reportedDmg.erase(it);
+    return true;
 }
 
 bool readBloodByHand(const unsigned int hand[5], float* outBlood) {

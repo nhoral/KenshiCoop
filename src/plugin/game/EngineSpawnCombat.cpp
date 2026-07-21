@@ -1828,6 +1828,42 @@ bool woundSubjectLimbs(GameWorld* gw, const unsigned int subjHand[5],
     }
 }
 
+bool applyReportedDamage(GameWorld* gw, const unsigned int subjHand[5],
+                         float flesh, float blood) {
+    (void)gw;
+    Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],
+                                     subjHand[1], subjHand[2]);
+    if (!s) return false;
+    if (flesh < 0.0f) flesh = 0.0f;
+    if (blood < 0.0f) blood = 0.0f;
+    __try {
+        MedicalSystem* med = &s->medical;
+        // Concentrate the flesh delta on the weakest limb (index picked by lowest
+        // current flesh): a real melee swing lands on ONE part, and finishing a
+        // wounded limb yields a clean monotone flesh-min series for the oracle.
+        unsigned int n = med->anatomy.count;
+        MedicalSystem::HealthPartStatus* target = 0;
+        float lo = 3.0e38f;
+        for (unsigned int i = 0; i < n; ++i) {
+            MedicalSystem::HealthPartStatus* p =
+                med->anatomy.stuff ? med->anatomy.stuff[i] : 0;
+            if (!p) continue;
+            if (p->flesh < lo) { lo = p->flesh; target = p; }
+        }
+        if (target) {
+            target->flesh -= flesh;
+            if (target->flesh < 0.0f) target->flesh = 0.0f;
+            float stun = target->fleshStun - (flesh + 15.0f);
+            target->fleshStun = (stun < 0.0f) ? 0.0f : stun;
+        }
+        med->blood -= blood;
+        if (med->blood < 0.0f) med->blood = 0.0f;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 int healSubjectBandage(GameWorld* gw, const unsigned int subjHand[5]) {
     (void)gw;
     Character* s = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],

@@ -191,6 +191,8 @@ void NetLink::queueMedical(const MedicalPacket& pkt) { pushLocked(outCs_, outMed
 
 void NetLink::queueTreatment(const TreatmentPacket& pkt) { pushLocked(outCs_, outTreatments_, pkt); }
 
+void NetLink::queueCombatHit(const CombatHitPacket& pkt) { pushLocked(outCs_, outCombatHits_, pkt); }
+
 void NetLink::queueSpeed(const SpeedPacket& pkt) { pushLocked(outCs_, outSpeed_, pkt); }
 
 void NetLink::queueStats(const StatsPacket& pkt) { pushLocked(outCs_, outStats_, pkt); }
@@ -641,6 +643,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &tp)
                             && inbound_) {
                             inbound_->pushTreatment(tp.ownerId, tp);
+                        }
+                    } else if (type == PKT_COMBAT_HIT) {
+                        // Reliable join-dealt damage report (join -> host): the
+                        // host wounds the authoritative world NPC.
+                        CombatHitPacket chp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
+                            && inbound_) {
+                            inbound_->pushCombatHit(chp.ownerId, chp);
                         }
                     } else if (type == PKT_SPEED_REQ || type == PKT_SPEED_SET) {
                         // Reliable game-speed request/set (consensus speed sync).
@@ -1132,9 +1142,11 @@ void NetLink::threadLoop() {
         // Replicator so steady state is silent.
         std::vector<MedicalPacket>   meds;
         std::vector<TreatmentPacket> treats;
+        std::vector<CombatHitPacket> combatHits;
         EnterCriticalSection(&outCs_);
         meds.swap(outMedical_);
         treats.swap(outTreatments_);
+        combatHits.swap(outCombatHits_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < meds.size(); ++i) {
             ENetPacket* out = enet_packet_create(&meds[i], sizeof(MedicalPacket),
@@ -1149,6 +1161,17 @@ void NetLink::threadLoop() {
         }
         for (size_t i = 0; i < treats.size(); ++i) {
             ENetPacket* out = enet_packet_create(&treats[i], sizeof(TreatmentPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        for (size_t i = 0; i < combatHits.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&combatHits[i], sizeof(CombatHitPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
