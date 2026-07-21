@@ -938,6 +938,15 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
                 (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
             cf[sizeof(cf) - 1] = '\0'; coop::logLine(cf);
         }
+    } else if (carryDeath) {
+        // Dead body with no local copy: don't force-REQ/mint. Minting spawns a
+        // fresh unnamed corpse (the "Name" portrait that appears after a death,
+        // since proxy names aren't replicated). Suppress any in-flight reply mint.
+        rekeyedOld_[newK] = nowMs();
+        char fb[176]; _snprintf(fb, sizeof(fb) - 1,
+            "[%s] REKEY-DEAD skip-mint new=%u,%u,%u,%u,%u",
+            (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
+        fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
     } else {
         // ok=0: no local body at the OLD hand and no proxy to migrate. The
         // recruit/move fired while this hand was OUTSIDE our interest (the
