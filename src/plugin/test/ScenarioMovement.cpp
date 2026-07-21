@@ -93,6 +93,80 @@ private:
 
 const float LeaderMoveScenario::LEG = 14.0f;
 
+// stop_probe (walk-drive overshoot/snap-back repro, concept ported from
+// CTRL-ALT-E/KENSHI-CO-OP e36b960): like leader_move but purpose-built to expose
+// ON-STOP behaviour in the JOIN's driven copy. The HOST walks its squad leader out
+// a fixed leg, lets it ARRIVE and FULLY STOP (issues the move ONCE per leg, then
+// holds the same destination for several seconds so the body decelerates to a
+// natural halt exactly like a player right-click), then walks back, stops, and
+// repeats for a long window. leader_move re-issues its move every evidence tick,
+// which restarts the path and MASKS the very stop we measure; stop_probe issues
+// once per leg so the deceleration tail is real - that tail is where the driven
+// copy overshot the mark and snapped back before the taper + halting-settle fix.
+// The long duration + short cycle means a late-loading join (heavy modlists load
+// minutes after the host) still overlaps many clean walk->STOP cycles. Diagnostic,
+// not a tight gate: read the join's per-frame [drv] trace (KENSHICOOP_DRIVEDBG=1)
+// at each stop, plus the standard smoothness/crosscheck.
+class StopProbeScenario : public TimedScenario {
+public:
+    StopProbeScenario()
+        : TimedScenario("stop_probe", 500),
+          recvCount_(0), haveStart_(false), issued_(false),
+          lx_(0), lz_(0), sx_(0), sy_(0), sz_(0) {}
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        if (ctx.isHost) {
+            Character* ld = engine::leader(ctx.gw);
+            if (ld && engine::readPos(ld, &sx_, &sy_, &sz_)) haveStart_ = true;
+        }
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Host: drive the leader out-and-back with a REAL stop at each end. Issue
+        // the move ONCE per leg (only when the leg target changes) so the engine
+        // walks to it and decelerates to a natural halt - re-issuing every tick
+        // would restart the path and mask the stop we are measuring.
+        if (ctx.isHost && haveStart_) {
+            Character* ld = engine::leader(ctx.gw);
+            if (ld) {
+                unsigned long ph = ctx.elapsedMs % CYCLE_MS;
+                bool outLeg = ph < (CYCLE_MS / 2);
+                float tx = outLeg ? (sx_ + LEG) : sx_;
+                float tz = outLeg ? (sz_ + LEG) : sz_;
+                if (!issued_ || tx != lx_ || tz != lz_) {
+                    engine::orderMoveTo(ld, tx, sy_, tz);
+                    issued_ = true; lx_ = tx; lz_ = tz;
+                }
+            }
+        }
+
+        // 2 Hz MEMBER/RECV lines for the runner's cross-check + screenshot anchor.
+        if (evidenceDue(ctx.elapsedMs)) {
+            Character* ld = engine::leader(ctx.gw);
+            if (ctx.isHost) logScenarioLine("MEMBER", ld);
+            else if (logScenarioLine("RECV", ld)) ++recvCount_;
+        }
+
+        if (ctx.elapsedMs >= DURATION_MS) {
+            passed_ = ctx.isHost ? (engine::leader(ctx.gw) != 0) : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static const unsigned long DURATION_MS = 120000; // long: a late join still overlaps stops
+    static const unsigned long CYCLE_MS    = 12000;  // out(+arrive/hold) then back(+arrive/hold)
+    static const float         LEG;                  // leg length - long enough to reach cruise
+    unsigned int  recvCount_;
+    bool          haveStart_;
+    bool          issued_;
+    float         lx_, lz_;       // last issued leg target (dedupe re-issue)
+    float         sx_, sy_, sz_;  // start pose
+};
+
+const float StopProbeScenario::LEG = 15.0f;
+
 // fast_march (2026-07-11 rubber-banding validation): leader_move at 5x game
 // speed. Speed consensus is min(host, join), so BOTH sides vote 5x through the
 // loud simulated-click path (writeGameSpeed - the intent hooks capture it as a
@@ -689,6 +763,7 @@ const float CampApproachScenario::HOP = 2800.0f;
 
 Scenario* makeMovementScenario(const std::string& name) {
     if (name == "leader_move")  return new LeaderMoveScenario();
+    if (name == "stop_probe")   return new StopProbeScenario();
     if (name == "fast_march")   return new FastMarchScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();
     if (name == "travel_parity") return new TravelParityScenario();

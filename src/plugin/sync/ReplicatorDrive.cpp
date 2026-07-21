@@ -1316,6 +1316,26 @@ void Replicator::applyTargets(GameWorld* gw) {
         // order already overrides AI movement, and clearGoals would CANCEL
         // our destination. removeFromUpdateList is never used: it freezes
         // the movement controller (walk + teleport both no-op).
+        // Walk-drive on-stop overshoot fix A/B toggle (default ON). Set
+        // KENSHICOOP_STOPFIX=0 to run the pre-fix behavior for a same-DLL before/
+        // after comparison (mirrors the repo's KENSHICOOP_NO_DETACH A/B knob).
+        // OFF forces the taper fraction to 1.0 (no taper) and skips the halting-
+        // settle branch, exactly reproducing the original walk-drive.
+        static int stopFixMode = -1;
+        if (stopFixMode < 0) {
+            const char* e = getenv("KENSHICOOP_STOPFIX");
+            stopFixMode = (e && e[0] == '0') ? 0 : 1;
+        }
+        // Per-frame drive trace for the driven squad leader (KENSHICOOP_DEBUG_
+        // STOP_PROBE=1): logs the rendered ACTUAL pos vs the streamed authoritative
+        // NEWEST pos each frame, so an on-stop overshoot (actual runs PAST newest
+        // then snaps back) is directly visible in the join log at each host stop.
+        static int stopProbeTrace = -1;
+        if (stopProbeTrace < 0) {
+            const char* e = getenv("KENSHICOOP_DEBUG_STOP_PROBE");
+            stopProbeTrace = (e && e[0] == '1') ? 1 : 0;
+        }
+
         bool snapOk;
         if (isSquad) {
             snapOk = haveNewest;
@@ -1367,7 +1387,42 @@ void Replicator::applyTargets(GameWorld* gw) {
                             gapNewest, vlen, snapGate, d.haveDest);
             }
             d.parked = false; d.haveDest = false;
+        } else if (stopFixMode && isSquad && genuinelyMoving && vlen < SETTLE_VEL) {
+            // Halting settle (walk-drive overshoot/snap-back fix, concept ported
+            // from CTRL-ALT-E/KENSHI-CO-OP e36b960). The squad classifier
+            // (hostMoving) keys on cMoving/cSpeed, which decay SLOWLY and keep
+            // reading "moving" for many frames AFTER the body has physically
+            // stopped - so the walk-drive below kept aiming at a lead point past
+            // the stop and the engine coasted the body PAST the mark, then the
+            // rest-entry park snapped it back (THE on-stop rubberband). The TRUE
+            // translation velocity vlen (from the snapshot stream) collapses the
+            // instant real motion ceases, so gating the settle on IT holds the
+            // body exactly when the source halts. Constant-speed glide-in for any
+            // residual gap (a fixed small step per frame - no big first-frame jump
+            // off a lag = no snap); a genuine warp was already caught by the
+            // velocity-aware snap gate above. parked=true lets applyRest continue
+            // the identical settle once the classifier finally drops to rest.
+            if (!d.parked) { engine::endAction(c); d.parked = true; }
+            if (haveActual && haveNewest) {
+                EntityState k = newest;
+                if (gapNewest > MAX_CATCHUP_STEP) {
+                    float f = MAX_CATCHUP_STEP / gapNewest;
+                    k.x = ax + (newest.x - ax) * f;
+                    k.y = ay + (newest.y - ay) * f;
+                    k.z = az + (newest.z - az) * f;
+                } // else already within one step: settle exactly onto the mark
+                engine::applyRaw(c, k);
+            }
+            d.haveDest = false;
         } else if (genuinelyMoving) {
+            // Deceleration taper (walk-drive overshoot fix, same source commit):
+            // shrink the lead projection, the gap catch-up boost, and the speed
+            // cap in lockstep with the source's TRUE translation velocity (vlen),
+            // so a decelerating body converges to the source's velocity at the
+            // stop instead of running past it and snapping back. speedFrac ~1 at
+            // cruise, ->0 as the source halts.
+            float speedFrac = stopFixMode ? driveSpeedTaper(vlen, CATCHUP_REF_SPEED)
+                                          : 1.0f; // A/B off = no taper (original)
             float tx = newest.x, ty = newest.y, tz = newest.z;
             // Lead only while the instantaneous velocity is meaningful: the
             // debounced classifier keeps the walk verdict through mid-walk
@@ -1378,15 +1433,15 @@ void Replicator::applyTargets(GameWorld* gw) {
                 float segSec  = (float)segMs / 1000.0f * 1.5f;
                 if (segSec > leadSec) leadSec = segSec;
                 if (leadSec > 3.0f)   leadSec = 3.0f;
-                float lead = vlen * leadSec;
+                float lead = vlen * leadSec * speedFrac;
                 tx += vx / vlen * lead; ty += vy / vlen * lead; tz += vz / vlen * lead;
             }
             float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
                                      : (REISSUE_DIST + 1.0f);
             if (moved > REISSUE_DIST) {
-                float spd = out.cSpeed + gapNewest * catchupK_;
+                float spd = out.cSpeed + gapNewest * catchupK_ * speedFrac;
                 float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
-                float cap = base * 2.5f;
+                float cap = base * (1.0f + 1.5f * speedFrac); // 2.5x cruise -> 1x stop
                 if (spd > cap) spd = cap;
                 engine::walkTo(c, tx, ty, tz, spd);
                 if (isSquad) ++walkReissueSquad_;
@@ -1418,6 +1473,29 @@ void Replicator::applyTargets(GameWorld* gw) {
             // same chair instead of standing on it.
             applyRest(c, d, out, haveActual, ax, ay, az, now, isSquad);
             d.haveDest = false;
+        }
+
+        // Per-frame stop-probe trace (KENSHICOOP_DEBUG_STOP_PROBE=1): the driven
+        // squad leader's rendered ACTUAL pos vs the streamed authoritative NEWEST.
+        // At a host stop, newest freezes; a pre-fix body overshoots (actual runs
+        // PAST newest, gap re-grows) then snaps back, a fixed body converges. gapAN
+        // is |actual-newest|; over is the signed progress of actual PAST newest
+        // along the source travel direction (positive = overshoot beyond the mark).
+        if (stopProbeTrace && isSquad && haveActual && haveNewest) {
+            float over = 0.0f;
+            float vl = std::sqrt(vx * vx + vy * vy + vz * vz);
+            if (vl > 0.01f) {
+                // component of (actual-newest) along the travel unit vector: >0
+                // means the body is ahead of the authoritative mark (overshoot).
+                over = ((ax - newest.x) * vx + (ay - newest.y) * vy +
+                        (az - newest.z) * vz) / vl;
+            }
+            char pb[220]; _snprintf(pb, sizeof(pb) - 1,
+                "[stopprobe] fix=%d moving=%d gapAN=%.2f over=%.2f vlen=%.2f "
+                "cSpeed=%.2f parked=%d actual=%.1f,%.1f newest=%.1f,%.1f",
+                stopFixMode, genuinelyMoving ? 1 : 0, gapNewest, over, vlen,
+                out.cSpeed, d.parked ? 1 : 0, ax, az, newest.x, newest.z);
+            pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
         }
 
         // ---- Oracles (measured from the body's ACTUAL rendered motion) --------
