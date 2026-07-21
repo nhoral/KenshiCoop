@@ -316,6 +316,81 @@ void testSaveXfer() {
         rmTree(cr); rmTree(old);
     }
 
+    // --- F. crash recovery: a stranded PARTIAL staging (__incoming) is discarded
+    // Reproduces a transfer killed mid-receive (kill -9 / crash / forced game
+    // close): the join has staged SOME but not ALL files into __incoming and the
+    // commit was never attempted. On the next recovery the partial staging must be
+    // discarded cleanly, and the join's real save must be left byte-intact - the
+    // partial scratch is NEVER the real save and must never touch it.
+    {
+        std::string cr  = savexfer::saveFolderFor("coopresume");
+        std::string inc = savexfer::saveFolderFor("coopresume__incoming");
+        std::string old = savexfer::saveFolderFor("coopresume__old");
+        rmTree(cr); rmTree(inc); rmTree(old);
+        // Real save present; partial staging with only 1 of an expected 2 files.
+        writeFile(cr  + "\\quick.save", "JOIN-REAL-SAVE");
+        writeFile(inc + "\\quick.save", "HALF-RECEIVED"); // platoon\a.platoon never arrived
+        savexfer::recoverStrandedSave("coopresume");
+        SXCHECK("recover-partial: stranded __incoming discarded",
+                !dirExists(inc));
+        SXCHECK("recover-partial: join's real save byte-intact",
+                readFile(cr + "\\quick.save") == "JOIN-REAL-SAVE");
+        SXCHECK("recover-partial: no __old orphan invented",
+                !dirExists(old));
+        rmTree(cr); rmTree(inc); rmTree(old);
+    }
+
+    // --- F2. mid-commit-swap kill: __old (real save moved out) AND a leftover
+    // __incoming both present, save/<name>/ absent. Recovery must restore the real
+    // save from __old AND discard the orphaned staging in one pass.
+    {
+        std::string cr  = savexfer::saveFolderFor("coopresume");
+        std::string inc = savexfer::saveFolderFor("coopresume__incoming");
+        std::string old = savexfer::saveFolderFor("coopresume__old");
+        rmTree(cr); rmTree(inc); rmTree(old);
+        writeFile(old + "\\quick.save", "STRANDED-REAL-SAVE");     // real save, moved out
+        writeFile(inc + "\\quick.save", "UNCOMMITTED-STAGING");    // staging, never swapped in
+        savexfer::recoverStrandedSave("coopresume");
+        SXCHECK("recover-swap: real save restored from __old",
+                readFile(cr + "\\quick.save") == "STRANDED-REAL-SAVE");
+        SXCHECK("recover-swap: __old cleaned after restore",
+                !dirExists(old));
+        SXCHECK("recover-swap: leftover __incoming discarded",
+                !dirExists(inc));
+        rmTree(cr); rmTree(inc); rmTree(old);
+    }
+
+    // --- F3. integration: a leftover partial staging must never leak into the
+    // next committed save. Pre-seed __incoming with a stale file that is NOT part
+    // of the new transfer; a following valid transfer of the same name must commit
+    // ONLY the new file set (stale scratch discarded, real save replaced atomically).
+    {
+        std::string cr  = savexfer::saveFolderFor("coopresume");
+        std::string inc = savexfer::saveFolderFor("coopresume__incoming");
+        std::string old = savexfer::saveFolderFor("coopresume__old");
+        rmTree(cr); rmTree(inc); rmTree(old);
+        writeFile(cr  + "\\quick.save", "JOIN-REAL-SAVE");
+        writeFile(inc + "\\stale.dat",  "GARBAGE-FROM-PRIOR-KILL"); // not in the new set
+        writeFile(inc + "\\quick.save", "HALF-RECEIVED");
+        std::vector<File> f;
+        f.push_back(File("quick.save", "NEW-HOST-SAVE"));
+        f.push_back(File("platoon\\a.platoon", "PLATOON-A"));
+        int rc = deliver("coopresume", f, /*badCrc*/false, /*zeroFiles*/false);
+        SXCHECK("leftover-partial: valid transfer still commits", rc == 1);
+        SXCHECK("leftover-partial: committed save has the new content",
+                readFile(cr + "\\quick.save") == "NEW-HOST-SAVE");
+        SXCHECK("leftover-partial: nested new file committed",
+                readFile(cr + "\\platoon\\a.platoon") == "PLATOON-A");
+        SXCHECK("leftover-partial: stale scratch file did NOT leak into the commit",
+                !dirExists(cr + "\\stale.dat") &&
+                readFile(cr + "\\stale.dat").empty());
+        SXCHECK("leftover-partial: staging cleaned up",
+                !dirExists(inc));
+        SXCHECK("leftover-partial: no __old orphan after commit",
+                !dirExists(old));
+        rmTree(cr); rmTree(inc); rmTree(old);
+    }
+
     // Clean the throwaway tree.
     rmTree(root);
     (void)saveRoot;

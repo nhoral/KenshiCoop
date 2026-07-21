@@ -282,6 +282,26 @@ void recoverStrandedSave(const std::string& name) {
         // it (leaving it would poison the NEXT commit's move-out).
         removeTree(oldDir, 0);
     }
+
+    // Discard any stranded staging (<name>__incoming). It is scratch from a
+    // transfer that was killed mid-RECEIVE (some but not all files staged, commit
+    // never attempted) or mid-COMMIT (verified staging not yet swapped in) - the
+    // __old logic above already put the real save back, so anything left in
+    // __incoming is disposable. Staging is NEVER the real save, so discarding it
+    // unconditionally can never lose data; leaving it would let a partial folder
+    // linger as a junk save slot and, if a re-stage ever failed to wipe it,
+    // pollute the next transfer's CRC verify. A live transfer only (re)creates
+    // this folder AFTER recovery runs (onSaveBegin calls us first), so no
+    // in-flight staging is ever collateral here.
+    std::string incomingDir = finalDir + "__incoming";
+    if (GetFileAttributesA(incomingDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        removeTree(incomingDir, 0);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[save] RECOVER discarded stranded staging '%s__incoming'",
+                  name.c_str());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
 }
 
 bool folderInventory(const std::string& folder, unsigned int* outFiles,

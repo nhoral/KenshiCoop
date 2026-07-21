@@ -48,9 +48,13 @@ bool saveNameSafe(const std::string& name);
 // the process died - or a move faulted - inside that window, the real save is
 // stranded in save/<name>__old/ with NO save/<name>/ (the "join lost its save"
 // symptom). recoverStrandedSave restores it (or reclaims a redundant __old when
-// save/<name>/ already exists). Idempotent + no-op for an unsafe name. Called
-// defensively at the top of onSaveBegin so the next transfer of the same save
-// heals a prior crashed commit before it re-stages.
+// save/<name>/ already exists). It ALSO discards any stranded
+// save/<name>__incoming/ staging - scratch left by a transfer killed mid-receive
+// (partial files, no commit attempted) or mid-commit (staging not yet swapped
+// in); staging is never the real save, so this can only remove disposable
+// scratch. Idempotent + no-op for an unsafe name. Called defensively at the top
+// of onSaveBegin so the next transfer of the same save heals a prior crash
+// before it re-stages.
 void recoverStrandedSave(const std::string& name);
 
 // Recursive inventory of 'folder': file count, total bytes, and the newest
