@@ -1403,6 +1403,40 @@ static void testMoneyReconcile() {
     CHECK_EQ("B converges to 650", bFinal, 650);
     CHECK("A/B baselines agree",   a.known == b.known);
     CHECK("baselines are 650",     a.known == 650);
+
+    // THE CLAMP FIX (2026-07-21): a remote delta that would drive the wallet
+    // negative is clamped to 0, and the baseline MUST follow the clamped value
+    // (0), NOT the theoretical delta. Otherwise 'known' goes negative, diverges
+    // from the real wallet, and the NEXT moneyLocalDelta reads cur(0)-known(<0)
+    // as a positive spurious delta - money printed from nothing, permanent desync.
+    //
+    // Repro: shared pool at 1000. This client (join) spends 800 locally (wallet
+    // 1000->200, baseline follows to 200 after publishing -800). Meanwhile the
+    // host spent 1000; that -1000 delta arrives here: 200 + (-1000) = -800 ->
+    // clamp to 0. Pre-fix, known landed at -800 (200 + (-1000)); post-fix it must
+    // land at 0 (the value actually written to the wallet).
+    {
+        MoneyState j; int jd = 0;
+        moneyLocalDelta(j, 1000, &jd);                 // seed at the shared 1000
+        CHECK("clamp: local spend of 800 detected", moneyLocalDelta(j, 200, &jd));
+        CHECK_EQ("clamp: local spend delta = -800", (long long)jd + 1000, 200); // jd == -800
+        CHECK("clamp: baseline followed local spend", j.known == 200);
+
+        // Host's -1000 arrives; 200 + (-1000) = -800 -> clamp to 0.
+        int applied = moneyApplyDelta(j, 200, -1000);
+        CHECK_EQ("clamp: wallet clamped to 0", applied, 0);
+        // THE ASSERTION THAT FAILS PRE-FIX: known must equal the real wallet (0),
+        // not the un-clamped theoretical baseline (-800).
+        CHECK("clamp: baseline follows clamped wallet (0), not theoretical (-800)",
+              j.known == 0);
+
+        // The decisive property: a subsequent publish must NOT fabricate a delta.
+        // Pre-fix, moneyLocalDelta(cur=0, known=-800) returned true with a +800
+        // spurious delta (money from nothing). Post-fix, cur==known==0 -> silent.
+        int spurious = 0;
+        CHECK("clamp: next publish emits NO phantom delta",
+              !moneyLocalDelta(j, 0, &spurious));
+    }
 }
 
 int main() {

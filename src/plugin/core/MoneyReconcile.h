@@ -46,14 +46,22 @@ inline bool moneyLocalDelta(MoneyState& s, int cur, int* outDelta) {
     return true;
 }
 
-// Aplica un delta REMOTO sobre la cartera local: avanza la base por el delta
-// (para que el proximo moneyLocalDelta no lo confunda con un cambio local) y
-// devuelve el nuevo valor que hay que escribir en la cartera. Un cambio local
-// aun sin publicar sobrevive: queda como (cur - known) tras esta llamada y se
+// Aplica un delta REMOTO sobre la cartera local: avanza la base y devuelve el
+// nuevo valor que hay que escribir en la cartera. La cartera de Kenshi nunca es
+// negativa, asi que el resultado se clampa a >=0 AQUI (unico sitio con el clamp)
+// y la base avanza por el delta REALMENTE aplicado (want - cur), NO por el delta
+// teorico. Si avanzasemos la base por el delta completo mientras la cartera se
+// clampa a 0, 'known' quedaria negativo y divergido de la cartera real (0): el
+// siguiente moneyLocalDelta veria cur(0) - known(<0) = delta positivo espurio y
+// publicaria dinero de la nada al peer (desync permanente). En el caso no-clamp
+// (want>=0) want-cur == delta, identico al comportamiento anterior, por lo que
+// un cambio local aun sin publicar sigue sobreviviendo como (cur - known) y se
 // publica en el siguiente moneyLocalDelta.
 inline int moneyApplyDelta(MoneyState& s, int cur, int delta) {
-    s.known += delta;   // la base sigue al valor compartido
-    return cur + delta; // nuevo valor de la cartera local
+    int want = cur + delta;      // valor teorico tras el delta remoto
+    if (want < 0) want = 0;      // la cartera compartida nunca baja de 0
+    s.known += (want - cur);     // la base sigue al valor REALMENTE escrito
+    return want;                 // nuevo valor de la cartera local (ya clampado)
 }
 
 } // namespace coop

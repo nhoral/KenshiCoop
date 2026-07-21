@@ -515,8 +515,9 @@ void Replicator::applyMoney(const SyncContext& ctx) {
         if (delta == 0) continue;
         int cur = -1;
         if (!engine::readPlayerWallet(gw, &cur) || cur < 0) continue;
+        // moneyApplyDelta clamps the wallet to >=0 AND keeps the baseline in
+        // sync with the clamped value (no spurious phantom delta next publish).
         int want = coop::moneyApplyDelta(factionMoney_, cur, delta);
-        if (want < 0) want = 0; // never drive the engine wallet negative
         bool ok = engine::writePlayerWallet(gw, want);
         char b[112];
         _snprintf(b, sizeof(b) - 1, "[money] RECV delta=%d was=%d now=%d ok=%d",
