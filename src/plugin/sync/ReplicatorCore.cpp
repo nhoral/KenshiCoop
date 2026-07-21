@@ -189,6 +189,7 @@ void Replicator::resetSession() {
     peerCamMs_ = 0;
     furnPeerPend_.clear();
     ownFurnExit_.clear();
+    ownCarriedNoSee_.clear(); // 16b owner-side carry heal: old world's anchors
     // Session maps + change-gate baselines (they describe the OLD world; the
     // reloaded save re-seeds them on first sample).
     ownBuilds_.clear();

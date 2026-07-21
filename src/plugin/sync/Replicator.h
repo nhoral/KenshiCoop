@@ -799,6 +799,11 @@ private:
     void logDriveTelemetry(unsigned long now);
     //   * age out long-stale targets_ entries (reliable-event latches preserved).
     void ageOutStaleTargets(unsigned long now);
+    //   * owner-side carried self-heal (SYNC_GAPS 16b): unlike the phases above
+    //     this one also reads LOCAL carry state, so it takes gw + the captured
+    //     squad rather than only Replicator members + the tick clock.
+    void healOwnCarried(GameWorld* gw, const EntityState* oracleSquad,
+                        unsigned int oracleSquadN, unsigned long now);
 
     std::map<Key, Driven> targets_;
     // Host side: last bodyState we published per owned entity (+ when it was last
@@ -955,6 +960,12 @@ private:
     // (5 s re-author window) PEER-ENTER must not re-jail a body its owner
     // just freed - the exit-vs-reauthor race guard.
     std::map<Key, unsigned long> ownFurnExit_;
+    // Owner-side carried self-heal (SYNC_GAPS 16b): per-own-hand debounce
+    // anchor - first tick an OWNED body's local isBeingCarried had NO live
+    // streamed TASK_CARRY_BODY claim backing it (0 = disarmed). Stepped by
+    // coop::carriedHealStep in applyTargets; entries erased once the body is
+    // no longer carried, so the map stays squad-sized.
+    std::map<Key, unsigned long> ownCarriedNoSee_;
     InterpConfig          cfg_;
     float                 catchupK_;  // walk-drive gap-proportional speed gain
     float                 snapDist_;  // moving-body hard-snap distance floor (u)

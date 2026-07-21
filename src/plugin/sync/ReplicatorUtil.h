@@ -33,6 +33,7 @@
 #include "../core/DeathLatch.h" // rekeyCarryLatch (down/death latch carry on re-key)
 #include "ChangeGate.h" // Phase 6: shared change-gated send/accept policy
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
+#include "../core/CarriedHeal.h" // carriedHealStep (owner-side carried self-heal, 16b)
 #include "../CoopLog.h"
 
 #include <windows.h> // GetTickCount
@@ -163,6 +164,11 @@ const unsigned long ATTR_WINDOW_MS = 3000; // remember a combatant's victim this
 const unsigned long CARRY_HEAL_MS = 1500; // min gap between self-heal pickups
 const unsigned long CARRY_DROP_MS = 3000; // stream must stop reporting the carry
                                           // this long before the local copy drops
+const unsigned long CARRY_CLAIM_STALE_MS = 30000; // owner-side heal (16b): a streamed
+                                          // row older than this no longer counts as
+                                          // claiming its carry subject (matches the
+                                          // targets_ prune horizon - a WAN stall must
+                                          // never read as a host-side drop)
 // Furniture occupancy sync (protocol 19): same shape as the carry self-heal.
 const unsigned long FURN_HEAL_MS = 1500;  // min gap between self-heal enters
 const unsigned long FURN_EXIT_MS = 3000;  // stream must stop reporting occupancy

@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/core/CarriedHeal.h"  // owner-side carried self-heal (16b)
 
 #include <set>
 
@@ -1355,6 +1356,70 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 12. Owner-side carried self-heal debounce (CarriedHeal.h) ------------------
+// Guards the SYNC_GAPS 16b fix: the owner of a carried body reconciles its LOCAL
+// isBeingCarried against the carrier's streamed TASK_CARRY_BODY claim. The step
+// must (a) stay quiet while a live stream claims the carry, (b) arm-then-fire only
+// after a full debounce window with NO claim (a one-batch stream blip must never
+// rip a genuine carry apart - the carryNoSeeTick lesson), and (c) re-arm after
+// firing so a release that failed to take retries a full window later.
+
+static void testCarriedHeal() {
+    std::printf("== owner-side carried heal debounce (CarriedHeal.h) ==\n");
+    const unsigned long DROP = 3000;
+    unsigned long tick = 0;
+
+    // Not carried: nothing to do, anchor stays disarmed.
+    tick = 0;
+    CHECK("not carried -> NONE",
+          carriedHealStep(false, false, 1000, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("not carried -> anchor disarmed", tick == 0);
+
+    // Carried + claimed by a live stream: believed, anchor stays disarmed.
+    tick = 0;
+    CHECK("carried+claimed -> NONE",
+          carriedHealStep(true, true, 1000, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("carried+claimed -> anchor disarmed", tick == 0);
+
+    // First unclaimed tick arms the window but must NOT act yet.
+    tick = 0;
+    CHECK("first unclaimed -> ARM",
+          carriedHealStep(true, false, 1000, DROP, &tick) == CARRIED_HEAL_ARM);
+    CHECK("ARM stamps the anchor", tick == 1000);
+
+    // Inside the window: still quiet (a stream blip shorter than the window).
+    CHECK("inside window -> NONE",
+          carriedHealStep(true, false, 1000 + DROP, DROP, &tick) == CARRIED_HEAL_NONE);
+    CHECK("window boundary is exclusive (== dropMs does not fire)", tick == 1000);
+
+    // A claim arriving mid-window disarms it - no release ever happens.
+    CHECK("claim mid-window -> NONE + disarm",
+          carriedHealStep(true, true, 2500, DROP, &tick) == CARRIED_HEAL_NONE &&
+          tick == 0);
+
+    // Full window with no claim: fire, and re-arm (anchor back to 0).
+    tick = 0;
+    carriedHealStep(true, false, 1000, DROP, &tick);           // arm at t=1000
+    CHECK("window elapsed -> FIRE",
+          carriedHealStep(true, false, 1000 + DROP + 1, DROP, &tick) ==
+          CARRIED_HEAL_FIRE);
+    CHECK("FIRE re-arms (anchor cleared)", tick == 0);
+
+    // Still stuck after a failed release: the NEXT pass arms again, then fires
+    // again a full window later (throttled retry, never a per-tick drop spam).
+    CHECK("post-FIRE re-arms on next pass",
+          carriedHealStep(true, false, 5000, DROP, &tick) == CARRIED_HEAL_ARM);
+    CHECK("post-FIRE retry fires a full window later",
+          carriedHealStep(true, false, 5000 + DROP + 1, DROP, &tick) ==
+          CARRIED_HEAL_FIRE);
+
+    // Body put down locally (drop finally applied): disarmed, back to quiet.
+    carriedHealStep(true, false, 12000, DROP, &tick);          // re-armed
+    CHECK("local drop applied -> NONE + disarm",
+          carriedHealStep(false, false, 12500, DROP, &tick) == CARRIED_HEAL_NONE &&
+          tick == 0);
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1377,6 +1442,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testCarriedHeal();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;
