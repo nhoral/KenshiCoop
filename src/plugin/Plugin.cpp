@@ -739,10 +739,31 @@ void coopPanelDrive(GameWorld* gw) {
         detail = "Offline - press F2, then set Connection to ONLINE";
         ostate = 0;
     }
-    ps.detail = detail.c_str();
     // Still pump Steam callbacks so an inbound "Join Game" (a friend inviting
-    // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
+    // US) can fire coopUiConnect; the outbound invite/picker UI is gone. Pumped
+    // BEFORE reading steaminvite::status() so the status we surface is fresh.
     coop::steaminvite::tick();
+
+    // Surface the REAL connection error/status the lower layers already produce
+    // instead of only the generic Offline/Connecting/Connected text. Priority:
+    //   1. netUiError()  - a hard NET-thread reject (protocol/version mismatch);
+    //                      this is the failure that used to vanish into the log
+    //                      and leave the JOIN stuck on "Connecting..." -> "Offline".
+    //   2. steaminvite::status() - the Steam invite/lobby flow's own messages
+    //                      ("Version mismatch with host...", "Lobby creation
+    //                      failed...", "Connecting to host...") - already written,
+    //                      previously never consumed (orphaned getter).
+    //   3. the generic detail computed above.
+    // ostate (overlay colour) is left as-is: a hard reject drops the connection,
+    // so isRunning() goes false and the text shows in the Offline colour naturally.
+    const char* netErrMsg = coop::netUiError();          // "" unless a reject fired
+    const char* steamMsg  = coop::steaminvite::status(); // "" when idle
+    if (netErrMsg && netErrMsg[0]) {
+        detail = netErrMsg;
+    } else if (steamMsg && steamMsg[0]) {
+        detail = steamMsg;
+    }
+    ps.detail = detail.c_str();
 
     coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
     coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());

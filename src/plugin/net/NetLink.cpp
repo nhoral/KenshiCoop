@@ -27,6 +27,14 @@ const enet_uint8 CH_UNRELIABLE = 1;  // entity batches / stealth / cam (newest s
 const enet_uint8 CH_BULK       = 2;  // coordinated save/load transfer (bulk reliable)
 const int        CH_COUNT      = 3;  // channels negotiated at host-create / connect
 
+// Disconnect reason codes carried in enet_peer_disconnect(peer, data) - ENet
+// delivers 'data' to the peer as event.data on its DISCONNECT event. This is how
+// the HOST tells a REJECTED joiner WHY (the host detects a version mismatch at
+// HELLO, before any WELCOME, so the join otherwise just sees a bare disconnect
+// and no on-screen reason). 0 = normal/graceful (ENet's default); nonzero = a
+// specific reason the peer can map to a user-facing message.
+const enet_uint32 DISCONNECT_VERSION_MISMATCH = 1;
+
 // Net-thread diagnostics. OutputDebugStringA is thread-safe, and CoopLog guards
 // its FILE* with a lock, so both are safe to call off the main thread.
 void netLog(const char* msg) {
@@ -47,6 +55,20 @@ void netErr(const char* msg) {
     buf[sizeof(buf) - 1] = '\0';
     coop::logErrLine(buf);
 }
+
+// Cross-thread UI-error channel backing store (see NetLink.h). The buffer holds
+// the latest player-facing connection-reject reason; the NET thread writes it and
+// the MAIN thread reads it. Wrapped in a global object whose constructor runs at
+// DLL load under the loader lock (single-threaded, before any net thread exists),
+// so the CRITICAL_SECTION is always initialized before first use - no lazy-init
+// race (VC10 has no thread-safe function-local statics).
+struct NetUiErrChannel {
+    CRITICAL_SECTION cs;
+    char             buf[256];
+    NetUiErrChannel() { InitializeCriticalSection(&cs); buf[0] = '\0'; }
+    ~NetUiErrChannel() { DeleteCriticalSection(&cs); }
+};
+NetUiErrChannel g_netUiErr; // constructed at DLL load, destroyed at unload
 
 // Monotonic ms clock for the batch send stamp (v35). QPC, not GetTickCount:
 // the receiver reconstructs snapshot SPACING from consecutive stamps, and
@@ -77,6 +99,31 @@ void pushLocked(CRITICAL_SECTION& cs, std::vector<T>& q, const T& v) {
 }
 } // namespace
 
+// Cross-thread UI-error channel (declared in NetLink.h). setNetUiError() is
+// called on the NET thread; netUiError()/clearNetUiError() on the MAIN thread.
+// All three take the same lock, so the buffer is never read mid-write.
+void setNetUiError(const char* msg) {
+    EnterCriticalSection(&g_netUiErr.cs);
+    _snprintf(g_netUiErr.buf, sizeof(g_netUiErr.buf) - 1, "%s", msg ? msg : "");
+    g_netUiErr.buf[sizeof(g_netUiErr.buf) - 1] = '\0';
+    LeaveCriticalSection(&g_netUiErr.cs);
+}
+const char* netUiError() {
+    // The caller (F2 panel) is MAIN-thread only, so copy the shared buffer into a
+    // MAIN-thread-private static under the lock and hand back a stable pointer -
+    // the returned string can't be torn by a concurrent NET-thread write.
+    static char mainCopy[256];
+    EnterCriticalSection(&g_netUiErr.cs);
+    memcpy(mainCopy, g_netUiErr.buf, sizeof(mainCopy));
+    LeaveCriticalSection(&g_netUiErr.cs);
+    return mainCopy;
+}
+void clearNetUiError() {
+    EnterCriticalSection(&g_netUiErr.cs);
+    g_netUiErr.buf[0] = '\0';
+    LeaveCriticalSection(&g_netUiErr.cs);
+}
+
 NetLink::NetLink()
     : isHost_(false), port_(0),
       enetHost_(0), serverPeer_(0), inbound_(0),
@@ -94,11 +141,13 @@ NetLink::~NetLink() {
 }
 
 bool NetLink::startHost(int port, Inbound* inbound) {
+    clearNetUiError(); // wipe any reject reason from a previous attempt
     isHost_ = true; port_ = port; inbound_ = inbound; myId_ = 0;
     return launchThread();
 }
 
 bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound) {
+    clearNetUiError(); // wipe any reject reason from a previous attempt
     isHost_ = false; ip_ = ip; port_ = port; inbound_ = inbound; myId_ = 0;
     return launchThread();
 }
@@ -452,7 +501,15 @@ void NetLink::threadLoop() {
                                           (unsigned)h.version, (unsigned)PROTOCOL_VERSION);
                                 b[sizeof(b) - 1] = '\0';
                                 netErr(b);
-                                enet_peer_disconnect(ev.peer, 0);
+                                // Surface the reject on the host's F2 panel too, not
+                                // just the log: the joiner was turned away for a
+                                // version mismatch and the host should see why.
+                                setNetUiError("Rejected a joiner: version mismatch - "
+                                              "update both to the same KenshiCoop build");
+                                // Carry the reason to the join in the disconnect data,
+                                // so the rejected player sees WHY on their own screen
+                                // (they never get a WELCOME to check the version).
+                                enet_peer_disconnect(ev.peer, DISCONNECT_VERSION_MISMATCH);
                             } else {
                                 u32 id = nextId++;
                                 // TWO-PLAYER ASSUMPTION (step-6 guard): the sync model
@@ -464,6 +521,10 @@ void NetLink::threadLoop() {
                                 if (id >= 2) {
                                     netErr("3+ players unsupported: join-authored state is "
                                            "not relayed peer-to-peer; expect desync");
+                                    // A clear, user-visible warning on the host's panel
+                                    // (this is a soft guard - the peer is still admitted).
+                                    setNetUiError("3+ players not supported - "
+                                                  "expect desync");
                                 }
                                 ev.peer->data = (void*)(size_t)id;
                                 WelcomePacket w;
@@ -490,6 +551,11 @@ void NetLink::threadLoop() {
                                           (unsigned)w.version, (unsigned)PROTOCOL_VERSION);
                                 b[sizeof(b) - 1] = '\0';
                                 netErr(b);
+                                // THE key UX fix: the JOIN used to sit on "Connecting..."
+                                // and silently drop to "Offline" here. Publish the real
+                                // reason so the F2 panel/overlay shows it on screen.
+                                setNetUiError("Version mismatch with host - "
+                                              "update both to the same KenshiCoop build");
                             } else {
                                 InterlockedExchange(&myId_, (LONG)w.playerId);
                                 char b[96];
@@ -893,6 +959,14 @@ void NetLink::threadLoop() {
                     } else {
                         serverPeer_ = 0;
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
+                        // The host may have carried a reject reason in the disconnect
+                        // data (version mismatch): surface it so the JOIN shows WHY on
+                        // screen instead of silently dropping to "Offline".
+                        if (ev.data == DISCONNECT_VERSION_MISMATCH) {
+                            netErr("host rejected us: protocol/version mismatch");
+                            setNetUiError("Version mismatch with host - "
+                                          "update both to the same KenshiCoop build");
+                        }
                         netLog("disconnected from host");
                     }
                     break;
