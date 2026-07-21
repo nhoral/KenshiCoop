@@ -654,6 +654,19 @@ void Replicator::publishDoors(const SyncContext& ctx) {
         // Protocol 28 partition: doors on SESSION-PLACED buildings (ours or
         // minted proxies) ride PKT_BUILD_DOOR on the translated identity -
         // their runtime hands would never resolve on the peer anyway.
+        // Channel-order caveat: this filter reads mintByLocal_, which
+        // applyBuilds populates (idx 2 in kCh[]) AFTER publishDoors runs
+        // (idx 1). The window is benign in practice: applyBuilds sets
+        // mintByLocal_ in the SAME statement that mints the proxy, so the
+        // building's doors can only be enumerated here on a LATER tick, by
+        // which point the key is already present; and a door's first sighting
+        // seeds its row silently (no packet) below. Worst case a proxy door
+        // whose state changed in the exact seed tick emits ONE PKT_DOOR with a
+        // runtime hand the peer drops clean, self-correcting next sample - no
+        // data loss. NOT worth reordering kCh[] to close: that table's order is
+        // the fixed wire cadence (see driveSampledChannels), and moving builds
+        // ahead of doors would perturb every channel's publish sequence for a
+        // cosmetic, self-healing transient.
         if (r.doorIndex >= 0) {
             Key pk; pk.t = r.parentHand[0]; pk.c = r.parentHand[1];
             pk.cs = r.parentHand[2]; pk.i = r.parentHand[3]; pk.s = r.parentHand[4];

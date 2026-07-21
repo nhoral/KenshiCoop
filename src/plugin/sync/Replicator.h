@@ -1414,10 +1414,23 @@ private:
     unsigned long prodSampleMs_;
     bool          prodSync_;
     // Protocol 38 known-research rows, keyed by the RESEARCH stringID (the
-    // cross-client-stable wire identity, spike 401). HOST: sent/lastSendMs =
-    // first-sight send + safety resend. JOIN: seqSeen = stale-row guard,
-    // applied = the local startResearch landed (isKnown flipped) so resends
-    // stop re-applying.
+    // cross-client-stable wire identity, spike 401). Research now runs as a
+    // grow-only CRDT union (kCh[] hostAuth=false): BOTH sides publish their
+    // known set AND apply what they receive, so a JOIN-side unlock reaches the
+    // host too (this is the fix/crafting-research-join-authority change; the
+    // old model was one-directional host->join). Per row: sent/lastSendMs =
+    // first-sight send + safety resend (our PUBLISH half); seqSeen =
+    // stale/dup-row guard, applied = the local startResearch landed (isKnown
+    // flipped) so resends stop re-applying (our APPLY half). Convergence is by
+    // idempotence - knowing a sid can never be "un-known", so there is no
+    // arbitration and message order does not matter.
+    // FUTURE (4-player): the SCALAR seqSeen guard is safe TODAY because a row's
+    // content is independent of the emitter (any sender asserting sid X means
+    // the exact same thing). With 3+ distinct emitters interleaving their own
+    // seq counters on one sid, this single per-row counter must be re-audited:
+    // a high seq from one peer can shadow a still-unapplied resend from
+    // another - harmless here ONLY because 'applied' latches on the first
+    // successful start, but a per-sender seqSeen would be the clean fix.
     struct ResearchRow {
         unsigned long lastSendMs;
         u32  seqSeen;
