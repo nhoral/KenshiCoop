@@ -25,6 +25,21 @@
 
 namespace coop {
 
+// --- Cross-thread connection-error channel (NET thread -> UI) ----------------
+// The NET thread rejects/aborts a connection for reasons a player must see
+// (protocol/version mismatch above all): before this channel those reasons only
+// reached the file log via netErr(), so a failed JOIN just sat on "Connecting..."
+// and then fell back to "Offline" with no explanation on screen. setNetUiError()
+// publishes a one-line human reason under an internal lock; the MAIN-thread F2
+// panel/overlay reads it each tick via netUiError() and shows it over the generic
+// status. clearNetUiError() is called when a fresh connect attempt starts so a
+// stale reason from a previous try never lingers. The buffer is guarded by a
+// CRITICAL_SECTION constructed at DLL load (before any net thread exists), so
+// every access is race-free.
+void        setNetUiError(const char* msg); // NET thread: publish a reject reason
+const char* netUiError();                   // MAIN thread: "" when none pending
+void        clearNetUiError();              // MAIN thread: wipe on a new attempt
+
 class NetLink {
 public:
     NetLink();

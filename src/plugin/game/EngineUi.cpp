@@ -541,6 +541,14 @@ Character*   g_overlayLeader = 0;
 int          g_overlayState  = -1;
 std::string  g_overlayText;
 
+// Ephemeral toast label state (peer connect/disconnect transitions). A SEPARATE
+// ScreenLabel from the persistent overlay above, driven the same way but at a
+// higher head offset so both can show at once without overlapping.
+ScreenLabel* g_toast         = 0;
+Character*   g_toastLeader   = 0;
+int          g_toastState    = -1;
+std::string  g_toastText;
+
 int overlayColorId(int state) { return state == 2 ? 0 : (state == 1 ? 2 : 1); }
 
 Character* panelLeaderSeh(GameWorld* gw) {
@@ -550,35 +558,56 @@ Character* panelLeaderSeh(GameWorld* gw) {
         return gw->player->playerCharacters[0];
     } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
-} // namespace
 
-void coopOverlayTick(GameWorld* gw, const char* text, int state, bool show) {
-    ForgottenGUI* g = ::gui;
-    if (!g) return;
-
+// Shared driver for one leader-tracked ScreenLabel (the persistent overlay OR the
+// ephemeral toast). The label/leader/state/text statics are passed IN by pointer
+// so the two banners stay fully independent labels sharing this create-once /
+// update-in-place / destroy-on-hide lifecycle (the spike-47/48 render path via the
+// marker* SEH shims). offY is the head-height offset that separates the two.
+void trackedLabelTick(ForgottenGUI* g, GameWorld* gw, const char* text, int state,
+                      bool show, float offY, ScreenLabel** label,
+                      Character** leaderSlot, int* stateSlot, std::string* textSlot) {
     Character* leader = show ? panelLeaderSeh(gw) : 0;
     if (!show || !leader) {
-        if (g_overlay) {
-            markerDestroySeh(g, g_overlay);
-            g_overlay = 0; g_overlayLeader = 0; g_overlayState = -1; g_overlayText.clear();
+        if (*label) {
+            markerDestroySeh(g, *label);
+            *label = 0; *leaderSlot = 0; *stateSlot = -1; textSlot->clear();
         }
         return;
     }
 
     std::string t = text ? std::string(text) : std::string();
-    if (!g_overlay || leader != g_overlayLeader) {
-        if (g_overlay) markerDestroySeh(g, g_overlay);
+    if (!*label || leader != *leaderSlot) {
+        if (*label) markerDestroySeh(g, *label);
         MyGUI::Colour col; markerColour(overlayColorId(state), &col);
-        Ogre::Vector3 off(0.0f, 2.8f, 0.0f);
-        g_overlay = markerCreateSeh(g, leader, &t, &col, &off);
-        g_overlayLeader = leader; g_overlayState = state; g_overlayText = t;
+        Ogre::Vector3 off(0.0f, offY, 0.0f);
+        *label = markerCreateSeh(g, leader, &t, &col, &off);
+        *leaderSlot = leader; *stateSlot = state; *textSlot = t;
         return;
     }
-    if (t != g_overlayText || state != g_overlayState) {
+    if (t != *textSlot || state != *stateSlot) {
         MyGUI::Colour col; markerColour(overlayColorId(state), &col);
-        markerUpdateSeh(g_overlay, &t, &col);
-        g_overlayText = t; g_overlayState = state;
+        markerUpdateSeh(*label, &t, &col);
+        *textSlot = t; *stateSlot = state;
     }
+}
+} // namespace
+
+void coopOverlayTick(GameWorld* gw, const char* text, int state, bool show) {
+    ForgottenGUI* g = ::gui;
+    if (!g) return;
+    // Persistent status banner: pinned at head height 2.8 (spike-47 render offset).
+    trackedLabelTick(g, gw, text, state, show, 2.8f,
+                     &g_overlay, &g_overlayLeader, &g_overlayState, &g_overlayText);
+}
+
+void coopToastTick(GameWorld* gw, const char* text, int state, bool show) {
+    ForgottenGUI* g = ::gui;
+    if (!g) return;
+    // Ephemeral transition toast: sits at 3.4, just ABOVE the persistent overlay,
+    // so a "Peer connected/disconnected" pop never overlaps the status banner.
+    trackedLabelTick(g, gw, text, state, show, 3.4f,
+                     &g_toast, &g_toastLeader, &g_toastState, &g_toastText);
 }
 
 } // namespace engine
