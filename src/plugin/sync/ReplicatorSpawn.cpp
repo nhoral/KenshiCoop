@@ -897,7 +897,18 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // into our squad), insertPeerMember pins the actual local hand OWNED so
         // publishOwned streams it and the local player controls it. Idempotent +
         // tab-aware, so a squad-move re-containers an existing member too.
-        insertPeerMember(gw, c, newK, tag, destOwned);
+        // Don't re-join a dead body to the player squad: joinPlayerSquadAt
+        // triggers the squad-portrait refresh, and a portrait for a dead/re-keyed
+        // hand derefs a null PortraitData (MainBarGUI crash on death). The corpse
+        // stays down via the death latch on targets_[newK]. KO'd members still insert.
+        if (carryDeath) {
+            char sk[176]; _snprintf(sk, sizeof(sk) - 1,
+                "[%s] MEMBER skip new=%u,%u,%u,%u,%u (death-latched corpse)",
+                (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
+            sk[sizeof(sk) - 1] = '\0'; coop::logLine(sk);
+        } else {
+            insertPeerMember(gw, c, newK, tag, destOwned);
+        }
         if (destOwned) {
             // Control hand-off: drop every residual DRIVE artifact so publishOwned
             // streams the body immediately and applyTargets never fights our own
