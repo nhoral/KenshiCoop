@@ -35,6 +35,7 @@
 #include "net/SteamInvite.h"
 #include "game/Engine.h"
 #include "game/EngineUi.h"       // Phase 5a: F2 co-op panel + status overlay
+#include "game/ToastTimer.h"     // ephemeral peer connect/disconnect toast clock
 #include "game/EngineScenario.h" // Phase 5a: auto-bake scene builders
 #include "sync/Replicator.h"
 #include "sync/SaveXfer.h"
@@ -176,6 +177,26 @@ const DWORD     CRAFT_REARM_MS  = 3000; // re-issue the work goal at most this o
 const DWORD  SWAP_MIN_MS        = 400;   // shorter world-swap dips are flicker, not a reload
 const DWORD  LOAD_PUMP_GRACE_MS = 2000;  // deferred-LOADGAME backstop grace window
 
+// Ephemeral peer connect/disconnect toast (EngineUi coopToastTick). Purely a UI
+// blip - NOT session lifecycle state, so it lives as loose statics here rather
+// than in SessionController: it self-expires after TOAST_SHOW_MS and needs no
+// reset on a session boundary. processNetEvents arms it on a real connect/leave
+// edge; coopPanelDrive polls toastVisible() each frame and drives the label.
+bool         g_toastArmed = false; // a transition toast is currently timed
+DWORD        g_toastArmMs = 0;     // GetTickCount at the arming edge
+std::string  g_toastText;          // "Peer connected" / "Peer disconnected"
+int          g_toastState = 0;     // overlay colour state (2 = green, 0 = red)
+
+// Arm the ephemeral toast for a peer transition. connected=true -> green
+// "Peer connected"; false -> red "Peer disconnected". Records the wall clock so
+// coopPanelDrive can time out the banner via coop::engine::toastVisible().
+void armPeerToast(bool connected) {
+    g_toastText  = connected ? "Peer connected" : "Peer disconnected";
+    g_toastState = connected ? 2 : 0;
+    g_toastArmMs = GetTickCount();
+    g_toastArmed = true;
+}
+
 // Original function pointers, filled by KenshiLib::AddHook.
 void (*g_mainLoop_orig)(GameWorld*, float) = 0;
 void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
@@ -278,6 +299,9 @@ void processNetEvents(GameWorld* gw) {
         if (g_cfg.latejoinSync) g_repl.onPeerConnected(g_net, g_net.localId());
         else coopLog("[latejoin] connect edge seen, resync OFF (gate)");
         g_peerPresent = true;
+        // Pop the ephemeral "Peer connected" toast at the exact connect edge
+        // (distinct from the persistent status banner, which only reflects state).
+        armPeerToast(true);
         // Coordinated save (protocol 31): while connected under save-sync,
         // the JOIN never writes a save locally - the host's save is
         // authoritative and a local save press forwards as PKT_SAVE_REQ.
@@ -302,6 +326,9 @@ void processNetEvents(GameWorld* gw) {
         // release any carry or occupancy its driven copies still hold.
         if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw);
         g_peerPresent = false;
+        // Pop the ephemeral "Peer disconnected" toast at the exact leave edge -
+        // the momentary notice the persistent banner (now back to "waiting") lacks.
+        armPeerToast(false);
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
@@ -767,6 +794,14 @@ void coopPanelDrive(GameWorld* gw) {
 
     coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
     coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
+
+    // Ephemeral transition toast: a peer connect/leave edge armed it (armPeerToast);
+    // show it until TOAST_SHOW_MS elapses, then disarm so coopToastTick removes the
+    // label. Independent of the persistent overlay above (its own label + timer).
+    bool toastShow = coop::engine::toastVisible(g_toastArmed, g_toastArmMs,
+                                                GetTickCount(), coop::engine::TOAST_SHOW_MS);
+    if (g_toastArmed && !toastShow) g_toastArmed = false; // window elapsed: retire it
+    coop::engine::coopToastTick(gw, g_toastText.c_str(), g_toastState, toastShow);
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.

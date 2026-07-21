@@ -33,6 +33,7 @@
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
+#include "../plugin/game/ToastTimer.h"   // ephemeral connect/disconnect toast clock
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
 
 #include <set>
@@ -1355,6 +1356,46 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 12. Ephemeral toast visibility clock (ToastTimer.h toastVisible) -----------
+// Guards the peer connect/disconnect on-screen TOAST (2026-07-21): armPeerToast
+// records GetTickCount at the connect/leave edge and coopPanelDrive keeps the
+// EngineUi toast label shown only while toastVisible() is true, then disarms so
+// the label self-hides - the "momentary transition notice" distinct from the
+// persistent status banner. This locks the pure timing: un-armed is never shown,
+// an armed toast shows through the window and hides exactly at TOAST_SHOW_MS, and
+// the unsigned subtraction tolerates a GetTickCount wrap mid-window.
+static void testToastTimer() {
+    std::printf("== ephemeral toast visibility clock (ToastTimer.h) ==\n");
+    using coop::engine::toastVisible;
+    const unsigned long dur = coop::engine::TOAST_SHOW_MS; // 4000
+
+    // Un-armed: never visible, whatever the clock says.
+    CHECK("unarmed never visible",        !toastVisible(false, 0,     999999, dur));
+    CHECK("unarmed never visible (armMs)",!toastVisible(false, 10000, 10000,  dur));
+
+    // Armed: visible from the arming instant, through the window, hidden AT the
+    // boundary (elapsed >= duration) and after.
+    CHECK("armed visible at t0",           toastVisible(true, 10000, 10000, dur));
+    CHECK("armed visible mid-window",      toastVisible(true, 10000, 12000, dur));
+    CHECK("armed visible at 3999 ms",      toastVisible(true, 10000, 13999, dur));
+    CHECK("armed hidden AT window (4000)", !toastVisible(true, 10000, 14000, dur));
+    CHECK("armed hidden past window",      !toastVisible(true, 10000, 20000, dur));
+
+    // GetTickCount wrap: armed 100 ms before the 2^32 rollover, the unsigned delta
+    // still measures true elapsed time across the boundary.
+    const unsigned long nearMax  = 0xFFFFFFFFul - 100; // armed 100 ms before wrap
+    const unsigned long preWrap  = nearMax + 50;       // 50 ms later, no overflow
+    const unsigned long postWrap = 1899UL;             // (nearMax + 2000) mod 2^32
+    const unsigned long postHide = 3999UL;             // (nearMax + 4100) mod 2^32
+    CHECK("wrap: 50 ms still visible",     toastVisible(true, nearMax, preWrap,  dur));
+    CHECK("wrap: 2000 ms still visible",   toastVisible(true, nearMax, postWrap, dur));
+    CHECK("wrap: 4100 ms hidden",         !toastVisible(true, nearMax, postHide, dur));
+
+    // Duration sanity: a few seconds - long enough to read, short enough to feel
+    // momentary and not be mistaken for the persistent banner.
+    CHECK("toast window sane (2-8 s)", dur >= 2000 && dur <= 8000);
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1377,6 +1418,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testToastTimer();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

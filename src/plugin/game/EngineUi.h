@@ -51,6 +51,14 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
 // to remove it. Main-thread only; SEH-guarded.
 void coopOverlayTick(GameWorld* gw, const char* text, int state, bool show);
 
+// Ephemeral co-op TOAST: a second leader-tracked ScreenLabel, sitting just above
+// the persistent overlay, that announces a peer CONNECT/DISCONNECT transition for
+// a few seconds and then self-hides. Same render path (marker* shims) and state
+// colouring as the overlay, but an independent label with its own lifetime - the
+// caller drives show via ToastTimer's toastVisible(), passing show=false once the
+// window elapses so this removes it. Main-thread only; SEH-guarded.
+void coopToastTick(GameWorld* gw, const char* text, int state, bool show);
+
 } // namespace engine
 } // namespace coop
 
