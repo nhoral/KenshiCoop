@@ -33,6 +33,7 @@
 #include "../core/DeathLatch.h" // rekeyCarryLatch (down/death latch carry on re-key)
 #include "ChangeGate.h" // Phase 6: shared change-gated send/accept policy
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
+#include "../core/JailAnchor.h" // chainAnchorStep (captive kind-conflict anchor, spike 58)
 #include "../CoopLog.h"
 
 #include <windows.h> // GetTickCount

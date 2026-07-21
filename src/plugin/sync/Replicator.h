@@ -731,6 +731,15 @@ private:
         // self-heal; this guard re-asserts setChainedMode independently so a peer
         // PC's local lockpick can't leave the owner's prisoner unlocked on the peer.
         unsigned long chainHealTick;
+        // Spike 58 (kind-conflict anchor): the furniture kind last vouched for
+        // this body by a RELIABLE edge (RECV ENTER, or the host's own
+        // PEER-ENTER authoring; 0 = none, cleared on a reliable EXIT / the
+        // debounced HEAL EXIT). While the lossy stream says chained
+        // (streamKind=3) but an edge vouches the local cage/bed (1/2), the
+        // cage/bed stays the transform anchor and the shackle is re-asserted
+        // EQUIP-only (chainAnchorStep) - the kind=3 heal must not break an
+        // edge-vouched cage every FURN_HEAL_MS (the 75-885 u re-seat teleport).
+        int           furnEdgeKind;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
         // Velocity-aware snap gate (2026-07-11): slow-decaying peak of the
@@ -770,7 +779,7 @@ private:
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
-                   haveChainOwner(false), chainHealTick(0),
+                   haveChainOwner(false), chainHealTick(0), furnEdgeKind(0),
                    sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
                    zeroF(0), activeF(0), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;

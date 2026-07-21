@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/core/JailAnchor.h" // chainAnchorStep (captive kind-conflict anchor, spike 58)
 
 #include <set>
 
@@ -1355,6 +1356,44 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 12. Captive kind-conflict anchor (JailAnchor.h) ---------------------------
+// Guards the spike-58 fix: a chained+caged prisoner streams CHAINED-only in the
+// lossy batch while the reliable edges vouch the cage. The step must (a) HOLD an
+// edge-vouched cage/bed (no break, no re-chain transform - the 75-885 u re-seat
+// teleport), (b) still RECHAIN a stale/unvouched local attach (the Flashbox
+// case), and (c) stay quiet when the stream is not chained or the copy already
+// is (no invented heals).
+
+static void testJailAnchor() {
+    std::printf("== captive kind-conflict anchor (JailAnchor.h) ==\n");
+
+    // Not a chained stream: never this policy's business (kind 1/2 heals and
+    // the no-furniture drive handle those).
+    CHECK("cage stream -> NONE",    chainAnchorStep(2, 2, 2) == CHAIN_ANCHOR_NONE);
+    CHECK("bed stream -> NONE",     chainAnchorStep(1, 1, 1) == CHAIN_ANCHOR_NONE);
+    CHECK("no stream kind -> NONE", chainAnchorStep(0, 2, 2) == CHAIN_ANCHOR_NONE);
+
+    // Already chained locally: in sync, nothing to heal.
+    CHECK("chained+chained -> NONE",        chainAnchorStep(3, 3, 0) == CHAIN_ANCHOR_NONE);
+    CHECK("chained+chained vouched -> NONE", chainAnchorStep(3, 3, 3) == CHAIN_ANCHOR_NONE);
+
+    // The bug: CHAINED-only continuous bit against an edge-vouched cage/bed.
+    // The anchor wins - never break it over the disagreement.
+    CHECK("vouched cage vs chained -> HOLD", chainAnchorStep(3, 2, 2) == CHAIN_ANCHOR_HOLD);
+    CHECK("vouched bed vs chained -> HOLD",  chainAnchorStep(3, 1, 1) == CHAIN_ANCHOR_HOLD);
+
+    // An UNVOUCHED local cage is the Flashbox stale attach: break + re-chain.
+    CHECK("unvouched cage -> RECHAIN",       chainAnchorStep(3, 2, 0) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("unvouched bed -> RECHAIN",        chainAnchorStep(3, 1, 0) == CHAIN_ANCHOR_RECHAIN);
+    // Vouch/local mismatch is no vouch at all (edge moved on, copy did not).
+    CHECK("bed vouch, cage local -> RECHAIN", chainAnchorStep(3, 2, 1) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("chain vouch, cage local -> RECHAIN", chainAnchorStep(3, 2, 3) == CHAIN_ANCHOR_RECHAIN);
+
+    // No local furniture at all: the plain re-chain heal (lost/late ENTER).
+    CHECK("no furniture -> RECHAIN",          chainAnchorStep(3, 0, 0) == CHAIN_ANCHOR_RECHAIN);
+    CHECK("no furniture, stale vouch -> RECHAIN", chainAnchorStep(3, 0, 2) == CHAIN_ANCHOR_RECHAIN);
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1377,6 +1416,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testJailAnchor();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;
