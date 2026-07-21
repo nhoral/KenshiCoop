@@ -21,8 +21,10 @@ namespace engine {
 // MyGUI comboboxes/editboxes have no usable RVAs and don't receive keyboard focus
 // during gameplay) and Connect/Disconnect. The friend's Steam ID is entered by
 // clipboard: "Copy my Steam ID" puts the player's own id on the clipboard to
-// share, and "Paste friend's Steam ID" reads the friend's id back in (per-session,
-// never written to disk). The UDP endpoint (ip/port) still comes from
+// share, and "Paste friend's Steam ID" reads the friend's id back in. A valid
+// paste is remembered across launches (persisted to coop_last_peer.txt) so it
+// pre-fills next time; it stays overridable by pasting a different friend's id.
+// The UDP endpoint (ip/port) still comes from
 // coop_config.json. The GUI layer stays session-agnostic: live status is passed IN
 // via *st and the user's actions are handed BACK through the callbacks (the plugin
 // root owns the session/config wiring). Main-thread only; SEH-guarded.

@@ -28,6 +28,7 @@
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
+#include "../plugin/core/Config.h" // saveLastPeer/loadLastPeer round-trip (compiled from Config.cpp)
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
@@ -781,6 +782,41 @@ static void testSteamIdParse() {
           !coop::parseSteamId64("12345678901234567", id) && id == 123ull);
 }
 
+// ---- 7b. Last-peer persistence (Config.cpp saveLastPeer/loadLastPeer) ------------
+// Guards the F2-panel convenience persistence: a valid pasted friend SteamID is
+// written to coop_last_peer.txt so the next launch pre-fills it (loadConfig folds
+// it into steamPeer when neither env nor coop_config.json set one). The store must
+// round-trip, re-validate on read (a junk file yields 0, never a bogus peer), and
+// treat id 0 as "nothing to remember". No game deps - path resolves next to the
+// module, which for this test exe is the cwd (GetModuleHandleA("KenshiCoop.dll")
+// is null here), so the file lands in the working dir and is cleaned up after.
+static void testLastPeerPersist() {
+    std::printf("== last-peer persistence (Config.cpp) ==\n");
+    std::remove("coop_last_peer.txt"); // start from a known-empty state
+
+    CHECK("missing file -> 0", coop::loadLastPeer() == 0ull);
+
+    coop::saveLastPeer(76561198012345678ull);
+    CHECK("saved id round-trips", coop::loadLastPeer() == 76561198012345678ull);
+
+    // A later paste overwrites the remembered id (truncating write, not appending).
+    coop::saveLastPeer(76561198099999999ull);
+    CHECK("second save overwrites", coop::loadLastPeer() == 76561198099999999ull);
+
+    // id 0 is a no-op: it must NOT wipe the remembered peer.
+    coop::saveLastPeer(0ull);
+    CHECK("save(0) is a no-op", coop::loadLastPeer() == 76561198099999999ull);
+
+    // A corrupted/edited file re-validates to 0 (parseSteamId64 gate on read).
+    {
+        std::FILE* f = std::fopen("coop_last_peer.txt", "wb");
+        if (f) { std::fputs("not-a-steam-id", f); std::fclose(f); }
+        CHECK("corrupted file -> 0", coop::loadLastPeer() == 0ull);
+    }
+
+    std::remove("coop_last_peer.txt"); // clean up the test artifact
+}
+
 // ---- 8. Pose-fixture acceptance (WorkPose.h) ------------------------------------
 // Guards the mining-sync fix (2026-07-14): a player mining an ore node operates a
 // mine building. A single 6 m seat gate rejected the CORRECT mine as "far"
@@ -1371,6 +1407,7 @@ int main() {
     testInterp();
     testOwnRanks();
     testSteamIdParse();
+    testLastPeerPersist();
     testWorkPoseMatch();
     testTaskClear();
     testDeathRekey();
