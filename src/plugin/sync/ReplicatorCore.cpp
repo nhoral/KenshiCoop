@@ -223,7 +223,7 @@ void Replicator::resetSession() {
     medRecv_.clear();
     medNpc_.clear();
     statsPub_.clear();
-    moneyPub_.clear();
+    factionMoney_ = coop::MoneyState(); // re-seed the shared-wallet baseline on load
     stealthPub_.clear();
     pinOwned_.clear();
     pinPeer_.clear();

@@ -1038,10 +1038,11 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             g_repl.publishStats(gw, g_net, g_net.localId());
             g_repl.applyStats(gw, g_inbound);
         }
-        // Per-tab wallet sync (protocol 22): each client streams the money of
-        // the squad tabs it OWNS (change-gated reliable, keyed by tab rank);
-        // received snapshots land on the peer tabs via Ownerships::setMoney.
-        // Ordered after publishOwned (ownership ranks are the partition rule).
+        // Shared-wallet sync (protocol 22b): the player's real money is ONE
+        // per-faction wallet (Faction::factionOwnerships) shared by both co-op
+        // players, so each client publishes the DELTA of its own local change
+        // and the peer ADDS it - concurrent spends sum correctly. Reliable +
+        // ordered, so each delta applies exactly once (no safety resend).
         if (g_cfg.moneySync) {
             g_repl.publishMoney(replCtx(gw));
             g_repl.applyMoney(replCtx(gw));

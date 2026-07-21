@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/core/MoneyReconcile.h" // Phase 6/22b: shared-wallet delta reconcile
 
 #include <set>
 
@@ -207,7 +208,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v44: bulk channel + session epoch)", (int)PROTOCOL_VERSION, 44);
+    CHECK_EQ("PROTOCOL_VERSION (v44: bulk channel + session epoch + shared-wallet delta 22b)", (int)PROTOCOL_VERSION, 44);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -1355,6 +1356,89 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- 11. Shared-wallet delta reconciliation (MoneyReconcile.h) ------------------
+// Guards the money-sync fix (2026-07-20): the player's real wallet is ONE shared
+// per-faction pool, so the channel replicates DELTAS and the peer ADDS them.
+// This locks: seed-is-silent, idle-is-silent, local delta detection + baseline
+// advance, remote delta apply + baseline advance (echo-guard), and the decisive
+// property - two CONCURRENT spends converge to the same total on both clients
+// (which absolute-value sync would corrupt).
+static void testMoneyReconcile() {
+    std::printf("== shared-wallet delta reconciliation (MoneyReconcile.h) ==\n");
+
+    // First sample seeds silently (no spurious delta at connect).
+    MoneyState s; int d = 12345;
+    CHECK("first sample seeds (no send)", !moneyLocalDelta(s, 1000, &d));
+    CHECK("seed sets baseline",           s.known == 1000);
+
+    // No change -> nothing to publish.
+    CHECK("idle wallet is silent", !moneyLocalDelta(s, 1000, &d));
+
+    // A local spend publishes a negative delta and advances the baseline.
+    CHECK("local spend detected",  moneyLocalDelta(s, 750, &d));
+    CHECK_EQ("spend delta = -250", (long long)d + 1000, 750); // d == -250
+    CHECK("baseline followed spend", s.known == 750);
+    CHECK("same wallet now idle",  !moneyLocalDelta(s, 750, &d));
+
+    // A remote delta is applied by ADDING it, and the baseline advances so the
+    // next local check does NOT echo it back.
+    int now = moneyApplyDelta(s, 750, -100); // peer spent 100
+    CHECK_EQ("apply subtracts",    now, 650);
+    CHECK("baseline followed apply", s.known == 650);
+    CHECK("applied delta not echoed", !moneyLocalDelta(s, 650, &d));
+
+    // The crux: two concurrent spends from a shared 1000 pool converge to 650 on
+    // BOTH clients (absolute-value sync would land one side on 750, the other on
+    // 900, losing money). A: local -250, then receives B's -100. B: local -100,
+    // then receives A's -250. Both must end at 650 with matching baselines.
+    MoneyState a; MoneyState b;
+    int da = 0, db = 0;
+    moneyLocalDelta(a, 1000, &da); // seed A
+    moneyLocalDelta(b, 1000, &db); // seed B
+    CHECK("A publishes its spend", moneyLocalDelta(a, 750, &da));  // da = -250
+    CHECK("B publishes its spend", moneyLocalDelta(b, 900, &db));  // db = -100
+    int aFinal = moneyApplyDelta(a, 750, db); // A applies B's -100
+    int bFinal = moneyApplyDelta(b, 900, da); // B applies A's -250
+    CHECK_EQ("A converges to 650", aFinal, 650);
+    CHECK_EQ("B converges to 650", bFinal, 650);
+    CHECK("A/B baselines agree",   a.known == b.known);
+    CHECK("baselines are 650",     a.known == 650);
+
+    // THE CLAMP FIX (2026-07-21): a remote delta that would drive the wallet
+    // negative is clamped to 0, and the baseline MUST follow the clamped value
+    // (0), NOT the theoretical delta. Otherwise 'known' goes negative, diverges
+    // from the real wallet, and the NEXT moneyLocalDelta reads cur(0)-known(<0)
+    // as a positive spurious delta - money printed from nothing, permanent desync.
+    //
+    // Repro: shared pool at 1000. This client (join) spends 800 locally (wallet
+    // 1000->200, baseline follows to 200 after publishing -800). Meanwhile the
+    // host spent 1000; that -1000 delta arrives here: 200 + (-1000) = -800 ->
+    // clamp to 0. Pre-fix, known landed at -800 (200 + (-1000)); post-fix it must
+    // land at 0 (the value actually written to the wallet).
+    {
+        MoneyState j; int jd = 0;
+        moneyLocalDelta(j, 1000, &jd);                 // seed at the shared 1000
+        CHECK("clamp: local spend of 800 detected", moneyLocalDelta(j, 200, &jd));
+        CHECK_EQ("clamp: local spend delta = -800", (long long)jd + 1000, 200); // jd == -800
+        CHECK("clamp: baseline followed local spend", j.known == 200);
+
+        // Host's -1000 arrives; 200 + (-1000) = -800 -> clamp to 0.
+        int applied = moneyApplyDelta(j, 200, -1000);
+        CHECK_EQ("clamp: wallet clamped to 0", applied, 0);
+        // THE ASSERTION THAT FAILS PRE-FIX: known must equal the real wallet (0),
+        // not the un-clamped theoretical baseline (-800).
+        CHECK("clamp: baseline follows clamped wallet (0), not theoretical (-800)",
+              j.known == 0);
+
+        // The decisive property: a subsequent publish must NOT fabricate a delta.
+        // Pre-fix, moneyLocalDelta(cur=0, known=-800) returned true with a +800
+        // spurious delta (money from nothing). Post-fix, cur==known==0 -> silent.
+        int spurious = 0;
+        CHECK("clamp: next publish emits NO phantom delta",
+              !moneyLocalDelta(j, 0, &spurious));
+    }
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1377,6 +1461,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testMoneyReconcile();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

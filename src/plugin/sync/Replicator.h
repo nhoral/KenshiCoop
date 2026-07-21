@@ -25,6 +25,7 @@
 #include "Interp.h"
 #include "../../netproto/Wire.h"
 #include "../core/Inbound.h"
+#include "../core/MoneyReconcile.h"
 #include "../net/NetLink.h"
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
@@ -287,16 +288,16 @@ public:
     // fights accumulate locally (the owner's stream overwrites it).
     void applyStats(GameWorld* gw, Inbound& in);
 
-    // AFTER publishOwned (protocol 22, both clients): stream the WALLET
-    // (Ownerships::money) of every squad tab this client OWNS, keyed by tab
-    // RANK - change-gated on the reliable channel with a ~1 Hz floor and a
-    // periodic safety resend (the publishStats pacing). Kenshi's wallet is
-    // per-Platoon; nothing else about money is on the wire (shop_probe).
+    // AFTER publishOwned (protocol 22b, both clients): publish the DELTA of our
+    // local change to the SHARED player-faction wallet (the real UI/shop wallet,
+    // engine::readPlayerWallet) on the reliable channel. Delta-based so two
+    // concurrent spenders sum correctly; no safety resend (reliable+ordered
+    // delivery applies each delta exactly once). Silent when the wallet is idle.
     void publishMoney(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 22): drain received wallet snapshots and write
-    // each PEER-owned tab's money onto our local copy of that tab's platoon
-    // via Ownerships::setMoney. Never writes a rank we own.
+    // BEFORE engine (protocol 22b): drain received wallet deltas and ADD each to
+    // our local copy of the shared faction wallet (engine::writePlayerWallet),
+    // advancing the baseline so the delta is not re-detected as a local change.
     void applyMoney(const SyncContext& ctx);
 
     // Per-tab wallet sync master enable (KENSHICOOP_MONEY_SYNC).
@@ -1285,13 +1286,11 @@ private:
     // RESEND_MS names to these fields, so behavior is unchanged - this is the one
     // place their cadence now lives. See SyncTuning.h.
     SyncTuning tuning_;
-    // Protocol 22: per OWNED tab rank, the last SENT wallet value + send time
-    // (change gate + safety resend). A settled economy is silent.
-    struct MoneyPub {
-        int lastSent; unsigned long lastSendMs;
-        MoneyPub() : lastSent(-1), lastSendMs(0) {}
-    };
-    std::map<unsigned int, MoneyPub> moneyPub_;
+    // Protocol 22b: the SHARED player-faction wallet reconciled by delta (see
+    // MoneyReconcile.h). One baseline for the whole session - the wallet is
+    // per-faction, not per-tab. seeded on the first sample, advanced on every
+    // local delta published and every remote delta applied.
+    MoneyState factionMoney_;
     bool moneySync_;
     // Protocol 24 faction-relation sync state, per faction sid.
     // known      = our current baseline (seeded on first sight, updated on every

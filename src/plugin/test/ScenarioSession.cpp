@@ -197,19 +197,14 @@ private:
     }
 
     void doMoneyMutation(const ScenarioContext& ctx) {
-        EntityState sq[MAX_SQUAD];
-        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
-        int idx = tabLeaderIdx(sq, n, 0u); // host owns tab rank 0
+        // Bump the SHARED player-faction wallet (the real one); protocol 22b
+        // carries the +MONEY_BUMP delta to the join, which the census verifies.
         int before = -1, after = -1, ok = 0;
-        if (idx >= 0) {
-            unsigned int h[5];
-            handFromEntity(sq[idx], h);
-            if (engine::readWalletByHand(h, &before)) {
-                int want = before + MONEY_BUMP;
-                if (engine::writeWalletByHand(h, want)) {
-                    engine::readWalletByHand(h, &after);
-                    ok = (after == want) ? 1 : 0;
-                }
+        if (engine::readPlayerWallet(ctx.gw, &before) && before >= 0) {
+            int want = before + MONEY_BUMP;
+            if (engine::writePlayerWallet(ctx.gw, want)) {
+                engine::readPlayerWallet(ctx.gw, &after);
+                ok = (after == want) ? 1 : 0;
             }
         }
         moneyOk_ = (ok == 1);
@@ -285,21 +280,17 @@ private:
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
-        // Wallets: both tab leaders.
-        EntityState sq[MAX_SQUAD];
-        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
-        for (unsigned int rank = 0; rank < 2; ++rank) {
-            int idx = tabLeaderIdx(sq, n, rank);
-            if (idx < 0) continue;
-            unsigned int h[5];
-            handFromEntity(sq[idx], h);
+        // Wallet: the SHARED player-faction wallet (rank 0 = the one pool). Both
+        // sides must read the same value once the host's bump delta has crossed.
+        {
             int money = -1;
-            if (!engine::readWalletByHand(h, &money)) continue;
-            char b[128];
-            _snprintf(b, sizeof(b) - 1,
-                      "SCENARIO LJMONEYROW rank=%u money=%d t=%lu",
-                      rank, money, ctx.elapsedMs);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            if (engine::readPlayerWallet(ctx.gw, &money)) {
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO LJMONEYROW rank=0 money=%d t=%lu",
+                          money, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
         }
         ++censusLogged_;
     }

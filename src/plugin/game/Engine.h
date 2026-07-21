@@ -1283,6 +1283,16 @@ bool readWalletByHand(const unsigned int mHand[5], int* outMoney);
 // Ownerships::setMoney (the money-sync apply primitive). Returns true on ok.
 bool writeWalletByHand(const unsigned int mHand[5], int money);
 
+// SEH-guarded: read/write the player's REAL wallet - the FACTION wallet
+// (gw->player->participant->factionOwnerships), which is what the UI shows and
+// shops mutate. There is ONE such wallet per player faction, shared by the whole
+// squad (not per-tab). This is the source of truth PKT_MONEY replicates; the
+// per-Platoon walletByHand pair above is the dead field the old channel used.
+// readPlayerWallet: *outMoney = -1 on failure, returns true on ok.
+// writePlayerWallet: money < 0 rejected, returns true on ok.
+bool readPlayerWallet(GameWorld* gw, int* outMoney);
+bool writePlayerWallet(GameWorld* gw, int money);
+
 // Purchase observability detour (protocol 22, 1c groundwork): hook Inventory::
 // buyItem so every REAL trade-UI purchase logs a "[shop] BUY-LOCAL" line
 // (seller identity + money, item sid, buyer). Automation cannot reach a real

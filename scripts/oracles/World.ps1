@@ -60,16 +60,17 @@ function Test-ShopProbe {
     if ($null -eq $hostBuy) { $why += "host never logged its SHOPBUY attempt" }
     if ($null -eq $joinBuy) { $why += "join never logged its SHOPBUY attempt" }
 
-    # 4. Both scripted wallet writes logged (the 1b apply-primitive check + the
-    #    decisive crossing lever: side-distinct sentinels, host 5000 / join 7000).
-    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=(\d+) target=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
+    # 4. Both scripted wallet writes logged (the apply-primitive check: each side
+    #    ADDS a side-distinct amount to the shared faction wallet - host +4000,
+    #    join +6000. With money sync OFF the deltas do NOT cross - the baseline).
+    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=\d+ add=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
     $hostSet = Select-String -Path $HostFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
     $joinSet = Select-String -Path $JoinFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($null -eq $hostSet) { $why += "host never logged its WALLETSET" }
     if ($null -eq $joinSet) { $why += "join never logged its WALLETSET" }
     $hostSetOk = $false; $joinSetOk = $false
-    if ($hostSet) { $hostSetOk = ($hostSet.Matches[0].Groups[4].Value -eq '1') -and ($hostSet.Matches[0].Groups[6].Value -eq $hostSet.Matches[0].Groups[3].Value) }
-    if ($joinSet) { $joinSetOk = ($joinSet.Matches[0].Groups[4].Value -eq '1') -and ($joinSet.Matches[0].Groups[6].Value -eq $joinSet.Matches[0].Groups[3].Value) }
+    if ($hostSet) { $hostSetOk = ($hostSet.Matches[0].Groups[3].Value -eq '1') -and ([int]$hostSet.Matches[0].Groups[5].Value -eq [int]$hostSet.Matches[0].Groups[4].Value + [int]$hostSet.Matches[0].Groups[2].Value) }
+    if ($joinSet) { $joinSetOk = ($joinSet.Matches[0].Groups[3].Value -eq '1') -and ([int]$joinSet.Matches[0].Groups[5].Value -eq [int]$joinSet.Matches[0].Groups[4].Value + [int]$joinSet.Matches[0].Groups[2].Value) }
 
     # FINDING A: final wallet divergence per rank (does anything cross today?).
     $rankDiv = @{}
@@ -144,14 +145,15 @@ function Test-ShopProbe {
                             walletDiv = $rankDivMetric } -Detail $detail)
 }
 
-# money_sync (protocol 22, moneySync ON): the wallet-channel gate. Same script
-# as shop_probe minus the vendor legs: each side writes a side-distinct wallet
-# sentinel into the tab it OWNS (host rank0=5000, join rank1=7000) and the
-# channel must carry it across - the gate is CONVERGENCE:
-#   1. both WALLETSET writes succeeded (apply primitive works);
-#   2. the peer's WALLET series ends at the sender's sentinel for that rank
-#      (a "[money] RECV" landed and stuck);
-#   3. every rank readable on both sides ends converged (no drift elsewhere).
+# money_sync (protocol 22b, moneySync ON): the shared-wallet gate. The player's
+# real money is ONE shared per-faction pool (engine::readPlayerWallet), so the
+# channel replicates DELTAS: host ADDS +add_h, join ADDS +add_j, and both sides'
+# pools must CONVERGE to base + add_h + add_j (each side sees the peer's delta).
+# The gate:
+#   1. both WALLETSET writes succeeded (ok=1, after=before+add);
+#   2. host and join final WALLET (rank 0) are EQUAL (the shared pool converged);
+#   3. that final reflects BOTH deltas (final == host-before + add_h + add_j),
+#      i.e. neither side's contribution was lost (what absolute sync would do).
 function Test-MoneySync {
     param([string]$HostFile, [string]$JoinFile)
     $why = @()
@@ -161,49 +163,50 @@ function Test-MoneySync {
     if ($hw.Keys.Count -eq 0) { $why += "host logged no WALLET series" }
     if ($jw.Keys.Count -eq 0) { $why += "join logged no WALLET series" }
 
-    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=(\d+) target=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
+    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=\d+ add=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
     $hostSet = Select-String -Path $HostFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
     $joinSet = Select-String -Path $JoinFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
     if ($null -eq $hostSet) { $why += "host never logged its WALLETSET" }
     if ($null -eq $joinSet) { $why += "join never logged its WALLETSET" }
     foreach ($pair in @(@('host', $hostSet), @('join', $joinSet))) {
         $side = $pair[0]; $s = $pair[1]
-        if ($s -and (($s.Matches[0].Groups[4].Value -ne '1') -or
-                     ($s.Matches[0].Groups[6].Value -ne $s.Matches[0].Groups[3].Value))) {
-            $why += "$side WALLETSET write failed (ok/after mismatch)"
+        if ($s) {
+            $add = [int]$s.Matches[0].Groups[2].Value
+            $before = [int]$s.Matches[0].Groups[4].Value
+            $after = [int]$s.Matches[0].Groups[5].Value
+            if (($s.Matches[0].Groups[3].Value -ne '1') -or ($after -ne $before + $add)) {
+                $why += "$side WALLETSET write failed (ok/after mismatch)"
+            }
         }
     }
 
-    # Crossing: the peer's final money at the sender's rank equals the sentinel.
-    $crossed = 0; $expected = 0
-    foreach ($leg in @(@($hostSet, $jw, 'host->join'), @($joinSet, $hw, 'join->host'))) {
-        $s = $leg[0]; $peer = $leg[1]; $tag = $leg[2]
-        if ($null -eq $s) { continue }
-        $rank = [int]$s.Matches[0].Groups[2].Value
-        $tgt  = [int]$s.Matches[0].Groups[3].Value
-        $expected++
-        if (-not $peer.ContainsKey($rank)) { $why += "$tag rank $rank absent from peer WALLET series"; continue }
-        $end = $peer[$rank][$peer[$rank].Count - 1].money
-        if ($end -eq $tgt) { $crossed++ }
-        else { $why += "$tag sentinel did not cross (peer rank $rank ended $end, want $tgt)" }
-    }
+    $addH = if ($hostSet) { [int]$hostSet.Matches[0].Groups[2].Value } else { 0 }
+    $addJ = if ($joinSet) { [int]$joinSet.Matches[0].Groups[2].Value } else { 0 }
+    $hostBefore = if ($hostSet) { [int]$hostSet.Matches[0].Groups[4].Value } else { -1 }
 
-    # No drift on any co-visible rank.
-    $diverged = @()
-    foreach ($r in $hw.Keys) {
-        if (-not $jw.ContainsKey($r)) { continue }
-        $hEnd = $hw[$r][$hw[$r].Count - 1].money
-        $jEnd = $jw[$r][$jw[$r].Count - 1].money
-        if ($hEnd -ge 0 -and $jEnd -ge 0 -and $hEnd -ne $jEnd) { $diverged += "rank$r($hEnd/$jEnd)" }
+    # Both sides' shared pool (rank 0) must end EQUAL and reflect both deltas.
+    $crossed = 0; $expected = 2
+    $hEnd = if ($hw.ContainsKey(0)) { $hw[0][$hw[0].Count - 1].money } else { -1 }
+    $jEnd = if ($jw.ContainsKey(0)) { $jw[0][$jw[0].Count - 1].money } else { -1 }
+    if ($hEnd -lt 0 -or $jEnd -lt 0) {
+        $why += "shared wallet series missing (host=$hEnd join=$jEnd)"
+    } else {
+        if ($hEnd -ne $jEnd) { $why += "pools diverged (host=$hEnd join=$jEnd)" }
+        else {
+            $wantFinal = $hostBefore + $addH + $addJ
+            # host delta present on the join side (join saw host's contribution)
+            if ($jEnd -eq $wantFinal) { $crossed++ } else { $why += "join pool missing host delta (join=$jEnd want=$wantFinal)" }
+            # join delta present on the host side (host saw join's contribution)
+            if ($hEnd -eq $wantFinal) { $crossed++ } else { $why += "host pool missing join delta (host=$hEnd want=$wantFinal)" }
+        }
     }
-    if ($diverged.Count -gt 0) { $why += ("final wallets diverged: " + ($diverged -join ", ")) }
 
     $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
     $detail = $why -join "; "
-    Write-Host "  MONEY-SYNC $v - crossed=$crossed/$expected $detail"
+    Write-Host "  MONEY-SYNC $v - crossed=$crossed/$expected hostPool=$hEnd joinPool=$jEnd $detail"
     return (Add-GateResult -Name "money_sync" -Status $v `
                 -Metrics @{ crossed = $crossed; expected = $expected
-                            diverged = $diverged.Count } -Detail $detail)
+                            hostPool = $hEnd; joinPool = $jEnd } -Detail $detail)
 }
 
 # recruit_probe (protocol 23 phase 0): mid-session recruitment evidence.
@@ -2285,24 +2288,34 @@ function Test-VendorTrade {
     $hInv = Get-TinvFinal $HostFile
     $jInv = Get-TinvFinal $JoinFile
 
+    # 2. Wallet (protocol 22b): the SHARED faction pool (rank 0). Both sides'
+    #    debits (-PRICE each) plus both seeds land on the ONE pool, so both series
+    #    must CONVERGE to the same final AND that final must reflect BOTH debits
+    #    (the pool dropped by 2*PRICE from its peak = both spends crossed).
     $crossed = 0
-    foreach ($leg in @(@($hostTrade, $jw, 'host->join'), @($joinTrade, $hw, 'join->host'))) {
-        $t = $leg[0]; $peerW = $leg[1]; $tag = $leg[2]
-        if ($null -eq $t -or $t.Matches[0].Groups[3].Value -ne '1') { continue }
-        $rank   = [int]$t.Matches[0].Groups[2].Value
-        $wAfter = [int]$t.Matches[0].Groups[7].Value
-        # 2. wallet debit crossed.
-        if (-not $peerW.ContainsKey($rank)) { $why += "$tag rank $rank absent from peer WALLET series" }
-        else {
-            $end = $peerW[$rank][$peerW[$rank].Count - 1].money
-            if ($end -eq $wAfter) { $crossed++ }
-            else { $why += "$tag wallet debit did not cross (peer rank $rank ended $end, want $wAfter)" }
-        }
-        # 3. inventory content converged.
+    $hPool = if ($hw.ContainsKey(0)) { $hw[0] } else { @() }
+    $jPool = if ($jw.ContainsKey(0)) { $jw[0] } else { @() }
+    if ($hPool.Count -eq 0 -or $jPool.Count -eq 0) {
+        $why += "shared WALLET series missing (host=$($hPool.Count) join=$($jPool.Count) samples)"
+    } else {
+        $hEnd = $hPool[$hPool.Count - 1].money
+        $jEnd = $jPool[$jPool.Count - 1].money
+        $peak = 0
+        foreach ($s in $hPool) { if ($s.money -gt $peak) { $peak = $s.money } }
+        foreach ($s in $jPool) { if ($s.money -gt $peak) { $peak = $s.money } }
+        $price = if ($hostTrade) { [int]$hostTrade.Matches[0].Groups[5].Value } else { 250 }
+        if ($hEnd -ne $jEnd) { $why += "shared pool diverged (host=$hEnd join=$jEnd)" }
+        elseif ($peak - $hEnd -ne 2 * $price) { $why += "pool did not reflect both debits (peak=$peak final=$hEnd drop=$($peak - $hEnd) want=$(2*$price))" }
+        else { $crossed = 2 }
+    }
+
+    # 3. Inventory content converged for each traded tab (host added to rank 0,
+    #    join to rank 1); the bought item crossed via the inventory channel.
+    foreach ($rank in @(0, 1)) {
         if (-not ($hInv.ContainsKey($rank) -and $jInv.ContainsKey($rank))) {
-            $why += "$tag rank $rank TINV series missing on a side"
+            $why += "rank $rank TINV series missing on a side"
         } elseif ($hInv[$rank].hash -ne $jInv[$rank].hash) {
-            $why += "$tag rank $rank inventory hash diverged (host $($hInv[$rank].hash) join $($jInv[$rank].hash))"
+            $why += "rank $rank inventory hash diverged (host $($hInv[$rank].hash) join $($jInv[$rank].hash))"
         }
     }
 
