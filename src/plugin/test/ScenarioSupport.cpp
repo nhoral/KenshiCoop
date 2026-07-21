@@ -95,26 +95,6 @@ void logVitalsLine(const unsigned int h[5], unsigned long t) {
     coop::logLine(b);
 }
 
-// Combat-state parity sample for the body at hand h (readCombatByHand). Logged
-// on BOTH host and join for the SAME baked hand so an oracle can pair the two
-// sides by hand+time and measure combat COHESION: a driven copy locally engaged
-// while the authority streams peace (the "in combat on join, not host" churn the
-// player reported) surfaces as a fight-state divergence. Silent no-op if the
-// hand is unresolved on this side.
-void logCombatStateLine(const unsigned int h[5], unsigned long t) {
-    engine::CombatRead cr;
-    if (!engine::readCombatByHand(h, &cr) || !cr.valid) return;
-    bool fight = cr.inCombat || cr.modeActive;
-    char b[192];
-    _snprintf(b, sizeof(b) - 1,
-              "SCENARIO COMBATSTATE hand=%u,%u t=%lu fight=%d wait=%d tgt=%u,%u sw=%d",
-              h[3], h[4], t, fight ? 1 : 0, cr.waiting ? 1 : 0,
-              cr.hasTarget ? cr.target[3] : 0, cr.hasTarget ? cr.target[4] : 0,
-              cr.swordState);
-    b[sizeof(b) - 1] = '\0';
-    coop::logLine(b);
-}
-
 // ---- Squad-tab classification (shared by the player_* / medic scenarios) ----
 // Mirrors CoopPresenceScenario's partition EXACTLY (and therefore the
 // Replicator's): a member's tab identity is its hand CONTAINER, and a tab's

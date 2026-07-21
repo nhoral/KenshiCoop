@@ -1068,15 +1068,6 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             g_repl.publishMedical(gw, g_net, g_net.localId());
             g_repl.applyMedical(gw, g_inbound, g_net, g_net.localId());
             g_repl.applyTreatments(gw, g_inbound);
-            // Join-dealt authoritative damage (protocol 45): the JOIN forwards the
-            // damage its guarded melee would have dealt to driven world-NPC copies;
-            // the HOST applies it to the real body (blood + a frontal flesh wound),
-            // which the vitals stream then mirrors back. Decouples the join PC's
-            // damage from its disrupted (position-driven) copy animation.
-            if (g_cfg.isHost)
-                g_repl.applyCombatHits(gw, g_inbound);
-            else
-                g_repl.publishCombatHits(gw, g_net, g_net.localId());
         }
         // Character stats sync (protocol 17): owner-authoritative CharStats
         // stream for player-squad members, both directions. publishStats
@@ -1928,15 +1919,9 @@ void installEngineDetours() {
     if (g_cfg.damageGuard) {
         if (coop::engine::installDamageGuardHook()) {
             g_repl.setDamageGuard(true);
-            // Join-dealt authoritative damage report (protocol 45): only the JOIN
-            // reports (the HOST owns + simulates world NPCs, so its own swings land
-            // natively). Enabling report mode on the join makes the guard accumulate
-            // the damage its player-squad melee WOULD have dealt to driven world-NPC
-            // copies; publishCombatHits forwards it and the host wounds the real body.
-            g_repl.setReportCombat(!g_cfg.isHost);
             coopLog(g_cfg.isHost
                 ? "[dmg] hitByMeleeAttack detour installed; damage guard ON (host, driven peer-squad bodies)"
-                : "[dmg] hitByMeleeAttack detour installed; damage guard ON + combat-hit report ON (join)");
+                : "[dmg] hitByMeleeAttack detour installed; damage guard ON (default)");
         } else {
             coopLog("[dmg] FAILED to install hitByMeleeAttack detour; damage guard disabled");
         }

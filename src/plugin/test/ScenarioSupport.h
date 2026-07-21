@@ -43,10 +43,6 @@ bool logScenarioLine(const char* kind, Character* c);
 void logScenarioEntity(const char* kind, const EntityState& e);
 // Extended "SCENARIO VITALS" line for the body at hand h (readObjectHand layout).
 void logVitalsLine(const unsigned int h[5], unsigned long t);
-// "SCENARIO COMBATSTATE" combat-cohesion sample (readCombatByHand) for hand h.
-// Emit on BOTH sides for the same baked hand so an oracle can pair host<->join
-// and flag a copy fighting locally while the authority reports peace.
-void logCombatStateLine(const unsigned int h[5], unsigned long t);
 // Squad-tab classification (mirrors the Replicator's ownership partition).
 bool tabHandLess(const EntityState& a, const EntityState& b);
 bool tabCtnrLess(const EntityState& a, const EntityState& b);

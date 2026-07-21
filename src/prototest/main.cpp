@@ -89,7 +89,6 @@ static void testSizes() {
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
     CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
     CHECK_EQ("sizeof(TreatmentPacket)",         sizeof(TreatmentPacket),         77);
-    CHECK_EQ("sizeof(CombatHitPacket)",         sizeof(CombatHitPacket),         37);
     CHECK_EQ("sizeof(SpeedPacket)",             sizeof(SpeedPacket),             14);
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
@@ -220,7 +219,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v45: join-dealt combat-hit report)", (int)PROTOCOL_VERSION, 45);
+    CHECK_EQ("PROTOCOL_VERSION (v44: bulk channel + session epoch)", (int)PROTOCOL_VERSION, 44);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -266,7 +265,6 @@ static void testRoundTrips() {
     roundTrip<InvXferPacket>("InvXferPacket", (u8)PKT_INV_XFER);
     roundTrip<MedicalPacket>("MedicalPacket", (u8)PKT_MEDICAL);
     roundTrip<TreatmentPacket>("TreatmentPacket", (u8)PKT_TREATMENT);
-    roundTrip<CombatHitPacket>("CombatHitPacket", (u8)PKT_COMBAT_HIT);
     roundTrip<SpeedPacket>("SpeedPacket(REQ)", (u8)PKT_SPEED_REQ);
     roundTrip<SpeedPacket>("SpeedPacket(SET)", (u8)PKT_SPEED_SET);
     roundTrip<StatsPacket>("StatsPacket", (u8)PKT_STATS);
@@ -1145,7 +1143,6 @@ static void testFlushWorldStateContract() {
     InvXferPacket   xf;  std::memset(&xf,  0, sizeof(xf));
     MedicalPacket   mp;  std::memset(&mp,  0, sizeof(mp));
     TreatmentPacket tp;  std::memset(&tp,  0, sizeof(tp));
-    CombatHitPacket chp; std::memset(&chp, 0, sizeof(chp));
     SpeedPacket     sp;  std::memset(&sp,  0, sizeof(sp));
     StatsPacket     stp; std::memset(&stp, 0, sizeof(stp));
     MoneyPacket     mo;  std::memset(&mo,  0, sizeof(mo));
@@ -1172,7 +1169,7 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (28).
+    // --- Push one sentinel into every WORLD-STATE queue (27).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1184,7 +1181,6 @@ static void testFlushWorldStateContract() {
     in.pushInvXfer(1, xf);
     in.pushMedical(1, mp);
     in.pushTreatment(1, tp);
-    in.pushCombatHit(1, chp);
     in.pushSpeed(1, sp);
     in.pushStats(1, stp);
     in.pushMoney(1, mo);
@@ -1231,7 +1227,6 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("invXfer",     InboundInvXfer,     drainInvXfers);
     WS_EMPTY("medical",     InboundMedical,     drainMedical);
     WS_EMPTY("treatment",   InboundTreatment,   drainTreatments);
-    WS_EMPTY("combatHit",   InboundCombatHit,   drainCombatHits);
     WS_EMPTY("speed",       InboundSpeed,       drainSpeed);
     WS_EMPTY("stats",       InboundStats,       drainStats);
     WS_EMPTY("money",       InboundMoney,       drainMoney);

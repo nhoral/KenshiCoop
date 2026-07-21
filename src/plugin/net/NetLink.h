@@ -93,11 +93,6 @@ public:
     // driven copy, forwarded to the body's owner).
     void queueTreatment(const TreatmentPacket& pkt);
 
-    // MAIN thread: queue a reliable join-dealt damage report (join -> host). The
-    // join's melee on a driven world-NPC copy is suppressed locally; the host
-    // applies the reported damage to the authoritative body.
-    void queueCombatHit(const CombatHitPacket& pkt);
-
     // MAIN thread: queue a reliable game-speed packet (REQ join->host, SET
     // host->join). Change-gated by the caller; pkt.type selects the direction.
     void queueSpeed(const SpeedPacket& pkt);
@@ -252,7 +247,6 @@ private:
     // Reliable medical snapshots + treatment deltas (phase 2). Guarded by outCs_.
     std::vector<MedicalPacket>   outMedical_;
     std::vector<TreatmentPacket> outTreatments_;
-    std::vector<CombatHitPacket> outCombatHits_;
     // Reliable game-speed REQ/SET packets (consensus speed sync). Guarded by outCs_.
     std::vector<SpeedPacket>     outSpeed_;
     // Reliable character-stats snapshots (protocol 17). Guarded by outCs_.

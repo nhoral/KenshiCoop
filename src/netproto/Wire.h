@@ -24,7 +24,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 45;
+const u16 PROTOCOL_VERSION = 44;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -68,8 +68,7 @@ enum PacketType {
     PKT_NPC_CENSUS       = 38,// RELIABLE wide-radius NPC existence list (protocol 36); NpcCensusHeader
     PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
-    PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
-    PKT_COMBAT_HIT       = 42 // RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_CAM_HINT         = 41 // UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -702,32 +701,6 @@ struct TreatmentPacket {
     u32 sIndex;
     u32 sSerial;
     f32 partBand[MED_PARTS_MAX]; // bandage level per anatomy part (-1 = not raised)
-};
-
-// Join-dealt authoritative damage report (protocol 45; join -> host). World-NPC
-// health is HOST-authoritative, and the join's local melee swings on driven NPC
-// copies are suppressed by the damage guard (cosmetic-only). But the join PC's
-// hits must still WOUND the real NPC on the host, and a driven copy cannot land
-// its own swing there (holding position parity with the moving owner PC stomps
-// its attack goal - the "join does no damage" bug). So the join accumulates the
-// damage its OWN player-squad melee WOULD have dealt to each driven NPC copy
-// (captured at the guard, keyed by the copy's CANONICAL hand) and reports it
-// here; the host resolves the victim and applies it to the authoritative body
-// (blood + a frontal flesh wound), then the medical sim + vitals stream mirror
-// the result back. Idempotent-ish per hitId (log correlation only; the amounts
-// are deltas, so a dropped/duped datagram would mis-total - hence RELIABLE).
-struct CombatHitPacket {
-    u8  type;    // = PKT_COMBAT_HIT
-    u32 ownerId; // network player id of the sender (the ATTACKER's machine)
-    u32 hitId;   // monotonic per-sender (log correlation)
-    // victim hand (the host-owned world NPC that was struck), canonical key
-    u32 sType;
-    u32 sContainer;
-    u32 sContainerSerial;
-    u32 sIndex;
-    u32 sSerial;
-    f32 flesh;   // accumulated flesh damage to apply (frontal part)
-    f32 blood;   // accumulated blood loss to apply
 };
 
 // Consensus game speed (pause/1x/2x/3x). As PKT_SPEED_REQ it carries one

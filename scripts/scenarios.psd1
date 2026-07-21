@@ -1309,21 +1309,6 @@
             Advisory = @('smoothness', 'anim_truth', 'march', 'existence_parity')
             Tier = 'full'; WanVariant = $false
         }
-        # pc_assault: the DAMAGE-gated counterpart to assault_town + combat-cohesion
-        # diagnostic. Both sides buff their OWN squad to 120 and the join orders its
-        # PC to attack a baked bar NPC (Save 'sync'); the fix (reciprocal provoke +
-        # self-defend) sustains the join PC's host-side fight so the victim's flesh/
-        # blood DROPS on the host (authoritative join-dealt damage) and STREAMS back
-        # to the join - the "join does no damage to NPCs" bug. Test-PcAssault walks
-        # the intent chain link by link, gates flesh-OR-blood damage host+join, and
-        # reports host<->join combat-cohesion (Get-CombatParity) as a FINDING.
-        pc_assault = @{
-            Save = 'sync'; Setup = ''; Tolerance = 20.0
-            PrimaryGate = 'pc_assault'
-            Gating   = @('pc_assault', 'clock_sync')
-            Advisory = @('smoothness', 'anim_truth', 'march')
-            Tier = 'full'; WanVariant = $false
-        }
 
         # ---- inventory ---------------------------------------------------------------
         inv_order = @{

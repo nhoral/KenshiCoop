@@ -274,21 +274,6 @@ public:
     // stream then mirrors the healed state back to everyone.
     void applyTreatments(GameWorld* gw, Inbound& in);
 
-    // JOIN only (protocol 45): forward the join-dealt damage accumulated on driven
-    // world-NPC copies (drained into pendingHits_ during applyTargets) to the host
-    // as reliable CombatHitPackets. The join's local swing is guarded (cosmetic),
-    // so this is the only path by which the join PC actually wounds the host's NPC.
-    void publishCombatHits(GameWorld* gw, NetLink& net, u32 ownerId);
-
-    // HOST only (protocol 45): drain received join-dealt damage reports and apply
-    // them AUTHORITATIVELY to the world NPC the host owns (blood loss + a frontal
-    // flesh wound via woundSubjectLimbs). Ignores reports for bodies the host is
-    // not the combat authority for (partition safety, like applyTreatments).
-    void applyCombatHits(GameWorld* gw, Inbound& in);
-
-    // Enable join-dealt damage reporting (join only; see publishCombatHits).
-    void setReportCombat(bool v) { reportCombat_ = v; }
-
     // AFTER publishOwned (protocol 17, both clients): stream each OWNED
     // player-squad member's CharStats (attributes/skills/xp) on the RELIABLE
     // channel - change-gated by a quantized fingerprint, ~1 Hz floor, periodic
@@ -698,14 +683,6 @@ private:
         u32          combatTgtSer;    //   so a host-side retarget re-issues immediately
         unsigned long combatSeenTick; // last tick the host stream reported combat (the
                                       //   disarm DEBOUNCE: a 1-batch gap must not reset the AI)
-        unsigned long provokeTick;    // last reciprocal-provoke of the target (throttle): while
-                                      //   the copy isn't landing, order the victim to fight back
-                                      //   so a passive target's brawl goes mutual and sustains
-        bool         selfDefend;      // the copy's OWN ordered attack failed past the re-issue cap
-                                      //   while provoking: drop it and let the provoked enemy's
-                                      //   incoming swings drive NATURAL self-defense (the only path
-                                      //   that ever drew blood - ordered-attack + puppet-drive
-                                      //   together suppress it; this releases both)
         unsigned long combatSnapTick; // last hard snap (cooldown; a failed teleport must not
                                       //   re-fire every frame - walk-converge between snaps)
         unsigned long combatSnapCount;// cumulative combat hard-snaps on this hand (Phase 1 warp
@@ -787,8 +764,7 @@ private:
                    koLatched(false), deathLatched(false),
                    combatArmed(false), combatTick(0), combatOrders(0),
                    combatTgtIdx(0), combatTgtSer(0),
-                   combatSeenTick(0), provokeTick(0), selfDefend(false),
-                   combatSnapTick(0), combatSnapCount(0),
+                   combatSeenTick(0), combatSnapTick(0), combatSnapCount(0),
                    combatOverTick(0), npcSnapTick(0),
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
@@ -1247,16 +1223,6 @@ private:
 
     // Damage-guard state (join side): suppress local melee damage on driven bodies.
     bool                 dmgGuard_;
-
-    // Join-dealt authoritative damage report (protocol 45). reportCombat_ is set on
-    // the JOIN only; while ON, applyTargets drains the guard's accumulated per-copy
-    // damage into pendingHits_ (keyed by the copy's canonical hand), and
-    // publishCombatHits forwards it to the host. nextHitId_ is a per-sender counter
-    // for log correlation.
-    struct PendingHit { float flesh; float blood; PendingHit() : flesh(0.0f), blood(0.0f) {} };
-    bool                 reportCombat_;
-    std::map<Key, PendingHit> pendingHits_;
-    unsigned int         nextHitId_;
 
     // Carried-body sync (protocol 18): master enable (KENSHICOOP_CARRY_SYNC).
     bool                 carrySync_;

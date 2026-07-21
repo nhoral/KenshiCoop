@@ -146,10 +146,6 @@ const unsigned int  COMBAT_REISSUE_CAP    = 5;    // max timer re-issues per epi
 const unsigned long COMBAT_DISARM_MS      = 4000; // host-stream combat gap before the copy
                                                   // is disarmed (stance samples ride the
                                                   // lossy batch; a gap must not AI-reset)
-const unsigned long COMBAT_PROVOKE_MS     = 1800; // reciprocal-provoke throttle: while the
-                                                  // driven copy isn't landing (localFight=0),
-                                                  // order the victim to fight back this often
-                                                  // so a passive target's brawl goes mutual
 const unsigned long COMBAT_SNAP_COOL_MS   = 3000; // min gap between hard snaps per body (a
                                                   // snap that can't stick - stagger, stale
                                                   // interp - must not re-fire every frame)

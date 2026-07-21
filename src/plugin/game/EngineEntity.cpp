@@ -551,22 +551,6 @@ Character* leader(GameWorld* gw) {
     }
 }
 
-unsigned int listPlayerChars(GameWorld* gw, Character** out, unsigned int maxOut) {
-    if (!gw || !out || maxOut == 0) return 0;
-    unsigned int n = 0;
-    __try {
-        if (!gw->player) return 0;
-        unsigned int size = (unsigned int)gw->player->playerCharacters.size();
-        for (unsigned int i = 0; i < size && n < maxOut; ++i) {
-            Character* c = gw->player->playerCharacters[i];
-            if (c) out[n++] = c;
-        }
-        return n;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return n;
-    }
-}
-
 // True if 'obj' is one of the local player's squad members (we never stream our
 // own controllable squad as a host NPC). Caller holds the SEH frame.
 // External linkage (EngineInternal.h): also used by the spawn/combat TU.

@@ -111,13 +111,6 @@ struct InboundTreatment {
     TreatmentPacket pkt;
 };
 
-// One received join-dealt damage report (protocol 45): the join's melee on a
-// driven world-NPC copy was suppressed locally; the host wounds the real NPC.
-struct InboundCombatHit {
-    u32             ownerId;
-    CombatHitPacket pkt;
-};
-
 // One received game-speed packet (consensus speed sync): a REQUEST from a peer
 // (host consumes; join requests never reach a join) or the host's arbitrated
 // SET (join applies). pkt.type distinguishes the two.
@@ -372,8 +365,7 @@ public:
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    wp_(worldReset_),
-        med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
-        speed_(worldReset_),
+        med_(worldReset_),        treat_(worldReset_),      speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   buildPlace_(worldReset_), buildState_(worldReset_),
@@ -476,11 +468,6 @@ public:
     void pushTreatment(u32 ownerId, const TreatmentPacket& pkt) {
         InboundTreatment it; it.ownerId = ownerId; it.pkt = pkt;
         EnterCriticalSection(&cs_); treat_.push_back(it); LeaveCriticalSection(&cs_);
-    }
-    // NET thread: one received join-dealt damage report, owner-tagged.
-    void pushCombatHit(u32 ownerId, const CombatHitPacket& pkt) {
-        InboundCombatHit it; it.ownerId = ownerId; it.pkt = pkt;
-        EnterCriticalSection(&cs_); combatHit_.push_back(it); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received game-speed request/set, owner-tagged.
     void pushSpeed(u32 ownerId, const SpeedPacket& pkt) {
@@ -645,9 +632,6 @@ public:
     void drainTreatments(std::deque<InboundTreatment>& out) {
         EnterCriticalSection(&cs_); out.swap(treat_); LeaveCriticalSection(&cs_);
     }
-    void drainCombatHits(std::deque<InboundCombatHit>& out) {
-        EnterCriticalSection(&cs_); out.swap(combatHit_); LeaveCriticalSection(&cs_);
-    }
     void drainSpeed(std::deque<InboundSpeed>& out) {
         EnterCriticalSection(&cs_); out.swap(speed_); LeaveCriticalSection(&cs_);
     }
@@ -770,7 +754,6 @@ private:
     WorldQ<InboundWorldPickup>     wp_;
     WorldQ<InboundMedical>         med_;
     WorldQ<InboundTreatment>       treat_;
-    WorldQ<InboundCombatHit>       combatHit_;
     WorldQ<InboundSpeed>           speed_;
     WorldQ<InboundStats>           stats_;
     WorldQ<InboundMoney>           money_;

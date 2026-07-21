@@ -57,7 +57,6 @@
 #include <kenshi/Item.h>            // Item / InventoryItemBase (quantity/quality/equipped)
 #include <kenshi/CharBody.h>        // CharBody::currentAction / _NV_setCurrentAction
 #include <kenshi/CombatClass.h>     // CombatClass::combatState (active-vs-waiting stance)
-#include <kenshi/Damages.h>         // Damages (melee hit floats; protocol 45 join-dealt report)
 #include <kenshi/CharStats.h>       // CharStats (protocol 17 stats sync)
 #include <kenshi/Tasker.h>          // Tasker::key() -> TaskType, Tasker::subject (hand)
 #include <kenshi/util/hand.h>       // hand (5-field identity, getRootObject)
