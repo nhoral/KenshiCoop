@@ -87,6 +87,20 @@
 
     Scenarios = @{
         # ---- entity stream / presence -------------------------------------------
+        # stop_probe: diagnostic repro for on-stop overshoot/rubberband in the driven
+        # copy (walk-drive taper + halting-settle fix, concept from CTRL-ALT-E e36b960).
+        # Host walks its squad leader out-and-back on squad1 with a REAL halt at each
+        # end (move issued once per leg), for a long window so a heavy-modlist join
+        # still overlaps many stops. Read the join [drv] trace (KENSHICOOP_DRIVEDBG=1)
+        # at the stops. Not tiered (never runs in regress); smoothness/crosscheck
+        # advisory only.
+        stop_probe = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'crosscheck'
+            Gating   = @('crosscheck')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'clock_sync')
+            Tier = 'none'; WanVariant = $false
+        }
         leader_move = @{
             Save = 'sync'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'crosscheck'
