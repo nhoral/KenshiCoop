@@ -24,6 +24,7 @@
 #include <windows.h>
 
 #include "../core/SteamId.h" // parseSteamId64 (pure) for the paste-from-clipboard button
+#include "../core/Config.h"  // saveLastPeer - persist the pasted friend ID for next launch
 
 namespace coop {
 namespace engine {
@@ -213,10 +214,10 @@ DataPanelLine*          g_peerLine     = 0; // white "Friend's Steam ID" row
 DataPanelLine*          g_selfLine     = 0; // white "Your Steam ID" row
 std::string             g_selfIdStr;   // self SteamID as digits (set each tick; "" = none)
 
-// Friend's SteamID pasted in-panel this session (0 = none). Per-session by
-// design: it lives only in memory, so relaunching Kenshi clears it and the
-// friend's id is re-pasted (nothing is written to disk). Passed to onConnect,
-// where it overrides the (usually empty) config steamPeer.
+// Friend's SteamID pasted in-panel this session (0 = none). A valid paste is also
+// persisted to coop_last_peer.txt (see saveLastPeer) so the NEXT launch pre-fills
+// it as the default peer; within a session this in-memory value is still what wins
+// and is passed to onConnect, overriding the (usually empty) config steamPeer.
 unsigned long long      g_pastedPeer   = 0;
 bool                    g_pasteFailed  = false; // last paste wasn't a valid Steam ID
 
@@ -265,6 +266,10 @@ void onPasteIdBtn(DataPanelLine*) {
     if (clipboardGetText(clip) && coop::parseSteamId64(clip, id)) {
         g_pastedPeer  = id;
         g_pasteFailed = false;
+        // Persist for next launch so a regular co-op pair never re-pastes (best-
+        // effort; a write failure only loses the convenience default, not this
+        // session's peer, which lives in g_pastedPeer above).
+        coop::saveLastPeer(id);
         char b[64];
         _snprintf(b, sizeof(b) - 1, "[coop-ui] paste friend id=%llu ok=1", id);
         b[sizeof(b) - 1] = '\0';

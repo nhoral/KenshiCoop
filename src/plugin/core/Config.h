@@ -498,6 +498,14 @@ void loadConfig(Config& out);
 // applies without restarting the game. No-op for keys absent from the file.
 void reloadPeerFromFile(Config& c);
 
+// Persist / read the friend SteamID last pasted in the F2 panel. Stored in a small
+// sibling file (coop_last_peer.txt) next to coop_config.json so a co-op pair does
+// not have to re-paste each other's IDs every launch. saveLastPeer is best-effort
+// (silent on I/O failure) and ignores id 0; loadLastPeer returns 0 when the file is
+// missing or its contents are not a valid SteamID64 (re-validated on read).
+void saveLastPeer(unsigned long long id);
+unsigned long long loadLastPeer();
+
 // One-line summary of the RESOLVED (effective) config - every sync channel's
 // on/off state plus the key tuning knobs - for the startup log. Makes "which
 // config did this run actually use?" answerable from the log alone (real

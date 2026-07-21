@@ -2,6 +2,7 @@
 
 #include "Config.h"
 #include "OwnRanks.h"
+#include "SteamId.h" // parseSteamId64 (pure) - re-validates the persisted last-peer file
 #include <cstdlib>
 #include <cstdio>
 #include <map>
@@ -70,16 +71,30 @@ std::map<std::string, std::string> parseFlatJson(const std::string& text) {
     return m;
 }
 
-// Absolute path to coop_config.json next to KenshiCoop.dll (fallback: cwd).
-std::string configFilePath() {
+// Directory that holds KenshiCoop.dll, with a trailing slash (fallback: cwd = "").
+// Both the config file and its sibling last-peer file live here.
+std::string moduleDirPath() {
     char buf[MAX_PATH];
     HMODULE h = GetModuleHandleA("KenshiCoop.dll");
     DWORD n = GetModuleFileNameA(h, buf, MAX_PATH); // h == 0 would give the exe path
-    if (h == 0 || n == 0 || n >= MAX_PATH) return "coop_config.json";
+    if (h == 0 || n == 0 || n >= MAX_PATH) return std::string();
     std::string p(buf, n);
     size_t slash = p.find_last_of("\\/");
-    p = (slash != std::string::npos) ? p.substr(0, slash + 1) : std::string();
-    return p + "coop_config.json";
+    return (slash != std::string::npos) ? p.substr(0, slash + 1) : std::string();
+}
+
+// Absolute path to coop_config.json next to KenshiCoop.dll (fallback: cwd).
+std::string configFilePath() {
+    return moduleDirPath() + "coop_config.json";
+}
+
+// Absolute path to the sibling last-peer file (coop_last_peer.txt) next to
+// coop_config.json / the DLL. This is the tiny convenience store for the friend
+// SteamID last pasted in the F2 panel - kept OUT of coop_config.json so the
+// hand-authored config (with its // comments, which our flat parser would strip
+// on a rewrite) is never clobbered.
+std::string lastPeerFilePath() {
+    return moduleDirPath() + "coop_last_peer.txt";
 }
 
 std::map<std::string, std::string> readConfigFile() {
@@ -247,6 +262,13 @@ void loadConfig(Config& c) {
     c.transport = envOr("KENSHICOOP_TRANSPORT", fileOr(f, "transport", "udp").c_str());
     c.steamPeer = (unsigned long long)_strtoui64(
         envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str()).c_str(), 0, 10);
+    // Lowest-precedence default: if neither the env var nor coop_config.json set a
+    // peer (the normal panel-driven install ships steamPeer unset), fall back to the
+    // friend SteamID last pasted in the F2 panel (persisted in coop_last_peer.txt).
+    // This flows through to CoopPanelState::peerSteamId, so the panel opens with the
+    // last friend's ID pre-filled; the player can still paste a different one to play
+    // with someone else that session. Precedence stays env > file > last-pasted.
+    if (c.steamPeer == 0) c.steamPeer = loadLastPeer();
     c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
 
     // In-game panel session control: opt-in legacy auto-start. Default OFF so a
@@ -413,6 +435,31 @@ void reloadPeerFromFile(Config& c) {
     if (it != f.end() && !it->second.empty()) c.ip = it->second;
     it = f.find("port");
     if (it != f.end() && !it->second.empty()) c.port = std::atoi(it->second.c_str());
+}
+
+void saveLastPeer(unsigned long long id) {
+    // Persist the friend SteamID last pasted in the F2 panel so a regular co-op
+    // pair does not have to re-paste each other's IDs on every launch. Best-effort:
+    // a failed open is silently ignored (this is only a convenience default). id 0
+    // is a no-op - we never persist "no peer".
+    if (id == 0) return;
+    std::ofstream f(lastPeerFilePath().c_str(), std::ios::binary | std::ios::trunc);
+    if (!f) return;
+    char b[32];
+    _snprintf(b, sizeof(b) - 1, "%llu\n", id);
+    b[sizeof(b) - 1] = '\0';
+    f << b;
+}
+
+unsigned long long loadLastPeer() {
+    // Read the persisted last-peer SteamID (0 if the file is missing/unreadable or
+    // its contents are not a valid SteamID64). Re-validating through parseSteamId64
+    // means a corrupted/edited file can never inject a bogus peer.
+    std::ifstream f(lastPeerFilePath().c_str(), std::ios::binary);
+    if (!f) return 0;
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    unsigned long long id = 0;
+    return parseSteamId64(text, id) ? id : 0;
 }
 
 } // namespace coop
