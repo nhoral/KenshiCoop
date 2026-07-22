@@ -110,6 +110,53 @@
             Tier = 'smoke'; WanVariant = $true
         }
 
+        # ident_sync (protocol 46 regression for PR #28 fixes #4 name-sync + #5
+        # animal-age-sync): squad1 + the 'npc' setup scene has the host spawn a
+        # world NPC that the join mints as a proxy - name_sync asserts the minted
+        # proxy carries the host's replicated name (not the default "Name"), and
+        # age_sync asserts the StatsPacket age agrees host<->join. name_sync is the
+        # PrimaryGate (the mint is the always-present signal); age_sync SKIPs
+        # cleanly if no aged body is under sync (a squad-animal fixture would make
+        # #5 deterministic). Tier 'none' = run explicitly (-Scenario ident_sync).
+        ident_sync = @{
+            Save = 'squad1'; Setup = 'recruit'; Tolerance = 3.0
+            # The 'recruit' setup scene has the host spawn + recruit a world NPC, so
+            # it becomes an OWNED member that publishOwned streams and the join MINTS
+            # as a proxy - a deterministic runtime mint. name_sync (PrimaryGate)
+            # asserts that minted proxy carries the host's replicated name, never the
+            # default "Name" (PR #28 fix #4). age_sync asserts the StatsPacket age
+            # agrees host<->join (fix #5). Tier 'none' = run explicitly.
+            PrimaryGate = 'name_sync'
+            Gating   = @('name_sync', 'age_sync')
+            Advisory = @('clock_sync')
+            # squad1 is a 2-tab save with the tabs far apart, so the recruited NPC
+            # spawns ~1.4ku from the JOIN's interest anchor - past the default 600u
+            # mint radius (bodies defer as "far"). Widen it so the proxy mints and
+            # name_sync gets its signal (census radius is 2000).
+            DiagEnv = @{ KENSHICOOP_SPAWN_MINT_RADIUS = '2000' }
+            Tier = 'none'; WanVariant = $false
+        }
+
+        # death_portrait (regression for the death-portrait crash fix): the repro is
+        # a player's own character dying (1 char per player; the host's char died and
+        # both clients crashed). The host's char is already a proxy on the join from
+        # the shared squad1 save, so the scenario bleeds the HOST-OWNED leader out via
+        # LIMB wounds (the game runs its own point-of-no-return death - a forced kill
+        # would bypass the death sequence), and the death crosses instantly on the
+        # join's proxy. The corpse re-keys + the mod would rebuild a portrait for the
+        # dead hand and deref a null PortraitData (the MainBarGUI crash + phantom
+        # "Name") - the fix SKIPs that re-join. death_portrait requires the join to
+        # WITNESS the death, then asserts no phantom 'Name' corpse + (if the
+        # death-latched rekey fires) the skip; health_* asserts no crash. Tier 'none'
+        # = run explicitly.
+        death_portrait = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'death_portrait'
+            Gating   = @('death_portrait')
+            Advisory = @('clock_sync')
+            Tier = 'none'; WanVariant = $false
+        }
+
         # split_interest (step 5): the host's tab leaves the bar; bar NPCs must keep
         # streaming via the second interest sphere (the join's tab leader). The join
         # walks nothing - its member IS the remote anchor. Save 'sync' (the bar

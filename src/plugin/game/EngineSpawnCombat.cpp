@@ -127,8 +127,36 @@ Character* sameTemplateNear(GameWorld* gw, const char* charSid,
     }
 }
 
+// setName takes a std::string (destructor forbids __try in-frame): the POD-only
+// shim wraps the non-POD callee, mirroring charName/charNameCopy.
+void setProxyNameCopy(Character* c, const char* name) {
+    c->setName(std::string(name));
+}
+void setProxyNameGuarded(Character* c, const char* name) {
+    if (!c || !name || !name[0]) return;
+    __try {
+        setProxyNameCopy(c, name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// Age read/write for the stats-channel animal-scale sync (protocol 46). Age
+// drives CharacterAnimal body scale; humans return a cosmetic age (harmless).
+float charAge(Character* c) {
+    if (!c) return -1.0f;
+    __try {
+        return c->getAge();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1.0f; }
+}
+void setCharAge(Character* c, float age) {
+    if (!c || !(age > 0.0f && age < 1.0e6f)) return;
+    __try {
+        c->setAge(age);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
-                         float x, float y, float z, float heading, float age) {
+                         float x, float y, float z, float heading, float age,
+                         const char* name) {
     if (!gw || !gw->theFactory || !g_createCharFn || !charSid || !charSid[0]) return 0;
     // Creature-size sync (protocol 39): animals scale body size by age, so the
     // proxy must be CREATED at the host's age or it spawns full-grown (the
@@ -175,6 +203,9 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
     // authority for a proxy (AI-suspend re-asserts this every driven tick).
     detachFromTownAI(c);
     clearGoals(c);
+    // Name sync (protocol 45): give the proxy the host body's name so runtime
+    // NPCs/recruits don't show Kenshi's default "Name" on the peer.
+    setProxyNameGuarded(c, name);
     return c;
 }
 
@@ -619,6 +650,53 @@ bool killSubject(GameWorld* gw, const unsigned int subjHand[5]) {
         med->blood     = 0.0f; // past the point of no return
         med->unconcious = true;
         med->dead      = true; // Character::isDead() reads this -> BODY_DEAD
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// The host's own squad leader (playerCharacters[0]) - a HOST-OWNED body that the
+// join already holds as a proxy from the shared save, so its death crosses the
+// wire immediately (no recruit / far-mint). Used by the death-portrait regression
+// to reproduce "a player's own character dies". SEH-guarded; 0 on fault/empty.
+Character* hostOwnedLeader(GameWorld* gw) {
+    if (!gw || !gw->player) return 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        return gw->player->playerCharacters[0];
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// Bleed a body out LETHALLY without forcing death: set a high currentBleedRate +
+// low blood so the game's own medical tick drains it to zero and runs its NATURAL
+// death sequence (which re-keys the corpse + refreshes the squad portrait - the
+// null-PortraitData path the death fix guards). killSubject sets med->dead
+// directly and BYPASSES that sequence, so it can't reproduce the crash. Operates
+// on the Character* directly (no hand round-trip), re-assertable each tick so
+// clotting never lowers the rate before the body finishes bleeding out.
+bool bleedOutCharacter(GameWorld* gw, Character* c) {
+    (void)gw;
+    if (!c) return false;
+    __try {
+        MedicalSystem* med = &c->medical;
+        // Setting currentBleedRate directly is futile - the game recomputes it every
+        // frame from the per-part wound state (getExtraBleedingAmount reads the
+        // part's derivedFleshHealthPercent). So WOUND every part deep: force both
+        // flesh and the derived percent hard negative (re-asserted each tick so an
+        // update() re-derive can't clot it), and pull the starting blood down so the
+        // game's OWN bloodloss update drains the rest to 0 and runs its natural
+        // point-of-no-return death (corpse re-key + portrait refresh). No med->dead
+        // poke - that is what makes killSubject bypass the death sequence.
+        unsigned int n = med->anatomy.count;
+        for (unsigned int i = 0; i < n; ++i) {
+            MedicalSystem::HealthPartStatus* p =
+                med->anatomy.stuff ? med->anatomy.stuff[i] : 0;
+            if (!p) continue;
+            p->flesh = -500.0f;                    // deep open wound
+            p->derivedFleshHealthPercent = -5.0f;  // what the bloodloss check reads
+        }
+        if (med->blood > 30.0f) med->blood = 30.0f; // low start; game bleeds it to 0
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;

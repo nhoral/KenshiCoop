@@ -1638,6 +1638,12 @@ private:
     // syncSpawns runs a ~1 s liveness sweep: SEH-read each pointer's current
     // hand and resolve it back; anything but the same pointer unbinds the
     // entry untouched.
+    // Minted-proxy discriminator (keyed by pointer): only bodies WE created via
+    // spawnProxyNpc may be destroyed on cleanup. rekeyPeerBody also binds REAL
+    // save-stable bodies into proxyByKey_ (a recruit/squad-move rebind), and
+    // destroying one on peer-leave crashes (freed body still in playerCharacters)
+    // and bakes it out of the save. Membership survives key migration for free.
+    std::set<Character*> mintedProxies_;
     // JOIN: per-hand request state - debounce, retry cap, negative-reply
     // backoff (deniedMs = when the host said "can't resolve either" or the
     // local proxy spawn failed; retried only after a long cooldown).

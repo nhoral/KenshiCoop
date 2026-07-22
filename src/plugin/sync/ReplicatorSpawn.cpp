@@ -64,6 +64,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 spawnReq_.erase(it->first); // allow a fresh REQ/mint cycle
                 lifeSet(it->first, LIFE_UNKNOWN, "proxy-despawned");
+                mintedProxies_.erase(it->second);
                 proxyByKey_.erase(it++);
                 continue;
             }
@@ -77,7 +78,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             const Key& bk = it->first;
             Character* orig = engine::resolveCharByHand(bk.i, bk.s, bk.t, bk.c, bk.cs);
             if (orig && orig != it->second) {
-                engine::despawnProxyNpc(gw, it->second);
+                if (mintedProxies_.count(it->second)) {
+                    engine::despawnProxyNpc(gw, it->second);
+                    mintedProxies_.erase(it->second);
+                }
                 char b[176]; _snprintf(b, sizeof(b) - 1,
                     "[spawn] proxy DUPE-HEAL hand=%u,%u,%u,%u,%u (original resolved; "
                     "proxy destroyed, proxies=%u)",
@@ -122,11 +126,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.found = found ? 1 : 0;
             pkt.dead  = dead ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
+            if (found) engine::charName(c, pkt.name, sizeof(pkt.name));
             net.queueSpawnInfo(pkt);
             char b[224]; _snprintf(b, sizeof(b) - 1,
-                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
+                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s' name='%s'",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
-                pkt.charSid, pkt.facSid);
+                pkt.charSid, pkt.facSid, pkt.name);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
@@ -372,7 +377,8 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             }
         }
         Character* proxy = engine::spawnProxyNpc(gw, p.charSid, p.facSid,
-                                                 p.x, p.y, p.z, p.heading, p.age);
+                                                 p.x, p.y, p.z, p.heading, p.age,
+                                                 p.name);
         if (!proxy) {
             // Local mint failed (template/faction absent here - modded host?).
             // Back off hard; retrying in seconds cannot succeed.
@@ -405,6 +411,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             }
         }
         proxyByKey_[k] = proxy;
+        mintedProxies_.insert(proxy);
         ++mintedThisTick;
         lifeSet(k, LIFE_RESOLVED, "mint");
         // Dead on arrival: latch the down state now (the same reliable-latch
@@ -413,12 +420,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         if (p.dead) targets_[k].deathLatched = true;
         // mintDist (Phase 1 telemetry): how far from our squad the proxy
         // appeared - the spawn-parity oracle gates its distribution.
-        char b[224]; _snprintf(b, sizeof(b) - 1,
+        char b[248]; _snprintf(b, sizeof(b) - 1,
             "[spawn] proxy BOUND hand=%u,%u,%u,%u,%u sid='%s' fac='%s' dead=%d "
-            "age=%.2f pos=%.1f,%.1f,%.1f mintDist=%.0f cen=%d (proxies=%u)",
+            "age=%.2f pos=%.1f,%.1f,%.1f mintDist=%.0f cen=%d (proxies=%u) name='%s'",
             k.t, k.c, k.cs, k.i, k.s, p.charSid, p.facSid, p.dead ? 1 : 0,
             p.age, p.x, p.y, p.z, mintDist, rq.fromCensus ? 1 : 0,
-            (unsigned)proxyByKey_.size());
+            (unsigned)proxyByKey_.size(), p.name);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // Phase 1b: a recruit/move whose ok=0 rekey enrolled a force-REQ (the
         // interest-split recruit) now has its proxy body - make it a real squad
@@ -689,6 +696,8 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if ((nk.t | nk.c | nk.cs | nk.i | nk.s) == 0) {
                     pinPeer_.erase(k);
                     pinOwned_.erase(k);
+                    { std::map<Key, Character*>::iterator pf = proxyByKey_.find(k);
+                      if (pf != proxyByKey_.end()) mintedProxies_.erase(pf->second); }
                     proxyByKey_.erase(k);
                     targets_.erase(k);
                     rekeyedOld_[k] = nowMs(); // no REQ for the dead key's tail
@@ -830,8 +839,12 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // proxy - destroy it with the NPC-correct SEH-guarded despawnProxyNpc
         // (removeWorldItemProxy is for world Item* proxies and mis-handles a
         // Character body; the same rekey path already uses despawnProxyNpc for
-        // its control-flip phantom cull below).
-        culled = engine::despawnProxyNpc(gw, mint) ? 1 : 0;
+        // its control-flip phantom cull below). Only if WE minted it - a rebased
+        // real body under this key must never be destroyed.
+        if (mintedProxies_.count(mint)) {
+            culled = engine::despawnProxyNpc(gw, mint) ? 1 : 0;
+            mintedProxies_.erase(mint);
+        }
         repaired = 1;
     }
     if (c) {
@@ -897,7 +910,18 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // into our squad), insertPeerMember pins the actual local hand OWNED so
         // publishOwned streams it and the local player controls it. Idempotent +
         // tab-aware, so a squad-move re-containers an existing member too.
-        insertPeerMember(gw, c, newK, tag, destOwned);
+        // Don't re-join a dead body to the player squad: joinPlayerSquadAt
+        // triggers the squad-portrait refresh, and a portrait for a dead/re-keyed
+        // hand derefs a null PortraitData (MainBarGUI crash on death). The corpse
+        // stays down via the death latch on targets_[newK]. KO'd members still insert.
+        if (carryDeath) {
+            char sk[176]; _snprintf(sk, sizeof(sk) - 1,
+                "[%s] MEMBER skip new=%u,%u,%u,%u,%u (death-latched corpse)",
+                (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
+            sk[sizeof(sk) - 1] = '\0'; coop::logLine(sk);
+        } else {
+            insertPeerMember(gw, c, newK, tag, destOwned);
+        }
         if (destOwned) {
             // Control hand-off: drop every residual DRIVE artifact so publishOwned
             // streams the body immediately and applyTargets never fights our own
@@ -918,8 +942,9 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
             // stray proxy and drop its binding (manual 2026-07-17: Squint).
             std::map<Key, Character*>::iterator px = proxyByKey_.find(newK);
             if (px != proxyByKey_.end()) {
-                if (px->second && px->second != c)
+                if (px->second && px->second != c && mintedProxies_.count(px->second))
                     engine::despawnProxyNpc(gw, px->second);
+                mintedProxies_.erase(px->second);
                 proxyByKey_.erase(px);
             }
             char cf[176]; _snprintf(cf, sizeof(cf) - 1,
@@ -927,6 +952,15 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
                 (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
             cf[sizeof(cf) - 1] = '\0'; coop::logLine(cf);
         }
+    } else if (carryDeath) {
+        // Dead body with no local copy: don't force-REQ/mint. Minting spawns a
+        // fresh unnamed corpse (the "Name" portrait that appears after a death,
+        // since proxy names aren't replicated). Suppress any in-flight reply mint.
+        rekeyedOld_[newK] = nowMs();
+        char fb[176]; _snprintf(fb, sizeof(fb) - 1,
+            "[%s] REKEY-DEAD skip-mint new=%u,%u,%u,%u,%u",
+            (tag ? tag : "squad"), newK.t, newK.c, newK.cs, newK.i, newK.s);
+        fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
     } else {
         // ok=0: no local body at the OLD hand and no proxy to migrate. The
         // recruit/move fired while this hand was OUTSIDE our interest (the

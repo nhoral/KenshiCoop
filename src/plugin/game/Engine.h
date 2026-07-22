@@ -276,6 +276,10 @@ void* markerCreate(Character* c, const char* text, int colorId);
 bool  markerUpdate(void* label, const char* text, int colorId);
 void  markerDestroy(void* label);
 
+// True while any inventory/trade window is open (the engine UI holds Item
+// pointers). Inventory-sync must not free items during this window. SEH-guarded.
+bool  inventoryUiOpen();
+
 // ---- In-game co-op session panel ---------------------------------------------
 // Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
 // CoopDisconnectFn, coopPanelTick, coopOverlayTick. The UI root (Plugin.cpp)
@@ -324,7 +328,13 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
 // cosmetic; combat outcomes stay host-authoritative + damage-guarded. Returns
 // the proxy Character* or 0.
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
-                         float x, float y, float z, float heading, float age);
+                         float x, float y, float z, float heading, float age,
+                         const char* name);
+
+// Age read/write (protocol 46 animal-scale sync). SEH-guarded; charAge returns
+// <= 0 on fault, setCharAge no-ops a non-finite/<=0 value.
+float charAge(Character* c);
+void  setCharAge(Character* c, float age);
 
 // SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
 // (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block
@@ -1226,6 +1236,16 @@ bool amputateSubjectLimb(GameWorld* gw, const unsigned int subjHand[5], int limb
 // without waiting for random combat limb rolls. Returns true if applied.
 bool woundSubjectLimbs(GameWorld* gw, const unsigned int subjHand[5],
                        float flesh, float blood);
+
+// The host's own squad leader (playerCharacters[0]) - host-owned, already a proxy
+// on the join. 0 on fault/empty. Used by the death-portrait regression.
+Character* hostOwnedLeader(GameWorld* gw);
+
+// Bleed a body out lethally (high currentBleedRate + low blood) so the GAME runs
+// its own natural death sequence - unlike killSubject, which forces med->dead and
+// skips it. Operates on the Character* directly; re-assert each tick. Used by the
+// death-portrait regression to reproduce a natural squad-member death.
+bool bleedOutCharacter(GameWorld* gw, Character* c);
 
 // Protocol 45 (host applies join-dealt damage): unlike woundSubjectLimbs (which
 // sets ABSOLUTE floor levels for the medic scaffold), this SUBTRACTS cumulative

@@ -140,6 +140,13 @@ void Replicator::applyInventories(GameWorld* gw) {
         unsigned int cHand[5] = { k.t, k.c, k.cs, k.i, k.s };
         const InvItemEntry* items = it->second.items.empty() ? 0 : &it->second.items[0];
         unsigned int n = (unsigned int)it->second.items.size();
+        // Defer the reconcile while an inventory/trade UI is open: freeing items
+        // the UI holds is a use-after-free (Inventory::removeItem crash on city
+        // entry). Idempotent - re-arm dirty and retry once the window closes.
+        if (engine::inventoryUiOpen()) {
+            it->second.dirty = true;
+            continue;
+        }
         // Protocol 37 (the race that blinded the detector in run 141024): if this
         // peer container's LOCAL contents differ from the transfer detector's
         // baseline, a user mutation (possibly one end of a cross-owner drag) has not
