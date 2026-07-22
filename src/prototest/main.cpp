@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/core/ProdAuthority.h" // autoridad por-objeto de crafteo (protocolo 33)
 
 #include <set>
 
@@ -1355,6 +1356,42 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+static void testProdAuthority() {
+    std::printf("== production per-object authority (ProdAuthority.h) ==\n");
+
+    // Maquina baked (sin colocador): manda el HOST. Preserva EXACTAMENTE el
+    // comportamiento host-autoritativo previo. placedByLocal es irrelevante.
+    CHECK("baked: host es autoridad",
+          prodIsLocalAuthority(/*isHost*/true,  /*isPlaced*/false, /*placedByLocal*/false));
+    CHECK("baked: join NO es autoridad",
+          !prodIsLocalAuthority(/*isHost*/false, /*isPlaced*/false, /*placedByLocal*/false));
+
+    // Maquina placed: manda quien la COLOCO, sea host o join. Este es el fix:
+    // el join conduce las maquinas que el construyo.
+    CHECK("placed por join: join es autoridad",
+          prodIsLocalAuthority(/*isHost*/false, /*isPlaced*/true, /*placedByLocal*/true));
+    CHECK("placed por peer (proxy en join): join NO es autoridad",
+          !prodIsLocalAuthority(/*isHost*/false, /*isPlaced*/true, /*placedByLocal*/false));
+    CHECK("placed por host: host es autoridad",
+          prodIsLocalAuthority(/*isHost*/true,  /*isPlaced*/true, /*placedByLocal*/true));
+    CHECK("placed por peer (proxy en host): host NO es autoridad",
+          !prodIsLocalAuthority(/*isHost*/true,  /*isPlaced*/true, /*placedByLocal*/false));
+
+    // Invariante de particion: para CUALQUIER maquina, exactamente UN lado es la
+    // autoridad -> nunca hay dos escritores sobre la misma maquina. Barremos las
+    // 4 combinaciones (baked/placed x colocada-por-host/join) y comprobamos que
+    // host y join no son ambos autoridad ni ambos no-autoridad de la misma.
+    // baked: host lo posee en los dos clientes (placedByLocal solo aplica a placed).
+    CHECK("baked: exactamente una autoridad",
+          prodIsLocalAuthority(true, false, false) != prodIsLocalAuthority(false, false, false));
+    // placed colocada por el HOST: en el host placedByLocal=true, en el join =false.
+    CHECK("placed-by-host: exactamente una autoridad",
+          prodIsLocalAuthority(true, true, true) != prodIsLocalAuthority(false, true, false));
+    // placed colocada por el JOIN: en el join placedByLocal=true, en el host =false.
+    CHECK("placed-by-join: exactamente una autoridad",
+          prodIsLocalAuthority(false, true, true) != prodIsLocalAuthority(true, true, false));
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1377,6 +1414,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testProdAuthority();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

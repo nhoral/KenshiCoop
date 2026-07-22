@@ -265,6 +265,30 @@ void processNetEvents(GameWorld* gw) {
     std::deque<coop::u32> conns, leaves;
     g_inbound.drainConnects(conns);
     g_inbound.drainLeaves(leaves);
+    // Ordering note (connect vs leave in the same drain batch): conn_ and leave_
+    // are two SEPARATE net-thread queues, so draining them independently LOSES
+    // the true cross-queue interleave - from here we cannot tell "connect then
+    // leave" (a blip, ends absent) from "leave then connect" (a reconnect, ends
+    // present). We process connects first, then leaves, then the unconditional
+    // crash-cleanup at the bottom. Crucially, that trailing
+    // clearPeerReplicationState()/resetSession() runs whenever ANY leave is in
+    // the batch, AFTER both loops, and wipes the very row/build maps a connect's
+    // onPeerConnected() resync re-arms - so it is ORDER-INDEPENDENT: swapping
+    // these two loops would NOT change the same-batch outcome (the connect's
+    // resync is reset either way; only its already-queued outbound re-announce
+    // survives). We deliberately keep this order and let the batch resolve to
+    // the clean/absent state, because:
+    //  - The safety-critical proxy despawn (clearPeerReplicationState) is
+    //    unconditional and thus never at risk from ordering.
+    //  - A real reconnect's connect and leave edges are many ticks apart, so
+    //    they land in SEPARATE batches: the leave batch cleans, a LATER connect
+    //    batch resyncs correctly. The same-batch collision is a rare timing
+    //    edge that self-heals via the peers' periodic safety resends (RESEND_MS)
+    //    plus that subsequent connect edge.
+    // A same-batch reconnect that keeps its resync would require running the
+    // connect handling AFTER the trailing clear - a larger restructure that
+    // would leave a genuine blip pointing g_peerPresent at a gone peer; not
+    // worth it for a rare, self-healing case. (Re-audit if multi-peer lands.)
     for (std::deque<coop::u32>::iterator it = conns.begin(); it != conns.end(); ++it) {
         char b[96];
         _snprintf(b, sizeof(b) - 1, "handshake: peer present id=%u (local id=%u)",

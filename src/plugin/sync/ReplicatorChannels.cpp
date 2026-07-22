@@ -11,6 +11,7 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/ProdAuthority.h" // modelo de autoridad por-objeto (protocolo 33)
 
 namespace coop {
 
@@ -653,6 +654,19 @@ void Replicator::publishDoors(const SyncContext& ctx) {
         // Protocol 28 partition: doors on SESSION-PLACED buildings (ours or
         // minted proxies) ride PKT_BUILD_DOOR on the translated identity -
         // their runtime hands would never resolve on the peer anyway.
+        // Channel-order caveat: this filter reads mintByLocal_, which
+        // applyBuilds populates (idx 2 in kCh[]) AFTER publishDoors runs
+        // (idx 1). The window is benign in practice: applyBuilds sets
+        // mintByLocal_ in the SAME statement that mints the proxy, so the
+        // building's doors can only be enumerated here on a LATER tick, by
+        // which point the key is already present; and a door's first sighting
+        // seeds its row silently (no packet) below. Worst case a proxy door
+        // whose state changed in the exact seed tick emits ONE PKT_DOOR with a
+        // runtime hand the peer drops clean, self-correcting next sample - no
+        // data loss. NOT worth reordering kCh[] to close: that table's order is
+        // the fixed wire cadence (see driveSampledChannels), and moving builds
+        // ahead of doors would perturb every channel's publish sequence for a
+        // cosmetic, self-healing transient.
         if (r.doorIndex >= 0) {
             Key pk; pk.t = r.parentHand[0]; pk.c = r.parentHand[1];
             pk.cs = r.parentHand[2]; pk.i = r.parentHand[3]; pk.s = r.parentHand[4];
@@ -743,6 +757,7 @@ inline int qProd(float v) {
 
 void Replicator::publishProd(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    const bool isHost = ctx.isHost; // autoridad por-objeto: baked -> host publica
     if (!prodSync_) return;
     const unsigned long SAMPLE_MS = tuning_.prodSampleMs;  // machines tick slowly; 1 Hz is plenty
     const unsigned long RESEND_MS = tuning_.prodResendMs;  // safety resend = the join drift corrector
@@ -762,12 +777,19 @@ void Replicator::publishProd(const SyncContext& ctx) {
         // join's placement translates through the reverse map). Everything
         // else is a BAKED machine with a save-stable hand.
         int keyKind = 0; Key wk = lk;
+        bool placedByLocal = false; // colocada por ESTE cliente (esta en ownBuilds_)
         if (ownBuilds_.find(lk) != ownBuilds_.end()) {
-            keyKind = 1;
+            keyKind = 1; placedByLocal = true;
         } else {
             std::map<Key, Key>::iterator mit = mintByLocal_.find(lk);
             if (mit != mintByLocal_.end()) { keyKind = 1; wk = mit->second; }
         }
+        // Autoridad por-objeto: publicamos SOLO las maquinas de las que somos
+        // duenno (baked -> host; placed -> quien la coloco). Una maquina placed
+        // del peer (proxy minted, placedByLocal=false) la conduce el peer: no la
+        // publicamos para no crear dos escritores sobre la misma maquina.
+        if (!prodIsLocalAuthority(isHost, keyKind == 1, placedByLocal))
+            continue;
         ProdRow& pr = prodRows_[std::make_pair(keyKind, wk)];
         int qOut = qProd(r.outAmount);
         int qIn0 = qProd(r.nInputs > 0 ? r.inAmount[0] : -1.0f);
@@ -826,6 +848,7 @@ void Replicator::publishProd(const SyncContext& ctx) {
 
 void Replicator::applyProd(const SyncContext& ctx) {
     Inbound& in = *ctx.in;
+    const bool isHost = ctx.isHost; // autoridad por-objeto: ignora ecos de maquinas propias
     std::deque<InboundProd> got;
     in.drainProd(got);
     if (got.empty()) return;
@@ -837,17 +860,22 @@ void Replicator::applyProd(const SyncContext& ctx) {
         ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wk)];
         if (!sync::gateSeqAccept(pr.seqSeen, p.seq)) continue; // stale/dup row
         pr.seqSeen = p.seq;
-        // Resolve the wire key to OUR machine's hand: baked hands resolve
-        // directly; a placer key is either a building WE placed (our own
-        // hand) or one we MINTED for the host's placement (translation map).
+        // Resolve the wire key to OUR machine's hand, aplicando SOLO las
+        // maquinas de las que NO somos autoridad (ProdAuthority.h). Una fila
+        // para una maquina propia se ignora: seria el peer pisando nuestro
+        // estado (ese era el bug del join-espectador).
         unsigned int hand[5];
         if (p.keyKind == 0) {
+            // Baked: la conduce el host. Si somos host, somos la autoridad ->
+            // ignoramos ecos; el join aplica lo que recibe.
+            if (isHost) continue;
             for (unsigned int h = 0; h < 5; ++h) hand[h] = p.key[h];
         } else {
             std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(wk);
             if (ob != ownBuilds_.end()) {
-                if (ob->second.removed) continue;
-                memcpy(hand, ob->second.hand, sizeof(hand));
+                // La colocamos NOSOTROS -> somos la autoridad; no aplicamos las
+                // filas del peer sobre nuestra propia maquina.
+                continue;
             } else {
                 std::map<Key, PeerBuild>::iterator pb = peerBuilds_.find(wk);
                 if (pb == peerBuilds_.end() || pb->second.minted != 1 ||
@@ -1226,8 +1254,17 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         { &Replicator::doorSync_,     0,                     &Replicator::publishDoors,      &Replicator::applyDoors,      false },
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
         { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
-        { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  }
+        // Prod y research pasan a DIRECCION SIMETRICA (hostAuth=false): ambos
+        // clientes publican Y aplican. Prod usa autoridad POR-OBJETO interna
+        // (publishProd/applyProd leen ctx.isHost + ProdAuthority.h -> baked lo
+        // conduce el host, placed quien la coloco), asi que nunca hay dos
+        // escritores sobre la misma maquina pese al camino simetrico; ese era
+        // el bug del join-espectador que revertia el crafteo del join. Research
+        // es una UNION grow-only (CRDT): ambos publican su set conocido y saltan
+        // lo ya conocido, converge sin arbitraje y una investigacion del JOIN
+        // llega al host. Antes ambos eran hostAuth=true (host->join un sentido).
+        { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       false },
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   false }
     };
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
     for (int i = 0; i < n; ++i) {

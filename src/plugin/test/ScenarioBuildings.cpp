@@ -506,9 +506,18 @@ private:
 // + setItem write applied); crossing/convergence is the sync oracle's job.
 class ProdProbeScenario : public TimedScenario {
 public:
-    explicit ProdProbeScenario(bool probe)
-        : TimedScenario(probe ? "prod_probe" : "prod_sync", /*evidenceMs=*/1000),
-          probe_(probe), censusLogged_(0),
+    // joinDrives: si true, es el JOIN quien coloca+opera las maquinas (el host
+    // observa). Sirve para verificar en vivo la AUTORIDAD POR-OBJETO del
+    // protocolo 33: una maquina placed la conduce quien la coloco, asi que el
+    // JOIN debe poder crafteear y el HOST verlo sin revertirlo. Con false (por
+    // defecto) el comportamiento es IDENTICO al prod_sync/prod_probe previos.
+    // El nombre resuelto se pasa a TimedScenario (que ya gestiona name()/passed_/
+    // el timing de evidencia), por eso joinDrives elige "prod_sync_join" aqui.
+    explicit ProdProbeScenario(bool probe, bool joinDrives = false)
+        : TimedScenario(joinDrives ? "prod_sync_join"
+                                   : (probe ? "prod_probe" : "prod_sync"),
+                        /*evidenceMs=*/1000),
+          probe_(probe), joinDrives_(joinDrives), censusLogged_(0),
           placed_(false), placeGenOk_(false), placeBenchOk_(false),
           rampStep_(0), rampGenDone_(false), rampBenchDone_(false),
           nextRampMs_(0), nextOpMs_(0), opCount_(0), nextResearchMs_(0),
@@ -531,7 +540,10 @@ public:
     virtual bool onTick(const ScenarioContext& ctx) {
         if (evidenceDue(ctx.elapsedMs))
             logCensus(ctx);
-        if (ctx.isHost) {
+        // El CONDUCTOR (host por defecto; join si joinDrives_) coloca+opera las
+        // maquinas; el otro lado solo observa/aplica lo que reciba por la red.
+        const bool isDriver = (ctx.isHost != joinDrives_);
+        if (isDriver) {
             if (!placed_ && ctx.elapsedMs >= PLACE_AT_MS) {
                 placed_ = true;
                 doPlace(ctx);
@@ -567,7 +579,7 @@ public:
         }
         if (ctx.elapsedMs >= DURATION_MS) {
             passed_ = (censusLogged_ > 0);
-            if (ctx.isHost) {
+            if (isDriver) {
                 // Local legs on the driving side: both machines placed and
                 // completed, the power toggle applied, the native output
                 // write landed, and the operate loop ran. What CROSSED (or
@@ -752,6 +764,7 @@ private:
     static const unsigned int  MAX_RAMP_STEPS    = 8;
 
     bool          probe_;
+    bool          joinDrives_; // true: conduce el JOIN (prueba autoridad por-objeto)
     unsigned int  censusLogged_;
     bool          placed_;
     bool          placeGenOk_;
@@ -1265,6 +1278,10 @@ Scenario* makeBuildingScenario(const std::string& name) {
     if (name == "bdoor_sync")    return new BdoorProbeScenario(false);
     if (name == "prod_probe")     return new ProdProbeScenario(true);
     if (name == "prod_sync")      return new ProdProbeScenario(false);
+    // prod_sync_join: mismo script pero conduce el JOIN. Prueba en vivo que el
+    // join puede craftear en una maquina que EL coloco y el host lo ve sin
+    // revertirlo (autoridad por-objeto del protocolo 33).
+    if (name == "prod_sync_join") return new ProdProbeScenario(false, true);
     if (name == "research_probe") return new ResearchProbeScenario(true);
     if (name == "research_sync")  return new ResearchProbeScenario(false);
     if (name == "store_probe")    return new StoreProbeScenario(true);
