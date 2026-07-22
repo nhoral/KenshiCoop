@@ -182,6 +182,7 @@ function Invoke-OneOracle {
         "drop_probe"    { return (Test-DropProbe       -HostFile $HostLog) }
         "wi_sync"       { return (Test-WorldItemSync   -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "wi_join"       { return (Test-WorldItemSync   -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance -JoinAuthor -GateName "wi_join") }
+        "wi_peer_pickup" { return (Test-WorldItemPeerPickup -HostFile $HostLog -JoinFile $JoinLog) }
         "wpn_relocate"  { return (Test-WpnRelocate     -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_drop"   { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog) }
         "armor_drop"    { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "armor_drop") }
