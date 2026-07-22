@@ -361,6 +361,72 @@ void Replicator::applyTreatments(GameWorld* gw, Inbound& in) {
     }
 }
 
+// JOIN only (protocol 45): forward the join-dealt damage that applyTargets drained
+// into pendingHits_ (per driven world-NPC copy, keyed by canonical hand). The
+// join's own melee is guarded (cosmetic), so this reliable report is the ONLY path
+// by which the join PC actually wounds the host's authoritative NPC. Sent as it
+// accumulates; the map is cleared each publish (unsent-on-drop is acceptable - the
+// next swing re-accumulates, and RELIABLE delivery covers a queued send).
+void Replicator::publishCombatHits(GameWorld* gw, NetLink& net, u32 ownerId) {
+    (void)gw;
+    if (pendingHits_.empty()) return;
+    for (std::map<Key, PendingHit>::iterator it = pendingHits_.begin();
+         it != pendingHits_.end(); ++it) {
+        const Key&       k  = it->first;
+        const PendingHit& ph = it->second;
+        if (ph.flesh <= 0.0f && ph.blood <= 0.0f) continue;
+        CombatHitPacket chp;
+        memset(&chp, 0, sizeof(chp));
+        chp.type    = (u8)PKT_COMBAT_HIT;
+        chp.ownerId = ownerId;
+        chp.hitId   = nextHitId_++;
+        chp.sType = k.t; chp.sContainer = k.c; chp.sContainerSerial = k.cs;
+        chp.sIndex = k.i; chp.sSerial = k.s;
+        chp.flesh = ph.flesh; chp.blood = ph.blood;
+        net.queueCombatHit(chp);
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[combat] HIT SEND id=%u hand=%u,%u flesh=%.1f blood=%.1f",
+            chp.hitId, k.i, k.s, ph.flesh, ph.blood);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    pendingHits_.clear();
+}
+
+// HOST only (protocol 45): drain received join-dealt damage reports and wound the
+// authoritative world NPC (blood loss + a frontal flesh wound). The host owns +
+// simulates world NPCs, so this is the authoritative application; the vitals
+// stream then mirrors the new state back to the join's cosmetic copy. A report for
+// a body the host OWNS as a player-squad member is skipped (PvP is out of scope
+// and would be a partition error, mirroring applyTreatments' authority guard).
+void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
+    std::deque<InboundCombatHit> got;
+    in.drainCombatHits(got);
+    for (std::deque<InboundCombatHit>::iterator it = got.begin(); it != got.end(); ++it) {
+        const CombatHitPacket& p = it->pkt;
+        Key k; k.t = p.sType; k.c = p.sContainer; k.cs = p.sContainerSerial;
+        k.i = p.sIndex; k.s = p.sSerial;
+        if (ownHands_.find(k) != ownHands_.end()) {
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[combat] HIT RECV id=%u hand=%u,%u SKIP (own body)",
+                p.hitId, k.i, k.s);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+        unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        bool applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
+        // A wounded world NPC is definitionally combat-scoped: mark it so the NPC
+        // vitals stream (publishMedical, Phase B) mirrors the authoritative drop
+        // back to the join's cosmetic copy (link 6 - "damage reached the join").
+        // The join's own copy is damage-guarded, so without this stream it would
+        // never reflect the host-applied wound.
+        if (applied && streamNpcs_) medNpc_[k] = nowMs();
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f applied=%d",
+            p.hitId, k.i, k.s, p.flesh, p.blood, applied ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::publishStats(GameWorld* gw, NetLink& net, u32 ownerId) {
     (void)gw;
     const unsigned long RESEND_MS   = 5000; // safety resend (cheap insurance)

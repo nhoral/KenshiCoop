@@ -49,6 +49,19 @@ void Replicator::applyTargets(GameWorld* gw) {
     // damage, so the join's cosmetic fights cannot diverge the local-only medical
     // model. A body we stop driving drops out and takes local damage again.
     if (dmgGuard_) engine::clearDamageGuard();
+    // Join-dealt damage report (protocol 45, JOIN only): keep the engine-side
+    // accumulator armed and refresh the ATTACKER set (our controllable squad) each
+    // tick, mirroring the guard-set rebuild. A guarded swing BY one of these bodies
+    // ON a driven copy is captured for publishCombatHits; the set rebuild handles
+    // recruit/roster churn. On the host reportCombat_ is false, so the accumulator
+    // stays disabled (host swings land natively on the NPCs it owns).
+    if (reportCombat_) {
+        engine::setCombatReport(true);
+        engine::clearReportAttackers();
+        Character* pcs[64];
+        unsigned int np = engine::listPlayerChars(gw, pcs, 64);
+        for (unsigned int i = 0; i < np; ++i) engine::addReportAttacker(pcs[i]);
+    }
     // Driven-body pointer set rebuilds per tick too: enforceHostAuthority uses it
     // to recognise a streamed body whose LOCAL hand key changed (combat detach
     // re-containers world NPCs) so it never hides a body we are driving.
@@ -259,6 +272,21 @@ void Replicator::applyTargets(GameWorld* gw) {
         //     host locomotion so it still animates. Grounded engine-walk + real
         //     sit/idle poses for NPCs arrive in Stage 5 (AI quiet-in-place).
         bool isSquad = engine::isLocalPlayerChar(gw, c);
+
+        // Join-dealt authoritative damage (protocol 45). The guard suppressed our
+        // player-squad melee on this driven copy (cosmetic); drain the damage it
+        // WOULD have dealt and stage it under the copy's canonical hand for
+        // publishCombatHits to forward to the host (which owns the real body).
+        // World NPCs only - a squad copy is a peer PC (PvP, out of scope), but we
+        // still drain it so the engine-side accumulator stays bounded.
+        if (reportCombat_) {
+            float rf = 0.0f, rb = 0.0f;
+            if (engine::takeReportedDamage(c, &rf, &rb) && !isSquad &&
+                (rf > 0.0f || rb > 0.0f)) {
+                PendingHit& ph = pendingHits_[it->first];
+                ph.flesh += rf; ph.blood += rb;
+            }
+        }
 
         // ---- Phase A jail-observe (KENSHICOOP_JAIL_OBSERVE, read-only spike) ----
         // For a peer-owned captive (the join's jailed PC as driven on the host),

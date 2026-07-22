@@ -1309,6 +1309,23 @@
             Advisory = @('smoothness', 'anim_truth', 'march', 'existence_parity')
             Tier = 'full'; WanVariant = $false
         }
+        # pc_assault: the DAMAGE-gated counterpart to assault_town + combat-cohesion
+        # diagnostic. Both sides buff their OWN squad to 120 and the join orders its
+        # PC to attack a baked bar NPC (Save 'sync'); the report-and-apply damage
+        # channel (protocol 45) makes the victim's flesh/blood DROP on the host
+        # (authoritative join-dealt damage) and STREAM back to the join - closing the
+        # "join does no damage to NPCs" gap. Test-PcAssault HARD-gates the damage
+        # transfer (protocol-45 [combat] HIT RECV/SEND: host applies join-dealt
+        # damage AND it streams back to the join) and REPORTS host<->join combat
+        # cohesion (Get-CombatParity joinOnlyFrac/churn) as a FINDING - the warp-
+        # cohesion regression guard is combat_snap_rate on combat_crowd/battle/win.
+        pc_assault = @{
+            Save = 'sync'; Setup = ''; Tolerance = 20.0
+            PrimaryGate = 'pc_assault'
+            Gating   = @('pc_assault', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
 
         # ---- inventory ---------------------------------------------------------------
         inv_order = @{

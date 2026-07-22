@@ -1372,6 +1372,234 @@ private:
     EntityState   seen_[MAX_REMEMBER];
 };
 
+// pc_assault (join PC deals REAL damage to a host-owned NPC + combat-cohesion
+// diagnostic): the damage-gated counterpart to assault_town. assault_town gates
+// only the intent chain (issue -> CAP -> order -> hostview) and never proves the
+// join's attack DAMAGES anything - exactly the "join does no damage to NPCs" gap.
+// Here:
+//   * Save 'sync' (baked bar crowd) so many hostile-able NPCs stand near the
+//     co-located squads. Baked hands resolve identically host<->join, so the
+//     enemy the join fights (cr.target) is the SAME hand the host copy damages,
+//     and the drop streams back (baked NPCs have no runtime-spawn medical proxy
+//     gap).
+//   * BOTH sides buff their OWN squad to 120 (statsSync streams the raise to the
+//     host copy of the join PC), so the join's authoritative host-side fight -
+//     which the reciprocal-provoke + self-defend fix now sustains - draws blood.
+// The join's damage-guard suppresses its LOCAL swings, so the proof is HOST-side:
+// the victim's flesh/blood must DROP on the host (the join-dealt authoritative
+// damage) and STREAM back to the join. SCENARIO COMBATSTATE is sampled on BOTH
+// sides for the same baked hands so the oracle can measure combat COHESION (a
+// copy fighting on the join while the host reports peace - the reported churn).
+//   join:  "SCENARIO PCASSAULT issued ...", [combat] CAP, VITALS/COMBATSTATE
+//   host:  "SCENARIO PCASSAULT spawned=n" (baked victims in reach), [combat] order
+//          r=2, "hostview fight=1", VITALS (authoritative drop) + COMBATSTATE.
+class PcAssaultScenario : public TimedScenario {
+public:
+    PcAssaultScenario()
+        : TimedScenario("pc_assault", 0), lastLogMs_(0), lastOrderMs_(0),
+          haveOwn_(false), havePeer_(false), haveVic_(false), issued_(false),
+          buffed_(false), spawned_(false), pickFailLogged_(false),
+          nSpawn_(0), nBuffed_(0), hostFightSeen_(0) {}
+
+    virtual void onGameplay(const ScenarioContext& ctx) { latchLeaders(ctx); }
+    virtual void onStart(const ScenarioContext& ctx) { latchLeaders(ctx); }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveOwn_ || !havePeer_) latchLeaders(ctx);
+
+        // Both: buff OWN squad to 120 so the join's PC is a lethal attacker whose
+        // host-side fight actually draws blood (statsSync streams the raise).
+        if (!buffed_ && ctx.elapsedMs >= BUFF_AT_MS) buffOwnSquad(ctx);
+        // HOST: confirm the baked victim pool near the leaders (no runtime spawn).
+        if (ctx.isHost && !spawned_ && ctx.elapsedMs >= SPAWN_AT_MS) confirmVictimPool(ctx);
+
+        // JOIN: pick the nearest bar NPC near our OWN leader FIRST (the join PC
+        // stands among the crowd, same as assault_town), falling back to the peer
+        // leader's vicinity; order our own leader to attack it, kept alive on a
+        // cadence (orderAttackByHand no-ops while already fighting).
+        if (!ctx.isHost && haveOwn_ && ctx.elapsedMs >= ASSAULT_AT_MS) {
+            if (!haveVic_ && (ctx.elapsedMs - lastOrderMs_) >= 2500) {
+                lastOrderMs_ = ctx.elapsedMs;
+                haveVic_ = engine::pickCombatVictim(ctx.gw, ownHand_, 0, vic_, 0);
+                if (!haveVic_ && havePeer_)
+                    haveVic_ = engine::pickCombatVictim(ctx.gw, peerHand_, 0, vic_, 0);
+                if (!haveVic_ && !pickFailLogged_) {
+                    coop::logLine("SCENARIO PCASSAULT pick FAILED (no upright NPC; retrying)");
+                    pickFailLogged_ = true;
+                }
+            }
+            if (haveVic_ && (!issued_ || (ctx.elapsedMs - lastOrderMs_) >= 2500)) {
+                lastOrderMs_ = ctx.elapsedMs;
+                bool ok = engine::orderAttackByHand(ctx.gw, ownHand_, vic_);
+                if (!issued_) {
+                    char b[160]; _snprintf(b, sizeof(b) - 1,
+                        "SCENARIO PCASSAULT issued atk=%u,%u vic=%u,%u ok=%d",
+                        ownHand_[3], ownHand_[4], vic_[3], vic_[4], ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    issued_ = true;
+                }
+            }
+        }
+
+        // 1 Hz series: the attacker's local combat read + the victim's vitals +
+        // combat-state parity samples. The host learns the victim hand from its
+        // OWN combat read of the driven join-PC copy (cr.target) and logs its
+        // blood - the authoritative drop that IS the join-dealt damage.
+        if (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            const unsigned int* atk = ctx.isHost ? peerHand_ : ownHand_;
+            bool haveAtk = ctx.isHost ? havePeer_ : haveOwn_;
+            if (haveAtk) {
+                engine::CombatRead cr;
+                bool fight = engine::readCombatByHand(atk, &cr) &&
+                             (cr.inCombat || cr.modeActive);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO PCASSAULT %s fight=%d tgt=%u,%u wait=%d",
+                    ctx.isHost ? "hostview" : "joinview",
+                    fight ? 1 : 0,
+                    cr.hasTarget ? cr.target[3] : 0,
+                    cr.hasTarget ? cr.target[4] : 0,
+                    cr.waiting ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                if (ctx.isHost && fight) ++hostFightSeen_;
+                // Log the attacker's OWN combat target on BOTH sides: baked hands
+                // resolve identically host<->join, so the enemy the join PC fights
+                // (cr.target) is the SAME hand the host copy damages - the oracle
+                // compares that victim's blood on both logs (link 6). COMBATSTATE
+                // on the same hands feeds the host<->join combat-parity check.
+                if (cr.hasTarget) logVitalsLine(cr.target, ctx.elapsedMs);
+                logVitalsLine(atk, ctx.elapsedMs);
+                logCombatStateLine(atk, ctx.elapsedMs);
+                if (cr.hasTarget) logCombatStateLine(cr.target, ctx.elapsedMs);
+            }
+            if (!ctx.isHost && haveVic_) logVitalsLine(vic_, ctx.elapsedMs);
+            // Both: also sample the nearest few bar NPCs around each leader (belt-
+            // and-suspenders - the oracle can find the hurt hand even if cr.target
+            // flickers). Baked serials match across sides, so a drop the host logs
+            // here has a matching join-side series.
+            {
+                const unsigned int* ref = ctx.isHost ? peerHand_ : ownHand_;
+                bool haveRef = ctx.isHost ? havePeer_ : haveOwn_;
+                if (haveRef) {
+                    unsigned int e1[5], e2[5], e3[5];
+                    if (engine::pickCombatVictim(ctx.gw, ref, 0, e1, 0)) {
+                        logVitalsLine(e1, ctx.elapsedMs);
+                        logCombatStateLine(e1, ctx.elapsedMs);
+                        if (engine::pickCombatVictim(ctx.gw, ref, e1, e2, 0)) {
+                            logVitalsLine(e2, ctx.elapsedMs);
+                            logCombatStateLine(e2, ctx.elapsedMs);
+                            if (engine::pickCombatVictim(ctx.gw, ref, e1, e3, e2)) {
+                                logVitalsLine(e3, ctx.elapsedMs);
+                                logCombatStateLine(e3, ctx.elapsedMs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // The damage judgement is the oracle's (from the VITALS series); the
+            // scenario just certifies the setup ran (buff + victim pool / issue).
+            passed_ = ctx.isHost ? (buffed_ && havePeer_) : (issued_ && haveVic_);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static const unsigned long BUFF_AT_MS       = 8000;
+    static const unsigned long SPAWN_AT_MS      = 8000;
+    static const unsigned long ASSAULT_AT_MS    = 14000;
+    static const unsigned long HOST_DURATION_MS = 58000;
+    static const unsigned long JOIN_DURATION_MS = 50000;
+    static const unsigned int  MAX_LOG   = 40;
+    static const unsigned int  MAX_SQUAD = 32;
+
+    // Confirm the baked victim pool: count the nearest non-squad bar NPCs around
+    // the leader (no runtime spawn - baked NPCs resolve on both sides so their
+    // vitals stream back). Reuses the "spawned=N" marker (N = victims in reach).
+    void confirmVictimPool(const ScenarioContext& ctx) {
+        spawned_ = true;
+        nSpawn_ = 0;
+        const unsigned int* ref = havePeer_ ? peerHand_ : ownHand_;
+        unsigned int e1[5], e2[5], e3[5];
+        if (engine::pickCombatVictim(ctx.gw, ref, 0, e1, 0)) {
+            ++nSpawn_;
+            if (engine::pickCombatVictim(ctx.gw, ref, e1, e2, 0)) {
+                ++nSpawn_;
+                if (engine::pickCombatVictim(ctx.gw, ref, e1, e3, e2)) ++nSpawn_;
+            }
+        }
+        char b[96]; _snprintf(b, sizeof(b) - 1, "SCENARIO PCASSAULT spawned=%u", nSpawn_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (nSpawn_ == 0) coop::logLine("SCENARIO PCASSAULT spawn FAILED (no victims)");
+    }
+
+    void buffOwnSquad(const ScenarioContext& ctx) {
+        buffed_ = true;
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int idx = tabLeaderIdx(sq, n, ownRank);
+        if (idx < 0) { coop::logLine("SCENARIO PCASSAULT buff FAILED (no own leader)"); return; }
+        unsigned int leadC = sq[idx].hContainer, leadCs = sq[idx].hContainerSerial;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (sq[i].hContainer != leadC || sq[i].hContainerSerial != leadCs) continue;
+            unsigned int h[5]; handFromEntity(sq[i], h);
+            if (engine::raiseAllStats(ctx.gw, h, 120.0f) > 0) ++nBuffed_;
+        }
+        char b[112]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO PCASSAULT buff rank=%u buffed=%u", ownRank, nBuffed_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void latchLeaders(const ScenarioContext& ctx) {
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        EntityState sq[MAX_LOG];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_LOG);
+        if (!haveOwn_) {
+            int idx = tabLeaderIdx(sq, n, ownRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], ownHand_);
+                haveOwn_ = true;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO PCASSAULT own rank=%u hand=%u,%u",
+                    ownRank, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!havePeer_) {
+            int idx = tabLeaderIdx(sq, n, ownRank == 0u ? 1u : 0u);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], peerHand_);
+                havePeer_ = true;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO PCASSAULT peer rank=%u hand=%u,%u",
+                    ownRank == 0u ? 1u : 0u, peerHand_[3], peerHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    unsigned long lastLogMs_;
+    unsigned long lastOrderMs_;
+    bool          haveOwn_;
+    bool          havePeer_;
+    bool          haveVic_;
+    bool          issued_;
+    bool          buffed_;
+    bool          spawned_;
+    bool          pickFailLogged_;
+    unsigned int  nSpawn_;
+    unsigned int  nBuffed_;
+    unsigned int  hostFightSeen_;
+    unsigned int  ownHand_[5];
+    unsigned int  peerHand_[5];
+    unsigned int  vic_[5];
+};
+
 } // namespace
 
 Scenario* makeCombatScenario(const std::string& name) {
@@ -1384,6 +1612,7 @@ Scenario* makeCombatScenario(const std::string& name) {
     if (name == "combat_crowd") return new CombatCrowdScenario();
     if (name == "combat_battle") return new CombatBattleScenario();
     if (name == "combat_win")    return new CombatWinScenario();
+    if (name == "pc_assault")   return new PcAssaultScenario();
     return 0;
 }
 

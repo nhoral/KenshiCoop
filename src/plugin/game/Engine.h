@@ -172,6 +172,11 @@ bool readMotion(Character* c, bool* moving, float* speed);
 // SEH-guarded: fetch the local player's squad leader (playerCharacters[0]) or 0.
 Character* leader(GameWorld* gw);
 
+// SEH-guarded: write the local player's controllable characters (playerCharacters)
+// into out (up to maxOut). Returns the count. Used to register the combat-report
+// attacker set (the join's owned melee that the host should apply authoritatively).
+unsigned int listPlayerChars(GameWorld* gw, Character** out, unsigned int maxOut);
+
 // SEH-guarded: read the LOCAL camera's world center into out[3] (x,y,z).
 // Returns false when the camera is absent or not yet initialised (pre-load).
 // Camera-anchored interest lever (spike 35): purely local read; the join
@@ -933,6 +938,21 @@ unsigned int damageGuardCount();
 // bodies AND the hook stopped them).
 void         damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed);
 
+// ---- Join-dealt authoritative damage report (protocol 45) -------------------
+// The damage guard suppresses the join PC's melee on driven NPC copies (cosmetic
+// medical model), but those hits must still WOUND the real NPC on the host. When
+// combat reporting is ON (join only), the guard ACCUMULATES the damage a REPORT
+// ATTACKER (an owned player-squad body) would have dealt to each guarded copy,
+// keyed by the copy's Character*. The replicator drains it per driven copy and
+// sends a CombatHitPacket; the host applies it. setCombatReport(false) clears the
+// accumulator. The attacker set is rebuilt each tick (like the guard set).
+void         setCombatReport(bool on);
+void         clearReportAttackers();
+void         addReportAttacker(Character* c);
+// Drain the accumulated join-dealt damage for one victim copy (returns false if
+// nothing pending). flesh/blood are the summed deltas since the last drain.
+bool         takeReportedDamage(Character* c, float* outFlesh, float* outBlood);
+
 // Read a character's current blood level by hand (medical.blood). The vitals
 // ground-truth read for the damage_guard conformance oracle: the HOST's victim
 // must lose blood in a real fight while the JOIN's driven copy must not.
@@ -1206,6 +1226,16 @@ bool amputateSubjectLimb(GameWorld* gw, const unsigned int subjHand[5], int limb
 // without waiting for random combat limb rolls. Returns true if applied.
 bool woundSubjectLimbs(GameWorld* gw, const unsigned int subjHand[5],
                        float flesh, float blood);
+
+// Protocol 45 (host applies join-dealt damage): unlike woundSubjectLimbs (which
+// sets ABSOLUTE floor levels for the medic scaffold), this SUBTRACTS cumulative
+// deltas - the join reports the damage EACH suppressed swing would have dealt, and
+// the host wounds the authoritative NPC by that increment. flesh is subtracted
+// from the currently-weakest limb (concentrates a wound, so repeated hits chew one
+// part down - a clean monotone flesh series); blood is subtracted from the blood
+// pool. Both clamp at 0 (never heal). Returns true if applied.
+bool applyReportedDamage(GameWorld* gw, const unsigned int subjHand[5],
+                         float flesh, float blood);
 
 // Deterministic TREATMENT scaffold (medic_order): bandage every damaged limb on
 // the body at subjHand (HealthPartStatus::bandaging -> _maxHealth, raise only) -

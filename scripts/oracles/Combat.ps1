@@ -820,3 +820,250 @@ function Test-DeathParity {
                 "rekey-latch carries=$latch, vetoes=$vetoTotal (0 on owner-dead bodies)")
     return (Add-GateResult -Name "death_parity" -Status PASS -Metrics $m)
 }
+
+# Combat cohesion parity: pair host<->join SCENARIO COMBATSTATE samples per hand
+# and measure how often a body is fighting on the JOIN while the HOST reports
+# peace (the "in combat on join, not host" churn the player saw), plus join-side
+# fight-state toggles (churn/min). Reported as a FINDING - thresholds for a hard
+# gate are calibrated from real runs first. Sample times use the COMMON wall-clock
+# (line [HH:MM:SS.mmm] prefix + per-log clock offset) via Convert-StampToMs, so
+# SinceMs (from Get-MarkerTimeMs, wall-clock) filters correctly AND host<->join
+# samples pair on ONE clock. NOTE: PowerShell variable names are CASE-INSENSITIVE,
+# so a map named $H and a loop var $h are the SAME variable - use distinct words.
+function Get-CombatParity {
+    param([string]$HostFile, [string]$JoinFile, [int]$SinceMs = 0, [int]$TolMs = 1500)
+    $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO COMBATSTATE hand=(\d+,\d+) t=\d+ fight=(\d) wait=(\d)'
+    $hoff = Get-LogClockOffsetMs -File $HostFile
+    $hostMap = @{}
+    foreach ($m in (Select-String -Path $HostFile -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $t = Convert-StampToMs -Groups $g -OffsetMs $hoff
+        if ($t -lt $SinceMs) { continue }
+        $key = $g[5].Value
+        if (-not $hostMap.ContainsKey($key)) { $hostMap[$key] = New-Object System.Collections.ArrayList }
+        [void]$hostMap[$key].Add([pscustomobject]@{ t = $t; fight = [int]$g[6].Value })
+    }
+    $joff = Get-LogClockOffsetMs -File $JoinFile
+    $joinMap = @{}
+    foreach ($m in (Select-String -Path $JoinFile -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $t = Convert-StampToMs -Groups $g -OffsetMs $joff
+        if ($t -lt $SinceMs) { continue }
+        $key = $g[5].Value
+        if (-not $joinMap.ContainsKey($key)) { $joinMap[$key] = New-Object System.Collections.ArrayList }
+        [void]$joinMap[$key].Add([pscustomobject]@{ t = $t; fight = [int]$g[6].Value })
+    }
+    $pairs = 0; $joinOnly = 0; $hostOnly = 0; $agree = 0
+    $joinToggles = 0; $tSpanMax = 0
+    foreach ($hand in $joinMap.Keys) {
+        $jSamples = @($joinMap[$hand] | Sort-Object t)
+        $prev = $null
+        foreach ($s in $jSamples) { if ($null -ne $prev -and $s.fight -ne $prev) { $joinToggles++ }; $prev = $s.fight }
+        if ($jSamples.Count -ge 2) { $span = [int]$jSamples[-1].t - [int]$jSamples[0].t; if ($span -gt $tSpanMax) { $tSpanMax = $span } }
+        if (-not $hostMap.ContainsKey($hand)) { continue }
+        $hSamples = @($hostMap[$hand] | Sort-Object t)
+        foreach ($jr in $jSamples) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($hr in $hSamples) { $dd = [Math]::Abs([int]$hr.t - [int]$jr.t); if ($dd -lt $bd) { $bd = $dd; $best = $hr } }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $pairs++
+            if ($jr.fight -eq $best.fight) { $agree++ }
+            elseif ($jr.fight -eq 1) { $joinOnly++ } else { $hostOnly++ }
+        }
+    }
+    $joinOnlyFrac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
+    $hostOnlyFrac = if ($pairs -gt 0) { [Math]::Round($hostOnly / $pairs, 3) } else { 0 }
+    $churnPerMin  = if ($tSpanMax -gt 0) { [Math]::Round($joinToggles * 60000.0 / $tSpanMax, 1) } else { 0 }
+    return [pscustomobject]@{
+        pairs = $pairs; agree = $agree
+        joinOnlyCombat = $joinOnly; joinOnlyFrac = $joinOnlyFrac
+        hostOnlyCombat = $hostOnly; hostOnlyFrac = $hostOnlyFrac
+        joinToggles = $joinToggles; joinChurnPerMin = $churnPerMin
+        handsJoin = $joinMap.Count; handsHost = $hostMap.Count
+    }
+}
+
+# pc_assault (join PC deals REAL damage to a host-owned NPC): the damage-gated
+# counterpart to assault_town. Walks the same intent chain link by link AND adds
+# the damage links assault_town lacks - the whole point of the "join does no
+# damage to NPCs" report:
+#   1. issued  - join ordered its own leader onto the picked victim
+#   2. cap     - the join CAPTURED + streamed the combat intent ([combat] CAP)
+#   3. applied - the host ORDERED its join-PC copy into the fight (r=2; r=1 =
+#                target hand never resolved on the host)
+#   4. fight   - the host's local engine actually runs it (hostview fight=1)
+#   5. DAMAGE  - the victim's flesh/blood DROPS on the HOST (authoritative join-
+#                dealt damage) by >= MinHostDrop. THIS is the link the bug lives on.
+#                Bar/duel NPCs are tanky (blood barely moves, flesh takes the hit),
+#                so the metric is the bigger of the flesh-OR-blood drop.
+#   6. STREAM  - the drop reaches the JOIN (the victim's join-side series also
+#                falls / converges) so the join player SEES the NPC take damage.
+# Also reports host<->join combat COHESION (Get-CombatParity) as a FINDING.
+function Test-PcAssault {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinFight = 2, [double]$MinHostDrop = 5.0,
+          [double]$MinJoinDrop = 3.0, [double]$MaxEndGap = 12.0)
+    $spawn = Select-String -Path $HostFile -Pattern 'SCENARIO PCASSAULT spawned=(\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $nSpawn = if ($spawn) { [int]$spawn.Matches[0].Groups[1].Value } else { 0 }
+    $mi = Select-String -Path $JoinFile -Pattern 'SCENARIO PCASSAULT issued atk=(\d+),(\d+) vic=(\d+),(\d+) ok=(\d)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mi) {
+        Write-Host "  PC-ASSAULT FAIL - join never issued the assault (spawn=$nSpawn; no victim pick?) (link 1)"
+        return (Add-GateResult -Name "pc_assault" -Status FAIL -Metrics @{ spawned = $nSpawn } -Detail "no assault order (link 1)")
+    }
+    $atk = $mi.Matches[0].Groups[1].Value + ',' + $mi.Matches[0].Groups[2].Value
+    $vic = $mi.Matches[0].Groups[3].Value + ',' + $mi.Matches[0].Groups[4].Value
+    $T   = Get-MarkerTimeMs -File $JoinFile -Pattern 'SCENARIO PCASSAULT issued'
+
+    $capAll  = @(Select-String -Path $JoinFile -Pattern ('\[combat\] CAP hand=' + $atk + ' ') -ErrorAction SilentlyContinue).Count
+    $ordOk   = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=2') -ErrorAction SilentlyContinue).Count
+    $ordMiss = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=1') -ErrorAction SilentlyContinue).Count
+    $fight   = @(Select-String -Path $HostFile -Pattern 'SCENARIO PCASSAULT hostview fight=1' -ErrorAction SilentlyContinue).Count
+
+    # Protocol-45 authoritative join-dealt damage: the host logs a "[combat] HIT
+    # RECV ... applied=1" line for every join report it wounds the real NPC with.
+    # This is the UNAMBIGUOUS join-dealt signal - unlike the max vitals drop below,
+    # which can also credit the host's OWN buffed squad and land on an NPC the join
+    # never sampled (the join drop=-1 flake). The reported hand is the join PC's
+    # target, which the JOIN samples every tick, so its vitals series always exists.
+    $hitFlesh = 0.0; $hitBlood = 0.0; $hitCount = 0; $hitHand = ''
+    $hitAgg = @{}
+    foreach ($hm in (Select-String -Path $HostFile -Pattern '\[combat\] HIT RECV id=\d+ hand=(\d+,\d+) flesh=([\d.]+) blood=([\d.]+) applied=1' -ErrorAction SilentlyContinue)) {
+        $g = $hm.Matches[0].Groups
+        $hnd = $g[1].Value
+        $sum = [double]$g[2].Value + [double]$g[3].Value
+        if (-not $hitAgg.ContainsKey($hnd)) { $hitAgg[$hnd] = 0.0 }
+        $hitAgg[$hnd] += $sum
+        $hitFlesh += [double]$g[2].Value; $hitBlood += [double]$g[3].Value; $hitCount++
+    }
+    foreach ($hnd in $hitAgg.Keys) {
+        if ($hitHand -eq '' -or $hitAgg[$hnd] -gt $hitAgg[$hitHand]) { $hitHand = $hnd }
+    }
+    # Join side: "[combat] HIT SEND" proves the join captured its guarded swings'
+    # damage and forwarded it (the report half of the channel).
+    $hitSends = @(Select-String -Path $JoinFile -Pattern '\[combat\] HIT SEND ' -ErrorAction SilentlyContinue).Count
+
+    # Damage = the biggest flesh-OR-blood drop after the assault. Get-VitalsSeries
+    # returns its ArrayList via `,$list` (unrolls to the ArrayList on a bare
+    # assignment); wrapping it in @(...) instead yields a 1-element array HOLDING
+    # the ArrayList (Count=1, .blood broadcasts to nothing -> Measure finds no
+    # 'blood' property, drop reads 0). So assign directly, THEN filter with @().
+    $dmgDrop = {
+        param($file, $hand, $sinceMs)
+        $V = Get-VitalsSeries -File $file -HandIS $hand
+        if ($null -ne $sinceMs) { $V = @($V | Where-Object { $_.t -ge $sinceMs }) }
+        if ($V.Count -lt 2) { return $null }
+        $bloodD = [double]($V | Measure-Object -Property blood -Maximum).Maximum -
+                  [double]($V | Measure-Object -Property blood -Minimum).Minimum
+        $fl = @($V | Where-Object { $null -ne $_.pfl } | ForEach-Object { $_.pfl })
+        if ($fl.Count -lt 2) { $fl = @($V | Where-Object { $null -ne $_.fleshMin } | ForEach-Object { $_.fleshMin }) }
+        $fleshD = 0.0
+        if ($fl.Count -ge 2) {
+            $fleshD = [double]($fl | Measure-Object -Maximum).Maximum -
+                      [double]($fl | Measure-Object -Minimum).Minimum
+        }
+        return [pscustomobject]@{ dmg = [Math]::Max($fleshD, $bloodD); flesh = $fleshD; blood = $bloodD }
+    }
+    # Candidate victim hands from the host's VITALS lines after the assault.
+    $hostHands = @{}
+    foreach ($hm in (Select-String -Path $HostFile -Pattern 'SCENARIO VITALS hand=(\d+,\d+) ' -ErrorAction SilentlyContinue)) {
+        $hostHands[$hm.Matches[0].Groups[1].Value] = $true
+    }
+    $hostDrop = 0.0; $hurtHand = ''; $hostFlesh = 0.0; $hostBlood = 0.0
+    foreach ($h in $hostHands.Keys) {
+        if ($h -eq $atk) { continue }  # skip the attacker's own vitals
+        $d = & $dmgDrop $HostFile $h $T
+        if ($null -ne $d -and $d.dmg -gt $hostDrop) { $hostDrop = $d.dmg; $hurtHand = $h; $hostFlesh = $d.flesh; $hostBlood = $d.blood }
+    }
+    # Join-side "damage reached the join" proof. The join's NPC copies are damage-
+    # GUARDED (local swings suppressed), so ANY flesh/blood drop on a join-sampled
+    # copy is purely HOST-STREAMED damage (the round trip: join reports -> host
+    # applies -> vitals stream mirrors back). So take the max drop across the join's
+    # OWN sampled hands (symmetric to hostDrop) rather than requiring a specific
+    # cross-matched hand - the damaged hand flickers sub-second, so the host's
+    # max-drop / HIT hand is not reliably one the join independently sampled.
+    $joinHands = @{}
+    foreach ($hm in (Select-String -Path $JoinFile -Pattern 'SCENARIO VITALS hand=(\d+,\d+) ' -ErrorAction SilentlyContinue)) {
+        $joinHands[$hm.Matches[0].Groups[1].Value] = $true
+    }
+    $joinDrop = $null; $joinFlesh = 0.0; $joinBlood = 0.0; $endGap = $null; $joinHurt = ''
+    foreach ($h in $joinHands.Keys) {
+        if ($h -eq $atk) { continue }  # skip the join's own attacker vitals
+        $d = & $dmgDrop $JoinFile $h $T
+        if ($null -ne $d -and ($null -eq $joinDrop -or $d.dmg -gt $joinDrop)) {
+            $joinDrop = $d.dmg; $joinFlesh = $d.flesh; $joinBlood = $d.blood; $joinHurt = $h
+        }
+    }
+    # End-state convergence (advisory): if the join's most-hurt hand also has a host
+    # series, compare final blood so a partial stream surfaces.
+    if ($joinHurt -ne '') {
+        $Vh = Get-VitalsSeries -File $HostFile -HandIS $joinHurt; $Vh = @($Vh | Where-Object { $_.t -ge $T })
+        $Vj = Get-VitalsSeries -File $JoinFile -HandIS $joinHurt; $Vj = @($Vj | Where-Object { $_.t -ge $T })
+        if ($Vh.Count -ge 1 -and $Vj.Count -ge 1) {
+            # Coerce with @(...)[0]: a row's .t/.blood can occasionally arrive as a
+            # 1-element array (pipeline wrap upstream), and a bare [double] cast on
+            # an array throws (InvalidCast). @(...)[0] yields the scalar safely.
+            $htEnd = [double](@($Vh[-1].t)[0]); $jtEnd = [double](@($Vj[-1].t)[0])
+            $tEnd = [Math]::Min($htEnd, $jtEnd)
+            $hAt = @($Vh | Where-Object { [double](@($_.t)[0]) -le ($tEnd + 750) })
+            $jAt = @($Vj | Where-Object { [double](@($_.t)[0]) -le ($tEnd + 750) })
+            if ($hAt.Count -ge 1 -and $jAt.Count -ge 1) {
+                $hb = [double](@($hAt[-1].blood)[0]); $jb = [double](@($jAt[-1].blood)[0])
+                $endGap = [Math]::Abs($hb - $jb)
+            }
+        }
+    }
+
+    # Combat cohesion (Get-CombatParity): joinOnlyFrac is the "in combat on the join
+    # while the host reports peace" fraction. Reported as a FINDING, NOT gated: with
+    # the decoupled damage channel the join's local fight is cosmetic while the host
+    # copy holds POSITION PARITY (deliberately at peace), so a moderate joinOnlyFrac
+    # is EXPECTED and healthy here (measured 0.08-0.27 across clean runs). The real
+    # warp/redirect-churn regression guard is combat_snap_rate on combat_crowd/
+    # combat_battle/combat_win (it measures the driven-copy snap teleports directly);
+    # an upper bound on joinOnlyFrac would both flake and point the wrong way (the
+    # damage-first churn regression drove joinOnly toward 0, not up).
+    $cp = Get-CombatParity -HostFile $HostFile -JoinFile $JoinFile -SinceMs $T
+    $joinOnlyFrac = if ($null -ne $cp) { $cp.joinOnlyFrac } else { -1 }
+
+    $m = @{ spawned = $nSpawn; cap = $capAll; ordered = $ordOk; orderMiss = $ordMiss
+            hostFight = $fight
+            hitCount = $hitCount; hitSends = $hitSends
+            hitFlesh = [Math]::Round($hitFlesh, 1); hitBlood = [Math]::Round($hitBlood, 1); hitHand = $hitHand
+            hostDrop = [Math]::Round($hostDrop, 1); hostFlesh = [Math]::Round($hostFlesh, 1); hostBlood = [Math]::Round($hostBlood, 1)
+            hurtHand = $hurtHand; joinHurt = $joinHurt
+            joinDrop = if ($null -ne $joinDrop) { [Math]::Round($joinDrop, 1) } else { -1 }
+            joinFlesh = [Math]::Round($joinFlesh, 1); joinBlood = [Math]::Round($joinBlood, 1)
+            endGap = if ($null -ne $endGap) { [Math]::Round($endGap, 1) } else { -1 }
+            joinOnlyFrac = $joinOnlyFrac
+            joinChurnPerMin = if ($null -ne $cp) { $cp.joinChurnPerMin } else { -1 }
+            cohesionPairs = if ($null -ne $cp) { $cp.pairs } else { 0 } }
+    $joinDealt = $hitFlesh + $hitBlood
+    $bad = @()
+    if ($capAll -lt 1) { $bad += "join never streamed a combat intent for $atk (link 2: capture)" }
+    elseif ($ordOk -lt 1) {
+        if ($ordMiss -ge 1) { $bad += "host saw the intent but the target hand never resolved ($ordMiss r=1 orders; link 3: target resolve)" }
+        else                { $bad += "host never ordered the join-PC copy (0 [combat] order lines; link 3: apply)" }
+    }
+    if ($fight -lt $MinFight) { $bad += "host-side fight never ran (hostview fight=1 x$fight, need >= $MinFight; link 4)" }
+    # Link 5 (THE join-does-no-damage bug): the host must APPLY join-reported damage
+    # to the real NPC. The protocol-45 [combat] HIT RECV signal is authoritative and
+    # unambiguous (unlike the max vitals drop, which can credit the host's own squad).
+    if ($hitSends -lt 1) { $bad += "join never forwarded a combat-hit report (0 [combat] HIT SEND; link 5a: report channel)" }
+    if ($hitCount -lt 1) { $bad += "host applied NO join-dealt damage (0 [combat] HIT RECV applied=1; link 5: THE join-does-no-damage bug)" }
+    elseif ($joinDealt -lt $MinHostDrop) { $bad += "join-dealt damage too small: host applied flesh=$($m.hitFlesh) blood=$($m.hitBlood) (sum $([Math]::Round($joinDealt,1)) < $MinHostDrop; link 5)" }
+    # Link 6: the applied wound must STREAM back so the join SEES the NPC take damage.
+    if ($null -eq $joinDrop -or $joinDrop -lt $MinJoinDrop) {
+        if ($null -ne $endGap -and $endGap -le $MaxEndGap) {
+            if ($joinDealt -ge $MinHostDrop) { $bad += "damage did not reach the join: join drop=$($m.joinDrop) while host applied $([Math]::Round($joinDealt,1)) (link 6: vitals stream)" }
+        } else {
+            $bad += "damage did not reach the join: join drop=$($m.joinDrop) end-gap=$($m.endGap) (link 6: vitals stream)"
+        }
+    }
+    if ($null -ne $cp) {
+        Write-Host ("  PC-ASSAULT FINDING cohesion: pairs=$($cp.pairs) joinOnlyCombat=$($cp.joinOnlyCombat) ($($cp.joinOnlyFrac)) hostOnly=$($cp.hostOnlyCombat) joinChurn/min=$($cp.joinChurnPerMin) [handsJ=$($cp.handsJoin) handsH=$($cp.handsHost)]")
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  PC-ASSAULT FAIL - " + ($bad -join "; ") + " [spawn=$nSpawn cap=$capAll ord=$ordOk fight=$fight hitRecv=$hitCount join-dealt(fl=$($m.hitFlesh)/bl=$($m.hitBlood)) joinDrop=$($m.joinDrop) joinOnlyFrac=$joinOnlyFrac]")
+        return (Add-GateResult -Name "pc_assault" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  PC-ASSAULT PASS - atk=$atk hit-hand=$hitHand cap=$capAll host-orders=$ordOk hostview-fight=$fight; join-dealt authoritative damage flesh=$($m.hitFlesh)/blood=$($m.hitBlood) (x$hitCount reports) streamed to join drop=$($m.joinDrop) (end-gap $($m.endGap)); cohesion joinOnlyFrac=$joinOnlyFrac (finding)")
+    return (Add-GateResult -Name "pc_assault" -Status PASS -Metrics $m)
+}
