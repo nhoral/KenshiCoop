@@ -56,6 +56,10 @@ $script:CoopDiagEnvKeys = @(
     # Forces the join to NACK a MATCHing LOAD_GO so the real folder-transfer path
     # runs on one machine (bootstrap_stream / stream_test.ps1).
     'KENSHICOOP_FORCE_STREAM'
+    # Widen the proxy mint radius (default 600u) so a scenario whose subject spawns
+    # far from the join's interest anchor (ident_sync on the 2-tab squad1) still
+    # mints it instead of deferring it as "far".
+    'KENSHICOOP_SPAWN_MINT_RADIUS'
 )
 
 function Get-CoopDiagEnvKeys {

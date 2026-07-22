@@ -656,6 +656,53 @@ bool killSubject(GameWorld* gw, const unsigned int subjHand[5]) {
     }
 }
 
+// The host's own squad leader (playerCharacters[0]) - a HOST-OWNED body that the
+// join already holds as a proxy from the shared save, so its death crosses the
+// wire immediately (no recruit / far-mint). Used by the death-portrait regression
+// to reproduce "a player's own character dies". SEH-guarded; 0 on fault/empty.
+Character* hostOwnedLeader(GameWorld* gw) {
+    if (!gw || !gw->player) return 0;
+    __try {
+        if (gw->player->playerCharacters.size() == 0) return 0;
+        return gw->player->playerCharacters[0];
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// Bleed a body out LETHALLY without forcing death: set a high currentBleedRate +
+// low blood so the game's own medical tick drains it to zero and runs its NATURAL
+// death sequence (which re-keys the corpse + refreshes the squad portrait - the
+// null-PortraitData path the death fix guards). killSubject sets med->dead
+// directly and BYPASSES that sequence, so it can't reproduce the crash. Operates
+// on the Character* directly (no hand round-trip), re-assertable each tick so
+// clotting never lowers the rate before the body finishes bleeding out.
+bool bleedOutCharacter(GameWorld* gw, Character* c) {
+    (void)gw;
+    if (!c) return false;
+    __try {
+        MedicalSystem* med = &c->medical;
+        // Setting currentBleedRate directly is futile - the game recomputes it every
+        // frame from the per-part wound state (getExtraBleedingAmount reads the
+        // part's derivedFleshHealthPercent). So WOUND every part deep: force both
+        // flesh and the derived percent hard negative (re-asserted each tick so an
+        // update() re-derive can't clot it), and pull the starting blood down so the
+        // game's OWN bloodloss update drains the rest to 0 and runs its natural
+        // point-of-no-return death (corpse re-key + portrait refresh). No med->dead
+        // poke - that is what makes killSubject bypass the death sequence.
+        unsigned int n = med->anatomy.count;
+        for (unsigned int i = 0; i < n; ++i) {
+            MedicalSystem::HealthPartStatus* p =
+                med->anatomy.stuff ? med->anatomy.stuff[i] : 0;
+            if (!p) continue;
+            p->flesh = -500.0f;                    // deep open wound
+            p->derivedFleshHealthPercent = -5.0f;  // what the bloodloss check reads
+        }
+        if (med->blood > 30.0f) med->blood = 30.0f; // low start; game bleeds it to 0
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // combat_kill bias (NOT a kill): lower the subject's blood so an ongoing REAL melee
 // downs it decisively within the test window, without collapsing it ourselves (no
 // unconcious/dead set, no ragdoll) - the opponent's hits + bleeding do the takedown,

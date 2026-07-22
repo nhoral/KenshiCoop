@@ -1237,6 +1237,16 @@ bool amputateSubjectLimb(GameWorld* gw, const unsigned int subjHand[5], int limb
 bool woundSubjectLimbs(GameWorld* gw, const unsigned int subjHand[5],
                        float flesh, float blood);
 
+// The host's own squad leader (playerCharacters[0]) - host-owned, already a proxy
+// on the join. 0 on fault/empty. Used by the death-portrait regression.
+Character* hostOwnedLeader(GameWorld* gw);
+
+// Bleed a body out lethally (high currentBleedRate + low blood) so the GAME runs
+// its own natural death sequence - unlike killSubject, which forces med->dead and
+// skips it. Operates on the Character* directly; re-assert each tick. Used by the
+// death-portrait regression to reproduce a natural squad-member death.
+bool bleedOutCharacter(GameWorld* gw, Character* c);
+
 // Protocol 45 (host applies join-dealt damage): unlike woundSubjectLimbs (which
 // sets ABSOLUTE floor levels for the medic scaffold), this SUBTRACTS cumulative
 // deltas - the join reports the damage EACH suppressed swing would have dealt, and

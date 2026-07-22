@@ -129,9 +129,9 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             if (found) engine::charName(c, pkt.name, sizeof(pkt.name));
             net.queueSpawnInfo(pkt);
             char b[224]; _snprintf(b, sizeof(b) - 1,
-                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
+                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s' name='%s'",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
-                pkt.charSid, pkt.facSid);
+                pkt.charSid, pkt.facSid, pkt.name);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
@@ -420,12 +420,12 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         if (p.dead) targets_[k].deathLatched = true;
         // mintDist (Phase 1 telemetry): how far from our squad the proxy
         // appeared - the spawn-parity oracle gates its distribution.
-        char b[224]; _snprintf(b, sizeof(b) - 1,
+        char b[248]; _snprintf(b, sizeof(b) - 1,
             "[spawn] proxy BOUND hand=%u,%u,%u,%u,%u sid='%s' fac='%s' dead=%d "
-            "age=%.2f pos=%.1f,%.1f,%.1f mintDist=%.0f cen=%d (proxies=%u)",
+            "age=%.2f pos=%.1f,%.1f,%.1f mintDist=%.0f cen=%d (proxies=%u) name='%s'",
             k.t, k.c, k.cs, k.i, k.s, p.charSid, p.facSid, p.dead ? 1 : 0,
             p.age, p.x, p.y, p.z, mintDist, rq.fromCensus ? 1 : 0,
-            (unsigned)proxyByKey_.size());
+            (unsigned)proxyByKey_.size(), p.name);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // Phase 1b: a recruit/move whose ok=0 rekey enrolled a force-REQ (the
         // interest-split recruit) now has its proxy body - make it a real squad

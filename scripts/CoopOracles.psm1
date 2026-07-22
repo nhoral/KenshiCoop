@@ -160,6 +160,9 @@ function Invoke-OneOracle {
         "medic_order"   { return (Test-MedicOrder      -HostFile $HostLog -JoinFile $JoinLog) }
         "limb_loss"     { return (Test-LimbLoss        -HostFile $HostLog -JoinFile $JoinLog) }
         "stats_sync"    { return (Test-StatsSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "name_sync"     { return (Test-NameSync        -HostFile $HostLog -JoinFile $JoinLog) }
+        "age_sync"      { return (Test-AgeSync         -HostFile $HostLog -JoinFile $JoinLog) }
+        "death_portrait" { return (Test-DeathPortrait  -HostFile $HostLog -JoinFile $JoinLog) }
         "carry_order"   { return (Test-CarryOrder      -HostFile $HostLog -JoinFile $JoinLog) }
         "npc_carry"     { return (Test-NpcCarry        -HostFile $HostLog -JoinFile $JoinLog) }
         "npc_vitals"    { return (Test-NpcVitals       -HostFile $HostLog -JoinFile $JoinLog) }
