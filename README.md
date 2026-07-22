@@ -82,8 +82,10 @@ in-game, so the joining player doesn't need to load anything first.
    captured. This is per-session (nothing is written to disk), so re-paste it if
    you relaunch Kenshi.
 3. Leave **Transport** on **STEAM**.
-4. **Host:** load the save you want to play (or start a new game), set
-   **Role: HOST**, and toggle **Connection** to **ONLINE**.
+4. **Host:** load the save you want to play, or start a new game - pick
+   **Multiplayer (Wanderer x2)** from the start list for a ready-made two-squad
+   co-op start (see below). Then set **Role: HOST** and toggle **Connection** to
+   **ONLINE**.
 5. **Join:** straight from the **main menu** - no save needed - set
    **Role: JOIN** and toggle **Connection** to **ONLINE**. The host streams its
    world to you on connect and you load right into it. (If you already have an
