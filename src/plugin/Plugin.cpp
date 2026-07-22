@@ -1506,6 +1506,14 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // apply (its caches are now stale; the reset runs next tick's reload edge).
     tickReplicateApply(gw, worldLive);
 
+    // Cámara libre local (capturas / vídeo). POST-motor: el update() orbital ya
+    // corrió este frame, así que nuestra posición es la última que ve el renderer.
+    // Puramente local/visual (no red, no sync). Solo en sesiones interactivas
+    // (scenario vacío + sin test-seconds), igual que el panel F2, para no perturbar
+    // los oráculos del harness. El gate de config + la tecla van dentro.
+    if (g_cfg.scenario.empty() && g_cfg.testSeconds == 0)
+        coop::engine::freeCameraTick(gw, g_cfg.freeCamera);
+
     // Coordinated load deferred-signal backstop: if the LOADGAME signal stalls
     // past the grace window, pump SaveManager::execute() once from end-of-tick.
     tickLoadPumpBackstop(gw);

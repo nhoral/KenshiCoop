@@ -477,6 +477,15 @@ struct Config {
     // independent of the transport in use. 0 = off.
     unsigned long long steamPing;
 
+    // Cámara libre local (KENSHICOOP_FREE_CAMERA != "0"; DEFAULT ON). Feature de
+    // conveniencia 100% CLIENTE/VISUAL para capturas y vídeo: la tecla F3 desacopla
+    // la cámara Ogre del personaje y la deja volar con WASD + Q/E + flechas. No
+    // toca ningún canal de sync ni se replica al peer (cada jugador activa la suya
+    // de forma independiente). Solo actúa en sesiones interactivas (scenario vacío
+    // + sin test-seconds), igual que el panel F2, para no perturbar los oráculos.
+    // "0" es la escotilla de escape (deshabilita la tecla por completo).
+    bool          freeCamera;
+
     // In-game co-op panel session control (2026-07-13). When the mod is driven
     // by the F2 panel instead of the env launchers, networking is DEFERRED at
     // load: the session (host listen / client connect) only starts when the

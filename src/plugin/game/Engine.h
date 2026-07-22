@@ -276,6 +276,14 @@ void* markerCreate(Character* c, const char* text, int colorId);
 bool  markerUpdate(void* label, const char* text, int colorId);
 void  markerDestroy(void* label);
 
+// ---- Cámara libre local (capturas / vídeo) ----------------------------------
+// Modo de cámara libre reimplementado sobre 1.0.65 (el free-cam nativo solo
+// existe en 1.0.68). Llamado por-frame desde mainLoop_hook DESPUÉS del motor.
+// 'enabled' = master-switch de config (KENSHICOOP_FREE_CAMERA). La tecla F3
+// hace el toggle en runtime. 100% local/visual: no toca red ni sync. Definido
+// en FreeCamera.cpp; SEH-guarded internamente (no-op ante cualquier fallo).
+void freeCameraTick(GameWorld* gw, bool enabled);
+
 // ---- In-game co-op session panel ---------------------------------------------
 // Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
 // CoopDisconnectFn, coopPanelTick, coopOverlayTick. The UI root (Plugin.cpp)

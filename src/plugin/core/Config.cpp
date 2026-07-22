@@ -249,6 +249,10 @@ void loadConfig(Config& c) {
         envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str()).c_str(), 0, 10);
     c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
 
+    // Cámara libre local (feature de capturas/vídeo). DEFAULT ON; "0" la
+    // deshabilita. Es puramente local/visual: no hay wire, no hay sync.
+    c.freeCamera = envOr("KENSHICOOP_FREE_CAMERA", "1") != "0";
+
     // In-game panel session control: opt-in legacy auto-start. Default OFF so a
     // panel-driven (env-free) install defers the session to the Connect button;
     // the test harness overrides this in Plugin.cpp (scenario / test-seconds).
@@ -370,7 +374,7 @@ std::string describeConfig(const Config& c) {
         { "store",   c.storeSync },    { "squad",   c.squadSync },
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
         { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
-        { "censusFreezeAi", c.censusFreezeAi },
+        { "censusFreezeAi", c.censusFreezeAi }, { "freeCam", c.freeCamera },
     };
     s += " on=[";
     bool first = true;

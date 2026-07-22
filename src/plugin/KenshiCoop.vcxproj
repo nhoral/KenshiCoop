@@ -124,6 +124,7 @@
     <ClCompile Include="game\EngineSpawnCombat.cpp" />
     <ClCompile Include="game\EngineCharState.cpp" />
     <ClCompile Include="game\EngineWorld.cpp" />
+    <ClCompile Include="game\FreeCamera.cpp" />
     <!-- Diagnostic probes (spike 401/451/402): HARNESS-ONLY, excluded from the
          shipped Release DLL like the Scenario*.cpp harness (Phase 5e). Its only
          callers are the probe scenarios, which are themselves Release-excluded. -->
