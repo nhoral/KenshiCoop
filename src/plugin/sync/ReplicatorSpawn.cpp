@@ -64,6 +64,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 spawnReq_.erase(it->first); // allow a fresh REQ/mint cycle
                 lifeSet(it->first, LIFE_UNKNOWN, "proxy-despawned");
+                mintedProxies_.erase(it->second);
                 proxyByKey_.erase(it++);
                 continue;
             }
@@ -77,7 +78,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             const Key& bk = it->first;
             Character* orig = engine::resolveCharByHand(bk.i, bk.s, bk.t, bk.c, bk.cs);
             if (orig && orig != it->second) {
-                engine::despawnProxyNpc(gw, it->second);
+                if (mintedProxies_.count(it->second)) {
+                    engine::despawnProxyNpc(gw, it->second);
+                    mintedProxies_.erase(it->second);
+                }
                 char b[176]; _snprintf(b, sizeof(b) - 1,
                     "[spawn] proxy DUPE-HEAL hand=%u,%u,%u,%u,%u (original resolved; "
                     "proxy destroyed, proxies=%u)",
@@ -405,6 +409,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             }
         }
         proxyByKey_[k] = proxy;
+        mintedProxies_.insert(proxy);
         ++mintedThisTick;
         lifeSet(k, LIFE_RESOLVED, "mint");
         // Dead on arrival: latch the down state now (the same reliable-latch
@@ -689,6 +694,8 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 if ((nk.t | nk.c | nk.cs | nk.i | nk.s) == 0) {
                     pinPeer_.erase(k);
                     pinOwned_.erase(k);
+                    { std::map<Key, Character*>::iterator pf = proxyByKey_.find(k);
+                      if (pf != proxyByKey_.end()) mintedProxies_.erase(pf->second); }
                     proxyByKey_.erase(k);
                     targets_.erase(k);
                     rekeyedOld_[k] = nowMs(); // no REQ for the dead key's tail
@@ -830,8 +837,12 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
         // proxy - destroy it with the NPC-correct SEH-guarded despawnProxyNpc
         // (removeWorldItemProxy is for world Item* proxies and mis-handles a
         // Character body; the same rekey path already uses despawnProxyNpc for
-        // its control-flip phantom cull below).
-        culled = engine::despawnProxyNpc(gw, mint) ? 1 : 0;
+        // its control-flip phantom cull below). Only if WE minted it - a rebased
+        // real body under this key must never be destroyed.
+        if (mintedProxies_.count(mint)) {
+            culled = engine::despawnProxyNpc(gw, mint) ? 1 : 0;
+            mintedProxies_.erase(mint);
+        }
         repaired = 1;
     }
     if (c) {
@@ -929,8 +940,9 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
             // stray proxy and drop its binding (manual 2026-07-17: Squint).
             std::map<Key, Character*>::iterator px = proxyByKey_.find(newK);
             if (px != proxyByKey_.end()) {
-                if (px->second && px->second != c)
+                if (px->second && px->second != c && mintedProxies_.count(px->second))
                     engine::despawnProxyNpc(gw, px->second);
+                mintedProxies_.erase(px->second);
                 proxyByKey_.erase(px);
             }
             char cf[176]; _snprintf(cf, sizeof(cf) - 1,
