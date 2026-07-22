@@ -94,7 +94,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(StatsPacket)",             sizeof(StatsPacket),             194);
     CHECK_EQ("sizeof(StealthPacket)",           sizeof(StealthPacket),           427);
     CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          25);
-    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         143);
+    CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         191);
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
     CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              17);
@@ -220,7 +220,7 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v45: join-dealt combat-hit report)", (int)PROTOCOL_VERSION, 45);
+    CHECK_EQ("PROTOCOL_VERSION (v46: character name sync)", (int)PROTOCOL_VERSION, 46);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------

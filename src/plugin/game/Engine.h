@@ -328,7 +328,8 @@ bool describeCharacter(Character* c, char* charSid, unsigned int charSidLen,
 // cosmetic; combat outcomes stay host-authoritative + damage-guarded. Returns
 // the proxy Character* or 0.
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
-                         float x, float y, float z, float heading, float age);
+                         float x, float y, float z, float heading, float age,
+                         const char* name);
 
 // SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
 // (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block

@@ -24,7 +24,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 45;
+const u16 PROTOCOL_VERSION = 46;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -1012,6 +1012,7 @@ struct SpawnInfoPacket {
     u32 hSerial;
     char charSid[48]; // character template GameData stringID
     char facSid[48];  // faction GameData stringID ("" = unknown -> join fallback)
+    char name[48];    // host body's display name (protocol 46); "" = unnamed
     f32 x;            // world transform at reply time
     f32 y;
     f32 z;
