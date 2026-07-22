@@ -331,6 +331,11 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
                          float x, float y, float z, float heading, float age,
                          const char* name);
 
+// Age read/write (protocol 46 animal-scale sync). SEH-guarded; charAge returns
+// <= 0 on fault, setCharAge no-ops a non-finite/<=0 value.
+float charAge(Character* c);
+void  setCharAge(Character* c, float age);
+
 // SEH-guarded (Phase 1 spawn parity, game/ZoneQuery.cpp): is the world block at
 // (x,y,z) fully LOADED locally (loaded and not mid-load)? Within a loaded block
 // every baked shared-save NPC resolves by hand, so an unresolvable census hand

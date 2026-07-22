@@ -458,6 +458,10 @@ void Replicator::publishStats(GameWorld* gw, NetLink& net, u32 ownerId) {
             pkt.stats[i] = (i < n) ? sr.stats[i] : -1.0f;
         pkt.xp                  = sr.xp;
         pkt.freeAttributePoints = sr.freeAttribPts;
+        {
+            Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            pkt.age = c ? engine::charAge(c) : -1.0f;
+        }
         net.queueStats(pkt);
         if (changed) { // periodic resends stay silent; changes are the signal
             // str/dex/tough/stealth/athletics cover the scenario + the stats a
@@ -499,6 +503,12 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
         w.xp            = p.xp;
         w.freeAttribPts = p.freeAttributePoints;
         bool ok = engine::writeStats(c, w);
+        // Animal-scale sync (protocol 46): apply the owner's age only when it
+        // has drifted, so a growing squad animal matches size on the peer.
+        if (p.age > 0.0f && p.age < 1.0e6f) {
+            float cur = engine::charAge(c);
+            if (cur < 0.0f || fabs(cur - p.age) > 0.01f) engine::setCharAge(c, p.age);
+        }
         char b[200]; _snprintf(b, sizeof(b) - 1,
             "[stats] RECV hand=%u,%u ok=%d str=%.1f dex=%.1f tough=%.1f stealth=%.1f athl=%.1f xp=%.0f",
             k.i, k.s, ok ? 1 : 0, p.stats[1], p.stats[18], p.stats[21],

@@ -139,6 +139,21 @@ void setProxyNameGuarded(Character* c, const char* name) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// Age read/write for the stats-channel animal-scale sync (protocol 46). Age
+// drives CharacterAnimal body scale; humans return a cosmetic age (harmless).
+float charAge(Character* c) {
+    if (!c) return -1.0f;
+    __try {
+        return c->getAge();
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1.0f; }
+}
+void setCharAge(Character* c, float age) {
+    if (!c || !(age > 0.0f && age < 1.0e6f)) return;
+    __try {
+        c->setAge(age);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
                          float x, float y, float z, float heading, float age,
                          const char* name) {

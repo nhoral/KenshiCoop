@@ -780,6 +780,7 @@ struct StatsPacket {
     f32 stats[STATS_SLOT_MAX]; // by StatsEnumerated index (-1 = unreadable)
     f32 xp;                    // CharStats::xp (-1 = unreadable)
     f32 freeAttributePoints;   // CharStats::freeAttributePoints (int on wire as f32; -1 = unreadable)
+    f32 age;                   // Character::getAge (protocol 46); animals scale body size by age. <= 0 = unreadable
 };
 
 // ---- Protocol 22: per-tab wallet snapshot -----------------------------------
