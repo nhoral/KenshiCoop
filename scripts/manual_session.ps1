@@ -22,6 +22,11 @@
   powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -Save "c" -Sync
 
 .EXAMPLE
+  # Free play from the TITLE SCREEN: both clients boot to the main menu tiled
+  # side-by-side; you load the same save and go ONLINE via F2 on each by hand.
+  powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -TitleScreen
+
+.EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\manual_session.ps1 -Save "c" -AutoSpawn 5 -SkipBuild -Sync
 
 .EXAMPLE
@@ -31,7 +36,14 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$Save,
+    # Save both clients auto-load. Optional with -TitleScreen (both clients boot
+    # to the main menu instead, and you load + go online by hand via F2).
+    [string]$Save = "",
+    # Title-screen free play: launch BOTH clients to the Kenshi main menu with
+    # NO auto-load and NO auto-connect (KENSHICOOP_SAVE empty, AUTOCONNECT=0 on
+    # both). You then load a save and go ONLINE via the in-game F2 panel - the
+    # real remote-play flow. Skips save validation, -Sync, and inhabit ownership.
+    [switch]$TitleScreen,
     # Save the JOIN client loads. Defaults to $Save (shared-save mode). Pass a
     # DIFFERENT save (with its own characters) so the two squads have distinct
     # hands and fully render each other - including the player-controlled leaders.
@@ -166,26 +178,41 @@ if ($Inhabit -or $JoinFromMenu) {
     $AutoSpawn = 0       # inhabit drives EXISTING squad members, not spawned ones
 }
 
+# Title-screen mode boots both clients to the main menu (no auto-load), so no
+# save is required or validated. Every other mode auto-loads and needs a save.
+if (-not $TitleScreen -and $Save -eq "") {
+    throw "Provide -Save <name>, or pass -TitleScreen to boot both clients to the main menu."
+}
+
 # Validate the saves exist (auto-loading a missing save crashes the game). Both
 # installs read named saves from the same per-user folder, so a save created in
 # either client is visible to both - no copy/sync needed.
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
-# JoinFromMenu launches the join with no save (it sits at the menu), so only the
-# host's save must exist up front.
-$savesToCheck = if ($JoinFromMenu) { @($Save) } else { @($Save, $JoinSave) }
-foreach ($s in $savesToCheck | Select-Object -Unique) {
-    if (-not (Test-Path (Join-Path $saveRoot $s))) {
-        $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
-        throw "Save '$s' not found in $saveRoot. Available saves: $avail"
+if (-not $TitleScreen) {
+    # JoinFromMenu launches the join with no save (it sits at the menu), so only
+    # the host's save must exist up front.
+    $savesToCheck = if ($JoinFromMenu) { @($Save) } else { @($Save, $JoinSave) }
+    foreach ($s in $savesToCheck | Select-Object -Unique) {
+        if (-not (Test-Path (Join-Path $saveRoot $s))) {
+            $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
+            throw "Save '$s' not found in $saveRoot. Available saves: $avail"
+        }
     }
 }
 
 Write-Host "== KenshiCoop MANUAL session =="
-Write-Host "  host save:  $Save"
-Write-Host "  join save:  $JoinSave"
+if ($TitleScreen) {
+    Write-Host "  mode:       TITLE SCREEN (both clients boot to the main menu; no auto-load)"
+    Write-Host "  connect:    by hand - load a save, then F2 -> Connection ONLINE on both"
+} else {
+    Write-Host "  host save:  $Save"
+    Write-Host "  join save:  $JoinSave"
+}
 Write-Host "  autospawn:  $AutoSpawn (host only)"
 Write-Host "  self-exit:  OFF (close the windows yourself when done)"
-if ($Inhabit) {
+if ($TitleScreen) {
+    Write-Host "  NOTE: pick the SAME save on both clients (NPC sync is resolve-by-hand)."
+} elseif ($Inhabit) {
     Write-Host "  mode:       INHABIT (shared save, partitioned squad ownership)"
     Write-Host "  host owns:  $HostOwn   join owns:  $JoinOwn  (squad-member rank: 0 = leader)"
 } elseif ($Save -ne $JoinSave) {
@@ -249,7 +276,10 @@ if ($doTile) {
         -Width $WindowW -Height $WindowH -HostDir $HostDir -JoinDir $JoinDir
 }
 
-if ($Sync -and ($Save -eq $JoinSave)) {
+if ($Sync -and $TitleScreen) {
+    Write-Host ""
+    Write-Host "Skipping -Sync: title-screen mode auto-loads nothing (load a save by hand)."
+} elseif ($Sync -and ($Save -eq $JoinSave)) {
     Write-Host ""
     Write-Host "Syncing saves host -> join ..."
     & cmd /c "`"$scriptDir\sync_save.cmd`" `"$HostDir`" `"$JoinDir`""
@@ -276,7 +306,7 @@ function Set-CoopEnv {
     # user configures the connection at the menu). The host still auto-connects
     # (it hosts + loads its save); on the join's manual connect the host pushes
     # its world.
-    $env:KENSHICOOP_AUTOCONNECT  = if ($Mode -eq "join" -and $JoinFromMenu) { "0" } else { "1" }
+    $env:KENSHICOOP_AUTOCONNECT  = if ($TitleScreen) { "0" } elseif ($Mode -eq "join" -and $JoinFromMenu) { "0" } else { "1" }
     $env:KENSHICOOP_PORT         = "$Port"
     $env:KENSHICOOP_IP           = $Ip
     $env:KENSHICOOP_SAVE         = $SaveName
@@ -327,8 +357,9 @@ Write-Host ""
 $hostOwnEnv = if ($Inhabit -or $JoinFromMenu) { $HostOwn } else { "" }
 $joinOwnEnv = if ($Inhabit -or $JoinFromMenu) { $JoinOwn } else { "" }
 
-Write-Host "Launching HOST (save $Save, autospawn $AutoSpawn) ..."
-Set-CoopEnv -Mode "host" -SaveName $Save -Spawn $AutoSpawn -Own $hostOwnEnv
+$hostSaveName = if ($TitleScreen) { "" } else { $Save }
+Write-Host "Launching HOST ($(if ($TitleScreen) { '<main menu - no save>' } else { "save $Save" }), autospawn $AutoSpawn) ..."
+Set-CoopEnv -Mode "host" -SaveName $hostSaveName -Spawn $AutoSpawn -Own $hostOwnEnv
 $hostPid = Start-PastLauncher -Exe $hostExe -WorkDir $HostDir
 if ($hostPid -eq 0) { throw "Host failed to get past the launcher." }
 
@@ -337,8 +368,8 @@ if (-not $NoJoin) {
     Start-Sleep -Seconds $JoinDelaySec
     # JoinFromMenu: empty save name -> the join stays at the main menu and the
     # host's push-on-connect pulls it into the world.
-    $joinSaveName = if ($JoinFromMenu) { "" } else { $JoinSave }
-    Write-Host "Launching JOIN (save $(if ($JoinFromMenu) { '<main menu - no save>' } else { $JoinSave })) ..."
+    $joinSaveName = if ($JoinFromMenu -or $TitleScreen) { "" } else { $JoinSave }
+    Write-Host "Launching JOIN (save $(if ($JoinFromMenu -or $TitleScreen) { '<main menu - no save>' } else { $JoinSave })) ..."
     Set-CoopEnv -Mode "join" -SaveName $joinSaveName -Spawn 0 -Own $joinOwnEnv
     $joinPid = Start-PastLauncher -Exe $joinExe -WorkDir $JoinDir
     if ($joinPid -eq 0) { Write-Warning "Join failed to get past the launcher; host is up alone." }
@@ -347,7 +378,13 @@ if (-not $NoJoin) {
 Write-Host ""
 Write-Host "== Session live =="
 Write-Host "  host PID=$hostPid  join PID=$joinPid"
-if ($JoinFromMenu) {
+if ($TitleScreen) {
+    Write-Host "  BOTH clients are at the MAIN MENU (no auto-load, autoconnect OFF)."
+    Write-Host "  1) Load the SAME save on both (Continue / Load)."
+    Write-Host "  2) On each window press F2 -> set Connection ONLINE (host role on one,"
+    Write-Host "     join role on the other; UDP loopback is preset). Then free-play."
+    Write-Host "  Close both windows when done (no auto-exit)."
+} elseif ($JoinFromMenu) {
     Write-Host "  JOIN is waiting at the MAIN MENU (no save, autoconnect OFF)."
     Write-Host "  On the JOIN window: press F2 -> set Connection to ONLINE (role JOIN, UDP is"
     Write-Host "  preset for loopback). The host then pushes its world and the join loads in"
@@ -417,7 +454,7 @@ Copy-Item '$joinLogSrc' (Join-Path '$dest' 'KenshiCoop_join.log')
 # line never appears, the installs are running a stale DLL (the deploy-skip trap)
 # and any validation would be meaningless. Surface it loudly instead of silently
 # validating the wrong build.
-if ($Inhabit -or $JoinFromMenu) {
+if (($Inhabit -or $JoinFromMenu) -and -not $TitleScreen) {
     $hostLog = Join-Path $HostDir "KenshiCoop_host.log"
     Write-Host ""
     Write-Host "Confirming the deployed build is the inhabit build (watching host log) ..."

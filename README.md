@@ -108,7 +108,8 @@ is needed after an edit.
   (Wanderer x2)"** game start (New Game -> pick it from the list): the vanilla
   Wanderer start, but with two wanderers already split into separate squads, so
   the host gets squad 1 and the joining player squad 2 with no manual tab-splitting.
-  It's part of the one KenshiCoop mod - no second mod to install.
+  It's part of the one KenshiCoop mod - no second mod to install. The start was
+  authored by [zeroit789](https://github.com/zeroit789).
 - **The joining player doesn't need the host's save.** The host picks the save
   (or starts a new game); when the join connects from the menu, the host's world
   is streamed over automatically. Already having an identical copy on disk just
