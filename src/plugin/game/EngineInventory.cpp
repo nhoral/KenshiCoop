@@ -432,6 +432,99 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
     return n;
 }
 
+unsigned int captureNestedContainers(GameWorld* gw, const unsigned int cHand[5],
+                                     NestedContainerRead* out, unsigned int maxOut) {
+    if (!gw || !cHand || !out || maxOut == 0 || !g_getSectionsFn) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = invOf(ro);
+    if (!inv) return 0;
+    unsigned int n = 0;
+    __try {
+        lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+        unsigned int ns = secs ? secs->size() : 0;
+        for (unsigned int s = 0; s < ns && n < maxOut; ++s) {
+            InventorySection* sec = (*secs)[s];
+            if (!sec) continue;
+            // Nested containers live in container slots (backpack/cargo-style);
+            // skip plain loose sections and skip equipped-only sections that are
+            // not flagged as container slots.
+            if (!sec->containerSlot) continue;
+            const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
+            unsigned int ni = (unsigned int)its.size();
+            for (unsigned int i = 0; i < ni && n < maxOut; ++i) {
+                Item* it = its[i].item;
+                if (!it) continue;
+                RootObject* iobj = reinterpret_cast<RootObject*>(it);
+                if (!invOf(iobj)) continue; // not an inventory-carrying item
+                GameData* gd = it->getGameData();
+                if (!gd) continue;
+                unsigned int h[5];
+                if (!readObjectHand(iobj, h)) continue;
+                bool dup = false;
+                for (unsigned int k = 0; k < n; ++k) {
+                    if (out[k].hand[0] == h[0] && out[k].hand[1] == h[1] &&
+                        out[k].hand[2] == h[2] && out[k].hand[3] == h[3] &&
+                        out[k].hand[4] == h[4]) {
+                        dup = true; break;
+                    }
+                }
+                if (dup) continue;
+                memset(&out[n], 0, sizeof(out[n]));
+                for (int k = 0; k < 5; ++k) out[n].hand[k] = h[k];
+                out[n].key.itemType = (u32)gd->type;
+                out[n].key.section = sectionNameHash(sec->name.c_str());
+                strncpy(out[n].key.stringID, gd->stringID.c_str(),
+                        sizeof(out[n].key.stringID) - 1);
+                unsigned int ordinal = 0;
+                for (unsigned int k = 0; k < n; ++k) {
+                    if (out[k].key.itemType == out[n].key.itemType &&
+                        out[k].key.section == out[n].key.section &&
+                        strcmp(out[k].key.stringID, out[n].key.stringID) == 0)
+                        ++ordinal;
+                }
+                out[n].key.ordinal = (u8)ordinal; // caller caps this enumeration at 32
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return n;
+    }
+    return n;
+}
+
+bool resolveNestedContainerHand(const unsigned int parentHand[5],
+                                const NestedInvKey& key, unsigned int outHand[5]) {
+    if (!parentHand || !outHand || !g_getSectionsFn) return false;
+    RootObject* ro = resolveObjectByHand(parentHand);
+    if (!ro) return false;
+    Inventory* inv = invOf(ro);
+    if (!inv) return false;
+    __try {
+        lektor<InventorySection*>* secs = g_getSectionsFn(inv);
+        unsigned int ns = secs ? secs->size() : 0;
+        unsigned int ordinal = 0;
+        for (unsigned int s = 0; s < ns; ++s) {
+            InventorySection* sec = (*secs)[s];
+            if (!sec || !sec->containerSlot ||
+                sectionNameHash(sec->name.c_str()) != key.section) continue;
+            const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
+            for (unsigned int i = 0; i < (unsigned int)its.size(); ++i) {
+                Item* it = its[i].item;
+                if (!it) continue;
+                RootObject* iobj = reinterpret_cast<RootObject*>(it);
+                if (!invOf(iobj)) continue;
+                GameData* gd = it->getGameData();
+                if (!gd || (u32)gd->type != key.itemType ||
+                    strcmp(gd->stringID.c_str(), key.stringID) != 0) continue;
+                if (ordinal++ != key.ordinal) continue;
+                return readObjectHand(iobj, outHand);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return false;
+}
+
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                             const InvItemEntry* items, unsigned int count) {
     if (!gw) return false;

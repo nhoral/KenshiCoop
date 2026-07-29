@@ -466,6 +466,20 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
                                       InvItemEntry* out, unsigned int maxOut,
                                       unsigned int* outHash);
 
+struct NestedContainerRead {
+    u32 hand[5];
+    NestedInvKey key;
+};
+
+// SEH-guarded: enumerate inventory-carrying items inside cHand, returning each
+// local object hand and a parent-relative locator suitable for the wire.
+unsigned int captureNestedContainers(GameWorld* gw, const unsigned int cHand[5],
+                                     NestedContainerRead* out, unsigned int maxOut);
+
+// SEH-guarded: resolve a parent-relative locator to this peer's local item hand.
+bool resolveNestedContainerHand(const unsigned int parentHand[5],
+                                const NestedInvKey& key, unsigned int outHand[5]);
+
 // SEH-guarded: reconcile the local container (cHand) to the desired item multiset:
 // add any shortfall (createItem of the template + tryAddItem) and remove any excess
 // (removeItemAutoDestroy), per (stringID, itemType) key. count==0 empties it.

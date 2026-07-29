@@ -276,13 +276,22 @@ void Replicator::clearPeerReplicationState(GameWorld* gw) {
     // authority - or a freed pointer once the engine reaps it. SEH-guarded via
     // despawnProxyNpc so a single bad pointer can't take down the leave path.
     unsigned int cleared = 0;
+    unsigned int preservedSquad = 0;
     for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
          it != proxyByKey_.end(); ++it) {
-        if (gw && it->second && engine::despawnProxyNpc(gw, it->second))
-            ++cleared;
+        if (!gw || !it->second) continue;
+        // proxyByKey_ can temporarily bind real bodies after recruit/squad re-keys.
+        // Never destroy a live player-squad member on peer
+        // leave; those are save-authoritative world bodies, not disposable proxies.
+        if (engine::isPlayerSquad(gw, reinterpret_cast<RootObject*>(it->second))) {
+            ++preservedSquad;
+            continue;
+        }
+        if (engine::despawnProxyNpc(gw, it->second)) ++cleared;
     }
     char b[96];
-    _snprintf(b, sizeof(b) - 1, "[leave] cleared proxies=%u", cleared);
+    _snprintf(b, sizeof(b) - 1, "[leave] cleared proxies=%u keepSquad=%u",
+              cleared, preservedSquad);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
     // World-item proxies (Phase 3): the world stays LIVE across a peer leave /
@@ -356,7 +365,7 @@ void Replicator::ingestInv(Inbound& in) {
         // placement = our minted proxy). An unresolvable key (mint not
         // landed yet / refused / tombstoned) is dropped - the sender's 5 s
         // safety resend re-delivers once the mint exists.
-        if (it->keyKind == 1) {
+        if (it->keyKind == 1 || it->keyKind == 3) {
             std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(k);
             if (ob != ownBuilds_.end()) {
                 if (ob->second.removed) continue;
@@ -372,6 +381,14 @@ void Replicator::ingestInv(Inbound& in) {
                 k.cs = pb->second.localHand[2]; k.i = pb->second.localHand[3];
                 k.s = pb->second.localHand[4];
             }
+        }
+        if (it->keyKind == 2 || it->keyKind == 3) {
+            unsigned int parent[5] = { k.t, k.c, k.cs, k.i, k.s };
+            unsigned int local[5];
+            if (!engine::resolveNestedContainerHand(parent, it->nested, local))
+                continue;
+            k.t = local[0]; k.c = local[1]; k.cs = local[2];
+            k.i = local[3]; k.s = local[4];
         }
         InvRecv& r = invRecv_[k];
         r.ownerId = it->ownerId;
