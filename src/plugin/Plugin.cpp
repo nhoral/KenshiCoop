@@ -1936,6 +1936,12 @@ void installEngineDetours() {
             // the damage its player-squad melee WOULD have dealt to driven world-NPC
             // copies; publishCombatHits forwards it and the host wounds the real body.
             g_repl.setReportCombat(!g_cfg.isHost);
+            if (!g_cfg.isHost) {
+                if (coop::engine::installKnockoutReportHook())
+                    coopLog("[dmg] knockout detour installed; assassination report ON");
+                else
+                    coopLog("[dmg] WARN knockout detour unavailable; assassination report OFF");
+            }
             coopLog(g_cfg.isHost
                 ? "[dmg] hitByMeleeAttack detour installed; damage guard ON (host, driven peer-squad bodies)"
                 : "[dmg] hitByMeleeAttack detour installed; damage guard ON + combat-hit report ON (join)");

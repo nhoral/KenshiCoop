@@ -1244,7 +1244,13 @@ private:
     // damage into pendingHits_ (keyed by the copy's canonical hand), and
     // publishCombatHits forwards it to the host. nextHitId_ is a per-sender counter
     // for log correlation.
-    struct PendingHit { float flesh; float blood; PendingHit() : flesh(0.0f), blood(0.0f) {} };
+    struct PendingHit {
+        float flesh;
+        float blood;
+        float knockoutSkill;
+        bool knockout;
+        PendingHit() : flesh(0.0f), blood(0.0f), knockoutSkill(1.0f), knockout(false) {}
+    };
     bool                 reportCombat_;
     std::map<Key, PendingHit> pendingHits_;
     unsigned int         nextHitId_;

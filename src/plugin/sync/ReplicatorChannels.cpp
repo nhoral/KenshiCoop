@@ -374,7 +374,7 @@ void Replicator::publishCombatHits(GameWorld* gw, NetLink& net, u32 ownerId) {
          it != pendingHits_.end(); ++it) {
         const Key&       k  = it->first;
         const PendingHit& ph = it->second;
-        if (ph.flesh <= 0.0f && ph.blood <= 0.0f) continue;
+        if (ph.flesh <= 0.0f && ph.blood <= 0.0f && !ph.knockout) continue;
         CombatHitPacket chp;
         memset(&chp, 0, sizeof(chp));
         chp.type    = (u8)PKT_COMBAT_HIT;
@@ -383,10 +383,13 @@ void Replicator::publishCombatHits(GameWorld* gw, NetLink& net, u32 ownerId) {
         chp.sType = k.t; chp.sContainer = k.c; chp.sContainerSerial = k.cs;
         chp.sIndex = k.i; chp.sSerial = k.s;
         chp.flesh = ph.flesh; chp.blood = ph.blood;
+        chp.flags = ph.knockout ? COMBAT_HIT_KNOCKOUT : 0;
+        chp.koSkill = ph.knockoutSkill;
         net.queueCombatHit(chp);
         char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[combat] HIT SEND id=%u hand=%u,%u flesh=%.1f blood=%.1f",
-            chp.hitId, k.i, k.s, ph.flesh, ph.blood);
+            "[combat] HIT SEND id=%u hand=%u,%u flesh=%.1f blood=%.1f ko=%u skill=%.2f",
+            chp.hitId, k.i, k.s, ph.flesh, ph.blood, ph.knockout ? 1u : 0u,
+            ph.knockoutSkill);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     pendingHits_.clear();
@@ -413,7 +416,13 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
             continue;
         }
         unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
-        bool applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
+        bool applied = false;
+        if (p.flesh > 0.0f || p.blood > 0.0f)
+            applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
+        if (p.flags & COMBAT_HIT_KNOCKOUT) {
+            Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            if (c && engine::applyKnockout(c, p.koSkill)) applied = true;
+        }
         // A wounded world NPC is definitionally combat-scoped: mark it so the NPC
         // vitals stream (publishMedical, Phase B) mirrors the authoritative drop
         // back to the join's cosmetic copy (link 6 - "damage reached the join").
@@ -421,8 +430,9 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
         // never reflect the host-applied wound.
         if (applied && streamNpcs_) medNpc_[k] = nowMs();
         char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f applied=%d",
-            p.hitId, k.i, k.s, p.flesh, p.blood, applied ? 1 : 0);
+            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f ko=%u skill=%.2f applied=%d",
+            p.hitId, k.i, k.s, p.flesh, p.blood,
+            (p.flags & COMBAT_HIT_KNOCKOUT) ? 1u : 0u, p.koSkill, applied ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }

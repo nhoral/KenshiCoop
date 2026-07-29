@@ -43,6 +43,7 @@ struct InboundInv {
     u32                       ownerId;
     u8                        keyKind;
     u32                       cKey[5]; // type, container, containerSerial, index, serial
+    NestedInvKey              nested;
     std::vector<InvItemEntry> items;
 };
 
@@ -420,12 +421,13 @@ public:
         EnterCriticalSection(&cs_); evt_.push_back(ievt); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received container-contents snapshot, owner-tagged.
-    void pushInv(u32 ownerId, u8 keyKind, const u32 cKey[5],
+    void pushInv(u32 ownerId, u8 keyKind, const u32 cKey[5], const NestedInvKey& nested,
                  const InvItemEntry* items, unsigned int count) {
         InboundInv ii;
         ii.ownerId = ownerId;
         ii.keyKind = keyKind;
         for (int k = 0; k < 5; ++k) ii.cKey[k] = cKey[k];
+        ii.nested = nested;
         if (items && count > 0) ii.items.assign(items, items + count);
         EnterCriticalSection(&cs_); inv_.push_back(ii); LeaveCriticalSection(&cs_);
     }

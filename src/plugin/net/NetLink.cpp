@@ -149,11 +149,14 @@ void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int
 void NetLink::queueEvent(const EventPacket& ev) { pushLocked(outCs_, outEvents_, ev); }
 
 void NetLink::queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
+                               const NestedInvKey* nested,
                                const InvItemEntry* items, unsigned int count) {
     OutInv oi;
+    std::memset(&oi.nested, 0, sizeof(oi.nested));
     oi.ownerId = ownerId;
     oi.keyKind = keyKind;
     for (int k = 0; k < 5; ++k) oi.cKey[k] = cKey[k];
+    if (nested) oi.nested = *nested;
     if (count > INV_ITEMS_MAX) count = INV_ITEMS_MAX;
     if (items && count > 0) oi.items.assign(items, items + count);
     pushLocked(outCs_, outInv_, oi);
@@ -548,7 +551,7 @@ void NetLink::threadLoop() {
                                                 hdr.cContainerSerial, hdr.cIndex, hdr.cSerial };
                                 const InvItemEntry* items =
                                     (hdr.count > 0) ? reinterpret_cast<const InvItemEntry*>(p) : 0;
-                                inbound_->pushInv(hdr.ownerId, hdr.keyKind, cKey,
+                                inbound_->pushInv(hdr.ownerId, hdr.keyKind, cKey, hdr.nested,
                                                   items, hdr.count);
                             }
                         }
@@ -981,6 +984,7 @@ void NetLink::threadLoop() {
             hdr.cContainerSerial = invs[i].cKey[2];
             hdr.cIndex           = invs[i].cKey[3];
             hdr.cSerial          = invs[i].cKey[4];
+            hdr.nested           = invs[i].nested;
             hdr.count            = (u8)count;
             std::memcpy(out->data, &hdr, sizeof(hdr));
             if (count > 0)

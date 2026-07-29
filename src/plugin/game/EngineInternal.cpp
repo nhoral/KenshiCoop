@@ -1127,6 +1127,21 @@ struct ReportedDmg { float flesh; float blood; ReportedDmg() : flesh(0.0f), bloo
 std::map<Character*, ReportedDmg> g_reportedDmg;
 std::set<Character*>              g_reportAttackers;
 bool                              g_combatReport = false;
+std::map<Character*, float>       g_reportedKnockouts;
+bool                              g_suppressKnockoutReport = false;
+
+MedFloatFn g_knockoutOrig = 0;
+void __fastcall knockout_hook(MedicalSystem* self, float skill) {
+    Character* victim = 0;
+    if (g_combatReport && !g_suppressKnockoutReport) {
+        for (std::set<Character*>::iterator it = g_damageGuarded.begin();
+             it != g_damageGuarded.end(); ++it) {
+            if (&(*it)->medical == self) { victim = *it; break; }
+        }
+    }
+    g_knockoutOrig(self, skill);
+    if (victim) g_reportedKnockouts[victim] = skill;
+}
 
 HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
                                            Damages& damage, Character* who,
@@ -1977,6 +1992,13 @@ bool installDamageGuardHook() {
                               (void**)&g_hitByMeleeOrig) == KenshiLib::SUCCESS;
 }
 
+bool installKnockoutReportHook() {
+    intptr_t addr = KenshiLib::GetRealAddress(&MedicalSystem::knockout);
+    if (!addr) return false;
+    return KenshiLib::AddHook(addr, (void*)&knockout_hook,
+                              (void**)&g_knockoutOrig) == KenshiLib::SUCCESS;
+}
+
 bool installShopHook() {
     intptr_t addr = KenshiLib::GetRealAddress(&Inventory::buyItem);
     if (!addr) return false;
@@ -2220,7 +2242,10 @@ void damageGuardStats(unsigned long* outGuarded, unsigned long* outPassed) {
 
 void setCombatReport(bool on) {
     g_combatReport = on;
-    if (!on) g_reportedDmg.clear();
+    if (!on) {
+        g_reportedDmg.clear();
+        g_reportedKnockouts.clear();
+    }
 }
 void clearReportAttackers()          { g_reportAttackers.clear(); }
 void addReportAttacker(Character* c)  { if (c) g_reportAttackers.insert(c); }
@@ -2230,6 +2255,14 @@ bool takeReportedDamage(Character* c, float* outFlesh, float* outBlood) {
     if (outFlesh) *outFlesh = it->second.flesh;
     if (outBlood) *outBlood = it->second.blood;
     g_reportedDmg.erase(it);
+    return true;
+}
+
+bool takeReportedKnockout(Character* c, float* outSkill) {
+    std::map<Character*, float>::iterator it = g_reportedKnockouts.find(c);
+    if (it == g_reportedKnockouts.end()) return false;
+    if (outSkill) *outSkill = it->second;
+    g_reportedKnockouts.erase(it);
     return true;
 }
 

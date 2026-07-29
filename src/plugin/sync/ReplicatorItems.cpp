@@ -50,6 +50,29 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
         owned.insert(censusContainers_.begin(), censusContainers_.end());
     }
+    // Protocol 46: publish nested inventory containers (worn backpacks / cargo
+    // items) independently, so their contents sync. Discover them from each
+    // authored top-level container's containerSlot sections and add them to this
+    // tick's authored set.
+    struct NestedWire { Key parent; NestedInvKey locator; };
+    std::map<Key, NestedWire> nestedWire;
+    if (!owned.empty()) {
+        const unsigned int MAX_NESTED = 32;
+        std::set<Key> nested;
+        engine::NestedContainerRead rows[MAX_NESTED];
+        for (std::set<Key>::iterator it = owned.begin(); it != owned.end(); ++it) {
+            unsigned int p[5] = { it->t, it->c, it->cs, it->i, it->s };
+            unsigned int n = engine::captureNestedContainers(gw, p, rows, MAX_NESTED);
+            for (unsigned int i = 0; i < n; ++i) {
+                Key k; k.t = rows[i].hand[0]; k.c = rows[i].hand[1];
+                k.cs = rows[i].hand[2]; k.i = rows[i].hand[3]; k.s = rows[i].hand[4];
+                nested.insert(k);
+                NestedWire nw; nw.parent = *it; nw.locator = rows[i].key;
+                nestedWire[k] = nw;
+            }
+        }
+        owned.insert(nested.begin(), nested.end());
+    }
     if (owned.empty()) return;
     const unsigned long INV_RESEND_MS = 5000; // periodic safety resend (loss/late join)
     // A changed snapshot must be STABLE this long before we publish it. A change that only
@@ -98,8 +121,27 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         // protocol-27 placer key (own placement = our hand; a minted proxy =
         // the reverse map). Characters / baked containers stay raw (kind 0).
         u8 keyKind = 0;
+        const NestedInvKey* nestedKey = 0;
         u32 wireKey[5] = { it->t, it->c, it->cs, it->i, it->s };
-        if (ownBuilds_.find(*it) != ownBuilds_.end()) {
+        std::map<Key, NestedWire>::iterator nit = nestedWire.find(*it);
+        if (nit != nestedWire.end()) {
+            keyKind = 2;
+            Key parent = nit->second.parent;
+            wireKey[0] = parent.t; wireKey[1] = parent.c; wireKey[2] = parent.cs;
+            wireKey[3] = parent.i; wireKey[4] = parent.s;
+            if (ownBuilds_.find(parent) != ownBuilds_.end()) {
+                keyKind = 3;
+            } else {
+                std::map<Key, Key>::iterator pmit = mintByLocal_.find(parent);
+                if (pmit != mintByLocal_.end()) {
+                    keyKind = 3;
+                    wireKey[0] = pmit->second.t; wireKey[1] = pmit->second.c;
+                    wireKey[2] = pmit->second.cs; wireKey[3] = pmit->second.i;
+                    wireKey[4] = pmit->second.s;
+                }
+            }
+            nestedKey = &nit->second.locator;
+        } else if (ownBuilds_.find(*it) != ownBuilds_.end()) {
             keyKind = 1;
         } else {
             std::map<Key, Key>::iterator mit = mintByLocal_.find(*it);
@@ -110,7 +152,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                 wireKey[4] = mit->second.s;
             }
         }
-        net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n);
+        net.queueInvSnapshot(ownerId, keyKind, wireKey, nestedKey, items, n);
         pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n;
         if (changed) {
             char b[200];

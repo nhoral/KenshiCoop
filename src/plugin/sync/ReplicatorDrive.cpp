@@ -281,10 +281,16 @@ void Replicator::applyTargets(GameWorld* gw) {
         // still drain it so the engine-side accumulator stays bounded.
         if (reportCombat_) {
             float rf = 0.0f, rb = 0.0f;
-            if (engine::takeReportedDamage(c, &rf, &rb) && !isSquad &&
-                (rf > 0.0f || rb > 0.0f)) {
+            bool haveDamage = engine::takeReportedDamage(c, &rf, &rb);
+            float koSkill = 1.0f;
+            bool knockout = engine::takeReportedKnockout(c, &koSkill);
+            if (!isSquad && ((haveDamage && (rf > 0.0f || rb > 0.0f)) || knockout)) {
                 PendingHit& ph = pendingHits_[it->first];
                 ph.flesh += rf; ph.blood += rb;
+                if (knockout) {
+                    ph.knockout = true;
+                    ph.knockoutSkill = koSkill;
+                }
             }
         }
 

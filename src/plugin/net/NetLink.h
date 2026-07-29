@@ -50,9 +50,9 @@ public:
     // thread serializes [InvSnapshotHeader][InvItemEntry*count] and sends it on the
     // RELIABLE channel next tick. count may be 0 ("container now empty"). Copied
     // under lock; only enqueued on content-change so the reliable channel stays cheap.
-    // keyKind (protocol 34): 0 = cKey is the raw container hand, 1 = cKey is the
-    // protocol-27 placer key of a session-placed building (receiver translates).
+    // keyKind: 0/1 = raw/placer container, 2/3 = nested under raw/placer parent.
     void queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
+                          const NestedInvKey* nested,
                           const InvItemEntry* items, unsigned int count);
 
     // MAIN thread: queue a reliable world-item snapshot (Phase W1). The net thread
@@ -229,8 +229,9 @@ private:
     // list. Guarded by outCs_.
     struct OutInv {
         u32                       ownerId;
-        u8                        keyKind; // protocol 34: 0 raw hand, 1 placer key
+        u8                        keyKind;
         u32                       cKey[5];
+        NestedInvKey              nested;
         std::vector<InvItemEntry> items;
     };
     std::vector<OutInv>      outInv_;

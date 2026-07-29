@@ -293,6 +293,9 @@ void  markerDestroy(void* label);
 // knockDown drops a Character into (on=true) / out of (on=false) full-body
 // ragdoll - the join calls it to reproduce a host-authoritative down edge.
 bool knockDown(Character* c, bool on);
+// Apply a real engine-calculated knockout without replacing its duration with
+// the short forced timer used by the down-state replication scaffold.
+bool applyKnockout(Character* c, float skill);
 // Maintain an already-down body each tick by topping the KO timer (no re-collapse).
 // Prevents the get-up/flop flicker without re-triggering the ragdoll fall. Join-side.
 bool holdDown(Character* c);
@@ -465,6 +468,20 @@ RootObject* resolveObjectByHand(const unsigned int cHand[5]);
 unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
                                       InvItemEntry* out, unsigned int maxOut,
                                       unsigned int* outHash);
+
+struct NestedContainerRead {
+    u32 hand[5];
+    NestedInvKey key;
+};
+
+// SEH-guarded: enumerate inventory-carrying items inside cHand, returning each
+// local object hand and a parent-relative locator suitable for the wire.
+unsigned int captureNestedContainers(GameWorld* gw, const unsigned int cHand[5],
+                                     NestedContainerRead* out, unsigned int maxOut);
+
+// SEH-guarded: resolve a parent-relative locator to this peer's local item hand.
+bool resolveNestedContainerHand(const unsigned int parentHand[5],
+                                const NestedInvKey& key, unsigned int outHand[5]);
 
 // SEH-guarded: reconcile the local container (cHand) to the desired item multiset:
 // add any shortfall (createItem of the template + tryAddItem) and remove any excess
@@ -930,6 +947,9 @@ void         setTaskSelectSpike(bool on);
 // Same pattern as the AI-suspend detour: pointer-compared set, rebuilt each tick
 // on the main thread, hook installed once.
 bool         installDamageGuardHook();
+// Join only: capture MedicalSystem::knockout calls on guarded world-NPC copies.
+// Assassinations bypass hitByMeleeAttack, so this is their combat-report edge.
+bool         installKnockoutReportHook();
 void         clearDamageGuard();
 void         addDamageGuard(Character* c);
 unsigned int damageGuardCount();
@@ -952,6 +972,7 @@ void         addReportAttacker(Character* c);
 // Drain the accumulated join-dealt damage for one victim copy (returns false if
 // nothing pending). flesh/blood are the summed deltas since the last drain.
 bool         takeReportedDamage(Character* c, float* outFlesh, float* outBlood);
+bool         takeReportedKnockout(Character* c, float* outSkill);
 
 // Read a character's current blood level by hand (medical.blood). The vitals
 // ground-truth read for the damage_guard conformance oracle: the HOST's victim

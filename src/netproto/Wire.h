@@ -24,7 +24,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 45;
+const u16 PROTOCOL_VERSION = 47;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -408,19 +408,28 @@ struct InvItemEntry {
     char material[48];
 };
 
+// Protocol 46: identity of an inventory-bearing item relative to its stable
+// parent container. Recreated items have different raw hands on each peer, so
+// nested inventories (notably backpacks) are resolved by template + section +
+// same-template ordinal instead. Zero-filled for non-nested snapshots.
+struct NestedInvKey {
+    u32  itemType;
+    u16  section;
+    u8   ordinal;
+    char stringID[48];
+};
+
 // An inventory snapshot is: [InvSnapshotHeader][InvItemEntry * count]. The container
 // key identifies WHOSE inventory this is (a storage building, a character, a chest).
 // count == 0 is a valid "container is now empty" snapshot.
 struct InvSnapshotHeader {
     u8  type;    // = PKT_INV_SNAPSHOT
     u32 ownerId; // network player id of the authoritative sender
-    // Protocol 34: container identity kind. 0 = the c* fields are the raw
-    // (save-stable) hand - characters, baked chests, the previous implicit
-    // behaviour. 1 = the c* fields are the protocol-27 PLACER key of a
-    // session-placed building: the sender translated its local hand through
-    // its build maps (own placement = own hand; a minted proxy = the reverse
-    // map) and the receiver resolves through its own (peer key -> minted
-    // local hand; own key -> own hand) - the PKT_PROD identity approach.
+    // Protocol 34/46 container identity kind:
+    // 0 = raw save-stable hand (character, baked chest)
+    // 1 = protocol-27 placer key for a session-placed building
+    // 2 = nested item relative to a raw parent hand
+    // 3 = nested item relative to a parent placer key
     u8  keyKind;
     // container key (whose inventory; hand or placer key per keyKind)
     u32 cType;
@@ -428,6 +437,7 @@ struct InvSnapshotHeader {
     u32 cContainerSerial;
     u32 cIndex;
     u32 cSerial;
+    NestedInvKey nested;
     u8  count;   // number of InvItemEntry that follow
 };
 
@@ -716,6 +726,10 @@ struct TreatmentPacket {
 // (blood + a frontal flesh wound), then the medical sim + vitals stream mirror
 // the result back. Idempotent-ish per hitId (log correlation only; the amounts
 // are deltas, so a dropped/duped datagram would mis-total - hence RELIABLE).
+enum CombatHitFlags {
+    COMBAT_HIT_KNOCKOUT = 1 << 0
+};
+
 struct CombatHitPacket {
     u8  type;    // = PKT_COMBAT_HIT
     u32 ownerId; // network player id of the sender (the ATTACKER's machine)
@@ -728,6 +742,8 @@ struct CombatHitPacket {
     u32 sSerial;
     f32 flesh;   // accumulated flesh damage to apply (frontal part)
     f32 blood;   // accumulated blood loss to apply
+    u8  flags;   // CombatHitFlags outcome bits
+    f32 koSkill;  // MedicalSystem::knockout(skill) input for KO duration
 };
 
 // Consensus game speed (pause/1x/2x/3x). As PKT_SPEED_REQ it carries one

@@ -989,7 +989,11 @@ bool knockDown(Character* c, bool on) {
             // well past the re-arm interval. Fall back to ragdoll if unresolved.
             if (g_knockoutFn || g_knockoutForceFn) {
                 MedicalSystem* med = &c->medical;
-                if (g_knockoutFn)      g_knockoutFn(med, 1.0f);
+                if (g_knockoutFn) {
+                    g_suppressKnockoutReport = true;
+                    g_knockoutFn(med, 1.0f);
+                    g_suppressKnockoutReport = false;
+                }
                 if (g_knockoutForceFn) g_knockoutForceFn(med, 8.0f);
                 return true;
             }
@@ -1001,6 +1005,22 @@ bool knockDown(Character* c, bool on) {
         if (g_ragdollModeFn)   g_ragdollModeFn(c, false, RagdollPart::WHOLE);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_suppressKnockoutReport = false;
+        return false;
+    }
+}
+
+bool applyKnockout(Character* c, float skill) {
+    if (!c || !g_knockoutFn) return false;
+    __try {
+        if (skill < 0.0f) skill = 0.0f;
+        if (skill > 1.0f) skill = 1.0f;
+        g_suppressKnockoutReport = true;
+        g_knockoutFn(&c->medical, skill);
+        g_suppressKnockoutReport = false;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_suppressKnockoutReport = false;
         return false;
     }
 }
