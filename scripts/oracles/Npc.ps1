@@ -2181,3 +2181,87 @@ function Test-NpcCensus {
                             extraCulls = $extra; sent = $sent; recv = $recv } -Detail $detail)
 }
 
+
+# name_sync (protocol 46 regression, PR #28 fix #4): runtime-minted proxies used
+# to show Kenshi's default "Name" because the mod never replicated the name. The
+# host now sends it on SpawnInfoPacket ("[spawn] INFO send ... name='X'") and the
+# join sets it on the minted proxy ("[spawn] proxy BOUND ... name='X'"). PASS iff
+# every proxy the join minted carries a non-default name, matching the host's sent
+# name for that hand. FAIL if any minted proxy shows "Name" (the regression).
+function Test-NameSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $reSend  = "\[spawn\] INFO send hand=(\d+,\d+,\d+,\d+,\d+) .* name='([^']*)'"
+    $reBound = "\[spawn\] proxy BOUND hand=(\d+,\d+,\d+,\d+,\d+) .* name='([^']*)'"
+    $sent = @{}
+    foreach ($m in @(Select-String -Path $HostFile -Pattern $reSend -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $sent[$g[1].Value] = $g[2].Value
+    }
+    $bound = @{}
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern $reBound -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $bound[$g[1].Value] = $g[2].Value
+    }
+    if ($bound.Count -eq 0) {
+        $d = "no proxy minted on the join (npc scene did not stream a proxy) - no signal"
+        Write-Host "  NAME-SYNC SKIP - $d"
+        return (Add-GateResult -Name "name_sync" -Status SKIP -Metrics @{ minted = 0 } -Detail $d)
+    }
+    $bad = 0; $mismatch = 0; $good = 0
+    foreach ($h in $bound.Keys) {
+        $y = $bound[$h]
+        if ($y -eq "" -or $y -eq "Name") { $bad++; continue }
+        if ($sent.ContainsKey($h) -and $sent[$h] -ne "" -and $sent[$h] -ne $y) { $mismatch++; continue }
+        $good++
+    }
+    $met = @{ minted = $bound.Count; good = $good; defaultName = $bad; mismatch = $mismatch }
+    if ($bad -gt 0 -or $mismatch -gt 0) {
+        $d = "$bad proxy(ies) show default 'Name', $mismatch disagree with host (of $($bound.Count) minted)"
+        Write-Host "  NAME-SYNC FAIL - $d"
+        return (Add-GateResult -Name "name_sync" -Status FAIL -Metrics $met -Detail $d)
+    }
+    $d = "$good minted prox(ies) carry the host's replicated name (no default 'Name')"
+    Write-Host "  NAME-SYNC PASS - $d"
+    return (Add-GateResult -Name "name_sync" -Status PASS -Metrics $met -Detail $d)
+}
+
+# death_portrait (protocol 46 regression, PR #28 fix #3): a dying squad member
+# used to re-key + re-join to the player squad, derefing a null PortraitData
+# (MainBarGUI crash) and leaving a phantom "Name" corpse. The fix skips the
+# re-join on a death-latched rekey ("[..] MEMBER skip .. (death-latched corpse)")
+# and suppresses the unnamed corpse mint. FAIL on a phantom 'Name' corpse or a
+# death-latched rekey that still re-joined (no skip); PASS when a death occurred
+# without those symptoms (strong when the skip path actually fired). SKIP if no
+# death in window. health_* separately catches an outright crash.
+function Test-DeathPortrait {
+    param([string]$HostFile, [string]$JoinFile)
+    # Count deaths the JOIN actually witnessed (EVT_DEATH crossed to its proxy) -
+    # NOT the host's "kill issued", which proves nothing about the join's corpse
+    # handling. No join-side death => no signal => SKIP (never a false PASS). The
+    # line is "[event] RECV id=<n> ev=2 owner=..." (ev=2 = EVT_DEATH).
+    $deaths = @(Select-String -Path $JoinFile -Pattern "\[event\] RECV id=\d+ ev=2\b" -ErrorAction SilentlyContinue).Count
+    $rekeys = @(Select-String -Path $JoinFile -Pattern "\[event\] REKEY-LATCH .* death=1" -ErrorAction SilentlyContinue).Count
+    $skips  = @(Select-String -Path $JoinFile -Pattern "MEMBER skip .* \(death-latched corpse\)" -ErrorAction SilentlyContinue).Count
+    $nameCorpse = @(Select-String -Path $JoinFile -Pattern "\[spawn\] proxy BOUND .* name='Name'" -ErrorAction SilentlyContinue).Count
+    $met = @{ deaths = $deaths; rekeyLatched = $rekeys; memberSkips = $skips; nameCorpse = $nameCorpse }
+    if ($deaths -eq 0 -and $rekeys -eq 0) {
+        $d = "no death occurred in window - no signal"
+        Write-Host "  DEATH-PORTRAIT SKIP - $d"
+        return (Add-GateResult -Name "death_portrait" -Status SKIP -Metrics $met -Detail $d)
+    }
+    if ($nameCorpse -gt 0) {
+        $d = "$nameCorpse corpse proxy(ies) minted with default 'Name' (phantom-portrait regression)"
+        Write-Host "  DEATH-PORTRAIT FAIL - $d"
+        return (Add-GateResult -Name "death_portrait" -Status FAIL -Metrics $met -Detail $d)
+    }
+    if ($rekeys -gt 0 -and $skips -eq 0) {
+        $d = "$rekeys death-latched rekey(s) but corpse re-joined (no MEMBER skip) - null-portrait crash path"
+        Write-Host "  DEATH-PORTRAIT FAIL - $d"
+        return (Add-GateResult -Name "death_portrait" -Status FAIL -Metrics $met -Detail $d)
+    }
+    if ($rekeys -gt 0 -and $skips -gt 0) {
+        $d = "$rekeys death-latched rekey(s), all skipped from re-join ($skips) - no null-portrait path, no 'Name' corpse"
+    } else {
+        $d = "$deaths death(s), no phantom 'Name' corpse (death-latched rekey did not re-trigger in-window)"
+    }
+    Write-Host "  DEATH-PORTRAIT PASS - $d"
+    return (Add-GateResult -Name "death_portrait" -Status PASS -Metrics $met -Detail $d)
+}

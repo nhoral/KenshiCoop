@@ -161,6 +161,7 @@ void Replicator::resetSession() {
     canonicalOf_.clear();      // capture-translation reverse map (same pointers)
     jailObs_.clear();          // jail-observe spike per-captive last sample
     proxyByKey_.clear();
+    mintedProxies_.clear();
     suppressed_.clear();
     midBand_.clear();          // host mid-band round-robin (rebuilt by next census)
     midCursor_ = 0; midSliceMs_ = 0;
@@ -278,7 +279,8 @@ void Replicator::clearPeerReplicationState(GameWorld* gw) {
     unsigned int cleared = 0;
     for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
          it != proxyByKey_.end(); ++it) {
-        if (gw && it->second && engine::despawnProxyNpc(gw, it->second))
+        if (gw && it->second && mintedProxies_.count(it->second) &&
+            engine::despawnProxyNpc(gw, it->second))
             ++cleared;
     }
     char b[96];

@@ -391,3 +391,43 @@ function Test-MedicPose {
     return (Add-GateResult -Name "medic_pose" -Status PASS -Metrics $mtr)
 }
 
+
+# age_sync (protocol 46 regression, PR #28 fix #5): a growing squad animal kept
+# its mint-time size on the peer because age was only sent at mint. Age now rides
+# the periodic owner-authoritative StatsPacket ("[stats] SEND ... age=A" on the
+# owner; "[stats] RECV ... age=B" on the peer, B re-read after setAge). PASS iff
+# host and join agree on age for bodies both logged. SKIP if no age-bearing row
+# synced in the window (no aged/animal body) - a squad-animal fixture makes this
+# deterministic.
+function Test-AgeSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $reS = "\[stats\] SEND hand=(\d+,\d+) .* age=([-\d.]+)"
+    $reR = "\[stats\] RECV hand=(\d+,\d+) .* age=([-\d.]+)"
+    $sent = @{}
+    foreach ($m in @(Select-String -Path $HostFile -Pattern $reS -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $a = [double]$g[2].Value; if ($a -gt 0) { $sent[$g[1].Value] = $a }
+    }
+    $recv = @{}
+    foreach ($m in @(Select-String -Path $JoinFile -Pattern $reR -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups; $a = [double]$g[2].Value; if ($a -gt 0) { $recv[$g[1].Value] = $a }
+    }
+    $shared = @($sent.Keys | Where-Object { $recv.ContainsKey($_) })
+    if ($shared.Count -eq 0) {
+        $d = "no age-bearing stats row synced in window (no aged/animal body) - no signal"
+        Write-Host "  AGE-SYNC SKIP - $d"
+        return (Add-GateResult -Name "age_sync" -Status SKIP -Metrics @{ sent = $sent.Count; recv = $recv.Count } -Detail $d)
+    }
+    $agree = 0; $disagree = 0; $tol = 0.05
+    foreach ($h in $shared) {
+        if ([math]::Abs($sent[$h] - $recv[$h]) -le $tol) { $agree++ } else { $disagree++ }
+    }
+    $met = @{ shared = $shared.Count; agree = $agree; disagree = $disagree }
+    if ($disagree -gt 0) {
+        $d = "$disagree/$($shared.Count) bodies disagree on age (host vs join > $tol)"
+        Write-Host "  AGE-SYNC FAIL - $d"
+        return (Add-GateResult -Name "age_sync" -Status FAIL -Metrics $met -Detail $d)
+    }
+    $d = "$agree body(ies) agree on replicated age (host == join)"
+    Write-Host "  AGE-SYNC PASS - $d"
+    return (Add-GateResult -Name "age_sync" -Status PASS -Metrics $met -Detail $d)
+}

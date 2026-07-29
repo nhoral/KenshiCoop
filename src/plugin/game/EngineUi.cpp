@@ -105,6 +105,19 @@ void markerDestroy(void* label) {
     markerDestroySeh(g, (ScreenLabel*)label);
 }
 
+// True while any inventory/trade window is open. Callers defer inventory
+// mutation so the reconcile never frees an Item the open UI still holds
+// (Inventory::removeItem UAF, crash on entering cities/shops).
+bool inventoryUiOpen() {
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return false;
+    __try {
+        return g->getNumOpenInventoryWindows() > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // ---- In-game co-op session panel (config-driven, spike-50 DatapanelGUI stack) -
 // A native DatapanelGUI window toggled with F2. The player picks role + transport
 // (toggle BUTTONS - the only DatapanelGUI control with a callable RVA callback;

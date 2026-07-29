@@ -911,6 +911,16 @@ void tickSetupScene(GameWorld* gw) {
                 "SETUP(inventory): container hand=%u,%u,%u,%u,%u - SAVE 'inv1' now",
                 ch[0], ch[1], ch[2], ch[3], ch[4]); b[sizeof(b) - 1] = '\0'; coopLog(b); }
             else coopLog("SETUP(inventory): container prep FAILED");
+        } else if (g_cfg.setupScene == "recruit") {
+            // Recruit LIVE (name_sync regression, PR #28 fix #4): spawn a world
+            // NPC and recruit it into the HOST's squad so it becomes an OWNED
+            // member - publishOwned then streams it and the join MINTS it as a
+            // proxy carrying the replicated name. A runtime-minted proxy must NOT
+            // show Kenshi's default "Name" (the bug this fix closed).
+            Character* npc = coop::engine::spawnNpcInFront(gw, 2.5f, 1.0f);
+            bool ok = npc && coop::engine::recruitNpc(gw, npc);
+            coopLog(ok ? "SETUP: spawned + recruited world NPC (owned member)"
+                       : "SETUP: recruit spawn FAILED");
         } else {
             RootObject* seat = 0;
             bool ok = coop::engine::spawnSeatInFront(gw, 7.0f, 0.0f, &seat);

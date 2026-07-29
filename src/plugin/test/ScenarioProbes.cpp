@@ -1650,6 +1650,71 @@ private:
     unsigned int  ownHand_[5];
 };
 
+// ===========================================================================
+// IdentSyncScenario (protocol 46 regression: character-name + animal-age sync)
+// - PASSIVE. With the 'npc' setup scene the host spawns a world NPC, which the
+// join MINTS as a proxy carrying the host's replicated name ("[spawn] proxy
+// BOUND ... name='..'") - the name_sync oracle asserts it is not the default
+// "Name". The periodic StatsPacket carries the owner's age ("[stats] SEND/RECV
+// ... age=..") - the age_sync oracle asserts host and join agree. This scenario
+// only holds the armed run open so those edges fire, then reports PASS as a
+// liveness marker (the real verdict is the two oracles'). Identical host + join.
+// ===========================================================================
+class IdentSyncScenario : public Scenario {
+public:
+    const char* name() const { return "ident_sync"; }
+    void onStart(const ScenarioContext&) {}
+    bool onTick(const ScenarioContext& ctx) { return ctx.elapsedMs >= 45000; }
+    bool passed() const { return true; }
+};
+
+// ===========================================================================
+// DeathPortraitScenario (regression for the death-portrait crash fix): the repro
+// is "a player's own character dies" (1 char per player - the host's char died and
+// both clients crashed). The host's char is already a proxy on the join from the
+// shared save, so its death crosses instantly (no recruit / far-mint). This bleeds
+// the HOST-OWNED leader out via LIMB wounds (bleedOutCharacter skips the fatal
+// torso/head so the game bleeds it over time rather than dying instantly), letting
+// the game run its OWN point-of-no-return death - which the join witnesses on its
+// proxy, re-keys the corpse + refreshes the squad portrait (the null-PortraitData
+// deref the fix guards). The death_portrait oracle requires the join to witness the
+// death (EVT_DEATH), then asserts no phantom 'Name' corpse + (if the death-latched
+// rekey fires) the MEMBER skip; health_* asserts no crash. PASS here is a liveness
+// marker (the verdict is the oracle's + health's).
+// ===========================================================================
+class DeathPortraitScenario : public Scenario {
+public:
+    DeathPortraitScenario() : subj_(0), bled_(false) {}
+    const char* name() const { return "death_portrait"; }
+    void onStart(const ScenarioContext& ctx) {
+        if (ctx.isHost) {
+            subj_ = engine::hostOwnedLeader(ctx.gw);
+            coop::logLine(subj_ ? "SCENARIO death-portrait subject = host leader"
+                                : "SCENARIO death-portrait NO host leader");
+        }
+    }
+    bool onTick(const ScenarioContext& ctx) {
+        // Bleed the host's own char out (LIMB wounds -> the game bleeds it over
+        // time into its natural death). Re-asserted each tick so an update() re-derive
+        // can't heal the wounds before it finishes. killSubject would force med->dead
+        // and BYPASS the death sequence, so it can't reproduce the bug.
+        if (ctx.isHost && subj_ && ctx.elapsedMs >= 15000) {
+            bool ok = false;
+            __try { ok = engine::bleedOutCharacter(ctx.gw, subj_); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+            if (!bled_ && ok) {
+                coop::logLine("SCENARIO DEATH bleed-out started (death-portrait host char)");
+                bled_ = true;
+            }
+        }
+        return ctx.elapsedMs >= 130000; // room for the bleed-out + death propagation
+    }
+    bool passed() const { return true; }
+private:
+    Character* subj_;
+    bool       bled_;
+};
+
 } // namespace
 
 Scenario* makeProbeScenario(const std::string& name) {
@@ -1668,6 +1733,8 @@ Scenario* makeProbeScenario(const std::string& name) {
     if (name == "time_sync")     return new TimeProbeScenario(false);
     if (name == "hunger_probe")  return new HungerProbeScenario(true);
     if (name == "hunger_sync")   return new HungerProbeScenario(false);
+    if (name == "ident_sync")    return new IdentSyncScenario();
+    if (name == "death_portrait") return new DeathPortraitScenario();
     return 0;
 }
 
