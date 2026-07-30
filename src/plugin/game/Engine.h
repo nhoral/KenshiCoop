@@ -723,6 +723,15 @@ unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
 // relocateWeaponToGround. Returns 1 on success. `item` must be a still-live tracked object.
 int addItemPtrToInventory(GameWorld* gw, const unsigned int targetHand[5], void* item);
 
+// SEH-guarded (auto-revert mitigation, W1 non-gear pickup): a ground proxy that a
+// PEER picked up (it now sits in some character's inventory) must NOT be retained -
+// the authoring client still holds the real object, so keeping the picked-up proxy
+// duplicates it. Re-drop the proxy back onto the ground at (x,y,z) via the engine's
+// own Inventory::dropItem (a clean bag->ground move, NEVER a destroy). Returns 1 if
+// the object was in an inventory and got dropped, else 0 (already on the ground /
+// stale / not in an inventory).
+int dropProxyItemToGround(GameWorld* gw, void* item, float x, float y, float z);
+
 // ---- Equipped-gear (armour/weapon slot) test hooks (inv_equip scenario) ----
 // SEH-guarded: report the first EQUIPPED item worn by the object at cHand (its
 // template stringID + itemType) and the total count of worn items. Returns 1 if any

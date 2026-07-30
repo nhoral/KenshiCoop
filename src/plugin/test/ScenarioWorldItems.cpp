@@ -777,7 +777,221 @@ const char* const RejoinItemsScenario::SAVE_NAME = "coopresume";
 
 } // namespace
 
+// world_item_peer_pickup (W1 non-gear cross-client PICKUP conservation): the
+// dupe gate for a peer picking up a NON-GEAR ground item the other player
+// dropped. The HOST (owns rank 0) seeds ONE common non-gear item into its
+// leader's bag and DROPS it - it streams to the JOIN as a W1 template proxy
+// (a real, unowned, pickable ground object). The JOIN (owns rank 1) then PICKS
+// UP that proxy into its OWN rank-1 character (engine::pickupWorldItemIntoInventory
+// - the same relocate-into-bag a player order performs). Both clients census the
+// TOTAL number of that sid they can see = rank0 bag + rank1 bag + free ground.
+// CONSERVATION invariant: exactly ONE copy exists in the world at all times, so
+// total must NEVER exceed 1 on either client. On the UNFIXED W1 path the host
+// keeps its real dropped item on the ground (its liveness only checks its OWN
+// object, untouched by the join grabbing a proxy) AND the join's picked-up copy
+// mirrors back via the inventory channel -> the HOST sees total=2 (a silent
+// DUPE), while the join still sees 1. The auto-revert mitigation
+// (Replicator::revertProxyPickups) re-drops any picked-up proxy before the
+// inventory publish, so the host never sees the second copy and total stays 1.
+// Gate = wi_peer_pickup (Test-WorldItemPeerPickup): host maxtot<=1 AND fintot==1
+// AND the drop+pickup were actually exercised (dropped>0, picked>0).
+class WorldItemPeerPickupScenario : public Scenario {
+public:
+    WorldItemPeerPickupScenario()
+        : passed_(false), haveRanks_(false), isHost_(false), step_(0),
+          lastLogMs_(0), probeType_(0), dropped_(0), picked_(0),
+          maxTot_(0), finTot_(0) {
+        for (int i = 0; i < 5; ++i) { rank0_[i] = 0; rank1_[i] = 0; }
+        probeSid_[0] = '\0';
+    }
+    virtual const char* name() const { return "world_item_peer_pickup"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        // Deterministic common non-gear test template (same gamedata -> same sid
+        // on both clients), so the join can target the ground proxy by sid.
+        haveRanks_ = engine::commonTestItemSid(ctx.gw, probeSid_, sizeof(probeSid_), &probeType_) != 0;
+        // rank 0 = host-owned leader bag (drop source); rank 1 = join-owned bag
+        // (pickup destination). Resolved from the shared squad partition.
+        bool r0 = resolveRankContainer(ctx.gw, 0, rank0_);
+        bool r1 = resolveRankContainer(ctx.gw, 1, rank1_);
+        haveRanks_ = haveRanks_ && r0 && r1;
+        char b[220];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO WPU anchor host=%d have=%d sid='%s' type=%u r0=%u,%u,%u,%u,%u r1=%u,%u,%u,%u,%u",
+            isHost_ ? 1 : 0, haveRanks_ ? 1 : 0, probeSid_[0] ? probeSid_ : "(none)", probeType_,
+            rank0_[0], rank0_[1], rank0_[2], rank0_[3], rank0_[4],
+            rank1_[0], rank1_[1], rank1_[2], rank1_[3], rank1_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveRanks_) { if (ctx.elapsedMs >= 6000) { passed_ = false; return true; } return false; }
+
+        // ---- HOST: seed one non-gear item into rank 0, then drop it ----------
+        if (isHost_) {
+            if (step_ == 0 && ctx.elapsedMs >= 6000) {
+                step_ = 1;
+                int added = engine::addItemsToContainerBySid(ctx.gw, rank0_, probeSid_,
+                                                             probeType_, 1, 0, "", "");
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO WPU SEED added=%d sid='%s' type=%u", added, probeSid_, probeType_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (step_ == 1 && ctx.elapsedMs >= 9000) {
+                step_ = 2;
+                dropped_ = engine::dropItemFromInventory(ctx.gw, rank0_, probeSid_, probeType_, 1);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO WPU DROP dropped=%d", dropped_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- JOIN: pick up the host's ground proxy into rank 1 ---------------
+        if (!isHost_) {
+            if (step_ == 0 && ctx.elapsedMs >= 16000) {
+                step_ = 1;
+                // Relocate the free ground proxy (the only ground copy of the sid
+                // on the join) into the join-owned rank-1 bag - the conservation
+                // pickup a player order performs. Generous radius: rank 0 and rank 1
+                // are the same squad, co-located at the drop site.
+                picked_ = engine::pickupWorldItemIntoInventory(ctx.gw, rank1_, probeSid_,
+                                                               probeType_, 80.0f);
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO WPU PICKUP picked=%d", picked_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Both: census total copies of the sid every 500 ms --------------
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            int r0 = countInContainer(ctx.gw, rank0_, probeSid_, probeType_);
+            int r1 = countInContainer(ctx.gw, rank1_, probeSid_, probeType_);
+            int grnd = engine::countFreeGroundItemsNear(ctx.gw, rank0_, probeSid_, probeType_, 80.0f);
+            int total = r0 + r1 + grnd;
+            // Only track the max AFTER the drop has happened (the pre-seed total is
+            // a legitimate 1 in rank 0; we care about duplication post-drop).
+            bool afterDrop = isHost_ ? (step_ >= 2) : (ctx.elapsedMs >= 12000);
+            if (afterDrop && total > maxTot_) maxTot_ = total;
+            finTot_ = total;
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO WPU %s t=%lu r0=%d r1=%d grnd=%d total=%d",
+                isHost_ ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, r0, r1, grnd, total);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (isHost_) {
+                // Conserved iff the host never observed a second copy and the world
+                // settled back to exactly one (the dropped item on the ground).
+                passed_ = (dropped_ > 0) && (maxTot_ <= 1) && (finTot_ == 1);
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "WPU verdict role=host pass=%d dropped=%d maxtot=%d fintot=%d",
+                    passed_ ? 1 : 0, dropped_, maxTot_, finTot_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                // The join stays locally conserved (bag<->ground); its verdict just
+                // proves the pickup was exercised (else the host gate is vacuous).
+                passed_ = (picked_ > 0) && (maxTot_ <= 1);
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "WPU verdict role=join pass=%d picked=%d maxtot=%d fintot=%d",
+                    passed_ ? 1 : 0, picked_, maxTot_, finTot_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long HOST_DURATION_MS = 30000; // outlive the join + the dupe window
+    static const unsigned long JOIN_DURATION_MS = 24000;
+    static const unsigned int  MAX_SQUAD        = 32;
+
+    // Count copies of (sid,type) held in the container at `hand` (0 if unresolved).
+    int countInContainer(GameWorld* gw, const unsigned int hand[5],
+                         const char* sid, unsigned int type) {
+        if (hand[0] == 0 && hand[1] == 0 && hand[3] == 0 && hand[4] == 0) return 0;
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, hand, it, INV_ITEMS_MAX, 0);
+        int c = 0;
+        for (unsigned int i = 0; i < n; ++i)
+            if (it[i].itemType == type && strcmp(it[i].stringID, sid) == 0) {
+                int q = it[i].quantity; if (q < 1) q = 1; c += q;
+            }
+        return c;
+    }
+
+    // Resolve the container of the squad member in the requested ownership rank
+    // (0 = host leader, 1 = join). Mirrors the Replicator's tab partition, so it
+    // agrees on both clients from the shared save. (Same logic as the inventory
+    // scenarios' local helper.)
+    static bool resolveRankContainer(GameWorld* gw, unsigned int rank, unsigned int out[5]) {
+        for (int i = 0; i < 5; ++i) out[i] = 0;
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ false, sq, MAX_SQUAD);
+        if (n == 0) return false;
+        int best = -1;
+        for (unsigned int i = 0; i < n; ++i) {
+            int cr = containerRankOf(sq, n, i);
+            if (cr < 0 || (unsigned int)cr != rank) continue;
+            if (best < 0 || handLess(sq[i], sq[best])) best = (int)i;
+        }
+        if (best < 0) return false;
+        out[0] = sq[best].hType; out[1] = sq[best].hContainer;
+        out[2] = sq[best].hContainerSerial; out[3] = sq[best].hIndex; out[4] = sq[best].hSerial;
+        return true;
+    }
+    static bool handLess(const EntityState& a, const EntityState& b) {
+        if (a.hType != b.hType) return a.hType < b.hType;
+        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+        if (a.hContainerSerial != b.hContainerSerial) return a.hContainerSerial < b.hContainerSerial;
+        if (a.hIndex != b.hIndex) return a.hIndex < b.hIndex;
+        return a.hSerial < b.hSerial;
+    }
+    static bool ctnrLess(const EntityState& a, const EntityState& b) {
+        if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+        return a.hContainerSerial < b.hContainerSerial;
+    }
+    static bool ctnrEq(const EntityState& a, const EntityState& b) {
+        return a.hContainer == b.hContainer && a.hContainerSerial == b.hContainerSerial;
+    }
+    static int containerRankOf(const EntityState* sq, unsigned int n, unsigned int i) {
+        EntityState distinct[MAX_SQUAD]; unsigned int dn = 0;
+        for (unsigned int a = 0; a < n; ++a) {
+            bool seen = false;
+            for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[a])) { seen = true; break; }
+            if (!seen && dn < MAX_SQUAD) distinct[dn++] = sq[a];
+        }
+        for (unsigned int a = 1; a < dn; ++a)
+            for (unsigned int b = a; b > 0 && ctnrLess(distinct[b], distinct[b-1]); --b) {
+                EntityState t = distinct[b]; distinct[b] = distinct[b-1]; distinct[b-1] = t;
+            }
+        for (unsigned int b = 0; b < dn; ++b) if (ctnrEq(distinct[b], sq[i])) return (int)b;
+        return -1;
+    }
+
+    bool          passed_;
+    bool          haveRanks_;
+    bool          isHost_;
+    int           step_;
+    unsigned long lastLogMs_;
+    unsigned int  probeType_;
+    int           dropped_;
+    int           picked_;
+    int           maxTot_;
+    int           finTot_;
+    unsigned int  rank0_[5];
+    unsigned int  rank1_[5];
+    char          probeSid_[48];
+};
+
 Scenario* makeWorldItemScenario(const std::string& name) {
+    if (name == "world_item_peer_pickup") return new WorldItemPeerPickupScenario();
     if (name == "drop_probe")   return new DropProbeScenario();
     if (name == "world_item_sync") return new WorldItemSyncScenario();
     if (name == "world_item_drop") return new WorldItemDropScenario();

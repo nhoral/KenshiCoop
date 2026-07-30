@@ -1438,6 +1438,25 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $false
         }
+        # world_item_peer_pickup: NON-gear ground-item cross-client PICKUP
+        # conservation. The HOST drops a common non-gear item (W1 proxy); the JOIN
+        # picks that proxy up into its own rank-1 bag. On the unfixed W1 path the
+        # host keeps its real ground item AND gains the join's mirrored copy -> a
+        # silent DUPE (host total=2). The auto-revert mitigation re-drops any
+        # picked-up proxy before the inventory publish so total stays 1. Gate =
+        # host maxtot<=1 AND fintot==1, with drop+pickup actually exercised.
+        world_item_peer_pickup = @{
+            # invSync = the join's pickup must mirror to the host (the dupe channel);
+            # worldSync = the W1 proxy path + the revertProxyPickups mitigation are both
+            # gated on it. Named-scenario auto-enable was retired upstream in favour of
+            # this per-scenario DiagEnv, matching world_weapon_drop/world_armor_drop.
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'wi_peer_pickup'
+            Gating   = @('wi_peer_pickup', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # rejoin_items (Phase 3 item-dup fix): a reload must not duplicate save-
         # native ground items. Reuses the load_sync coordinated save+load lever
         # (loadSync + saveSync ON by default): the HOST drops K test items (both

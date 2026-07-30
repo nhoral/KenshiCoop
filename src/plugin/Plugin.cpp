@@ -1030,6 +1030,16 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
     }
     if (worldLive) {
         g_repl.publishOwned(gw, g_net, g_net.localId());
+        // Auto-revert (W1 non-gear pickup dupe mitigation): a NON-gear ground proxy is
+        // a real, pickable object; if a local character grabbed a peer's proxy, retaining
+        // it duplicates the authoring client's still-held real item (which mirrors back
+        // over the inventory channel below). Re-drop any picked-up proxy to the ground
+        // BEFORE publishInventories, so the pickup never becomes a published/persisted
+        // second copy. Gated on worldSync (proxies only exist when it is on). NOT pickup
+        // conservation (Phase W4) - the peer still cannot TAKE non-gear drops; the dupe
+        // is simply closed while the drop stays visible.
+        if (g_cfg.worldSync)
+            g_repl.revertProxyPickups(gw);
         // Both clients stream the contents of every squad member they OWN (host tab 0,
         // join tab 1) on content-change - bidirectional, disjoint by the same tab
         // partition as positional sync. Gated on invSync so ordinary co-op sessions add

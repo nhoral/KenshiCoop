@@ -211,6 +211,12 @@ public:
     // reconcile local proxies - spawn a proxy for a new (ownerId, netId), move it if it
     // changed, destroy it on cull. netId spaces are per-sender, culls owner-scoped.
     void applyWorldItems(GameWorld* gw, Inbound& in);
+    // Auto-revert mitigation (W1 non-gear pickup dupe): if a PEER picked up one of
+    // our tracked ground proxies (a real, unowned, pickable object), re-drop it to
+    // the ground before the inventory publish so the peer never retains (and never
+    // mirrors back) a second copy of the authoring client's real item. NOT full
+    // pickup conservation (Phase W4) - it prevents the dupe + keeps the drop visible.
+    void revertProxyPickups(GameWorld* gw);
 
     // BEFORE engine (Phase W2/W3, runs on EVERY client): diff each OWNED character's WEAPON
     // census. A sustained count DECREASE is a DROP (the weapon left the bag; we never mutate
