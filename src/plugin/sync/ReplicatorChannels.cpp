@@ -1569,10 +1569,79 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
         pinOwned_.erase(ok);
         pinPeer_.erase(ok);
         // Pin ownership BEFORE the wire (the recruit pattern): every edge
-        // polled from OUR roster is OUR user's action, so the new hand
-        // publishes from this side no matter which rank its container latched
-        // to (an appended tab inherits our ownership through this pin).
-        if (!exited) pinOwned_.insert(nk);
+        // polled from OUR roster is OUR user's action, so by DEFAULT the new
+        // hand publishes from this side no matter which rank its container
+        // latched to (an appended tab inherits our ownership through this pin).
+        //
+        // Author-side control-release (SYNC_GAPS gap 10, 2026-07-17 remaining
+        // edge): a move INTO a tab the PEER owns is the control hand-off in
+        // the opposite direction - the receiver's rekeyPeerBody already
+        // CLAIMS it (the destOwned CONTROL-FLIP), but claiming it here too
+        // kept the author streaming its stationary copy forever, so the new
+        // owner's move orders fought the ghost stream (the walk-gait / slow
+        // drive that only a save+reload re-anchored; recruit_ctl Phase B is
+        // ADVISORY for this reason). Release (pin PEER) instead of claim when
+        // BOTH hold:
+        //   * the destination container maps, in the LATCHED partition, to a
+        //     rank we do NOT own (rekeyPeerBody's destOwned predicate), AND
+        //   * the destination tab already holds a member we do NOT stream
+        //     (allSquad_ minus ownHands_, both refreshed by publishOwned
+        //     earlier this same tick) that is not itself one of this batch's
+        //     post-move hands - positive evidence the tab is genuinely the
+        //     peer's. A tab WE just appended (createSquad: rank outside BOTH
+        //     ownRanks_ sets, sole occupants = this batch's movers) shows no
+        //     such member and still pins owned.
+        // A hand the receive half already classified peer (pinPeer_, stamped
+        // by rekeyPeerBody/insertPeerMember - this edge is the engine's echo
+        // of that insertion, not a user drag) always stays peer. Everything
+        // ambiguous falls back to the legacy claim: that failure mode is the
+        // known reload-to-re-anchor workaround, never an unowned unit.
+        // KENSHICOOP_XFER_RELEASE=0 restores the legacy unconditional claim.
+        if (!exited) {
+            static int xferRel = -1;
+            if (xferRel < 0) { const char* e = getenv("KENSHICOOP_XFER_RELEASE"); xferRel = (e && e[0] == '0') ? 0 : 1; }
+            bool release = pinPeer_.find(nk) != pinPeer_.end(); // receive-half echo stays peer
+            if (!release && xferRel == 1) {
+                std::map<std::pair<u32, u32>, unsigned int>::const_iterator rit =
+                    tabRank_.find(std::make_pair((u32)nk.c, (u32)nk.cs));
+                if (rit != tabRank_.end()) {
+                    bool rankOwned = ownRanks_.empty() ? (rit->second == 0u)
+                                                       : (ownRanks_.count(rit->second) != 0);
+                    if (!rankOwned) {
+                        // Peer-evidence scan: another member already sitting in
+                        // the destination container that we do not stream and
+                        // that is not a sibling mover from this same batch.
+                        for (std::set<Key>::const_iterator sit = allSquad_.begin();
+                             sit != allSquad_.end() && !release; ++sit) {
+                            if (sit->c != nk.c || sit->cs != nk.cs) continue;
+                            if (!(*sit < nk) && !(nk < *sit)) continue; // the mover itself
+                            if (ownHands_.find(*sit) != ownHands_.end()) continue;
+                            bool inBatch = false;
+                            for (unsigned int j = 0; j < n; ++j) {
+                                if (sit->t == edges[j].after[0] &&
+                                    sit->c == edges[j].after[1] &&
+                                    sit->cs == edges[j].after[2] &&
+                                    sit->i == edges[j].after[3] &&
+                                    sit->s == edges[j].after[4]) { inBatch = true; break; }
+                            }
+                            if (inBatch) continue;
+                            release = true;
+                        }
+                    }
+                }
+            }
+            if (release) {
+                pinPeer_.insert(nk);
+                char rl[176];
+                _snprintf(rl, sizeof(rl) - 1,
+                          "[squad] XFER-RELEASE new=%u,%u,%u,%u,%u (dest tab is "
+                          "peer-owned; pin peer, stop streaming)",
+                          nk.t, nk.c, nk.cs, nk.i, nk.s);
+                rl[sizeof(rl) - 1] = '\0'; coop::logLine(rl);
+            } else {
+                pinOwned_.insert(nk);
+            }
+        }
         EventPacket ev;
         memset(&ev, 0, sizeof(ev));
         ev.type    = (u8)PKT_EVENT;
