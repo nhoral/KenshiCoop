@@ -98,6 +98,28 @@ std::string fileOr(const std::map<std::string, std::string>& f, const char* key,
     return std::string(def);
 }
 
+// Parse a comma/space-separated list of steamid64s ("111,222") into out
+// (protocol 49: the host's full friend list). Zero/garbage entries are
+// skipped; duplicates collapse.
+void parseSteamIdList(const std::string& csv, std::vector<unsigned long long>& out) {
+    out.clear();
+    size_t i = 0;
+    while (i < csv.size()) {
+        while (i < csv.size() && (csv[i] < '0' || csv[i] > '9')) ++i;
+        size_t j = i;
+        while (j < csv.size() && csv[j] >= '0' && csv[j] <= '9') ++j;
+        if (j > i) {
+            unsigned long long v =
+                (unsigned long long)_strtoui64(csv.substr(i, j - i).c_str(), 0, 10);
+            bool dup = false;
+            for (size_t k = 0; k < out.size(); ++k)
+                if (out[k] == v) { dup = true; break; }
+            if (v != 0 && !dup) out.push_back(v);
+        }
+        i = j;
+    }
+}
+
 } // namespace
 
 void loadConfig(Config& c) {
@@ -247,7 +269,18 @@ void loadConfig(Config& c) {
     c.transport = envOr("KENSHICOOP_TRANSPORT", fileOr(f, "transport", "udp").c_str());
     c.steamPeer = (unsigned long long)_strtoui64(
         envOr("KENSHICOOP_STEAM_PEER", fileOr(f, "steamPeer", "0").c_str()).c_str(), 0, 10);
+    // Protocol 49: the HOST's full friend list ("111,222"); when absent, the
+    // single steamPeer above is the whole list.
+    parseSteamIdList(
+        envOr("KENSHICOOP_STEAM_PEERS", fileOr(f, "steamPeers", "").c_str()),
+        c.steamPeers);
     c.steamPing = (unsigned long long)_strtoui64(envOr("KENSHICOOP_STEAM_PING", "0").c_str(), 0, 10);
+
+    // Protocol 49: the squad-tab rank a JOIN claims (0 = role default, i.e.
+    // rank 1). Player 3 sets 2 (config "ownRank" / env). Rides HELLO so the
+    // host rejects a doubly-claimed slot.
+    c.ownRank = (unsigned int)std::atoi(
+        envOr("KENSHICOOP_OWN_RANK_CLAIM", fileOr(f, "ownRank", "0").c_str()).c_str());
 
     // In-game panel session control: opt-in legacy auto-start. Default OFF so a
     // panel-driven (env-free) install defers the session to the Connect button;
@@ -334,15 +367,23 @@ void loadConfig(Config& c) {
 
     int armTimeout = std::atoi(envOr("KENSHICOOP_ARM_TIMEOUT_MS", "45000").c_str());
     c.scenarioArmTimeoutMs = (armTimeout > 0) ? (unsigned long)armTimeout : 0ul;
+    int armMinPeers = std::atoi(envOr("KENSHICOOP_ARM_MIN_PEERS", "1").c_str());
+    c.scenarioArmMinPeers = (armMinPeers > 1) ? (unsigned int)armMinPeers : 1u;
 
     // Ownership squad-tab ranks: parse a CSV of unsigned ints (e.g. "0", "1", "1,2").
     // KENSHICOOP_OWN_SQUAD is primary; KENSHICOOP_OWN_RANK is an accepted alias. Empty
-    // env -> default (host owns tab {0} / join owns tab {1}).
+    // env -> default (host owns tab {0} / join owns tab {1}), except that a
+    // JOIN with the protocol-49 single-slot claim (ownRank above) owns that
+    // rank instead - the third player's "squad slot 2" without env plumbing.
     c.ownRanks.clear();
     {
         std::string ranks = envOr("KENSHICOOP_OWN_SQUAD", envOr("KENSHICOOP_OWN_RANK", "").c_str());
         c.ownRanksFromEnv = parseRankList(ranks, c.ownRanks);
         resolveOwnRanks(c.ownRanks, c.isHost, c.ownRanksFromEnv);
+        if (!c.ownRanksFromEnv && !c.isHost && c.ownRank != 0) {
+            c.ownRanks.clear();
+            c.ownRanks.insert(c.ownRank);
+        }
     }
 }
 
@@ -400,15 +441,22 @@ std::string describeConfig(const Config& c) {
 }
 
 void reloadPeerFromFile(Config& c) {
-    // Re-read only the connection TARGET (friend code + UDP endpoint) from
-    // coop_config.json, so editing the file then hitting Connect in the panel
-    // takes effect without a game restart. Role/transport come from the panel
-    // toggles at Connect time and are left untouched here.
+    // Re-read only the connection TARGET (friend code(s) + UDP endpoint +
+    // squad-slot claim) from coop_config.json, so editing the file then
+    // hitting Connect in the panel takes effect without a game restart.
+    // Role/transport come from the panel toggles at Connect time and are
+    // left untouched here.
     std::map<std::string, std::string> f = readConfigFile();
     std::map<std::string, std::string>::const_iterator it;
     it = f.find("steamPeer");
     if (it != f.end() && !it->second.empty())
         c.steamPeer = (unsigned long long)_strtoui64(it->second.c_str(), 0, 10);
+    it = f.find("steamPeers");
+    if (it != f.end() && !it->second.empty())
+        parseSteamIdList(it->second, c.steamPeers);
+    it = f.find("ownRank");
+    if (it != f.end() && !it->second.empty())
+        c.ownRank = (unsigned int)std::atoi(it->second.c_str());
     it = f.find("ip");
     if (it != f.end() && !it->second.empty()) c.ip = it->second;
     it = f.find("port");

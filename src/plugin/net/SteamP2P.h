@@ -12,13 +12,18 @@
 // via enet_set_socket_hooks() (patch 0002), so every ENet datagram rides one
 // unreliable Steam P2P packet on channel 0. UDP stays the default transport.
 //
-// Two-player assumption (mirrors NetLink): ONE tunnel peer, configured up front
-// with the other player's steamid64 (two-code exchange; sending to a SteamID
-// implicitly accepts its inbound session, so no Steam callback plumbing needed).
+// Multi-peer tunnel (protocol 49): up to MAX_TUNNEL_PEERS counterparties,
+// configured up front with their steamid64s (code exchange; sending to a
+// SteamID implicitly accepts its inbound session, so no Steam callback
+// plumbing needed). Each registered peer is mapped to a fabricated ENet
+// address 1.0.0.(1+slot):port so ENet's per-address peer routing multiplexes
+// them over the one Steam socket. A JOIN registers exactly one (the host);
+// the HOST registers every friend.
 //
-// Threading: init()/setPeer()/setPingPeer() are called on the main thread before
-// the net thread launches; the ENet hooks and tick() run on the net thread. The
-// flat ISteamNetworking calls are thread-safe (IPC into the Steam client).
+// Threading: init()/setPeer(s)()/setPingPeer() are called on the main thread
+// before the net thread launches; the ENet hooks and tick() run on the net
+// thread. The flat ISteamNetworking calls are thread-safe (IPC into the
+// Steam client).
 
 #ifndef KENSHICOOP_STEAMP2P_H
 #define KENSHICOOP_STEAMP2P_H
@@ -35,8 +40,11 @@ bool init();
 bool ready();
 SteamId selfId();
 
-// Configure the single tunnel peer. Proactively accepts its inbound session
-// and allows Valve-relay fallback. Call before the net thread starts.
+// Configure the tunnel peer registry (protocol 49): slot i talks to the
+// fabricated ENet address 1.0.0.(1+i). Proactively accepts each id's inbound
+// session; Valve-relay fallback stays on. Call before the net thread starts.
+// setPeer is the single-counterparty convenience (a join's host link).
+void setPeers(const SteamId* ids, unsigned int count);
 void setPeer(SteamId id);
 
 // Accept an inbound P2P session from a specific SteamID. Used by the Steam

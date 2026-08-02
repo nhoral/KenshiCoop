@@ -80,6 +80,7 @@ void pushLocked(CRITICAL_SECTION& cs, std::vector<T>& q, const T& v) {
 NetLink::NetLink()
     : isHost_(false), port_(0),
       enetHost_(0), serverPeer_(0), inbound_(0),
+      claimRank_(1),
       outOwner_(0), outStampMs_(0), haveOut_(false),
       thread_(0), running_(0), stopFlag_(0), myId_(0),
       sendEpoch_(0),
@@ -101,6 +102,10 @@ bool NetLink::startHost(int port, Inbound* inbound) {
 bool NetLink::startClient(const std::string& ip, int port, Inbound* inbound) {
     isHost_ = false; ip_ = ip; port_ = port; inbound_ = inbound; myId_ = 0;
     return launchThread();
+}
+
+void NetLink::setClaimRank(u32 rank) {
+    claimRank_ = rank;
 }
 
 bool NetLink::launchThread() {
@@ -243,11 +248,18 @@ void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInv
 
 void NetLink::queueSaveReq(const SaveReqPacket& pkt) { pushLocked(outCs_, outSaveReq_, pkt); }
 
-void NetLink::queueSaveBegin(const SaveBeginPacket& pkt) { pushLocked(outCs_, outSaveBegin_, pkt); }
+void NetLink::queueSaveBegin(const SaveBeginPacket& pkt, u32 targetId) {
+    OutSaveBegin ob;
+    ob.targetId = targetId;
+    ob.pkt = pkt;
+    pushLocked(outCs_, outSaveBegin_, ob);
+}
 
 void NetLink::queueSaveFile(const SaveFileHeader& hdr, const char* relPath,
-                            const unsigned char* data, unsigned int dataLen) {
+                            const unsigned char* data, unsigned int dataLen,
+                            u32 targetId) {
     OutSaveFile of;
+    of.targetId = targetId;
     of.hdr = hdr;
     of.tail.reserve(hdr.pathLen + dataLen);
     of.tail.assign(relPath, relPath + hdr.pathLen);
@@ -256,8 +268,9 @@ void NetLink::queueSaveFile(const SaveFileHeader& hdr, const char* relPath,
 }
 
 void NetLink::queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs,
-                            unsigned int count) {
+                            unsigned int count, u32 targetId) {
     OutSaveDone od;
+    od.targetId = targetId;
     od.hdr = hdr;
     if (crcs && count > 0) od.crcs.assign(crcs, crcs + count);
     pushLocked(outCs_, outSaveDone_, od);
@@ -265,7 +278,12 @@ void NetLink::queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs,
 
 void NetLink::queueSaveAck(const SaveAckPacket& pkt) { pushLocked(outCs_, outSaveAck_, pkt); }
 
-void NetLink::queueLoadGo(const LoadGoPacket& pkt) { pushLocked(outCs_, outLoadGo_, pkt); }
+void NetLink::queueLoadGo(const LoadGoPacket& pkt, u32 targetId) {
+    OutLoadGo og;
+    og.targetId = targetId;
+    og.pkt = pkt;
+    pushLocked(outCs_, outLoadGo_, og);
+}
 
 void NetLink::queueLoadReq(const LoadReqPacket& pkt) { pushLocked(outCs_, outLoadReq_, pkt); }
 
@@ -308,6 +326,124 @@ bool NetLink::acceptEpoch(u32 ownerId, u32 epoch) {
     if (epoch < it->second) return false;
     it->second = epoch;
     return true;
+}
+
+// NET thread (protocol 49): the join-authored, owner-tagged packet classes the
+// host re-sends to the OTHER joins. Everything here already carries the
+// sender's ownerId and is deduped/gated per owner on the receiver, so a
+// relayed copy is indistinguishable from a direct one. Host-directed intents
+// (speed/save/load/spawn requests, cam hints, time probes) and the handshake
+// never relay; the host-authoritative channels (census/prod/research/time/
+// stealth/spawn-info) are only ever host-authored so they never arrive at the
+// host to begin with. PKT_ENTITY_BATCH relays too, but inside its epoch-
+// accepted branch in the receive ladder, not through this list. The symmetric
+// change-gated rows (faction/door/build) stay host-echoed for now: the host
+// applies the join's intent and its own authoritative stream re-broadcasts
+// the result, so relaying the raw row would race the echo.
+bool NetLink::isRelayedType(u8 type) {
+    switch (type) {
+        case PKT_EVENT:
+        case PKT_INV_SNAPSHOT:
+        case PKT_WORLD_ITEM:
+        case PKT_WORLD_ITEM_REMOVE:
+        case PKT_WORLD_ITEM_CLAIM:
+        case PKT_WORLD_DROP:
+        case PKT_WORLD_PICKUP:
+        case PKT_INV_XFER:
+        case PKT_MEDICAL:
+        case PKT_TREATMENT:
+        case PKT_COMBAT_HIT:
+        case PKT_STATS:
+        case PKT_MONEY:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// NET thread (protocol 49): re-send a received packet's bytes to every
+// connected join except the sender, preserving the channel it arrived on and
+// its delivery class. Mirrors enet_host_broadcast's refcount idiom: one
+// packet, N sends, destroy only if nobody queued it.
+void NetLink::relayToOthers(ENetPeer* from, enet_uint8 channelId, const ENetPacket* pkt) {
+    if (peersById_.size() < 2) return; // no third edge to serve
+    enet_uint32 flags =
+        pkt->flags & (ENET_PACKET_FLAG_RELIABLE | ENET_PACKET_FLAG_UNSEQUENCED);
+    ENetPacket* out = enet_packet_create(pkt->data, pkt->dataLength, flags);
+    if (!out) return;
+    for (std::map<u32, ENetPeer*>::iterator it = peersById_.begin();
+         it != peersById_.end(); ++it) {
+        if (it->second == from) continue;
+        if (it->second->state != ENET_PEER_STATE_CONNECTED) continue;
+        enet_peer_send(it->second, channelId, out);
+    }
+    if (out->referenceCount == 0) enet_packet_destroy(out);
+}
+
+// NET thread (protocol 49): route one outbound packet by target. On the host,
+// OWNER_ID_ALL broadcasts and a specific id goes to that join alone (the
+// targeted connect-push save); a join always has exactly one counterparty -
+// the host link. Takes ownership of 'pkt' either way.
+void NetLink::routeOut(u32 targetId, enet_uint8 channel, ENetPacket* pkt) {
+    if (isHost_) {
+        if (targetId == OWNER_ID_ALL) {
+            enet_host_broadcast(enetHost_, channel, pkt);
+            return;
+        }
+        std::map<u32, ENetPeer*>::iterator it = peersById_.find(targetId);
+        if (it != peersById_.end() &&
+            it->second->state == ENET_PEER_STATE_CONNECTED &&
+            enet_peer_send(it->second, channel, pkt) == 0) {
+            return;
+        }
+        if (pkt->referenceCount == 0) enet_packet_destroy(pkt); // target gone
+    } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+        enet_peer_send(serverPeer_, channel, pkt);
+    } else {
+        enet_packet_destroy(pkt);
+    }
+}
+
+// NET thread (protocol 49): one PKT_PEER_STATUS roster row to one join.
+void NetLink::sendStatusTo(ENetPeer* to, u32 ownerId, u32 ownRank, bool present) {
+    if (!to || to->state != ENET_PEER_STATE_CONNECTED) return;
+    PeerStatusPacket ps;
+    ps.type    = (u8)PKT_PEER_STATUS;
+    ps.present = present ? 1 : 0;
+    ps.ownerId = ownerId;
+    ps.ownRank = ownRank;
+    ENetPacket* out = enet_packet_create(&ps, sizeof(ps), ENET_PACKET_FLAG_RELIABLE);
+    if (out) enet_peer_send(to, CH_RELIABLE, out);
+}
+
+// NET thread (protocol 49): announce a roster edge to every join except
+// 'exceptId' (the subject itself - its own presence is implicit in its link).
+void NetLink::broadcastStatusExcept(u32 exceptId, u32 ownerId, u32 ownRank, bool present) {
+    for (std::map<u32, ENetPeer*>::iterator it = peersById_.begin();
+         it != peersById_.end(); ++it) {
+        if (it->first == exceptId) continue;
+        sendStatusTo(it->second, ownerId, ownRank, present);
+    }
+}
+
+// NET thread (protocol 49): all host bookkeeping for a join id that is gone -
+// normal disconnect or a crash-ghost eviction when its squad slot is
+// reclaimed. Erases the registry rows and the owner's epoch entries, tells
+// the game thread (which tears down that owner's driven state), and, when
+// 'announce' is set, tells the remaining joins so they do the same.
+void NetLink::dropPeer(u32 id, bool announce) {
+    u32 rank = 0;
+    std::map<u32, u32>::iterator rit = rankById_.find(id);
+    if (rit != rankById_.end()) { rank = rit->second; rankById_.erase(rit); }
+    peersById_.erase(id);
+    epochSeen_.erase(id);
+    if (announce) broadcastStatusExcept(id, id, rank, false);
+    if (inbound_) inbound_->pushLeave(id);
+    char b[64];
+    _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u rank=%u", (unsigned)id,
+              (unsigned)rank);
+    b[sizeof(b) - 1] = '\0';
+    netLog(b);
 }
 
 void NetLink::deliverEntity(u32 ownerId, u32 sendMs, const EntityState& e) {
@@ -393,6 +529,12 @@ void NetLink::threadLoop() {
     u32   nextId = 1;
     DWORD lastConnectAttempt = GetTickCount();
 
+    // Fresh session: no admitted joins yet (protocol 49). The registries are
+    // members only so the net-thread helpers can reach them; they never
+    // survive a thread restart.
+    peersById_.clear();
+    rankById_.clear();
+
     // Wall-clock time-sync state (client only). The join pings every ~2 s; each
     // pong yields an (rtt, offset) sample; the minimum-RTT sample wins (NTP
     // filter). CLOCKSYNC is logged every ~5 s so the oracles can align this
@@ -435,19 +577,26 @@ void NetLink::threadLoop() {
         while (enet_host_service(enetHost_, &ev, TICK_MS) > 0) {
             switch (ev.type) {
                 case ENET_EVENT_TYPE_CONNECT: {
-                    // A fresh connection restarts the peer's epoch sequence (a
-                    // reconnecting peer may resume at a lower epoch than the one
-                    // we last saw); forget prior per-owner epochs so the new
-                    // session's first batch is never mistaken for stale (v44).
-                    epochSeen_.clear();
                     if (isHost_) {
                         // Wait for the client's HELLO before assigning an id, so
                         // a version mismatch is rejected before we admit it.
+                        // Per-owner epoch state is NOT cleared here (protocol
+                        // 49): other joins' sessions continue across this
+                        // arrival, and ids are never reused, so the newcomer
+                        // starts with no entry anyway.
                         netLog("peer connecting (awaiting HELLO)");
                     } else {
-                        // Introduce ourselves with our protocol version.
+                        // A fresh host link restarts OUR whole session: every
+                        // owner behind that link (host + relayed joins) begins
+                        // a new epoch sequence, so forget all prior epochs -
+                        // the new session's first batch is never mistaken for
+                        // stale (v44).
+                        epochSeen_.clear();
+                        // Introduce ourselves with our protocol version + the
+                        // squad slot we claim (protocol 49).
                         HelloPacket h;
-                        h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION; h.nameLen = 0;
+                        h.type = (u8)PKT_HELLO; h.version = PROTOCOL_VERSION;
+                        h.ownRank = claimRank_; h.nameLen = 0;
                         ENetPacket* out = enet_packet_create(&h, sizeof(h), ENET_PACKET_FLAG_RELIABLE);
                         enet_peer_send(ev.peer, CH_RELIABLE, out);
                         netLog("connected to host; sent HELLO");
@@ -468,30 +617,96 @@ void NetLink::threadLoop() {
                                 netErr(b);
                                 enet_peer_disconnect(ev.peer, 0);
                             } else {
-                                u32 id = nextId++;
-                                // TWO-PLAYER ASSUMPTION (step-6 guard): the sync model
-                                // is host + ONE join. Join-authored events/inventory/
-                                // conservation intents reach only the host and are NOT
-                                // relayed to other joins, and OWNER_ID_ALL sweeps assume
-                                // a single peer. A third player connects at the wire
-                                // level but will silently desync - fail loudly instead.
-                                if (id >= 2) {
-                                    netErr("3+ players unsupported: join-authored state is "
-                                           "not relayed peer-to-peer; expect desync");
+                                // Admit policy (protocol 49). The sync model is a
+                                // host-relayed star: join-authored state reaches the
+                                // other joins through the host relay, so more than one
+                                // join is supported - up to MAX_PLAYERS, each on its
+                                // own squad-tab rank.
+                                //
+                                // Squad-slot uniqueness: a claim for rank 0 (the
+                                // host's tab) or for a rank a CONNECTED join already
+                                // holds is rejected loudly - with one exception: if
+                                // the holder's link is dead-but-not-yet-timed-out (a
+                                // crash ghost), the claim is treated as that player
+                                // rejoining and the ghost is evicted. ENet keeps a
+                                // crashed peer CONNECTED for its timeout window, so
+                                // without the eviction a crash rejoin would be locked
+                                // out for ~30 s.
+                                u32 rank = h.ownRank;
+                                u32 ghostId = 0;
+                                bool taken = (rank == 0);
+                                for (std::map<u32, u32>::iterator it = rankById_.begin();
+                                     it != rankById_.end(); ++it) {
+                                    if (it->second != rank) continue;
+                                    ghostId = it->first;
+                                    taken = true;
+                                    break;
                                 }
-                                ev.peer->data = (void*)(size_t)id;
-                                WelcomePacket w;
-                                w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
-                                ENetPacket* out =
-                                    enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
-                                enet_peer_send(ev.peer, CH_RELIABLE, out);
-                                char b[96];
-                                _snprintf(b, sizeof(b) - 1,
-                                          "peer connected id=%u (proto v%u)",
-                                          (unsigned)id, (unsigned)PROTOCOL_VERSION);
-                                b[sizeof(b) - 1] = '\0';
-                                netLog(b);
-                                if (inbound_) inbound_->pushConnect(id);
+                                if (taken && ghostId != 0) {
+                                    // Same slot, new link: evict the ghost and let the
+                                    // claim through. (A genuinely live holder loses its
+                                    // link here too - two people who BOTH configure
+                                    // slot 1 will see a reconnect fight in the logs,
+                                    // which is the loud failure we want.)
+                                    std::map<u32, ENetPeer*>::iterator pit =
+                                        peersById_.find(ghostId);
+                                    ENetPeer* ghost = (pit != peersById_.end()) ? pit->second : 0;
+                                    char eb[96];
+                                    _snprintf(eb, sizeof(eb) - 1,
+                                              "squad slot %u reclaimed; evicting old id=%u",
+                                              (unsigned)rank, (unsigned)ghostId);
+                                    eb[sizeof(eb) - 1] = '\0';
+                                    netLog(eb);
+                                    dropPeer(ghostId, true);
+                                    if (ghost) { ghost->data = 0; enet_peer_reset(ghost); }
+                                    taken = false;
+                                }
+                                if (taken) {
+                                    char rb[96];
+                                    _snprintf(rb, sizeof(rb) - 1,
+                                              "squad slot %u is not joinable; rejecting",
+                                              (unsigned)rank);
+                                    rb[sizeof(rb) - 1] = '\0';
+                                    netErr(rb);
+                                    enet_peer_disconnect(ev.peer, 0);
+                                } else if (peersById_.size() + 1 >= MAX_PLAYERS) {
+                                    char fb[96];
+                                    _snprintf(fb, sizeof(fb) - 1,
+                                              "session full (%u players); rejecting",
+                                              (unsigned)MAX_PLAYERS);
+                                    fb[sizeof(fb) - 1] = '\0';
+                                    netErr(fb);
+                                    enet_peer_disconnect(ev.peer, 0);
+                                } else {
+                                    u32 id = nextId++;
+                                    ev.peer->data = (void*)(size_t)id;
+                                    peersById_[id] = ev.peer;
+                                    rankById_[id]  = rank;
+                                    WelcomePacket w;
+                                    w.type = (u8)PKT_WELCOME; w.version = PROTOCOL_VERSION; w.playerId = id;
+                                    ENetPacket* out =
+                                        enet_packet_create(&w, sizeof(w), ENET_PACKET_FLAG_RELIABLE);
+                                    enet_peer_send(ev.peer, CH_RELIABLE, out);
+                                    // Roster exchange (protocol 49): the newcomer
+                                    // learns every join already here; they learn the
+                                    // newcomer. The receiving game threads reset that
+                                    // owner's state and re-burst their own reliable
+                                    // channels, which the relay carries across.
+                                    for (std::map<u32, u32>::iterator it = rankById_.begin();
+                                         it != rankById_.end(); ++it) {
+                                        if (it->first == id) continue;
+                                        sendStatusTo(ev.peer, it->first, it->second, true);
+                                    }
+                                    broadcastStatusExcept(id, id, rank, true);
+                                    char b[96];
+                                    _snprintf(b, sizeof(b) - 1,
+                                              "peer connected id=%u rank=%u (proto v%u)",
+                                              (unsigned)id, (unsigned)rank,
+                                              (unsigned)PROTOCOL_VERSION);
+                                    b[sizeof(b) - 1] = '\0';
+                                    netLog(b);
+                                    if (inbound_) inbound_->pushConnect(id);
+                                }
                             }
                         }
                     } else if (!isHost_ && type == PKT_WELCOME) {
@@ -515,6 +730,29 @@ void NetLink::threadLoop() {
                                 if (inbound_) inbound_->pushConnect(0); // host id = 0
                             }
                         }
+                    } else if (type == PKT_PEER_STATUS) {
+                        // Peer roster edge (protocol 49, host -> joins): another
+                        // join arrived or left. Forget that owner's epoch entries
+                        // (its session, if any, ended or is brand new) and hand
+                        // the edge to the game thread, which clears or seeds that
+                        // owner's replication state and - on an arrival - re-
+                        // bursts our own reliable channels so the newcomer
+                        // receives them through the host relay.
+                        PeerStatusPacket ps;
+                        if (!isHost_ &&
+                            readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ps)
+                            && inbound_) {
+                            epochSeen_.erase(ps.ownerId);
+                            char b[96];
+                            _snprintf(b, sizeof(b) - 1,
+                                      "peer roster: id=%u rank=%u %s",
+                                      (unsigned)ps.ownerId, (unsigned)ps.ownRank,
+                                      ps.present ? "joined" : "left");
+                            b[sizeof(b) - 1] = '\0';
+                            netLog(b);
+                            if (ps.present) inbound_->pushConnect(ps.ownerId);
+                            else            inbound_->pushLeave(ps.ownerId);
+                        }
                     } else if (type == PKT_ENTITY_BATCH) {
                         const unsigned len = (unsigned)ev.packet->dataLength;
                         if (len >= sizeof(EntityBatchHeader) && inbound_) {
@@ -531,6 +769,12 @@ void NetLink::threadLoop() {
                                     std::memcpy(&e, p + i * sizeof(EntityState), sizeof(e));
                                     deliverEntity(hdr.ownerId, hdr.sendMs, e);
                                 }
+                                // Host relay (protocol 49): a join's motion stream
+                                // must also reach the OTHER joins. Gated on our
+                                // epoch accept so a superseded session's batch is
+                                // never propagated.
+                                if (isHost_)
+                                    relayToOthers(ev.peer, ev.channelID, ev.packet);
                             }
                         }
                     } else if (type == PKT_EVENT) {
@@ -917,20 +1161,31 @@ void NetLink::threadLoop() {
                             }
                         }
                     }
+                    // Host relay (protocol 49): forward join-authored reliable
+                    // state to the other joins - the star's third edge. Runs
+                    // after local delivery so the relayed copy and our own
+                    // apply see the same order. (Entity batches relay in their
+                    // epoch-gated branch above, not here.)
+                    if (isHost_ && isRelayedType(type))
+                        relayToOthers(ev.peer, ev.channelID, ev.packet);
                     enet_packet_destroy(ev.packet);
                     break;
                 }
                 case ENET_EVENT_TYPE_DISCONNECT: {
-                    epochSeen_.clear(); // peer gone; its epoch sequence ends (v44)
                     if (isHost_) {
+                        // One join left; the others' sessions continue. dropPeer
+                        // erases its registry rows + epoch entries (per owner,
+                        // v44 generalized), announces the departure to the
+                        // remaining joins, and queues the game-thread leave.
                         u32 id = (u32)(size_t)ev.peer->data;
                         ev.peer->data = 0;
-                        if (inbound_) inbound_->pushLeave(id);
-                        char b[64];
-                        _snprintf(b, sizeof(b) - 1, "peer disconnected id=%u", (unsigned)id);
-                        b[sizeof(b) - 1] = '\0';
-                        netLog(b);
+                        if (id != 0) dropPeer(id, true);
+                        else netLog("unadmitted peer disconnected");
                     } else {
+                        // Our host link died: the whole remote session ends for
+                        // us - every owner's epoch sequence (host + relayed
+                        // joins) restarts on reconnect (v44).
+                        epochSeen_.clear();
                         serverPeer_ = 0;
                         if (inbound_) inbound_->pushLeave(OWNER_ID_ALL);
                         netLog("disconnected from host");
@@ -1554,7 +1809,7 @@ void NetLink::threadLoop() {
         // floods the channel - and CH_BULK keeps the megabytes off CH_RELIABLE,
         // so a live transfer no longer stalls door/money/faction events.
         std::vector<SaveReqPacket>   saveReqs;
-        std::vector<SaveBeginPacket> saveBegins;
+        std::vector<OutSaveBegin>    saveBegins;
         std::vector<OutSaveFile>     saveFiles;
         std::vector<OutSaveDone>     saveDones;
         std::vector<SaveAckPacket>   saveAcks;
@@ -1568,24 +1823,12 @@ void NetLink::threadLoop() {
         for (size_t i = 0; i < saveReqs.size(); ++i) {
             ENetPacket* out = enet_packet_create(&saveReqs[i], sizeof(SaveReqPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_BULK, out);
-            } else {
-                enet_packet_destroy(out);
-            }
+            routeOut(OWNER_ID_ALL, CH_BULK, out);
         }
         for (size_t i = 0; i < saveBegins.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&saveBegins[i], sizeof(SaveBeginPacket),
+            ENetPacket* out = enet_packet_create(&saveBegins[i].pkt, sizeof(SaveBeginPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_BULK, out);
-            } else {
-                enet_packet_destroy(out);
-            }
+            routeOut(saveBegins[i].targetId, CH_BULK, out);
         }
         for (size_t i = 0; i < saveFiles.size(); ++i) {
             unsigned bytes = sizeof(SaveFileHeader) + (unsigned)saveFiles[i].tail.size();
@@ -1594,13 +1837,7 @@ void NetLink::threadLoop() {
             if (!saveFiles[i].tail.empty())
                 std::memcpy(out->data + sizeof(SaveFileHeader), &saveFiles[i].tail[0],
                             saveFiles[i].tail.size());
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_BULK, out);
-            } else {
-                enet_packet_destroy(out);
-            }
+            routeOut(saveFiles[i].targetId, CH_BULK, out);
         }
         for (size_t i = 0; i < saveDones.size(); ++i) {
             unsigned bytes = sizeof(SaveDoneHeader)
@@ -1610,24 +1847,12 @@ void NetLink::threadLoop() {
             if (!saveDones[i].crcs.empty())
                 std::memcpy(out->data + sizeof(SaveDoneHeader), &saveDones[i].crcs[0],
                             saveDones[i].crcs.size() * sizeof(u32));
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_BULK, out);
-            } else {
-                enet_packet_destroy(out);
-            }
+            routeOut(saveDones[i].targetId, CH_BULK, out);
         }
         for (size_t i = 0; i < saveAcks.size(); ++i) {
             ENetPacket* out = enet_packet_create(&saveAcks[i], sizeof(SaveAckPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_BULK, out);
-            } else {
-                enet_packet_destroy(out);
-            }
+            routeOut(OWNER_ID_ALL, CH_BULK, out);
         }
 
         // Drain + send queued coordinated-load packets (protocol 32) on CH_BULK
@@ -1635,7 +1860,7 @@ void NetLink::threadLoop() {
         // share CH_BULK with the save transfer they gate (a NACK's fallback
         // stream must stay ordered behind its GO), and off CH_RELIABLE so they
         // do not queue behind - or ahead of - live game events.
-        std::vector<LoadGoPacket>   loadGos;
+        std::vector<OutLoadGo>      loadGos;
         std::vector<LoadReqPacket>  loadReqs;
         std::vector<LoadNackPacket> loadNacks;
         EnterCriticalSection(&outCs_);
@@ -1644,37 +1869,19 @@ void NetLink::threadLoop() {
         loadNacks.swap(outLoadNack_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < loadGos.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&loadGos[i], sizeof(LoadGoPacket),
+            ENetPacket* out = enet_packet_create(&loadGos[i].pkt, sizeof(LoadGoPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_BULK, out);
-            } else {
-                enet_packet_destroy(out);
-            }
+            routeOut(loadGos[i].targetId, CH_BULK, out);
         }
         for (size_t i = 0; i < loadReqs.size(); ++i) {
             ENetPacket* out = enet_packet_create(&loadReqs[i], sizeof(LoadReqPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_BULK, out);
-            } else {
-                enet_packet_destroy(out);
-            }
+            routeOut(OWNER_ID_ALL, CH_BULK, out);
         }
         for (size_t i = 0; i < loadNacks.size(); ++i) {
             ENetPacket* out = enet_packet_create(&loadNacks[i], sizeof(LoadNackPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_BULK, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_BULK, out);
-            } else {
-                enet_packet_destroy(out);
-            }
+            routeOut(OWNER_ID_ALL, CH_BULK, out);
         }
 
         // Transmit this peer's owned entities (latest snapshot), chunked so each
@@ -1720,6 +1927,8 @@ void NetLink::threadLoop() {
     }
 
     if (enetHost_) { enet_host_destroy(enetHost_); enetHost_ = 0; }
+    peersById_.clear(); // the ENetPeers died with the host (protocol 49)
+    rankById_.clear();
     if (steam) steamp2p::removeEnetHooks();
     InterlockedExchange(&running_, 0);
 }

@@ -140,6 +140,7 @@ typedef void      (__fastcall* AddJobFn)(Character* self, int t, RootObject* sub
                                          bool shift, bool addDontClear,
                                          const Ogre::Vector3* location);
 typedef Platoon*  (__fastcall* SeparateSquadFn)(Character* self, bool permanent);
+typedef void      (__fastcall* SetCharNameFn)(Character* self, const std::string* name);
 typedef void      (__fastcall* EndActionFn)(void* charBody);
 typedef void      (__fastcall* RagdollModeFn)(Character* self, bool on, int part);
 typedef void      (__fastcall* MedFloatFn)(MedicalSystem* self, float v);
@@ -351,6 +352,7 @@ extern AddGoalFn     g_addGoalFn;
 extern AddOrderFn      g_addOrderFn;
 extern AddJobFn        g_addJobFn;
 extern SeparateSquadFn g_separateSquadFn;
+extern SetCharNameFn g_setCharNameFn;
 extern EndActionFn     g_endActionFn;
 extern RagdollModeFn   g_ragdollModeFn;
 extern MedFloatFn      g_knockoutFn;
@@ -558,8 +560,13 @@ void logSeatResolveOnce(const char* side, int task, u32 npcIdx, u32 npcSer,
 bool isPlayerSquad(GameWorld* gw, RootObject* obj);
 // Live NON-player Faction* read off a nearby world NPC. Caller holds SEH.
 Faction* findNearbyNonPlayerFaction(GameWorld* gw);
-// Dual-interest centers (one per squad tab leader, up to two). Caller holds SEH.
-unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]);
+// Multi-interest centers (one per squad tab leader plus camera anchors).
+// Caller holds SEH. INTEREST_LEADERS = one leader sphere per player
+// (MAX_PLAYERS in Wire.h); INTEREST_MAX adds the local camera + one hint
+// slot per join (engine::PEER_CAM_SLOTS).
+const unsigned int INTEREST_LEADERS = 3;
+const unsigned int INTEREST_MAX     = 6;
+unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[INTEREST_MAX]);
 // Case-insensitive substring test on raw C strings (SEH legal).
 bool ciContains(const char* hay, const char* needle);
 // Template scans (reused g_dataScratch; main thread only).

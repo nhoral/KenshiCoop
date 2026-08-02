@@ -72,8 +72,9 @@ static int g_total  = 0;
 
 static void testSizes() {
     std::printf("== wire struct sizes (the packed contract both clients memcpy) ==\n");
-    CHECK_EQ("sizeof(HelloPacket)",             sizeof(HelloPacket),             4);
+    CHECK_EQ("sizeof(HelloPacket)",             sizeof(HelloPacket),             8); // v49: +ownRank
     CHECK_EQ("sizeof(WelcomePacket)",           sizeof(WelcomePacket),           7);
+    CHECK_EQ("sizeof(PeerStatusPacket)",        sizeof(PeerStatusPacket),        10); // v49: roster edge
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             54);
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
@@ -221,8 +222,11 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v48: nested container contents)",
-             (int)PROTOCOL_VERSION, 48);
+    CHECK_EQ("PROTOCOL_VERSION (v49: 3-player - relay, roster, slot claim)",
+             (int)PROTOCOL_VERSION, 49);
+    // Protocol 49: the policy player cap the host enforces at HELLO. The code
+    // is N-generic; this pins the tested limit (host + two joins).
+    CHECK_EQ("MAX_PLAYERS (protocol 49)", (int)MAX_PLAYERS, 3);
 
     // Protocol 48: the parent reference. A worn backpack owns a PRIVATE inventory, so a bagged
     // item is described by no snapshot unless it can name its container. The byte was already
@@ -323,6 +327,7 @@ static void testRoundTrips() {
     std::printf("== readPacket round-trips + truncation rejection ==\n");
     roundTrip<HelloPacket>("HelloPacket", (u8)PKT_HELLO);
     roundTrip<WelcomePacket>("WelcomePacket", (u8)PKT_WELCOME);
+    roundTrip<PeerStatusPacket>("PeerStatusPacket", (u8)PKT_PEER_STATUS);
     roundTrip<EventPacket>("EventPacket", (u8)PKT_EVENT);
     roundTrip<WorldDropPacket>("WorldDropPacket", (u8)PKT_WORLD_DROP);
     roundTrip<WorldPickupPacket>("WorldPickupPacket", (u8)PKT_WORLD_PICKUP);
@@ -364,16 +369,22 @@ static void testRoundTrips() {
 static void testFraming() {
     std::printf("== field offsets + batch framing ==\n");
 
-    // HELLO: [u8 type][u16 version][u8 nameLen] - the version check that rejects
-    // mismatched builds depends on this exact layout.
-    unsigned char hello[4];
+    // HELLO: [u8 type][u16 version][u32 ownRank][u8 nameLen] (v49) - the
+    // version check that rejects mismatched builds and the squad-slot claim
+    // the host admits on both depend on this exact layout.
+    unsigned char hello[8];
     hello[0] = (unsigned char)PKT_HELLO;
     hello[1] = (unsigned char)(PROTOCOL_VERSION & 0xFF);
     hello[2] = (unsigned char)((PROTOCOL_VERSION >> 8) & 0xFF);
-    hello[3] = 0;
+    hello[3] = 2; // ownRank = 2 (little-endian u32)
+    hello[4] = 0;
+    hello[5] = 0;
+    hello[6] = 0;
+    hello[7] = 0; // nameLen
     HelloPacket h;
-    CHECK("HELLO parses from raw bytes", readPacket(hello, 4, &h));
+    CHECK("HELLO parses from raw bytes", readPacket(hello, 8, &h));
     CHECK_EQ("HELLO version field offset", h.version, PROTOCOL_VERSION);
+    CHECK_EQ("HELLO ownRank field offset", h.ownRank, 2);
     CHECK("HELLO version mismatch detectable", ((u16)(PROTOCOL_VERSION + 1)) != h.version);
 
     // Entity batch framing: [EntityBatchHeader][EntityState*count], the exact
@@ -1557,6 +1568,19 @@ static void testChangeGate() {
     CHECK("seq accept newer",         gateSeqAccept(5, 6));
     CHECK("seq drop equal",          !gateSeqAccept(5, 5));
     CHECK("seq drop older",          !gateSeqAccept(5, 4));
+
+    // --- gateSeqAcceptFrom (protocol 49): per-(sender,row) form. Two senders'
+    // independent counters on ONE row must never judge each other - this is
+    // the 3-player fix for the shared-row spurious-drop bug.
+    {
+        std::map<unsigned int, unsigned int> seen;
+        CHECK("seqFrom sender1 first",       gateSeqAcceptFrom(seen, 1, 100));
+        CHECK("seqFrom sender2 lower ok",    gateSeqAcceptFrom(seen, 2, 3));
+        CHECK("seqFrom sender1 stale drops",!gateSeqAcceptFrom(seen, 1, 99));
+        CHECK("seqFrom sender1 dup drops",  !gateSeqAcceptFrom(seen, 1, 100));
+        CHECK("seqFrom sender2 newer ok",    gateSeqAcceptFrom(seen, 2, 4));
+        CHECK("seqFrom sender1 newer ok",    gateSeqAcceptFrom(seen, 1, 101));
+    }
 
     // --- gateShouldSend, MONEY flavor (minSend=1000, resend=5000, unsent=1) ---
     // A never-sent row streams once even unchanged (no silent seed).

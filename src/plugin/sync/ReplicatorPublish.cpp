@@ -687,7 +687,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // uses, so a camera-watched far NPC gets a mid-band drive slot too.
     {
         const float MID_NEAR_EDGE = 260.0f; // captureNpcs' NPC_CAPTURE_KEEP
-        float anchors[12];
+        float anchors[18];
         unsigned int nAnchor = engine::interestAnchors(gw, anchors);
         midBand_.clear();
         for (unsigned int i = 0; i < n; ++i) {
@@ -794,27 +794,38 @@ void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 owner
         return;
     }
 
-    // HOST: drain received hints (latest wins) into peerCam_ + staleness
-    // stamp, and publish a FRESH hint to the engine's interest layer. A
-    // stale hint (silent join > 3 s: alt-tabbed, loading, disconnecting)
-    // drops out of the anchor set rather than pinning interest forever.
+    // HOST: drain received hints (latest wins PER JOIN, protocol 49) into
+    // peerCams_ + staleness stamps, and publish each FRESH hint to one of the
+    // engine's peer-anchor slots. A stale hint (silent join > 3 s: alt-tabbed,
+    // loading, disconnecting) drops out of the anchor set rather than pinning
+    // interest forever; a departed join's entry is erased outright
+    // (clearOwnerReplicationState).
     std::deque<InboundCamHint> got;
     in.drainCamHints(got);
-    if (!got.empty()) {
-        const CamHintPacket& p = got.back().pkt;
-        peerCam_[0] = p.x; peerCam_[1] = p.y; peerCam_[2] = p.z;
-        peerCamMs_ = now;
+    for (std::deque<InboundCamHint>::iterator gi = got.begin();
+         gi != got.end(); ++gi) {
+        const CamHintPacket& p = gi->pkt;
+        PeerCam& pc = peerCams_[p.ownerId];
+        pc.p[0] = p.x; pc.p[1] = p.y; pc.p[2] = p.z;
+        pc.ms = now;
         static unsigned long logTick = 0; // main-thread only
         if (logTick == 0 || (now - logTick) >= 5000) {
             logTick = now;
-            char b[96];
-            _snprintf(b, sizeof(b) - 1, "[cam] hint recv=%.1f,%.1f,%.1f",
-                      p.x, p.y, p.z);
+            char b[112];
+            _snprintf(b, sizeof(b) - 1, "[cam] hint recv owner=%u %.1f,%.1f,%.1f",
+                      (unsigned)p.ownerId, p.x, p.y, p.z);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
-    bool fresh = (peerCamMs_ != 0) && (now - peerCamMs_) <= 3000;
-    engine::setPeerCamHint(fresh, peerCam_[0], peerCam_[1], peerCam_[2]);
+    unsigned int slot = 0;
+    for (std::map<u32, PeerCam>::iterator ci = peerCams_.begin();
+         ci != peerCams_.end() && slot < engine::PEER_CAM_SLOTS; ++ci, ++slot) {
+        const PeerCam& pc = ci->second;
+        bool fresh = (pc.ms != 0) && (now - pc.ms) <= 3000;
+        engine::setPeerCamHint(slot, fresh, pc.p[0], pc.p[1], pc.p[2]);
+    }
+    for (; slot < engine::PEER_CAM_SLOTS; ++slot)
+        engine::setPeerCamHint(slot, false, 0.0f, 0.0f, 0.0f);
 }
 
 

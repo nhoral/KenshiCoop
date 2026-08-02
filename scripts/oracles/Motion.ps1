@@ -130,7 +130,21 @@ function Test-MarchInPlace {
 function Test-SnapRate {
     param([string]$File, [string]$Label = "join", [double]$MaxPerMin = 3.0,
           [int]$MinWindowSec = 20, [switch]$SquadOnly,
-          [string]$GateName = "snap_rate")
+          [string]$GateName = "snap_rate",
+          # Optional LATER window anchor: a marker pattern whose first hit moves
+          # the baseline forward (the slew exclusion still applies; the LATEST
+          # of the two anchors wins). The 3-player analysis passes the SCENARIO
+          # arm marker: a 3-instance serialized boot leaves a long pre-arm
+          # stretch where world-NPC load-covers legitimately land (the same
+          # covers exist in 2P runs but fall outside/short of the window there),
+          # and those boot covers are convergence, not streaming quality.
+          [string]$StartPattern = "",
+          # Settle margin after the StartPattern hit: the arm edge IS the moment
+          # the last participant went live, and the next few seconds carry its
+          # arrival settle (host re-burst + interest expansion converging stale
+          # driven copies - the 3P analog of the connect-edge covers the slew
+          # exclusion absorbs in 2P). Steady-state snaps past the margin gate.
+          [int]$StartGraceMs = 0)
     if (-not (Test-Path $File)) {
         return (Add-GateResult -Name $GateName -Status SKIP -Detail "no log")
     }
@@ -150,12 +164,23 @@ function Test-SnapRate {
     })
     # Skip the clock catch-up window: baseline at the last sample before the
     # first slew=1.0 report (same exclusion the smoothness oracle applies).
+    # With -StartPattern, the marker's time competes and the LATEST anchor wins.
     $startIdx = 0
+    $anchorT = $null
     $om = Select-String -Path $File -Pattern "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[time\] OFFSET .*slew=1\.0" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -ne $om) {
-        $slewT = Convert-StampToMs -Groups $om.Matches[0].Groups -OffsetMs 0
+        $anchorT = Convert-StampToMs -Groups $om.Matches[0].Groups -OffsetMs 0
+    }
+    if ($StartPattern -ne "") {
+        $pm = Select-String -Path $File -Pattern ("\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*" + $StartPattern) -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $pm) {
+            $pT = (Convert-StampToMs -Groups $pm.Matches[0].Groups -OffsetMs 0) + $StartGraceMs
+            if ($null -eq $anchorT -or $pT -gt $anchorT) { $anchorT = $pT }
+        }
+    }
+    if ($null -ne $anchorT) {
         for ($i = 0; $i -lt $series.Count; $i++) {
-            if ($series[$i].t -le $slewT) { $startIdx = $i }
+            if ($series[$i].t -le $anchorT) { $startIdx = $i }
         }
     }
     $base = $series[$startIdx]

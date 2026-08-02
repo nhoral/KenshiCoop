@@ -144,6 +144,40 @@ function Test-CoopPresence {
     return (Add-GateResult -Name "coop_presence" -Status $status -Metrics $metrics)
 }
 
+# coop_presence_3p: THREE-log presence cross-check (protocol 49) - the
+# coop_presence treatment for the host-RELAYED join<->join edge. A 3-player
+# session has six directed MEMBER->RECV pairs; the join1<->join2 pairs are the
+# new mechanism (join-authored entity batches crossing TWO links via the host
+# relay), the other four re-prove the direct edges in the same run. All six
+# gate: PASS requires every pair tracked within tolerance; a missing series is
+# a SKIP and the caller must treat SKIP as failure (no-signal guard).
+# Requires the rank-generalized coop_presence scenario on a 3-tab save
+# ('squad3'): each client logs MEMBER for its own rank, RECV for every other.
+function Test-CoopPresence3p {
+    param([string]$HostFile, [string]$Join1File, [string]$Join2File, [double]$Tol)
+    $t = [Math]::Max($Tol, 6.0)
+    $dirs = @(
+        @{ A = $Join1File; B = $Join2File; Name = "join1->join2 RELAY" },
+        @{ A = $Join2File; B = $Join1File; Name = "join2->join1 RELAY" },
+        @{ A = $HostFile;  B = $Join1File; Name = "host->join1" },
+        @{ A = $Join1File; B = $HostFile;  Name = "join1->host" },
+        @{ A = $HostFile;  B = $Join2File; Name = "host->join2" },
+        @{ A = $Join2File; B = $HostFile;  Name = "join2->host" }
+    )
+    $statuses = @()
+    $metrics  = @{ tol = $t }
+    foreach ($d in $dirs) {
+        $r = Measure-NpcSync -HostFile $d.A -JoinFile $d.B -Tol $t -MinRatio 1.0 -MinJudged 1 `
+                             -Dir "presence $($d.Name)"
+        $statuses += $r.status
+        $key = ($d.Name.ToLower() -replace '[^a-z0-9]+', '_').Trim('_')
+        foreach ($k in $r.metrics.Keys) { $metrics["${key}_$k"] = $r.metrics[$k] }
+    }
+    $status = Merge-Status $statuses
+    Write-Host "  COOP-PRESENCE-3P $status - six directed pairs (tol=$t): $($statuses -join ', ')"
+    return (Add-GateResult -Name "coop_presence_3p" -Status $status -Metrics $metrics)
+}
+
 # ---- Pose / body-state oracles ---------------------------------------------------
 
 # Stage 5 pose oracle. For each STATIONARY host NPC with a reproducible task,

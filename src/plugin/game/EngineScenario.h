@@ -96,6 +96,12 @@ int  rearmDownScene(GameWorld* gw);
 // to split (host owns tab 0, join owns tab 1). Host-only; user SAVEs the result.
 bool setupSquadScene(GameWorld* gw);
 
+// Protocol 49 bake: grow the loaded save (normally 'squad1') to a THIRD player
+// squad tab by separating a non-leader member of a multi-member tab into its own
+// platoon, so ranks 0/1/2 each hold at least one member (host / join 1 / join 2).
+// Idempotent on a 3-tab save. Success == 3+ distinct containers in the dump.
+bool setupSquad3Scene(GameWorld* gw);
+
 // down_order LIVE-transition helpers (Stage 2). pickDownSubject pins the non-squad
 // NPC nearest the leader (its hand, readObjectHand layout); holdSubjectUpright keeps
 // it idle/in-range during the baseline; orderDownSubject knocks THAT subject out at

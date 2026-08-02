@@ -154,6 +154,7 @@ bool relPathSafe(const char* p, unsigned int len) {
 
 bool                  g_sendActive = false;
 u32                   g_sendXferId = 0;      // monotonic per-host
+u32                   g_sendTarget = OWNER_ID_ALL; // protocol 49: who receives this stream
 std::string           g_sendName;
 std::string           g_sendFolder;
 std::vector<XferFile> g_sendFiles;
@@ -393,7 +394,7 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 // ---- Sender (host) -------------------------------------------------------------
 #ifndef KENSHICOOP_PROTOTEST
 
-bool beginSend(NetLink& net, u32 localId, const std::string& name) {
+bool beginSend(NetLink& net, u32 localId, const std::string& name, u32 targetId) {
     sendCloseFile();
     g_sendFiles.clear();
     g_sendCrcs.clear();
@@ -419,6 +420,7 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
         g_sendTotalBytes += g_sendFiles[i].size;
 
     ++g_sendXferId;
+    g_sendTarget    = targetId;
     g_sendName      = name;
     g_sendFolder    = folder;
     g_sendFileIdx   = 0;
@@ -438,13 +440,13 @@ bool beginSend(NetLink& net, u32 localId, const std::string& name) {
     strncpy(bp.name, name.c_str(), sizeof(bp.name) - 1);
     bp.fileCount  = (u16)g_sendFiles.size();
     bp.totalBytes = g_sendTotalBytes;
-    net.queueSaveBegin(bp);
+    net.queueSaveBegin(bp, g_sendTarget);
 
     char b[192];
     _snprintf(b, sizeof(b) - 1,
-              "[save] XFER-BEGIN id=%u name='%s' files=%u bytes=%I64u",
+              "[save] XFER-BEGIN id=%u name='%s' files=%u bytes=%I64u target=%u",
               g_sendXferId, name.c_str(), (unsigned)g_sendFiles.size(),
-              g_sendTotalBytes);
+              g_sendTotalBytes, (unsigned)g_sendTarget);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     return true;
 }
@@ -492,7 +494,7 @@ bool tickSend(NetLink& net, u32 localId) {
         fh.pathLen = (u16)xf.rel.size();
         fh.offset  = (u32)g_sendOffset;
         fh.dataLen = (u16)got;
-        net.queueSaveFile(fh, xf.rel.c_str(), buf, (unsigned int)got);
+        net.queueSaveFile(fh, xf.rel.c_str(), buf, (unsigned int)got, g_sendTarget);
 
         g_sendOffset    += got;
         g_sendSentBytes += got;
@@ -510,7 +512,7 @@ bool tickSend(NetLink& net, u32 localId) {
         dh.xferId    = g_sendXferId;
         dh.fileCount = (u16)g_sendFiles.size();
         net.queueSaveDone(dh, g_sendCrcs.empty() ? 0 : &g_sendCrcs[0],
-                          (unsigned int)g_sendCrcs.size());
+                          (unsigned int)g_sendCrcs.size(), g_sendTarget);
         char b[176];
         _snprintf(b, sizeof(b) - 1,
                   "[save] XFER-SENT id=%u files=%u bytes=%I64u ms=%lu",
@@ -540,7 +542,11 @@ u16              recvFileCount()  { return g_recvFileCount; }
 
 static u32 g_lastAckXferId = 0;
 static int g_lastAckOk     = -1;
-void noteAck(u32 xferId, int ok) { g_lastAckXferId = xferId; g_lastAckOk = ok; }
+void noteAck(u32 xferId, u32 fromOwner, int ok) {
+    (void)fromOwner; // logged by the caller; latest ack wins the scalar gates
+    g_lastAckXferId = xferId;
+    g_lastAckOk     = ok;
+}
 u32  lastAckXferId() { return g_lastAckXferId; }
 int  lastAckOk()     { return g_lastAckOk; }
 

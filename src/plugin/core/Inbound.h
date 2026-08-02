@@ -11,6 +11,7 @@
 
 #include <windows.h>
 #include <deque>
+#include <set>
 #include <vector>
 #include "../../netproto/Wire.h"
 
@@ -405,6 +406,7 @@ public:
     void pushEntity(u32 ownerId, u32 sendMs, const EntityState& e) {
         InboundEntity ie; ie.ownerId = ownerId; ie.sendMs = sendMs; ie.e = e;
         EnterCriticalSection(&cs_); ent_.push_back(ie); sawRemote_ = true;
+        entOwners_.insert(ownerId);
         LeaveCriticalSection(&cs_);
     }
 
@@ -415,6 +417,18 @@ public:
     bool sawRemoteEntity() {
         EnterCriticalSection(&cs_); bool v = sawRemote_; LeaveCriticalSection(&cs_);
         return v;
+    }
+    // MAIN thread: how many DISTINCT peers have ever streamed us an owned-entity
+    // batch (protocol 49: on a join this includes relay-forwarded owners). The
+    // 3-player scenario arm gate (KENSHICOOP_ARM_MIN_PEERS) counts these so all
+    // participants start their scenario clocks only once EVERY peer is live -
+    // otherwise join 1's window can end before join 2 even reaches gameplay.
+    // World-scoped like sawRemote_ (cleared on flushWorldState).
+    unsigned int remoteEntityOwners() {
+        EnterCriticalSection(&cs_);
+        unsigned int n = (unsigned int)entOwners_.size();
+        LeaveCriticalSection(&cs_);
+        return n;
     }
     // MAIN thread: the current session generation. Bumped by flushWorldState()
     // on every world-state reset edge (reload / reconnect / disconnect). A
@@ -763,6 +777,7 @@ public:
         // re-observe the peer before time-sensitive host actions (e.g. a live
         // spawn) or a scenario may arm again.
         sawRemote_ = false;
+        entOwners_.clear();
         ++generation_;
         LeaveCriticalSection(&cs_);
     }
@@ -770,6 +785,7 @@ public:
 private:
     CRITICAL_SECTION          cs_;
     bool                      sawRemote_;  // set once any peer entity batch arrives
+    std::set<u32>             entOwners_;  // distinct peers whose entity batches arrived
     u32                       generation_; // session generation; bumped on flush
     // World-state reset list: every WorldQ below self-registers here at
     // construction so flushWorldState() clears them structurally. MUST be

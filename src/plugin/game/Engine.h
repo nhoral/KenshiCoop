@@ -184,21 +184,25 @@ unsigned int listPlayerChars(GameWorld* gw, Character** out, unsigned int maxOut
 bool cameraCenter(GameWorld* gw, float out[3]);
 
 // Camera-anchored interest anchor stores (protocol 43). The sync layer
-// publishes the LOCAL camera center and the peer's (fresh) camera hint each
+// publishes the LOCAL camera center and each join's (fresh) camera hint each
 // tick; interestCenters folds them in as extra anchors, deduped against the
 // squad-tab leader spheres. valid=false clears the anchor (camera not up /
-// hint stale). Main-thread only.
+// hint stale). Since protocol 49 the host holds one peer-hint SLOT per
+// possible join (PEER_CAM_SLOTS); the sync layer assigns slots. Main-thread
+// only.
+const unsigned int PEER_CAM_SLOTS = 2; // MAX_PLAYERS - 1 (Wire.h)
 void setLocalCamAnchor(bool valid, float x, float y, float z);
-void setPeerCamHint(bool valid, float x, float y, float z);
+void setPeerCamHint(unsigned int slot, bool valid, float x, float y, float z);
 // KENSHICOOP_CAM_INTEREST master enable: when off, interestCenters ignores
 // the camera anchors (squad-tab leaders only - the pre-43 behavior).
 void setCamInterest(bool on);
 
-// SEH-guarded: expose the current interest anchors (up to 4 x,y,z triples
-// into out[12]) to the sync layer - the mid-band nearest-first ordering
-// prioritizes by distance to the closest ANCHOR (tab leaders + cameras), so
-// camera-watched NPCs get mid-band drive slots too. Returns the anchor count.
-unsigned int interestAnchors(GameWorld* gw, float out[12]);
+// SEH-guarded: expose the current interest anchors (up to 6 x,y,z triples
+// into out[18]: three tab leaders + the local camera + two peer hints) to
+// the sync layer - the mid-band nearest-first ordering prioritizes by
+// distance to the closest ANCHOR (tab leaders + cameras), so camera-watched
+// NPCs get mid-band drive slots too. Returns the anchor count.
+unsigned int interestAnchors(GameWorld* gw, float out[18]);
 
 // ---- Stage 4 NPC replication primitives ------------------------------------
 

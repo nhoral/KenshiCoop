@@ -181,15 +181,17 @@ private:
 
 const float FastMarchScenario::LEG = 25.0f;
 
-// coop_presence (Phase 3.5, BIDIRECTIONAL presence - the keystone two-player test):
-// both clients MOVE their OWNED squad member (chosen by save-stable hand-rank, the
-// same ordering the Replicator partitions on: host owns rank 0, join owns rank 1 -
-// leader-first) and stream it, while driving + observing the PEER's owned member.
-// Each side logs MEMBER for its OWN member (authoritative truth it streams) and RECV
-// for the PEER's member (the local driven copy), so the runner cross-checks BOTH
-// directions by hand: host MEMBER(rank0) vs join RECV(rank0), and join MEMBER(rank1)
-// vs host RECV(rank1). Proves each player's character is present + correctly placed
-// on the other client. Requires a shared save with >=2 controllable squad members.
+// coop_presence (Phase 3.5, BIDIRECTIONAL presence - the keystone presence test):
+// every client MOVES its OWNED squad member (chosen by save-stable hand-rank, the
+// same ordering the Replicator partitions on: host owns rank 0, joins own their
+// claimed rank - leader-first) and streams it, while driving + observing every
+// OTHER rank's member. Each side logs MEMBER for its OWN member (authoritative
+// truth it streams) and RECV for every PEER rank's member (the local driven
+// copies), so the runner cross-checks every direction by hand - including, under
+// protocol 49, the join<->join edge that only exists via the host relay (a 3-log
+// run gates join1 MEMBER(rank1) vs join2 RECV(rank1) and vice versa). Proves each
+// player's character is present + correctly placed on every other client.
+// Requires a shared save with one controllable member per participating rank.
 class CoopPresenceScenario : public TimedScenario {
 public:
     CoopPresenceScenario()
@@ -199,8 +201,7 @@ public:
     virtual void onStart(const ScenarioContext&) {}
 
     virtual bool onTick(const ScenarioContext& ctx) {
-        const unsigned int ownRank  = ctx.isHost ? 0u : 1u; // our squad-tab rank
-        const unsigned int peerRank = ctx.isHost ? 1u : 0u; // the peer's squad-tab rank
+        const unsigned int ownRank = ctx.ownRank; // our squad-tab rank (protocol 49: join 2 owns 2)
 
         if (evidenceDue(ctx.elapsedMs)) {
             EntityState sq[MAX_SQUAD];
@@ -209,8 +210,9 @@ public:
             // Classify every shared-squad member by its SQUAD-TAB rank (same key the
             // Replicator partitions on: distinct hand-containers, sorted). Log MEMBER
             // for ALL members in OUR tab(s) (authoritative truth we stream) and RECV
-            // for ALL members in the PEER's tab(s) (the bodies we drive). Pick the
-            // lowest-hand owned member as the MOVER so the peer sees sustained motion.
+            // for ALL members in EVERY OTHER tab (the bodies we drive - host's AND,
+            // via the host relay, the other join's). Pick the lowest-hand owned
+            // member as the MOVER so the peers see sustained motion.
             int leaderIdx = -1; bool sawPeer = false;
             for (unsigned int i = 0; i < n; ++i) {
                 int cr = containerRankOf(sq, n, i);
@@ -218,7 +220,7 @@ public:
                 if ((unsigned int)cr == ownRank) {
                     logScenarioEntity("MEMBER", sq[i]);
                     if (leaderIdx < 0 || handLess(sq[i], sq[leaderIdx])) leaderIdx = (int)i;
-                } else if ((unsigned int)cr == peerRank) {
+                } else {
                     logScenarioEntity("RECV", sq[i]); sawPeer = true;
                 }
             }

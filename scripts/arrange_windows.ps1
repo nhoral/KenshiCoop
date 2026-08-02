@@ -1,7 +1,9 @@
 <#
 .SYNOPSIS
-  Place the two Kenshi client windows SIDE BY SIDE (host left, join right) on the
-  widest monitor, so a co-op test can be watched without one window hiding the other.
+  Place the Kenshi client windows SIDE BY SIDE (host left, join(s) rightward) on
+  the widest monitor, so a co-op test can be watched without one window hiding
+  another. Handles two windows (the classic host/join pair) or three (the
+  protocol-49 rig: pass -Join2Pid and the layout becomes host | join1 | join2).
 
 .DESCRIPTION
   Both clients run windowed (kenshi.cfg: Full Screen=No), but spawn at the same
@@ -27,6 +29,7 @@ param(
     # so the labels can swap. Pass these whenever you know them.
     [int]$HostPid = 0,
     [int]$JoinPid = 0,
+    [int]$Join2Pid = 0,
     # Which monitor to stage on: "widest" (default, e.g. an ultrawide - most room) or
     # "primary" (the monitor at virtual origin 0,0, i.e. the main laptop/desktop screen).
     [ValidateSet("widest", "primary")]
@@ -133,7 +136,7 @@ public static class WinArrange
 # kenshi_x64 but exits). When explicit PIDs are given, wait for exactly those; else
 # poll for any two. Poll until ready or we time out.
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
-$wantPids = @($HostPid, $JoinPid) | Where-Object { $_ -gt 0 }
+$wantPids = @($HostPid, $JoinPid, $Join2Pid) | Where-Object { $_ -gt 0 }
 $wins = @()
 while ((Get-Date) -lt $deadline) {
     $found = @()
@@ -173,9 +176,9 @@ Write-Host ("Staging monitor ($Monitor): {0}x{1} at ({2},{3})" -f $monW, $monH, 
 # Host on the left, join on the right. Prefer the explicit PID order; otherwise fall
 # back to PID sort (NOTE: not necessarily launch order, so labels may be approximate).
 function Get-Ordered {
-    if ($HostPid -gt 0 -or $JoinPid -gt 0) {
+    if ($HostPid -gt 0 -or $JoinPid -gt 0 -or $Join2Pid -gt 0) {
         $o = @()
-        foreach ($p0 in @($HostPid, $JoinPid)) {
+        foreach ($p0 in @($HostPid, $JoinPid, $Join2Pid) | Where-Object { $_ -gt 0 }) {
             $h = [WinArrange]::MainWindow([uint32]$p0)
             if ($h -ne [IntPtr]::Zero) { $o += [pscustomobject]@{ Pid = $p0; Hwnd = $h } }
         }
@@ -212,17 +215,26 @@ function Set-Placement {
             $sizes += [pscustomobject]@{ W = $wW; H = $wH }
         }
     }
-    # Layout math uses the widest target so the pair always fits.
+    # Layout math uses the widest target so every window fits; N slots (2 or 3).
+    $n = [Math]::Min($ord.Count, 3)
     $slotW = ($sizes | Measure-Object -Property W -Maximum).Maximum
     $slotH = ($sizes | Measure-Object -Property H -Maximum).Maximum
     $gap = $GapPx
-    $total = ($slotW * 2) + $gap
-    if ($total -gt $monW) { $gap = 0; $total = $slotW * 2 }
+    $total = ($slotW * $n) + ($gap * [Math]::Max(0, $n - 1))
+    if ($total -gt $monW) { $gap = 0; $total = $slotW * $n }
+    # Still too wide (three windows on a narrow monitor): overlap evenly so
+    # every window's left edge - and most of its content - stays visible.
+    $stepX = $slotW + $gap
+    if ($total -gt $monW -and $n -gt 1) {
+        $stepX = [int][Math]::Max(120, ($monW - $slotW) / ($n - 1))
+        $total = $slotW + $stepX * ($n - 1)
+    }
     $startX = $mon.Left + [int][Math]::Max(0, ($monW - $total) / 2)
     $y = $mon.Top + [int][Math]::Max(0, ($monH - $slotH) / 2)
-    $labels = @("host (left)", "join (right)")
-    for ($i = 0; $i -lt $ord.Count -and $i -lt 2; $i++) {
-        $x = $startX + ($i * ($slotW + $gap))
+    $labels = if ($n -ge 3) { @("host (left)", "join 1 (middle)", "join 2 (right)") }
+              else          { @("host (left)", "join (right)") }
+    for ($i = 0; $i -lt $ord.Count -and $i -lt 3; $i++) {
+        $x = $startX + ($i * $stepX)
         $tw = $sizes[$i].W; $th = $sizes[$i].H
         if ($enforceSize) {
             # Skip the resize when already conformant (a same-size SetWindowPos is

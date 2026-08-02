@@ -297,7 +297,7 @@ void onLobbyEnter(LobbyEnter_t* r) {
     b[sizeof(b) - 1] = '\0';
     steamLog(b);
     setStatus("Connecting to host...");
-    if (g_onConnect) g_onConnect(false, true, owner);
+    if (g_onConnect) { SteamId one = owner; g_onConnect(false, true, &one, 1, 0); }
 }
 
 void onP2PSessionRequest(P2PSessionRequest_t* r) {
@@ -405,12 +405,16 @@ bool init(ConnectFn onConnect) {
 bool ready() { return g_ready; }
 
 namespace {
-// Kick off the async friends-only 2-player lobby if we don't have one yet.
+// Kick off the async friends-only lobby if we don't have one yet. Capacity 3
+// (protocol 49: MAX_PLAYERS in Wire.h) so a second friend can enter; the
+// automated hosting hand-off still fires on the FIRST arrival - a third
+// player over Steam rides the host's steamPeers list (F2 panel / config),
+// not the invite hand-off.
 void createLobbyIfNeeded() {
     if (g_lobby != 0 || g_creating) return;
     g_creating = true;
-    steamLog("creating friends-only 2-player lobby...");
-    SteamAPICall_t call = g_createLobby(g_mm, k_ELobbyTypeFriendsOnly, 2);
+    steamLog("creating friends-only 3-player lobby...");
+    SteamAPICall_t call = g_createLobby(g_mm, k_ELobbyTypeFriendsOnly, 3);
     if (call == 0) {
         g_creating = false;
         steamLog("CreateLobby returned no call handle");
@@ -498,7 +502,7 @@ void tick() {
                     b[sizeof(b) - 1] = '\0';
                     steamLog(b);
                     setStatus("Friend joined - hosting...");
-                    if (g_onConnect) g_onConnect(true, true, m);
+                    if (g_onConnect) { SteamId one = m; g_onConnect(true, true, &one, 1, 0); }
                     break;
                 }
             }

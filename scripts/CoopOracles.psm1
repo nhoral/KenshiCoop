@@ -368,12 +368,178 @@ function Invoke-RunAnalysis {
     return $verdict
 }
 
+# Top-level THREE-PLAYER analysis (protocol 49): the Invoke-RunAnalysis
+# treatment over three logs. The 2P suite's whole value is the manifest-driven
+# oracle battery (health, CHECK FAIL, churn, snap-rate, march, clock-sync, ...)
+# plus the no-signal verdict rule - so a 3P run gets exactly that, twice: every
+# always-on gate and every manifest Gating/Advisory oracle runs once per
+# (host, join) pair, recorded with '@join1' / '@join2' suffixed gate names.
+# The scenario's own PrimaryGate is enforced per pair (SKIP fails - both direct
+# edges must actually be judged), and the RELAYED join<->join edge - the
+# mechanism only a 3P run can prove - is judged by coop_presence_3p, this run's
+# overall primary gate. Same verdict.json shape as the 2P path (run_3p_smoke.ps1
+# writes it next to the three logs; regress/trending tooling can consume it
+# unchanged).
+function Invoke-RunAnalysis3p {
+    param(
+        [Parameter(Mandatory = $true)][string]$HostLog,
+        [Parameter(Mandatory = $true)][string]$Join1Log,
+        [Parameter(Mandatory = $true)][string]$Join2Log,
+        [string]$Scenario = "coop_presence",
+        [double]$Tolerance = 3.0,
+        [string]$ManifestPath = "",
+        [hashtable]$RunInfo = @{},
+        [bool]$WanActive = $false,
+        [string]$OutJson = ""
+    )
+    $manifest = Get-ScenarioManifest -Path $ManifestPath
+    $entry = $null
+    if ($Scenario -ne "" -and $manifest.Scenarios.ContainsKey($Scenario)) {
+        $entry = $manifest.Scenarios[$Scenario]
+    }
+    if ($null -eq $entry) { throw "Invoke-RunAnalysis3p: scenario '$Scenario' not in manifest" }
+    if ($WanActive -and $entry.ContainsKey("WanTolerance")) {
+        Write-Host "  (WAN regime: tolerance $Tolerance -> $($entry.WanTolerance) per manifest)"
+        $Tolerance = $entry.WanTolerance
+    }
+    # The relayed join<->join edge crosses TWO impaired links under the WAN
+    # proxy (each join rides its own netsim), so it gets double the effective
+    # tolerance there; on loopback it is judged at the pair tolerance.
+    $relayTol = if ($WanActive) { [Math]::Max($Tolerance * 2, 12.0) } else { $Tolerance }
+
+    $gating = @($entry.Gating); $advisory = @($entry.Advisory)
+    $pairPrimary = $entry.PrimaryGate
+    if ($WanActive -and $entry.ContainsKey("WanDemote")) {
+        foreach ($d in @($entry.WanDemote)) {
+            if ($gating -contains $d) {
+                Write-Host "  (WAN regime: gate '$d' demoted to advisory per manifest)"
+                $gating   = @($gating | Where-Object { $_ -ne $d })
+                $advisory += $d
+            }
+        }
+    }
+
+    # Run the full 2P battery once per (host, join) pair, suffixing gate names.
+    $allGates = New-Object System.Collections.ArrayList
+    $pairs = @(
+        @{ Suffix = "join1"; Log = $Join1Log },
+        @{ Suffix = "join2"; Log = $Join2Log }
+    )
+    foreach ($p in $pairs) {
+        Write-Host ""
+        Write-Host "-- pair host<->$($p.Suffix) --"
+        Reset-GateResults
+        [void](Test-LogHealth -File $HostLog -Label "host" -Required $true -CleanPattern "SCENARIO RESULT")
+        [void](Test-LogHealth -File $p.Log -Label "join" -Required $true -CleanPattern "SCENARIO RESULT")
+        if (Test-Path $p.Log) {
+            $slew = Get-SlewSummary -File $p.Log
+            if ($null -ne $slew) {
+                $conv = if ($slew.converged) { "converged to 1x" } else { "STILL SLEWING at log end (slew=$($slew.lastSlew))" }
+                Write-Host "  FINDING: $($p.Suffix) clock catch-up - peakOff=$($slew.peakOffGh)gh peakSlew=$($slew.peakSlew)x for ~$($slew.slewSecs)s; $conv"
+            }
+        }
+        [void](Test-NoCheckFail -HostFile $HostLog -JoinFile $p.Log)
+        [void](Test-ScenarioResultPass -File $HostLog -Label "host" -Required $true)
+        [void](Test-ScenarioResultPass -File $p.Log -Label "join" -Required $true)
+        foreach ($id in ($gating + $advisory)) {
+            if ($id -eq "snap_rate") {
+                # 3P window anchor: score snaps from 15 s past the SCENARIO arm.
+                # The serialized 3-instance boot lands world-NPC load-covers in
+                # the pre-arm stretch, and the arm edge itself (the last
+                # participant going live) carries a one-time arrival settle -
+                # both are convergence, not streaming quality. Steady state
+                # (the whole scenario window and the post-scenario tail) gates.
+                [void](Test-SnapRate -File $p.Log -StartPattern "SCENARIO arm trigger=" -StartGraceMs 15000)
+            } else {
+                [void](Invoke-OneOracle -Id $id -HostLog $HostLog -JoinLog $p.Log `
+                          -Tolerance $Tolerance -ExpectedSkewMs $null)
+            }
+        }
+        foreach ($g in (Get-GateResults)) {
+            [void]$allGates.Add([pscustomobject]@{
+                gate = "$($g.gate)@$($p.Suffix)"; status = $g.status
+                metrics = $g.metrics; detail = $g.detail })
+        }
+    }
+
+    # The relayed edge - judged once over all three logs.
+    Write-Host ""
+    Write-Host "-- relayed edge join1<->join2 (via host) --"
+    Reset-GateResults
+    [void](Test-CoopPresence3p -HostFile $HostLog -Join1File $Join1Log -Join2File $Join2Log -Tol $relayTol)
+    foreach ($g in (Get-GateResults)) { [void]$allGates.Add($g) }
+
+    # Verdict: any always-on or gating FAIL on either pair fails; the pair
+    # primary gate must be JUDGED (non-SKIP) on both pairs; coop_presence_3p
+    # (the 3P mechanism) must PASS outright.
+    $byName = @{}
+    foreach ($g in $allGates) { $byName[$g.gate] = $g }
+    $reasons = @()
+    $alwaysOn = @("health_host", "health_join", "check_fail", "result_host", "result_join")
+    foreach ($p in @("join1", "join2")) {
+        foreach ($n in $alwaysOn) {
+            $k = "$n@$p"
+            if ($byName.ContainsKey($k) -and $byName[$k].status -eq "FAIL") { $reasons += "$k FAIL" }
+        }
+        foreach ($n in $gating) {
+            $k = "$n@$p"
+            if (-not $byName.ContainsKey($k)) { $reasons += "$k missing"; continue }
+            if ($byName[$k].status -eq "FAIL") { $reasons += "$k FAIL" }
+        }
+        if ($pairPrimary -ne "") {
+            $k = "$pairPrimary@$p"
+            if (-not $byName.ContainsKey($k)) { $reasons += "primary gate $k missing (no signal)" }
+            elseif ($byName[$k].status -eq "SKIP") { $reasons += "primary gate $k SKIP (no signal)" }
+        }
+    }
+    if (-not $byName.ContainsKey("coop_presence_3p")) {
+        $reasons += "primary gate coop_presence_3p missing (no signal)"
+    } elseif ($byName["coop_presence_3p"].status -ne "PASS") {
+        $reasons += "primary gate coop_presence_3p $($byName['coop_presence_3p'].status)"
+    }
+    $pass = ($reasons.Count -eq 0)
+
+    Write-Host ""
+    Write-Host "== Gate summary (3-player) =="
+    foreach ($g in $allGates) {
+        $bare = ($g.gate -split '@')[0]
+        $tag = ""
+        if ($advisory -contains $bare) { $tag = " (advisory)" }
+        elseif ($g.gate -eq "coop_presence_3p") { $tag = " (primary)" }
+        elseif ($bare -eq $pairPrimary) { $tag = " (pair primary)" }
+        Write-Host ("  {0,-22} {1,-4}{2}{3}" -f $g.gate, $g.status, $tag,
+                    $(if ($g.detail -ne "") { " - " + $g.detail } else { "" }))
+    }
+    if (-not $pass) { Write-Host ("  verdict reasons: " + ($reasons -join "; ")) }
+
+    $verdict = [pscustomobject]@{
+        timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+        scenario  = $Scenario
+        players   = 3
+        tolerance = $Tolerance
+        relayTolerance = $relayTol
+        pass      = $pass
+        reasons   = $reasons
+        primary   = "coop_presence_3p"
+        pairPrimary = $pairPrimary
+        gating    = $gating
+        advisory  = $advisory
+        run       = $RunInfo
+        gates     = @($allGates)
+    }
+    if ($OutJson -ne "") {
+        $verdict | ConvertTo-Json -Depth 6 | Set-Content -Path $OutJson -Encoding UTF8
+        Write-Host "  verdict json: $OutJson"
+    }
+    return $verdict
+}
+
 Export-ModuleMember -Function @(
     "Reset-GateResults", "Add-GateResult", "Get-GateResults", "Merge-Status",
     "Get-LogClockOffsetMs", "Get-ClockSyncStats", "Convert-StampToMs",
     "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs",
     "Test-LogHealth", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
-    "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence",
+    "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence", "Test-CoopPresence3p",
     "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose", "Test-BedWake", "Test-BedLay",
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",
     "Test-CombatProbe", "Test-CombatOrder", "Test-CombatKill", "Test-DamageGuard",
@@ -412,5 +578,5 @@ Export-ModuleMember -Function @(
     "Test-CampApproach",
     "Test-MintDistance", "Test-AntiZombie", "Test-Lifecycle",
     "Get-PanelConnects", "Get-PanelIntents", "Test-PanelConfig",
-    "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis"
+    "Get-ScenarioManifest", "Invoke-OneOracle", "Invoke-RunAnalysis", "Invoke-RunAnalysis3p"
 )

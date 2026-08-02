@@ -29,6 +29,11 @@ Validation fixtures referenced by `scripts/scenarios.psd1`:
 `sync`, `squad1`, `c`, `duel1`, `down1`, `craft1`, `bedcage1`, `pole1`, `camp`,
 `jailed`, `coopresume`.
 
+Three-player fixtures (protocol 49, `scripts/run_3p_smoke.ps1`): `squad3` - the
+squad1 squad split into THREE tabs (ranks 0/1/2 = host / join 1 / join 2, one
+member each; baked via `bake_scene.ps1 -Setup squad3 -BaseSave squad1
+-BakeSave squad3 -Promote`).
+
 Debug/exploratory saves (`together`, `separate`, `zoom`, ...) are intentionally NOT
 tracked - drift there is harmless. See the `coop-save-orchestration` skill for the
 full catalog and each save's purpose.

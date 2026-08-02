@@ -48,13 +48,13 @@ Replicator::Replicator()
       trustGrants_(0), trustRevokes_(0),
       authSuppresses_(0), authRestores_(0), authReassertMs_(0), authPruned_(0),
       censusRadius_(0.0f), censusSendMs_(0), censusRecvMs_(0), censusCulls_(0),
-      camHintSendMs_(0), peerCamMs_(0),
+      camHintSendMs_(0),
       midCursor_(0), midSliceMs_(0),
       censusParkDist_(0.0f), censusParks_(0), censusFreezeAi_(true),
       auditRows_(false), jailProbe_(false), jailObserve_(false),
-      speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
-      speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
-      speedSeqOut_(1), speedSeqSeen_(0),
+      speedLastApplied_(-1.0f), speedMyReq_(-1.0f),
+      speedMyCombat_(false), speedLastSet_(-1.0f),
+      speedSeqOut_(1),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), censusScanMs_(0),
@@ -71,7 +71,6 @@ Replicator::Replicator()
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
       lifeSweepMs_(0) {
-    peerCam_[0] = peerCam_[1] = peerCam_[2] = 0.0f;
 }
 
 // ---- Phase 3: unified entity lifecycle ---------------------------------------
@@ -187,9 +186,9 @@ void Replicator::resetSession() {
     parkMs_.clear();
     censusRecvMs_ = 0;
     censusSendMs_ = 0;
-    // Protocol 43: the camera hint describes the OLD world's coordinates.
+    // Protocol 43: the camera hints describe the OLD world's coordinates.
     camHintSendMs_ = 0;
-    peerCamMs_ = 0;
+    peerCams_.clear();
     furnPeerPend_.clear();
     ownFurnExit_.clear();
     // Session maps + change-gate baselines (they describe the OLD world; the
@@ -248,11 +247,10 @@ void Replicator::resetSession() {
     // save's speed becomes the new baseline; the join's slew re-measures).
     speedLastApplied_ = -1.0f;
     speedMyReq_       = -1.0f;
-    speedPeerReq_     = -1.0f;
+    speedVotes_.clear();
     speedMyCombat_    = false;
-    speedPeerCombat_  = false;
     speedLastSet_     = -1.0f;
-    speedSeqSeen_     = 0;
+    speedSeqSeen_.clear();
     speedLastSendMs_  = 0;
     speedCombatSampleMs_ = 0;
     speedCombatHoldMs_ = 0;
@@ -307,6 +305,90 @@ void Replicator::clearPeerReplicationState(GameWorld* gw) {
     resetSession();
 }
 
+void Replicator::clearOwnerReplicationState(GameWorld* gw, u32 ownerId) {
+    // The whole remote session ended (a join lost its host link, or the host
+    // went offline): the legacy full wipe is both correct and required.
+    if (ownerId == OWNER_ID_ALL) { clearPeerReplicationState(gw); return; }
+
+    // ONE owner left a session that continues for everyone else (protocol 49).
+    // Surgical teardown of exactly its authored state; everything shared and
+    // everything authored by the remaining owners stays live.
+    //
+    // 1. Proxies it authored: a minted body whose hand is pinned to this owner
+    //    has no authority left behind it - despawn it (SEH-guarded) before the
+    //    maps that point at it are erased. Save-native bodies it drove are NOT
+    //    despawned - they idle at their last pose until the owner rejoins.
+    unsigned int cleared = 0;
+    for (std::map<Key, u32>::iterator pi = pinPeer_.begin();
+         pi != pinPeer_.end(); ++pi) {
+        if (pi->second != ownerId) continue;
+        std::map<Key, Character*>::iterator px = proxyByKey_.find(pi->first);
+        if (px == proxyByKey_.end()) continue;
+        if (gw && px->second && engine::despawnProxyNpc(gw, px->second)) ++cleared;
+        proxyByKey_.erase(px);
+    }
+    // 2. Stop driving its bodies: erase the interp/drive records its stream
+    //    fed. drivenChars_/drivenSeen_/canonicalOf_ are pointer-keyed per-tick
+    //    caches - the drive grace prune ages them out naturally once nothing
+    //    re-feeds them.
+    unsigned int undriven = 0;
+    for (std::map<Key, Driven>::iterator ti = targets_.begin();
+         ti != targets_.end(); ) {
+        if (ti->second.owner == ownerId) { targets_.erase(ti++); ++undriven; }
+        else ++ti;
+    }
+    // 3. Its world-item proxies: keyed by (author, netId), so the scope is
+    //    exact. The REAL ground items it dropped stay grounded (conservation:
+    //    the drop happened; the item exists) - only the proxy layer goes.
+    unsigned int wcleared = 0;
+    for (std::map<std::pair<u32, u32>, WorldProxy>::iterator wi = worldProxies_.begin();
+         wi != worldProxies_.end(); ) {
+        if (wi->first.first == ownerId) {
+            if (gw && wi->second.obj && engine::removeWorldItemProxy(gw, wi->second.obj))
+                ++wcleared;
+            worldProxies_.erase(wi++);
+        } else ++wi;
+    }
+    // 4. Un-pin its hands (a rejoin re-pins under its new id), and drop its
+    //    received-container baselines so a rejoin's snapshots re-reconcile
+    //    from scratch.
+    for (std::map<Key, u32>::iterator pi = pinPeer_.begin();
+         pi != pinPeer_.end(); ) {
+        if (pi->second == ownerId) pinPeer_.erase(pi++);
+        else ++pi;
+    }
+    for (std::map<Key, InvRecv>::iterator ii = invRecv_.begin();
+         ii != invRecv_.end(); ) {
+        if (ii->second.ownerId == ownerId) invRecv_.erase(ii++);
+        else ++ii;
+    }
+    // 5. Its votes, hints, clock, and per-owner dedup rows. Erasing the speed
+    //    vote matters most: a departed join's pause (req 0) would otherwise
+    //    pin the arbitrated speed at 0 forever.
+    speedVotes_.erase(ownerId);
+    speedSeqSeen_.erase(ownerId);
+    peerCams_.erase(ownerId);
+    peerClock_.erase(ownerId);
+    for (std::set<std::pair<u32, u32> >::iterator di = appliedDrops_.begin();
+         di != appliedDrops_.end(); ) {
+        if (di->first == ownerId) appliedDrops_.erase(di++); else ++di;
+    }
+    for (std::set<std::pair<u32, u32> >::iterator pi2 = appliedPickups_.begin();
+         pi2 != appliedPickups_.end(); ) {
+        if (pi2->first == ownerId) appliedPickups_.erase(pi2++); else ++pi2;
+    }
+    for (std::set<std::pair<u32, u32> >::iterator xi = appliedXfers_.begin();
+         xi != appliedXfers_.end(); ) {
+        if (xi->first == ownerId) appliedXfers_.erase(xi++); else ++xi;
+    }
+    char b[128];
+    _snprintf(b, sizeof(b) - 1,
+              "[leave] owner=%u cleared: driven=%u proxies=%u worldProxies=%u",
+              (unsigned)ownerId, undriven, cleared, wcleared);
+    b[sizeof(b) - 1] = '\0';
+    coop::logLine(b);
+}
+
 void Replicator::ingest(Inbound& in) {
     std::deque<InboundEntity> got;
     in.drainEntities(got);
@@ -337,6 +419,7 @@ void Replicator::ingest(Inbound& in) {
             if ((long)(t - now) > 0) t = now;
         }
         Driven& d = targets_[keyOf(it->e)];
+        d.owner = it->ownerId; // protocol 49: scope a leave teardown to this owner
         d.interp.push(it->e, t, now);
         d.lastSeenMs = now;
     }

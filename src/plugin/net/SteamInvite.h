@@ -31,8 +31,12 @@ namespace steaminvite {
 typedef unsigned long long SteamId;
 
 // Fired (on the main thread, from the Steam callback pump / tick) when an invite
-// resolves a peer. Matches Plugin.cpp's coopUiConnect(isHost, useSteam, peerId).
-typedef void (*ConnectFn)(bool isHost, bool useSteam, SteamId peerId);
+// resolves a peer. Matches Plugin.cpp's coopUiConnect (the protocol-49 list
+// form; the invite layer always resolves exactly one peer, so it passes a
+// one-element list and no squad-slot override).
+typedef void (*ConnectFn)(bool isHost, bool useSteam,
+                          const unsigned long long* peerIds,
+                          unsigned int peerCount, unsigned int ownRank);
 
 // Resolve ISteamMatchmaking/ISteamFriends from the game's steam_api64.dll and
 // register the invite/lobby/P2P Steam callbacks. Idempotent; safe to call every

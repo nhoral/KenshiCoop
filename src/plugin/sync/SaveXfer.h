@@ -82,8 +82,12 @@ int tickWatch(unsigned int* outFiles, unsigned __int64* outBytes,
 
 // Snapshot save 'name' and queue the BEGIN. Returns false when the folder is
 // missing/empty (nothing is queued). One transfer at a time; a re-begin
-// abandons the previous one (the join drops stale xferIds).
-bool beginSend(NetLink& net, u32 localId, const std::string& name);
+// abandons the previous one (the join drops stale xferIds). targetId
+// (protocol 49): OWNER_ID_ALL streams to every join (the mid-session
+// coordinated save), a specific id streams to that join only (the
+// connect-push / NACK fallback for a late joiner).
+bool beginSend(NetLink& net, u32 localId, const std::string& name,
+               u32 targetId = OWNER_ID_ALL);
 bool sending();
 // Pump the active transfer (call every main-loop tick; internally throttled).
 // Logs "[save] XFER-SENT ..." and returns true on the tick the DONE goes out.
@@ -126,10 +130,12 @@ bool             receiving();
 unsigned __int64 recvBytes();
 unsigned __int64 recvTotalBytes();
 u16              recvFileCount();
-// HOST: the join's commit acknowledgement (Plugin.cpp feeds noteAck on the
-// PKT_SAVE_ACK drain). lastAckXferId 0 = none yet; lastAckOk 1 = the join
+// HOST: a join's commit acknowledgement (Plugin.cpp feeds noteAck on the
+// PKT_SAVE_ACK drain). lastAckXferId 0 = none yet; lastAckOk 1 = that join
 // verified + committed - the load_sync scenario's "join holds my copy" gate.
-void noteAck(u32 xferId, int ok);
+// fromOwner (protocol 49) names WHICH join acked; the latest ack wins the
+// scalar accessors (the scenario gates ran with a single join).
+void noteAck(u32 xferId, u32 fromOwner, int ok);
 u32  lastAckXferId();
 int  lastAckOk();
 

@@ -28,6 +28,8 @@
 #ifndef KENSHICOOP_CHANGE_GATE_H
 #define KENSHICOOP_CHANGE_GATE_H
 
+#include <map>
+
 namespace coop {
 namespace sync {
 
@@ -71,6 +73,19 @@ inline bool gateShouldSend(bool changed, unsigned long nowMs,
 // stamps seqSeen = incomingSeq when this returns true.
 inline bool gateSeqAccept(unsigned int seqSeen, unsigned int incomingSeq) {
     return seqSeen == 0 || incomingSeq > seqSeen;
+}
+
+// SEQ ACCEPT, per (sender, row) form (protocol 49). Seq counters are PER-SENDER
+// monotonic, so with more than one remote sender a single seqSeen slot per row
+// would judge sender B's counter against sender C's and spuriously drop rows.
+// Each row instead holds a small sender->seqSeen map; this accepts-and-stamps
+// in one call (last-writer-wins across senders, stale-per-sender still drops).
+inline bool gateSeqAcceptFrom(std::map<unsigned int, unsigned int>& seen,
+                              unsigned int sender, unsigned int incomingSeq) {
+    unsigned int& s = seen[sender];
+    if (!(s == 0 || incomingSeq > s)) return false;
+    s = incomingSeq;
+    return true;
 }
 
 } // namespace sync

@@ -40,10 +40,15 @@ struct CoopPanelState {
     // world... 42% (3.1/7.4 MB)"). Set by coopPanelDrive, rendered in dbgVal.
     const char*        transferDetail;
 };
-// The panel's role/transport selections at the moment Connect is hit. peerId is the
-// Steam ID pasted in-panel this session (0 if none), and overrides the config
-// steamPeer in coopUiConnect; the UDP endpoint is re-read from the config there.
-typedef void (*CoopConnectFn)(bool isHost, bool useSteam, unsigned long long peerId);
+// The panel's role/transport selections at the moment Connect is hit.
+// peerIds/peerCount are the Steam IDs pasted in-panel this session (protocol
+// 49: a HOST may paste up to two friends; a JOIN pastes the host's). count 0
+// = nothing pasted, the config steamPeer(s) stand. ownRank is the JOIN's
+// squad-slot choice from the panel (0 = keep config/default); the UDP
+// endpoint is re-read from the config in coopUiConnect.
+typedef void (*CoopConnectFn)(bool isHost, bool useSteam,
+                              const unsigned long long* peerIds,
+                              unsigned int peerCount, unsigned int ownRank);
 typedef void (*CoopDisconnectFn)();
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                    CoopDisconnectFn onDisconnect);

@@ -24,7 +24,13 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 48;
+const u16 PROTOCOL_VERSION = 49;
+
+// Session player cap (protocol 49): the host + up to two joins. The transport
+// and replication code is N-generic; this is the tested policy limit the host
+// enforces at admit time (HELLO), so raising it is a one-line change HERE once
+// a wider session has been soak-tested.
+const u32 MAX_PLAYERS = 3;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -70,7 +76,8 @@ enum PacketType {
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
     PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
     PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
-    PKT_WORLD_ITEM_CLAIM = 43 // RELIABLE proxy-consumed notice (protocol 47); WorldItemClaimHeader
+    PKT_WORLD_ITEM_CLAIM = 43,// RELIABLE proxy-consumed notice (protocol 47); WorldItemClaimHeader
+    PKT_PEER_STATUS      = 44 // RELIABLE peer roster edge (host -> joins, protocol 49); PeerStatusPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -127,6 +134,10 @@ const u32 OWNER_ID_ALL = 0xFFFFFFFFu;
 struct HelloPacket {
     u8  type;    // = PKT_HELLO
     u16 version; // = PROTOCOL_VERSION
+    u32 ownRank; // squad-tab rank this join claims (protocol 49; default 1).
+                 // The host rejects a claim that is 0 (the host's own tab) or
+                 // already held by a connected join - loud and deterministic
+                 // instead of two joins silently double-claiming one squad.
     u8  nameLen; // bytes of name following this struct (0..63)
     // char name[nameLen] follows
 };
@@ -135,6 +146,20 @@ struct WelcomePacket {
     u8  type;     // = PKT_WELCOME
     u16 version;  // host's PROTOCOL_VERSION (client re-checks)
     u32 playerId; // id the host assigned to this client
+};
+
+// Peer roster edge (protocol 49, host -> joins, reliable). The host announces
+// every join arrival/departure to the other joins, and sends the current
+// roster to a newly welcomed join, so each join can (a) track which remote
+// owners exist, (b) reset that owner's per-session state (epoch gate, driven
+// bodies) on a leave/rejoin edge, and (c) re-burst its own reliable state when
+// a new peer arrives (the newcomer receives it via the host relay). The host's
+// own presence is implicit in the link itself and is never announced.
+struct PeerStatusPacket {
+    u8  type;    // = PKT_PEER_STATUS
+    u8  present; // 1 = joined, 0 = left
+    u32 ownerId; // the join this row describes (never 0 = the host)
+    u32 ownRank; // the squad-tab rank that join claimed at HELLO
 };
 
 // A reliable one-shot transition. 'subject' is the hand the event happened TO; the

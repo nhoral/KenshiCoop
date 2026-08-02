@@ -15,7 +15,11 @@ makes becomes one shared save, streamed to both machines automatically.
 
 > **Status: work in progress.** This is a hobby project under active
 > development. Expect rough edges, desyncs, and crashes. Two players is the
-> current design target.
+> validated configuration; **three players (host + 2 joins) is supported as
+> of protocol 49** (host-relayed star - see
+> [docs/THREE_PLAYER.md](docs/THREE_PLAYER.md)) and is still being soak
+> tested. The shipped release kit predates protocol 49; three-player needs a
+> build from source until the next release.
 
 ## How it works
 

@@ -8,6 +8,7 @@
 
 #include <string>
 #include <set>
+#include <vector>
 
 namespace coop {
 
@@ -172,6 +173,14 @@ struct Config {
     // that never connects / host-only diagnostics). 0 = arm immediately at
     // gameplay start (the legacy behaviour; spike runs use this).
     unsigned long scenarioArmTimeoutMs;
+
+    // Scenario arm gate width (KENSHICOOP_ARM_MIN_PEERS, default 1): how many
+    // DISTINCT peers must have streamed us an owned-entity batch before the
+    // scenario clock arms (the timeout above still applies as the fallback).
+    // A 3-player run sets 2 on every instance so all three clocks arm together
+    // once the LAST participant is live - with the default 1, join 1's window
+    // could end before join 2 even reaches gameplay. 2-player runs keep 1.
+    unsigned int  scenarioArmMinPeers;
 
     // Bidirectional ownership partition (KENSHICOOP_OWN_SQUAD, CSV of unsigned ints;
     // KENSHICOOP_OWN_RANK accepted as an alias). Both clients load the SAME save and
@@ -467,10 +476,26 @@ struct Config {
     // steamPeer below; falls back to UDP (loudly) when Steam is unavailable.
     std::string   transport;
 
-    // The co-op partner's steamid64 (KENSHICOOP_STEAM_PEER). Two-code
-    // exchange: EACH side is configured with the OTHER's SteamID (sending to
-    // a SteamID implicitly accepts its session - no Steam callback plumbing).
+    // The co-op partner's steamid64 (KENSHICOOP_STEAM_PEER). Code exchange:
+    // EACH side is configured with the OTHER's SteamID (sending to a SteamID
+    // implicitly accepts its session - no Steam callback plumbing). A JOIN
+    // sets the HOST's id here.
     unsigned long long steamPeer;
+
+    // Protocol 49 (3-player): the HOST's full friend list - every join's
+    // steamid64 (KENSHICOOP_STEAM_PEERS / config "steamPeers", comma
+    // separated). When empty, steamPeer above is the whole list (the classic
+    // 2-player setup). Joins ignore this (their one counterparty is the
+    // host).
+    std::vector<unsigned long long> steamPeers;
+
+    // Protocol 49 (3-player): the squad-tab rank a JOIN claims at HELLO
+    // (KENSHICOOP_OWN_RANK_CLAIM / config "ownRank"). 0 = unset (role
+    // default: rank 1, the classic join). Player 3 sets 2. An explicit
+    // KENSHICOOP_OWN_SQUAD env override still wins the resolved set; this is
+    // the user-facing single-slot form of the same choice, and it also rides
+    // HelloPacket.ownRank so the host enforces slot uniqueness.
+    unsigned int ownRank;
 
     // Steam reachability spike (KENSHICOOP_STEAM_PING=<steamid64>): ping/echo
     // that peer on P2P channel 1 every 2 s and log RTT + punch-vs-relay,

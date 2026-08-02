@@ -36,6 +36,12 @@ public:
     bool startClient(const std::string& ip, int port, Inbound* inbound);
     void stop();
 
+    // MAIN thread, join only, before startClient: the squad-tab rank this
+    // session claims (protocol 49). Carried in HELLO so the host can reject a
+    // slot that is already taken (or evict that slot's dead ghost on a crash
+    // rejoin). Default 1 - the classic two-player join. Ignored on the host.
+    void setClaimRank(u32 rank);
+
     // MAIN thread: publish this peer's owned entities (copied under lock). The
     // net thread re-broadcasts the latest snapshot each tick. Pass count 0 to
     // publish nothing.
@@ -153,18 +159,25 @@ public:
     // header + relative path + payload, serialized by the net thread); ACK
     // join -> host (staged save verified + committed). All CH_RELIABLE - the
     // ordered stream is what makes the chunk protocol stateless per chunk.
+    // BEGIN/FILE/DONE take a targetId (protocol 49): OWNER_ID_ALL broadcasts
+    // (the mid-session coordinated save both joins must commit), a specific
+    // id streams to that join only (the connect-push for a late joiner must
+    // not yank the OTHER join back through a load).
     void queueSaveReq(const SaveReqPacket& pkt);
-    void queueSaveBegin(const SaveBeginPacket& pkt);
+    void queueSaveBegin(const SaveBeginPacket& pkt, u32 targetId = OWNER_ID_ALL);
     void queueSaveFile(const SaveFileHeader& hdr, const char* relPath,
-                       const unsigned char* data, unsigned int dataLen);
-    void queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs, unsigned int count);
+                       const unsigned char* data, unsigned int dataLen,
+                       u32 targetId = OWNER_ID_ALL);
+    void queueSaveDone(const SaveDoneHeader& hdr, const u32* crcs, unsigned int count,
+                       u32 targetId = OWNER_ID_ALL);
     void queueSaveAck(const SaveAckPacket& pkt);
 
     // MAIN thread: coordinated-load packets (protocol 32). GO host -> join
     // (load this save now, fingerprint attached); REQ join -> host (a
     // suppressed local load forwarded for arbitration); NACK join -> host
     // (copy missing/diverged - answer with a SaveXfer). All CH_RELIABLE.
-    void queueLoadGo(const LoadGoPacket& pkt);
+    // GO takes a targetId like the save stream above (protocol 49).
+    void queueLoadGo(const LoadGoPacket& pkt, u32 targetId = OWNER_ID_ALL);
     void queueLoadReq(const LoadReqPacket& pkt);
     void queueLoadNack(const LoadNackPacket& pkt);
 
@@ -208,6 +221,26 @@ private:
     void deliverEntity(u32 ownerId, u32 sendMs, const EntityState& e);
     void flushDelayed();
 
+    // Net-thread-only (protocol 49) multi-peer plumbing.
+    //   isRelayedType : join-authored, owner-tagged packet classes the host
+    //                   re-sends to the OTHER joins (the star's third edge).
+    //                   ENTITY_BATCH is relayed separately, inside its epoch-
+    //                   accepted branch.
+    //   relayToOthers : re-send the received bytes to every connected peer
+    //                   except the sender, preserving channel + delivery class.
+    //   routeOut      : send one outbound packet to targetId (OWNER_ID_ALL =
+    //                   broadcast on the host / the host link on a join).
+    //   sendStatusTo / broadcastStatusExcept: PKT_PEER_STATUS roster edges.
+    //   dropPeer      : host bookkeeping for a leaving/evicted join id -
+    //                   registry, rank, epoch entries, game-thread leave, and
+    //                   the roster broadcast to the remaining joins.
+    static bool isRelayedType(u8 type);
+    void relayToOthers(ENetPeer* from, enet_uint8 channelId, const ENetPacket* pkt);
+    void routeOut(u32 targetId, enet_uint8 channel, ENetPacket* pkt);
+    void sendStatusTo(ENetPeer* to, u32 ownerId, u32 ownRank, bool present);
+    void broadcastStatusExcept(u32 exceptId, u32 ownerId, u32 ownRank, bool present);
+    void dropPeer(u32 id, bool announce);
+
     // Net-thread-only (protocol 44): gate an incoming entity batch by its session
     // epoch. Returns false (drop) if 'epoch' is older than the newest accepted
     // from 'ownerId'; otherwise records it and returns true. epochSeen_ is reset
@@ -222,6 +255,19 @@ private:
     ENetHost*   enetHost_;   // net thread only
     ENetPeer*   serverPeer_; // client only; net thread only
     Inbound*    inbound_;
+
+    // Host-side join registry (protocol 49; net thread only). One entry per
+    // admitted join: its assigned player id -> the live ENet peer, and the
+    // squad-tab rank it claimed at HELLO (admit-time uniqueness + crash-rejoin
+    // eviction key). Ids are never reused within a session (nextId only
+    // grows), which is what keeps the per-owner epoch/replication state of an
+    // old link from ever colliding with its reconnection.
+    std::map<u32, ENetPeer*> peersById_;
+    std::map<u32, u32>       rankById_;
+
+    // Join-side squad-slot claim (protocol 49), set before startClient and
+    // read by the net thread when it sends HELLO. Default 1.
+    u32 claimRank_;
 
     CRITICAL_SECTION         outCs_;
     std::vector<EntityState> out_;
@@ -289,16 +335,20 @@ private:
     std::vector<SpawnInfoPacket> outSpawnInfo_;
     // Reliable coordinated-save packets (protocol 31). FILE carries its
     // variable tail (relative path + payload) pre-flattened; DONE carries its
-    // CRC table. Guarded by outCs_.
-    struct OutSaveFile { SaveFileHeader hdr; std::vector<u8> tail; };
-    struct OutSaveDone { SaveDoneHeader hdr; std::vector<u32> crcs; };
+    // CRC table. The host->join legs carry a targetId (protocol 49):
+    // OWNER_ID_ALL = broadcast, else that join only. Guarded by outCs_.
+    struct OutSaveBegin { u32 targetId; SaveBeginPacket pkt; };
+    struct OutSaveFile { u32 targetId; SaveFileHeader hdr; std::vector<u8> tail; };
+    struct OutSaveDone { u32 targetId; SaveDoneHeader hdr; std::vector<u32> crcs; };
     std::vector<SaveReqPacket>   outSaveReq_;
-    std::vector<SaveBeginPacket> outSaveBegin_;
+    std::vector<OutSaveBegin>    outSaveBegin_;
     std::vector<OutSaveFile>     outSaveFile_;
     std::vector<OutSaveDone>     outSaveDone_;
     std::vector<SaveAckPacket>   outSaveAck_;
-    // Reliable coordinated-load packets (protocol 32). Guarded by outCs_.
-    std::vector<LoadGoPacket>    outLoadGo_;
+    // Reliable coordinated-load packets (protocol 32; GO targeted like the
+    // save stream, protocol 49). Guarded by outCs_.
+    struct OutLoadGo { u32 targetId; LoadGoPacket pkt; };
+    std::vector<OutLoadGo>       outLoadGo_;
     std::vector<LoadReqPacket>   outLoadReq_;
     std::vector<LoadNackPacket>  outLoadNack_;
 

@@ -1105,6 +1105,193 @@ bool setupSquadScene(GameWorld* gw) {
     return ra || rb;
 }
 
+// Rename a squad member through the engine's own setter (Character::setName -
+// persists in the save, so a baked fixture carries human-readable names).
+// SEH split: the std::string lives in the wrapper (C2712 - no unwindables in
+// a __try function), the POD-only inner call carries the guard.
+static bool setCharNameSeh(Character* c, const std::string* s) {
+    __try {
+        g_setCharNameFn(c, s);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+static bool renameCharacter(Character* c, const char* name) {
+    if (!c || !name || !g_setCharNameFn) return false;
+    std::string s(name);
+    return setCharNameSeh(c, &s);
+}
+
+// setupSquad3Scene (protocol 49): grow the loaded save to a THREE-tab squad so
+// ranks 0/1/2 each hold at least one member - the fixture the 3-player positional
+// cross-check needs (host owns tab 0, join 1 tab 1, join 2 tab 2). Baked on top
+// of 'squad1' (tab 0: leader + one member, tab 1: one member): separate the
+// DONOR - a non-leader member of a multi-member tab - into its own platoon via
+// the proven detachFromTownAI lever (a distinct container = a distinct tab; the
+// faction stays the player's). Idempotent: a save that already has 3+ distinct
+// containers is left alone. The member dump makes the bake machine-verifiable:
+// success == 3+ distinct containers, one per rank.
+bool setupSquad3Scene(GameWorld* gw) {
+    if (!gw || !gw->player) { coop::logLine("SETUP(squad3): no player interface"); return false; }
+    PlayerInterface* pl = gw->player;
+
+    enum { MAXM = 32 };
+    unsigned int hand[MAXM][5];
+    Character*   memb[MAXM];
+    unsigned int nm = 0;
+
+    // Snapshot the tab partition (POD-only inside __try).
+    __try {
+        unsigned int n = pl->playerCharacters.size();
+        for (unsigned int i = 0; i < n && nm < MAXM; ++i) {
+            Character* c = pl->playerCharacters[i]; if (!c) continue;
+            if (readObjectHand(static_cast<RootObject*>(c), hand[nm])) { memb[nm] = c; ++nm; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("SETUP(squad3): member scan faulted");
+        return false;
+    }
+    if (nm < 3) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SETUP(squad3): only %u member(s) - need 3 (base save wrong?)", nm);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return false;
+    }
+
+    // Distinct containers (hand[1],hand[2]) + per-member tab size.
+    unsigned int dc[MAXM][2]; unsigned int dn = 0;
+    unsigned int tabCount[MAXM];
+    for (unsigned int i = 0; i < nm; ++i) {
+        unsigned int j = 0;
+        for (; j < dn; ++j) if (dc[j][0] == hand[i][1] && dc[j][1] == hand[i][2]) break;
+        if (j == dn) { dc[dn][0] = hand[i][1]; dc[dn][1] = hand[i][2]; tabCount[dn] = 0; ++dn; }
+        ++tabCount[j];
+    }
+    {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SETUP(squad3): members=%u tabs=%u", nm, dn);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    bool sep = true;
+    if (dn >= 3) {
+        coop::logLine("SETUP(squad3): already 3+ tabs - nothing to split");
+    } else {
+        // Donor: a NON-leader member of a multi-member tab - the member whose
+        // (hIndex,hSerial) is NOT the lowest of its container, so every existing
+        // tab keeps its leader in place.
+        int donor = -1;
+        for (unsigned int i = 0; i < nm && donor < 0; ++i) {
+            unsigned int cnt = 0; bool lowest = true;
+            for (unsigned int k = 0; k < nm; ++k) {
+                if (hand[k][1] != hand[i][1] || hand[k][2] != hand[i][2]) continue;
+                ++cnt;
+                if (k != i && (hand[k][3] < hand[i][3] ||
+                               (hand[k][3] == hand[i][3] && hand[k][4] < hand[i][4])))
+                    lowest = false;
+            }
+            if (cnt >= 2 && !lowest) donor = (int)i;
+        }
+        if (donor < 0) {
+            coop::logLine("SETUP(squad3): no multi-member tab to split (need a donor)");
+            return false;
+        }
+        {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                "SETUP(squad3): separating donor idx=%u,%u out of container(tab)=%u,%u",
+                hand[donor][3], hand[donor][4], hand[donor][1], hand[donor][2]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        sep = detachFromTownAI(memb[donor]);
+        coop::logLine(sep ? "SETUP(squad3): donor separated into its own platoon (tab 3)"
+                          : "SETUP(squad3): separate FAILED");
+    }
+
+    // Re-dump the partition so the bake is verifiable from the host log:
+    // 3+ distinct containers == 3+ squad tabs (ranks 0/1/2 all populated).
+    unsigned int verify[MAXM][2]; unsigned int vn = 0;
+    __try {
+        unsigned int n = pl->playerCharacters.size();
+        char hdr[96]; _snprintf(hdr, sizeof(hdr) - 1, "SETUP(squad3): playerChars=%u", n);
+        hdr[sizeof(hdr) - 1] = '\0'; coop::logLine(hdr);
+        for (unsigned int i = 0; i < n; ++i) {
+            Character* c = pl->playerCharacters[i]; if (!c) continue;
+            unsigned int h[5];
+            if (!readObjectHand(static_cast<RootObject*>(c), h)) continue;
+            char b2[160];
+            _snprintf(b2, sizeof(b2) - 1,
+                "SETUP(squad3): member[%u] idx=%u,%u container(tab)=%u,%u",
+                i, h[3], h[4], h[1], h[2]);
+            b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
+            unsigned int j = 0;
+            for (; j < vn; ++j) if (verify[j][0] == h[1] && verify[j][1] == h[2]) break;
+            if (j == vn && vn < MAXM) { verify[vn][0] = h[1]; verify[vn][1] = h[2]; ++vn; }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("SETUP(squad3): member dump faulted");
+    }
+    {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SETUP(squad3): distinct tabs now=%u (need 3) %s",
+                  vn, (vn >= 3) ? "OK" : "SHORT");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Name the tabs for the humans watching three screens: rank 0 'Host',
+    // rank 1 'Remote Player 1', rank 2 'Remote Player 2'. Rank = the position
+    // of the member's container among the sorted distinct containers - the
+    // same save-stable ordering the Replicator latches at session start, so
+    // the name on screen matches the slot that OWNS the body. setName goes
+    // through the engine, so the names persist into the bake.
+    if (vn >= 3) {
+        Character*   m2[MAXM];
+        unsigned int h2[MAXM][5];
+        unsigned int n2 = 0;
+        __try {
+            unsigned int n = pl->playerCharacters.size();
+            for (unsigned int i = 0; i < n && n2 < MAXM; ++i) {
+                Character* c = pl->playerCharacters[i]; if (!c) continue;
+                if (readObjectHand(static_cast<RootObject*>(c), h2[n2])) { m2[n2] = c; ++n2; }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            coop::logLine("SETUP(squad3): rename scan faulted");
+            n2 = 0;
+        }
+        unsigned int sc[MAXM][2]; unsigned int sn = 0;
+        for (unsigned int i = 0; i < n2; ++i) {
+            unsigned int j = 0;
+            for (; j < sn; ++j) if (sc[j][0] == h2[i][1] && sc[j][1] == h2[i][2]) break;
+            if (j == sn && sn < MAXM) { sc[sn][0] = h2[i][1]; sc[sn][1] = h2[i][2]; ++sn; }
+        }
+        for (unsigned int a = 1; a < sn; ++a)
+            for (unsigned int b2 = a; b2 > 0 && (sc[b2][0] < sc[b2-1][0] ||
+                     (sc[b2][0] == sc[b2-1][0] && sc[b2][1] < sc[b2-1][1])); --b2) {
+                unsigned int t0 = sc[b2][0], t1 = sc[b2][1];
+                sc[b2][0] = sc[b2-1][0]; sc[b2][1] = sc[b2-1][1];
+                sc[b2-1][0] = t0; sc[b2-1][1] = t1;
+            }
+        static const char* RANK_NAMES[3] = { "Host", "Remote Player 1", "Remote Player 2" };
+        for (unsigned int r = 0; r < sn && r < 3; ++r) {
+            int pick = -1;
+            for (unsigned int i = 0; i < n2; ++i) {
+                if (h2[i][1] != sc[r][0] || h2[i][2] != sc[r][1]) continue;
+                if (pick < 0 || h2[i][3] < h2[pick][3] ||
+                    (h2[i][3] == h2[pick][3] && h2[i][4] < h2[pick][4])) pick = (int)i;
+            }
+            if (pick < 0) continue;
+            bool rn = renameCharacter(m2[pick], RANK_NAMES[r]);
+            char b3[128];
+            _snprintf(b3, sizeof(b3) - 1,
+                "SETUP(squad3): rank %u member idx=%u,%u named '%s' %s",
+                r, h2[pick][3], h2[pick][4], RANK_NAMES[r], rn ? "ok" : "FAILED");
+            b3[sizeof(b3) - 1] = '\0'; coop::logLine(b3);
+        }
+    }
+    return sep && vn >= 3;
+}
+
 // Keep down bodies down. A healthy ragdolled body recovers and stands back up, and
 // ragdoll state does not survive save/load, so the host re-applies ragdoll on an
 // interval. Rather than guess WHICH nearby NPC is "the subject" (the pin is empty
