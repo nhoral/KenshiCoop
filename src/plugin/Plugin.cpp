@@ -186,6 +186,7 @@ void (*g_titleUpdate_orig)(TitleScreen*)   = 0;
 void startNetworking();
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId);
 void coopUiDisconnect();
+void coopUiOverlay(bool show);
 
 // Log to BOTH our dedicated per-line-flushed file (what the test runner reads)
 // and the engine's kenshi.log (handy when attached live).
@@ -741,6 +742,7 @@ void coopPanelDrive(GameWorld* gw) {
     ps.peerPresent  = g_peerPresent;
     ps.isHost       = g_cfg.isHost;
     ps.transportSel = (g_cfg.transport == "steam") ? 0 : 1;
+    ps.showOverlay  = g_cfg.showOverlay;
     std::string detail;
     int ostate;
     if (g_peerPresent) {
@@ -784,8 +786,10 @@ void coopPanelDrive(GameWorld* gw) {
     // US) can fire coopUiConnect; the outbound invite/picker UI is gone.
     coop::steaminvite::tick();
 
-    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
-    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
+    coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect,
+                                &coopUiOverlay);
+    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate,
+                                  g_net.isRunning() && g_cfg.showOverlay);
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
@@ -1749,6 +1753,15 @@ void coopUiDisconnect() {
     // World stays live on a manual disconnect: despawn minted proxies before
     // clearing maps so nothing lingers as a duplicate or gets baked into a save.
     sessionResetForUi();
+}
+
+// Banner visibility from the F2 panel. Session-independent by design: this only
+// flips the flag that gates coopOverlayTick's show argument, so the label is
+// destroyed (or recreated) on the next tick while the net thread is untouched.
+// Not persisted - coop_config.json / KENSHICOOP_OVERLAY set the starting state.
+void coopUiOverlay(bool show) {
+    g_cfg.showOverlay = show;
+    coopLog(show ? "[coop-ui] overlay -> shown" : "[coop-ui] overlay -> hidden");
 }
 
 } // namespace

@@ -93,6 +93,10 @@ in-game, so the joining player doesn't need to load anything first.
    transferring.)
 6. The white status line shows live state (and a banner over your leader shows
    it too, in-game). Toggle **Connection** to **OFFLINE** to leave.
+7. That banner is pinned in the play area rather than tucked in a corner, so if
+   you'd rather not see it, flip **Banner** to **OFF** in the same panel - the
+   session stays up. To start every session hidden, set `"overlay": false` in
+   `coop_config.json` (or `KENSHICOOP_OVERLAY=0`).
 
 **LAN / direct-UDP (advanced):** skip the Steam ID swap. Open
 `<Kenshi>\mods\KenshiCoop\coop_config.json`, set `"transport": "udp"`, and put

@@ -33,6 +33,7 @@ struct CoopPanelState {
     bool               peerPresent; // peer connected
     bool               isHost;      // current armed role (seeds the Host toggle)
     int                transportSel;// current armed transport (0 steam, 1 udp)
+    bool               showOverlay; // leader banner visible (seeds the Banner toggle)
     const char*        detail;      // one-line status string for the panel/overlay
     // Join-side save-transfer status (null when not streaming): while a join
     // receives the host's world at the menu it has no leader for the overlay, so
@@ -45,8 +46,12 @@ struct CoopPanelState {
 // steamPeer in coopUiConnect; the UDP endpoint is re-read from the config there.
 typedef void (*CoopConnectFn)(bool isHost, bool useSteam, unsigned long long peerId);
 typedef void (*CoopDisconnectFn)();
+// Banner toggle: fired on the Banner row's press edge with the NEW visibility.
+// The panel owns no session state, so the plugin root applies this to the config
+// and the next coopOverlayTick honours it (show=false destroys the label).
+typedef void (*CoopOverlayFn)(bool show);
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
-                   CoopDisconnectFn onDisconnect);
+                   CoopDisconnectFn onDisconnect, CoopOverlayFn onOverlay);
 
 // Persistent co-op connection-status overlay: a single ScreenLabel tracked to the
 // local leader (the spike-47/48 screenshot-proven render path) whose caption shows

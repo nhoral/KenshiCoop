@@ -258,6 +258,14 @@ void loadConfig(Config& c) {
         c.autoConnect = (ac == "1" || ac == "true");
     }
 
+    // Connection banner over the local leader. DEFAULT ON (unchanged behaviour);
+    // "0"/"false" hides it while the session stays up. The F2 panel toggles this
+    // live, so the config value is only the starting state.
+    {
+        std::string ov = envOr("KENSHICOOP_OVERLAY", fileOr(f, "overlay", "1").c_str());
+        c.showOverlay = !(ov == "0" || ov == "false");
+    }
+
     // Protocol 36 movement-smoothness knobs. Defaults are the historical
     // constants; any positive env value overrides for live A/B tuning.
     {
@@ -377,6 +385,7 @@ std::string describeConfig(const Config& c) {
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
         { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
         { "censusFreezeAi", c.censusFreezeAi },
+        { "overlay", c.showOverlay },
     };
     s += " on=[";
     bool first = true;

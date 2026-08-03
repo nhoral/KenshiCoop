@@ -500,6 +500,17 @@ struct Config {
     // A test scenario or KENSHICOOP_TEST_SECONDS ALWAYS auto-starts regardless
     // (the unattended harness never touches the panel); see Plugin.cpp.
     bool               autoConnect;
+
+    // Status-overlay visibility (KENSHICOOP_OVERLAY, "overlay" in the config;
+    // DEFAULT ON). The connection banner is a ScreenLabel pinned above the local
+    // leader's head, so unlike a corner HUD element it sits in the middle of the
+    // play area and follows the squad around. Players who keep a session running
+    // for hours want it gone without going OFFLINE, which was previously the only
+    // way to hide it (the show argument of coopOverlayTick was wired straight to
+    // "is the net thread up"). Toggled live from the F2 panel; the panel writes
+    // back through the CoopOverlayFn callback and nothing is persisted, matching
+    // how role/transport already behave.
+    bool               showOverlay;
 };
 
 // Read every KENSHICOOP_* var into 'out', applying host/join defaults. Values in

@@ -7,8 +7,14 @@
   // This file only matters for a LAN / direct-UDP game: set "transport": "udp"
   // and put the host's address in "ip" (and "port" if you changed it). ip/port are
   // re-read each time you click Connect, so you can edit them without restarting.
+  //
+  // "overlay": show the connection banner pinned above your squad leader
+  // (green = peer connected). Set false to start with it hidden. You can also
+  // toggle it any time from the F2 panel's "Banner" row - hiding it does NOT
+  // disconnect you.
   "transport": "steam",
   "ip": "127.0.0.1",
   "port": 27800,
-  "autoConnect": false
+  "autoConnect": false,
+  "overlay": true
 }
