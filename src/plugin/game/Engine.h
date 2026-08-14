@@ -794,7 +794,10 @@ struct WorldItemRaw {
 // SEH-guarded (host): enumerate free GROUND items within `radius` of the local leader
 // (interest scope) into out[] (up to maxOut), deduped by hand. Items inside inventories
 // are NOT enumerated by the engine's sphere query (confirmed by the W0 drop_probe), so
-// every result is a real world item. Returns the number written.
+// every result is a real world item. Items OWNED by a non-player faction (the "red"
+// stealing items placed in towns/shops) are excluded: they are save-natives both
+// clients already hold, and streaming one mints an unowned grey duplicate on the peer
+// (the theft-bypass dup, upstream #63/#66). Returns the number written.
 unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int maxOut,
                                float radius);
 

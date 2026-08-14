@@ -1562,6 +1562,10 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
         if (gw->player->playerCharacters.size() == 0) return 0;
         Character* ld = gw->player->playerCharacters[0];
         if (!ld) return 0;
+        // Player faction for the ownership filter below (0 tolerated: the filter
+        // then only skips items with SOME owner, which is still correct).
+        Faction* playerFac = 0;
+        __try { playerFac = gw->player->getFaction(); } __except (EXCEPTION_EXECUTE_HANDLER) { playerFac = 0; }
         Ogre::Vector3 center = ld->getPosition();
         // A dropped item enumerates under multiple category queries (W0 finding), so
         // scan WEAPON/ARMOUR/ITEM and DEDUPE by hand (index+serial) to avoid triples.
@@ -1579,6 +1583,18 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
                 for (unsigned int j = 0; j < n; ++j)
                     if (out[j].hand[3] == hd[3] && out[j].hand[4] == hd[4]) { dup = true; break; }
                 if (dup) continue;
+                // OWNERSHIP FILTER: an item owned by a non-player faction is world
+                // furniture (shop stock / town placements - the "red" stealing items),
+                // NOT a session drop, and the peer already holds it as a save-native.
+                // Streaming one makes the peer fabricate an owner=0 proxy on top of
+                // its own red native: a grey duplicate that is free to take, and whose
+                // pickup CLAIM then destroys the author's real item - the theft bypass
+                // (upstream #63/#66). Skipping it here keeps it out of the tracker
+                // entirely (baseline seeding included); real drops still stream via
+                // the query-free drop hook, which does not pass through this scan.
+                Faction* fac = 0;
+                __try { fac = o->getFaction(); } __except (EXCEPTION_EXECUTE_HANDLER) { fac = 0; }
+                if (fac && fac != playerFac) continue;
                 GameData* gd = 0;
                 __try { gd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
                 if (!gd) continue;
