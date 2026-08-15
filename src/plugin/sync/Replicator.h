@@ -263,6 +263,19 @@ public:
     // applyInventories so the re-home beats the inventory reconcile.
     void applyWeaponPickups(GameWorld* gw, Inbound& in);
 
+    // AFTER engine (protocol 56, BOTH clients): drain received save-native pickup
+    // notices - a peer consumed a ground item the stream never carries (an owned
+    // town/shop item the ownership filter excludes, or a free save-native both
+    // clients loaded) - and destroy OUR still-on-ground copy, located by the
+    // shared identity, template + position (an item's engine hand is per-session
+    // and does not resolve on the other client). Guarded: the match must be a
+    // LIVE ground item of the notice's sid within NATIVE_POS_TOL of the sender's
+    // position, and a copy already in a local bag or already gone is left alone,
+    // so replays, echoes and near-misses are no-ops.
+    void applyNativeTakes(GameWorld* gw, Inbound& in);
+    void sendNativeTaken(NetLink& net, u32 ownerId, const unsigned int ihand[5],
+                         const char* sid, float x, float y, float z, const char* kind);
+
     // BEFORE engine, every tick (Phase W3 convergence): keep groundedWeapons_ honest.
     // Nothing used to prune it, so a cached ground Item* survived the object's despawn and
     // a later re-home handed a dead pointer to the engine. Two jobs:
@@ -1436,13 +1449,16 @@ private:
     // row or a query-free drop-hook edge) so the item can be streamed and refreshed
     // by HANDLE resolution alone - no rescan needed. `seen` is retained only for the
     // legacy scan path; culling is now handle-based (engine::groundItemLiveness).
-    // `baseline` (Phase 3 item-dup fix): a ground item present at the FIRST
-    // post-load spatial scan is a SHARED save-native - both clients already hold
-    // it identically, so it must never be streamed (authoring it mints a proxy
-    // on top of the peer's own native = the rejoin/reload duplication). Baseline
-    // tracks are recorded for identity/liveness but skipped in the emit path;
-    // only items appearing AFTER the baseline (session drops, runtime spawns)
-    // stream. Re-seeded after every reload via worldSeeded_ in resetSession().
+    // `baseline` (Phase 3 item-dup fix): a SHARED save-native - both clients
+    // already hold it identically, so it must never be streamed (authoring it
+    // mints a proxy on top of the peer's own native = the rejoin/reload
+    // duplication). Baseline tracks are recorded for identity/liveness but
+    // skipped in the emit path. A ground item is a save-native unless the drop
+    // hook authored it (or it resolves an unresolved drop edge of ours, see
+    // pendingDrops_): the spatial scan alone can never promote an item to the
+    // stream, because natives keep popping into the scan long after load (a
+    // zone/interior finishing its stream-in 20+ s later looked exactly like a
+    // fresh drop and duped on the peer).
     struct WorldTrack {
         u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen;
         char stringID[48]; u32 itemType; u16 quantity; u16 quality; bool baseline;
@@ -1467,12 +1483,30 @@ private:
     // so netId spaces are per-sender and culls are scoped to their owner.
     std::map<std::pair<u32, u32>, WorldProxy> worldProxies_;
     u32                        nextWorldNetId_;
-    // First-scan-baseline latch (Phase 3): false after launch/reload; the first
-    // publishWorldItems pass seeds every in-range save-native as a baseline track
-    // (never-emit) and sets this true. resetSession() clears it so the reloaded
-    // world (which may now contain previously-dropped-then-baked items) re-baselines
-    // rather than re-streaming - closing the per-reload duplicate layering.
+    // Protocol 56 native-pickup watch: the owned save-natives the spatial scan SAW but
+    // (correctly) excluded from the stream, keyed by their LOCAL hand. Each
+    // publish pass re-resolves every watched hand: entered-a-bag -> send a
+    // PKT_NATIVE_TAKEN notice; unloaded/despawned -> silently forget (never a notice -
+    // an unload must not delete the peer's copy). appliedNativeTakes_ dedupes received
+    // (ownerId, takeId) pairs under reliable resend. Both reset in resetSession().
+    struct NativeWatch { char stringID[48]; float x, y, z; unsigned long lastSeenMs; };
+    std::map<Key, NativeWatch>      nativeWatch_;
+    u32                             nextNativeTakeId_;
+    std::set<std::pair<u32, u32> >  appliedNativeTakes_;
+
+    // Load-census latch: false after launch/reload; the first publishWorldItems
+    // pass whose scan sees the world populated logs the native census and sets
+    // this true. Bookkeeping only (every scan-only item is baseline regardless,
+    // see WorldTrack::baseline); resetSession() clears it so each reload logs
+    // its own census.
     bool                       worldSeeded_;
+    // Own drops the hook captured but could not key (unresolved item hand,
+    // logged DROP-CAP-SKIP): the ONE case where a scan-only sighting is a fresh
+    // drop and must stream. A new scan row that matches one of these by
+    // template + position (within PENDING_DROP_MS) is promoted to a streaming
+    // track; anything else the scan finds unannounced is a save-native.
+    struct PendingDrop { char stringID[48]; float x, y, z; unsigned long ms; };
+    std::vector<PendingDrop>   pendingDrops_;
 
     // Phase W2 conservation-drop state.
     // weaponCensus_: per OWNED character hand, the last-tick set of WEAPON copies it held,

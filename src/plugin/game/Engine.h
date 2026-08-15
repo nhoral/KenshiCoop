@@ -794,9 +794,40 @@ struct WorldItemRaw {
 // SEH-guarded (host): enumerate free GROUND items within `radius` of the local leader
 // (interest scope) into out[] (up to maxOut), deduped by hand. Items inside inventories
 // are NOT enumerated by the engine's sphere query (confirmed by the W0 drop_probe), so
-// every result is a real world item. Returns the number written.
+// every result is a real world item. Items OWNED by a non-player faction (the "red"
+// stealing items placed in towns/shops) are excluded: they are save-natives both
+// clients already hold, and streaming one mints an unowned grey duplicate on the peer
+// (the theft-bypass dup, upstream #63/#66). Returns the number written.
+// A save-native owned item the scan SAW but excluded (protocol 56): just enough
+// identity for the native-pickup watch - the local hand (per-session; a fast path
+// on the same client only), the stringID and the world position (which together are
+// the notice's cross-client identity).
+struct WorldNativeRaw {
+    unsigned int hand[5];
+    char         stringID[48];
+    float        x, y, z;
+};
+
+// natOut/natMax/natCount (optional): receive the owned items the filter skipped, deduped
+// by (index, serial) like the main rows, so the caller can watch natives for local
+// pickups (protocol 56) without a second scan.
 unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int maxOut,
-                               float radius);
+                               float radius, WorldNativeRaw* natOut = 0,
+                               unsigned int natMax = 0, unsigned int* natCount = 0);
+
+// SEH-guarded (protocol 56): destroy OUR copy of a save-native ground item a peer
+// reported consumed. Identity is template + position (expectSid within posTol of
+// expectPos - an item's engine hand is per-session and does NOT resolve on the
+// other client; itemHand is only a same-client fast path and may be all-zero).
+// Destroys ONLY a LIVE GROUND item of that template nearest to expectPos within
+// posTol; already-bagged, already-gone or absent copies are left alone, so a
+// stale or echoed notice cannot delete anything a local actor holds. Returns 1 if
+// destroyed (outHand, optional, receives the destroyed object's LOCAL hand), 0 if
+// skipped (*whySkipped set to a static reason string when given).
+int destroyNativeGroundItem(GameWorld* gw, const unsigned int itemHand[5],
+                            const char* expectSid, const float expectPos[3],
+                            float posTol, unsigned int outHand[5],
+                            const char** whySkipped = 0);
 
 // ---- Phase W1b: query-free ground-drop capture (town reliability) ----------
 // The W1 stream above discovers ground items with getObjectsWithinSphere, which

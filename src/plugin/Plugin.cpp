@@ -1306,6 +1306,10 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
             // Phase W3: re-home tracked ground copies into the picking character's bag, also
             // before the inventory reconcile (which can't refabricate a weapon into the proxy).
             g_repl.applyWeaponPickups(gw, g_inbound);
+            // Protocol 56: destroy our copy of any save-native ground item a peer just
+            // consumed (stole) - the pickup mirror the ownership filter (protocol 55)
+            // deliberately keeps out of the proxy stream.
+            g_repl.applyNativeTakes(gw, g_inbound);
         }
         // Protocol 37: relocate our copy of any cross-owner TRADED item between the
         // two containers BEFORE the inventory reconcile, so the conservation move

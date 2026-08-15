@@ -88,6 +88,10 @@ public:
     // drop. The peer re-homes its tracked ground copy back into the character's bag.
     void queueWorldPickup(const WorldPickupPacket& pkt);
 
+    // MAIN thread: queue a reliable save-native pickup notice (protocol 56). The peer
+    // destroys its own still-on-ground copy of the consumed native, resolved by hand.
+    void queueNativeTaken(const WorldNativeTakenPacket& pkt);
+
     // MAIN thread: queue a reliable cross-owner TRANSFER intent (protocol 37). The peer
     // relocates the real item between its own copies of the two containers.
     void queueInvXfer(const InvXferPacket& pkt);
@@ -280,6 +284,8 @@ private:
     // Reliable conservation DROP intents (Phase W2), fixed-size PODs. Guarded by outCs_.
     std::vector<WorldDropPacket> outWorldDrops_;
     std::vector<WorldPickupPacket> outWorldPickups_;
+    // Reliable save-native pickup notices (protocol 56). Guarded by outCs_.
+    std::vector<WorldNativeTakenPacket> outNativeTaken_;
     // Reliable cross-owner transfer intents (protocol 37). Guarded by outCs_.
     std::vector<InvXferPacket>   outInvXfers_;
     // Reliable transfer verdicts (protocol 50). Guarded by outCs_.

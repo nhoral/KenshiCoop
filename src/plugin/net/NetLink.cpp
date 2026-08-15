@@ -245,6 +245,7 @@ void NetLink::queueSpawnReq(const SpawnReqPacket& pkt) { pushLocked(outCs_, outS
 void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) { pushLocked(outCs_, outSpawnInfo_, pkt); }
 
 void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) { pushLocked(outCs_, outWorldPickups_, pkt); }
+void NetLink::queueNativeTaken(const WorldNativeTakenPacket& pkt) { pushLocked(outCs_, outNativeTaken_, pkt); }
 
 void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInvXfers_, pkt); }
 
@@ -622,6 +623,17 @@ void NetLink::threadLoop() {
                                 inbound_->pushWorldClaim(hdr.ownerId, hdr.authorId,
                                                          netIds, hdr.count);
                             }
+                        }
+                    } else if (type == PKT_NATIVE_TAKEN) {
+                        // A peer consumed a save-native ground item (protocol
+                        // 56) - never streamed, no netId - so WE destroy our
+                        // own still-on-ground copy, located by template +
+                        // position (the shared save data).
+                        if (ev.packet->dataLength >= sizeof(WorldNativeTakenPacket) && inbound_) {
+                            WorldNativeTakenPacket wnt;
+                            std::memcpy(&wnt, ev.packet->data, sizeof(wnt));
+                            wnt.stringID[sizeof(wnt.stringID) - 1] = '\0';
+                            inbound_->pushNativeTaken(wnt.ownerId, wnt);
                         }
                     } else if (type == PKT_NPC_CENSUS) {
                         // Reliable wide-radius NPC existence census (protocol
@@ -1075,6 +1087,23 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < pickups.size(); ++i) {
             ENetPacket* out = enet_packet_create(&pickups[i], sizeof(WorldPickupPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued save-native pickup notices on CH_RELIABLE (protocol 56).
+        std::vector<WorldNativeTakenPacket> takes;
+        EnterCriticalSection(&outCs_);
+        takes.swap(outNativeTaken_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < takes.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&takes[i], sizeof(WorldNativeTakenPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

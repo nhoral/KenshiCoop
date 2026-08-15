@@ -1555,13 +1555,20 @@ unsigned int worldItemHash(const char* sid, unsigned int type, unsigned short qt
 } // namespace
 
 unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int maxOut,
-                               float radius) {
+                               float radius, WorldNativeRaw* natOut,
+                               unsigned int natMax, unsigned int* natCount) {
+    if (natCount) *natCount = 0;
     if (!gw || !gw->player || !out || maxOut == 0 || !g_getObjsFn) return 0;
     unsigned int n = 0;
+    unsigned int nn = 0; // natives written to natOut
     __try {
         if (gw->player->playerCharacters.size() == 0) return 0;
         Character* ld = gw->player->playerCharacters[0];
         if (!ld) return 0;
+        // Player faction for the ownership filter below (0 tolerated: the filter
+        // then only skips items with SOME owner, which is still correct).
+        Faction* playerFac = 0;
+        __try { playerFac = gw->player->getFaction(); } __except (EXCEPTION_EXECUTE_HANDLER) { playerFac = 0; }
         Ogre::Vector3 center = ld->getPosition();
         // A dropped item enumerates under multiple category queries (W0 finding), so
         // scan WEAPON/ARMOUR/ITEM and DEDUPE by hand (index+serial) to avoid triples.
@@ -1579,6 +1586,55 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
                 for (unsigned int j = 0; j < n; ++j)
                     if (out[j].hand[3] == hd[3] && out[j].hand[4] == hd[4]) { dup = true; break; }
                 if (dup) continue;
+                // OWNERSHIP FILTER: an item owned by a non-player faction is world
+                // furniture (shop stock / town placements - the "red" stealing items),
+                // NOT a session drop, and the peer already holds it as a save-native.
+                // Streaming one makes the peer fabricate an owner=0 proxy on top of
+                // its own red native: a grey duplicate that is free to take, and whose
+                // pickup CLAIM then destroys the author's real item - the theft bypass
+                // (upstream #63/#66). Skipping it here keeps it out of the tracker
+                // entirely (baseline seeding included); real drops still stream via
+                // the query-free drop hook, which does not pass through this scan.
+                // "Unowned" is NOT a null faction: the engine parks ownerless ground
+                // items (player drops and minted proxies included) on a real sentinel
+                // Faction whose GameData stringID is 'nofac' (measured on 1.0.65 -
+                // getFaction never returned null in the diagnostic runs). Comparing
+                // pointers alone therefore reads EVERYTHING as owned and blinds the
+                // scan entirely, so the sentinel must pass the filter too.
+                Faction* fac = 0;
+                __try { fac = o->getFaction(); } __except (EXCEPTION_EXECUTE_HANDLER) { fac = 0; }
+                bool owned = (fac != 0) && (fac != playerFac);
+                if (owned) {
+                    char facSid[16] = "";
+                    facSidOf(fac, facSid, sizeof(facSid));
+                    if (strcmp(facSid, "nofac") == 0) owned = false;
+                }
+                if (owned) {
+                    // Protocol 56: report the skipped native (deduped like the main
+                    // rows) so the caller can watch it for a local pickup.
+                    if (natOut && nn < natMax) {
+                        bool ndup = false;
+                        for (unsigned int j = 0; j < nn; ++j)
+                            if (natOut[j].hand[3] == hd[3] && natOut[j].hand[4] == hd[4]) { ndup = true; break; }
+                        if (!ndup) {
+                            GameData* ngd = 0;
+                            __try { ngd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { ngd = 0; }
+                            Ogre::Vector3 np(0,0,0);
+                            __try { np = o->getPosition(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                            WorldNativeRaw& nw = natOut[nn];
+                            for (int t = 0; t < 5; ++t) nw.hand[t] = hd[t];
+                            nw.stringID[0] = '\0';
+                            if (ngd) {
+                                strncpy(nw.stringID, ngd->stringID.c_str(), sizeof(nw.stringID) - 1);
+                                nw.stringID[sizeof(nw.stringID) - 1] = '\0';
+                            }
+                            nw.x = np.x; nw.y = np.y; nw.z = np.z;
+                            ++nn;
+                            if (natCount) *natCount = nn;
+                        }
+                    }
+                    continue;
+                }
                 GameData* gd = 0;
                 __try { gd = o->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
                 if (!gd) continue;
@@ -1901,6 +1957,98 @@ int groundItemLiveness(const unsigned int itemHand[5], float out[3]) {
     RootObject* ro = resolveObjectByHand(itemHand);
     if (!ro) return 0; // destroyed / no longer resolvable
     return groundObjectLiveness(ro, out, 0);
+}
+
+// Protocol 56: destroy OUR copy of a save-native ground item a peer consumed.
+//
+// IDENTITY. An item's engine hand is NOT save-stable across clients: measured on
+// 1.0.65, the same native carried index/serial 8955/2494995200 on the sender and
+// did not resolve at all on the receiver (both had loaded the identical save) -
+// the (index, serial) half is assigned per session. What IS shared is the save
+// data itself: template (GameData stringID) + world position, identical on both
+// clients because neither moved it. So the notice is matched by sid + position:
+// the sender's hand is tried first only as a fast path for the same-client case
+// (echo/replay), then the receiver queries the sphere around the sender's
+// position and takes the LIVE ground item of that template nearest to it, within
+// posTol. Two identical templates lying within posTol of each other are
+// interchangeable copies on both machines, so "the nearest" removes the same
+// logical thing the sender did.
+//
+// GUARDS. Only an object that reads as a LIVE GROUND item is destroyed. A copy
+// already inside a local bag (someone here picked it up too) or already gone is
+// left alone, and nothing matching within posTol is a logged no-op - so echoed,
+// replayed or stale notices cannot delete anything a local actor holds.
+// outHand (optional) receives the destroyed object's LOCAL hand so the caller can
+// retire its own track for it.
+int destroyNativeGroundItem(GameWorld* gw, const unsigned int itemHand[5],
+                            const char* expectSid, const float expectPos[3],
+                            float posTol, unsigned int outHand[5],
+                            const char** whySkipped) {
+    if (whySkipped) *whySkipped = "";
+    if (outHand) for (int t = 0; t < 5; ++t) outHand[t] = 0;
+    if (!gw || !expectSid || !expectSid[0] || !expectPos || posTol <= 0.0f) {
+        if (whySkipped) *whySkipped = "bad-args"; return 0;
+    }
+    RootObject* best = 0;
+    float bestD2 = posTol * posTol;
+    bool sawBagged = false;
+    // Fast path: the sender's hand names the same object here (same-client echo,
+    // or an engine build where hands do turn out shared). Must still pass every
+    // check the spatial match passes.
+    if (itemHand && (itemHand[3] != 0 || itemHand[4] != 0)) {
+        RootObject* ro = resolveObjectByHand(itemHand);
+        if (ro) {
+            bool sidOk = false;
+            __try {
+                GameData* gd = ro->getGameData();
+                sidOk = (gd && strcmp(gd->stringID.c_str(), expectSid) == 0);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { sidOk = false; }
+            if (sidOk) {
+                bool pu = false; float here[3] = { 0.0f, 0.0f, 0.0f };
+                if (groundObjectLiveness(ro, here, &pu)) {
+                    float dx = here[0] - expectPos[0], dy = here[1] - expectPos[1], dz = here[2] - expectPos[2];
+                    float d2 = dx*dx + dy*dy + dz*dz;
+                    if (d2 <= bestD2) { best = ro; bestD2 = d2; }
+                } else if (pu) sawBagged = true;
+            }
+        }
+    }
+    // Spatial match: the shared identity.
+    if (!best && g_getObjsFn) {
+        __try {
+            Ogre::Vector3 center(expectPos[0], expectPos[1], expectPos[2]);
+            const itemType kinds[] = { ITEM, WEAPON, ARMOUR };
+            for (int k = 0; k < 3; ++k) {
+                g_npcQuery.clear();
+                g_getObjsFn(gw, &g_npcQuery, &center, posTol * 2.0f, kinds[k], 256, 0);
+                unsigned int total = g_npcQuery.size();
+                for (unsigned int i = 0; i < total; ++i) {
+                    RootObject* o = g_npcQuery[i]; if (!o) continue;
+                    bool sidOk = false;
+                    __try {
+                        GameData* gd = o->getGameData();
+                        sidOk = (gd && strcmp(gd->stringID.c_str(), expectSid) == 0);
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { sidOk = false; }
+                    if (!sidOk) continue;
+                    bool pu = false; float here[3] = { 0.0f, 0.0f, 0.0f };
+                    if (!groundObjectLiveness(o, here, &pu)) { if (pu) sawBagged = true; continue; }
+                    float dx = here[0] - expectPos[0], dy = here[1] - expectPos[1], dz = here[2] - expectPos[2];
+                    float d2 = dx*dx + dy*dy + dz*dz;
+                    if (d2 <= bestD2) { best = o; bestD2 = d2; }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { best = 0; }
+    }
+    if (!best) {
+        if (whySkipped) *whySkipped = sawBagged ? "in-local-bag" : "not-found";
+        return 0;
+    }
+    if (outHand) { unsigned int hd[5] = {0,0,0,0,0}; if (readObjectHand(best, hd)) for (int t = 0; t < 5; ++t) outHand[t] = hd[t]; }
+    if (!removeWorldItemProxy(gw, best)) {
+        if (whySkipped) *whySkipped = "destroy-failed";
+        return 0;
+    }
+    return 1;
 }
 
 // SEH-guarded (Phase W3): world position of a tracked Item* (as void*). The drop detector

@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+const u16 PROTOCOL_VERSION = 56;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -76,7 +76,8 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_NATIVE_TAKEN     = 49 // RELIABLE save-native ground item consumed (protocol 56); WorldNativeTakenPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -621,6 +622,38 @@ struct WorldItemClaimHeader {
 
 // 16 * sizeof(WorldItemEntry)=1168 + header(6) stays under a 1400 B datagram.
 const unsigned int WORLD_ITEMS_MAX = 16;
+
+// ---- Protocol 56: save-native ground pickup notice --------------------------
+// The W1 CLAIM above mirrors pickups of STREAMED items (tracked, netId-keyed), but a
+// save-native world item - shop stock / town placements, exactly the owned items the
+// protocol-55 ownership filter keeps OUT of the stream - has no netId and no proxy.
+// When a character picked one up (stealing it), nothing told the peer, whose own
+// save-native copy stayed on the ground: the "host stole it but the join still sees
+// it" ghost (upstream #44). Both clients loaded the IDENTICAL save, so the item's
+// 5-field engine hand resolves on both machines; this notice names the consumed
+// native by hand and the receiver destroys its own still-on-ground copy. The receiver
+// only acts on an object that still reads as a LIVE GROUND item - a copy already in a
+// local bag, or already gone, is left alone - so a stale or echoed notice is a no-op.
+// takeId is monotonic per sender (idempotency under reliable resend).
+struct WorldNativeTakenPacket {
+    u8  type;    // = PKT_NATIVE_TAKEN
+    u32 ownerId; // network player id of the sender (whose side consumed the native)
+    u32 takeId;  // monotonic per-sender (idempotency)
+    // the consumed native's engine hand ON THE SENDER. Measured on 1.0.65: an item's
+    // (index, serial) is assigned per session, so this does NOT resolve on the
+    // other client even for the identical save; it is carried for the same-client
+    // fast path and for the log only.
+    u32 iType;
+    u32 iContainer;
+    u32 iContainerSerial;
+    u32 iIndex;
+    u32 iSerial;
+    // The shared identity: template + world position (the save data both clients
+    // loaded, which neither moved). The receiver destroys the LIVE ground item of
+    // this template nearest to this position, within a few units, or nothing.
+    char stringID[48];
+    f32 x, y, z;
+};
 
 // ---- Phase W2: conservation DROP intent ------------------------------------
 // A WEAPON cannot be rebuilt on a peer (RootObjectFactory::createItem returns null for all

@@ -310,8 +310,31 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v55: runtime-fixture identity)",
-             (int)PROTOCOL_VERSION, 55);
+    CHECK_EQ("PROTOCOL_VERSION (v56: save-native pickup notice)",
+             (int)PROTOCOL_VERSION, 56);
+
+    // Protocol 56: save-native pickup notice. The ownership filter (protocol 55)
+    // keeps owned town/shop items out of the stream, so their pickup needs its own
+    // mirror: a notice keyed by template + position (the shared save data).
+    CHECK_EQ("PKT_NATIVE_TAKEN id", (int)PKT_NATIVE_TAKEN, 49);
+    CHECK("PKT_NATIVE_TAKEN distinct",
+          PKT_NATIVE_TAKEN != PKT_WORLD_ITEM_CLAIM &&
+          PKT_NATIVE_TAKEN != PKT_WORLD_PICKUP &&
+          PKT_NATIVE_TAKEN != PKT_WORLD_ITEM_REMOVE &&
+          PKT_NATIVE_TAKEN != PKT_FIXTURE);
+    {
+        WorldNativeTakenPacket nt; std::memset(&nt, 0, sizeof(nt));
+        nt.type = (u8)PKT_NATIVE_TAKEN; nt.ownerId = 2u; nt.takeId = 9u;
+        nt.iType = 0; nt.iContainer = 2069; nt.iContainerSerial = 11111;
+        nt.iIndex = 469; nt.iSerial = 346801760u;
+        nt.x = -51174.32f; nt.y = 1594.71f; nt.z = 2718.17f;
+        CHECK("native-taken carries the 5-field hand",
+              nt.iContainer == 2069 && nt.iSerial == 346801760u && nt.takeId == 9u);
+        // The receiver's identity checksum rides along: sid + the sender's ground
+        // position (a hand alone can name a different object on the other client).
+        CHECK("native-taken carries the position checksum",
+              nt.x < -51174.0f && nt.y > 1594.0f && nt.z > 2718.0f);
+    }
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -466,6 +489,7 @@ static void testRoundTrips() {
     roundTrip<EventPacket>("EventPacket", (u8)PKT_EVENT);
     roundTrip<WorldDropPacket>("WorldDropPacket", (u8)PKT_WORLD_DROP);
     roundTrip<WorldPickupPacket>("WorldPickupPacket", (u8)PKT_WORLD_PICKUP);
+    roundTrip<WorldNativeTakenPacket>("WorldNativeTakenPacket", (u8)PKT_NATIVE_TAKEN);
     roundTrip<InvXferPacket>("InvXferPacket", (u8)PKT_INV_XFER);
     roundTrip<MedicalPacket>("MedicalPacket", (u8)PKT_MEDICAL);
     roundTrip<TreatmentPacket>("TreatmentPacket", (u8)PKT_TREATMENT);
