@@ -373,14 +373,27 @@ function Set-CoopEnv {
 }
 
 # Wait until a regex appears in a (growing) file, or timeout. Returns $true/$false.
+# -StopPattern / -ProcId (optional): give up EARLY (returns $false) once the log
+# shows the stop pattern or the process is gone. The screenshot anchors below are
+# per-family phrases ("SCENARIO MEMBER" / "SCENARIO RECV") that many scenarios never
+# emit; without a stop condition every such scenario sat through the FULL anchor
+# timeouts (45 s + 60 s) after it had already logged its verdict and exited -
+# measured 105 s of a 167 s inv_backpack_drop run, i.e. most of a smoke tier's
+# wall clock was the harness waiting for lines that were never coming.
 function Wait-ForLogLine {
-    param([string]$File, [string]$Pattern, [int]$TimeoutSec)
+    param([string]$File, [string]$Pattern, [int]$TimeoutSec,
+          [string]$StopPattern = "", [int]$ProcId = 0)
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
         if (Test-Path $File) {
             $hit = Select-String -Path $File -Pattern $Pattern -SimpleMatch:$false -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($null -ne $hit) { return $true }
+            if ($StopPattern -ne "") {
+                $stop = Select-String -Path $File -Pattern $StopPattern -SimpleMatch:$false -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($null -ne $stop) { return $false }
+            }
         }
+        if ($ProcId -ne 0 -and $null -eq (Get-Process -Id $ProcId -ErrorAction SilentlyContinue)) { return $false }
         Start-Sleep -Milliseconds 500
     }
     return $false
@@ -495,21 +508,25 @@ if ($Scenario -ne "") {
             $joinShotWait = $manifestEntry.ShotWaitSec
         }
     }
-    if (Wait-ForLogLine -File $hostLog -Pattern $hostAnchor -TimeoutSec $hostShotWait) {
+    # Anchor waits stop early once the scenario has logged its verdict (or the
+    # process is gone): the shot then captures the end state instead of the
+    # harness idling through the full anchor timeout for a phrase this scenario
+    # family never emits.
+    if (Wait-ForLogLine -File $hostLog -Pattern $hostAnchor -TimeoutSec $hostShotWait -StopPattern "SCENARIO RESULT" -ProcId $hostPid) {
         Write-Host "Saw host '$hostAnchor'; capturing host shortly after."
         Start-Sleep -Seconds $hostShotDelay
     } else {
-        Write-Warning "No host '$hostAnchor' within $hostShotWait s; capturing host best-effort."
+        Write-Host "No host '$hostAnchor' before verdict/exit/timeout ($hostShotWait s max); capturing host best-effort."
     }
     if (Test-Alive $hostPid) { Take-Shot -ProcId $hostPid -Out $hostPng -Label "host" }
     else { Write-Warning "Host already exited before screenshot." }
 
     if ($joinPid -ne 0) {
-        if (Wait-ForLogLine -File $joinLog -Pattern $joinAnchor -TimeoutSec $joinShotWait) {
+        if (Wait-ForLogLine -File $joinLog -Pattern $joinAnchor -TimeoutSec $joinShotWait -StopPattern "SCENARIO RESULT" -ProcId $joinPid) {
             Write-Host "Saw join '$joinAnchor'; capturing join shortly after."
             Start-Sleep -Seconds $joinShotDelay
         } else {
-            Write-Warning "No join '$joinAnchor' within $joinShotWait s; capturing join best-effort."
+            Write-Host "No join '$joinAnchor' before verdict/exit/timeout ($joinShotWait s max); capturing join best-effort."
         }
         if (Test-Alive $joinPid) { Take-Shot -ProcId $joinPid -Out $joinPng -Label "join" }
         else { Write-Warning "Join already exited before screenshot." }
