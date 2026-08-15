@@ -255,7 +255,8 @@ void Replicator::resetSession() {
     censusContainers_.clear(); // protocol 34: re-censused in the new world
     worldTrack_.clear();
     worldProxies_.clear();
-    worldSeeded_ = false; // re-baseline the reloaded world's save-native items
+    worldSeeded_ = false; // re-census the reloaded world's save-native items
+    pendingDrops_.clear(); // unresolved drop edges belong to the old world
     weaponCensus_.clear();
     appliedDrops_.clear();
     appliedPickups_.clear();

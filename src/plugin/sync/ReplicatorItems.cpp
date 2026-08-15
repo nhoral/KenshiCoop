@@ -357,8 +357,10 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     //   (1) the query-free drop hook (engine::drainItemDrops) - a drop captured at
     //       Inventory::dropItem, so a TOWN drop is found even when the spatial query
     //       misses it (the core town-reliability fix); and
-    //   (2) the spatial scan (captureWorldItems) - best-effort, for pre-existing save
-    //       items / host runtime drops the drop hook didn't author.
+    //   (2) the spatial scan (captureWorldItems) - the census: pre-existing save
+    //       items become never-emit baseline tracks (identity + liveness), and a
+    //       drop the hook captured but could not key is resolved here by template
+    //       + position (pendingDrops_). The scan never streams anything on its own.
     // Both key a track by the item's LOCAL engine hand, so a drop found by BOTH sources
     // converges on ONE track (one netId) - no duplicate proxy. CULLING is now HANDLE-
     // based (engine::groundItemLiveness): a track is removed only when its real item is
@@ -384,43 +386,32 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (live) proxyObjs.insert(live);
     }
 
-    // ---- First-scan baseline (Phase 3 item-dup fix) ------------------------
-    // Every non-gear ground item present at the FIRST publish pass after a load
-    // is a SHARED save-native: the peer loaded the same save (or the host's
-    // connect-pushed save) and already holds an identical copy. Streaming it
-    // would mint a proxy on top of the peer's own native - the "rejoin/reload
-    // duplicated all items" report, compounding one layer per reload. Seed them
-    // as baseline tracks (identity + liveness only, NEVER emitted). Only items
-    // that appear AFTER this baseline (session drops via the hook, host runtime
-    // spawns) stream. resetSession() clears worldSeeded_ so each reload re-
-    // baselines the (possibly newly-baked) save-natives instead of re-streaming.
-    if (!worldSeeded_) {
-        worldSeeded_ = true;
-        engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
-        unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
-        unsigned int seeded = 0;
-        for (unsigned int i = 0; i < n; ++i) {
-            if (isGearType(raw[i].itemType)) continue;
-            if (!proxyObjs.empty() &&
-                proxyObjs.count(engine::resolveObjectByHand(raw[i].hand)) != 0)
-                continue; // already our proxy (defensive; unlikely at first scan)
-            Key k; k.t = raw[i].hand[0]; k.c = raw[i].hand[1]; k.cs = raw[i].hand[2];
-            k.i = raw[i].hand[3]; k.s = raw[i].hand[4];
-            if (worldTrack_.find(k) != worldTrack_.end()) continue;
-            WorldTrack t; memset(&t, 0, sizeof(t));
-            t.netId = nextWorldNetId_++; t.hash = 0; t.lastSendMs = 0;
-            t.x = raw[i].x; t.y = raw[i].y; t.z = raw[i].z; t.seen = true;
-            t.baseline = true; // never emit
-            strncpy(t.stringID, raw[i].stringID, sizeof(t.stringID) - 1);
-            t.stringID[sizeof(t.stringID) - 1] = '\0';
-            t.itemType = raw[i].itemType; t.quantity = raw[i].quantity; t.quality = raw[i].quality;
-            worldTrack_[k] = t;
-            ++seeded;
-        }
-        char b[96]; _snprintf(b, sizeof(b) - 1,
-            "[wi] BASELINE seeded=%u (save-native, never-stream)", seeded);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-    }
+    // ---- Save-native baseline (Phase 3 item-dup fix) ------------------------
+    // Every non-gear ground item the world holds that the DROP HOOK did not
+    // author is a SHARED save-native: the peer loaded the same save (or the
+    // host's connect-pushed save) and already holds an identical copy. Streaming
+    // it would mint a proxy on top of the peer's own native - the "rejoin/reload
+    // duplicated all items" report, compounding one layer per reload. Such items
+    // become baseline tracks (identity + liveness only, NEVER emitted).
+    //
+    // This used to be a one-shot FIRST-SCAN seed, and that raced the world:
+    // measured on 1.0.65, the first publish pass after a load routinely ran
+    // before the zone's items existed (scan n=0), so a baseline latched on it was
+    // empty and the natives that popped in 130-200 ms later streamed as fresh
+    // drops (14 grey duplicates on the peer). Widening the seed to a settle
+    // window was not enough either: an interior finishing its stream-in 20+ s
+    // after connect popped in another batch of natives on BOTH clients at the
+    // same instant, and each streamed them to the other. So the rule is now
+    // structural, not temporal: the spatial scan alone never promotes an item
+    // to the stream. The one exception is an own drop the hook captured but
+    // could not key (DROP-CAP-SKIP, below): it is remembered in pendingDrops_
+    // and the first scan row matching its template + position is the drop.
+    // (Discovery 1's hook detours Inventory::dropItem engine-wide, so every real
+    // drop - ours, an NPC's - is authored there; only save data and the peer's
+    // proxies, which the echo guard already filters, put items on the ground
+    // without it.)
+    const unsigned long PENDING_DROP_MS   = 5000;
+    const float         PENDING_DROP_DIST = 2.5f;
 
     // Gear (itemType WEAPON/ARMOUR) rides the W2 conservation drop/pickup channel
     // (the real shared-save object is relocated bag<->ground on each client), so the
@@ -432,23 +423,30 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned int nde = engine::drainItemDrops(de, 64);
         for (unsigned int i = 0; i < nde; ++i) {
             if (isGearType(de[i].itemType)) continue;
+            // A drop from a PEER-owned squad copy is the peer's to author (it streams
+            // its own drop); authoring it here too would duplicate the proxy. World
+            // NPC (class 0) and our own squad (class 1) drops still stream.
+            if (ownerClassForHand(de[i].ownerHand) == 2) continue;
             if (de[i].itemHand[3] == 0 && de[i].itemHand[4] == 0) {
-                // Unresolved hand: this drop cannot be keyed, so the reliable discovery path
-                // gives up on it and only the (town-unreliable) spatial scan can still find
-                // it. That is the one way a non-gear drop silently never reaches the peer, so
-                // say so unconditionally - it is rare, and guessing at it from a silent log is
-                // what made "dropped here, absent there" impossible to pin down.
+                // Unresolved hand: this drop cannot be keyed here, so only the (town-
+                // unreliable) spatial scan can still find it. Remember its template +
+                // position: the scan row that matches is THIS drop and streams; every
+                // other scan-only row is a save-native. Say so unconditionally - it is
+                // rare, and guessing at it from a silent log is what made "dropped
+                // here, absent there" impossible to pin down.
                 char b[200]; _snprintf(b, sizeof(b) - 1,
                     "[wi] DROP-CAP-SKIP sid='%s' qty=%u pos=%.2f,%.2f,%.2f (unresolved item "
                     "hand; spatial scan is the only remaining chance)",
                     de[i].stringID, de[i].quantity, de[i].x, de[i].y, de[i].z);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                if (pendingDrops_.size() < 32) {
+                    PendingDrop pd; memset(&pd, 0, sizeof(pd));
+                    strncpy(pd.stringID, de[i].stringID, sizeof(pd.stringID) - 1);
+                    pd.x = de[i].x; pd.y = de[i].y; pd.z = de[i].z; pd.ms = now;
+                    pendingDrops_.push_back(pd);
+                }
                 continue;
             }
-            // A drop from a PEER-owned squad copy is the peer's to author (it streams
-            // its own drop); authoring it here too would duplicate the proxy. World
-            // NPC (class 0) and our own squad (class 1) drops still stream.
-            if (ownerClassForHand(de[i].ownerHand) == 2) continue;
             Key k; k.t = de[i].itemHand[0]; k.c = de[i].itemHand[1]; k.cs = de[i].itemHand[2];
             k.i = de[i].itemHand[3]; k.s = de[i].itemHand[4];
             if (worldTrack_.find(k) != worldTrack_.end()) continue; // already tracked
@@ -466,10 +464,21 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
     }
 
-    // ---- Discovery 2: the spatial scan (best-effort) -----------------------
+    // ---- Discovery 2: the spatial scan (census + liveness identity) --------
+    // Every in-range ground item gets a track (identity + liveness), but a row
+    // the scan finds UNANNOUNCED is a save-native and is recorded as baseline
+    // (never emit). Only a row that resolves a pending unresolved own drop is
+    // promoted to a streaming track.
     {
+        // Age out pending unresolved drops the scan never found.
+        for (size_t p = 0; p < pendingDrops_.size(); ) {
+            if (now - pendingDrops_[p].ms > PENDING_DROP_MS)
+                pendingDrops_.erase(pendingDrops_.begin() + p);
+            else ++p;
+        }
         engine::WorldItemRaw raw[WORLD_ITEMS_MAX];
         unsigned int n = engine::captureWorldItems(gw, raw, WORLD_ITEMS_MAX, RADIUS);
+        unsigned int natives = 0;
         for (unsigned int i = 0; i < n; ++i) {
             if (isGearType(raw[i].itemType)) continue;
             if (!proxyObjs.empty() &&
@@ -485,7 +494,24 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 strncpy(t.stringID, raw[i].stringID, sizeof(t.stringID) - 1);
                 t.stringID[sizeof(t.stringID) - 1] = '\0';
                 t.itemType = raw[i].itemType; t.quantity = raw[i].quantity; t.quality = raw[i].quality;
+                // Attribute: an own drop the hook could not key, now found by the scan?
+                bool isDrop = false;
+                for (size_t p = 0; p < pendingDrops_.size(); ++p) {
+                    const PendingDrop& pd = pendingDrops_[p];
+                    float dx = raw[i].x - pd.x, dy = raw[i].y - pd.y, dz = raw[i].z - pd.z;
+                    if (strcmp(pd.stringID, raw[i].stringID) == 0 &&
+                        dx*dx + dy*dy + dz*dz <= PENDING_DROP_DIST * PENDING_DROP_DIST) {
+                        pendingDrops_.erase(pendingDrops_.begin() + p);
+                        isDrop = true; break;
+                    }
+                }
+                t.baseline = !isDrop; // unannounced = save-native, never emit
+                if (t.baseline) ++natives;
                 worldTrack_[k] = t;
+                if (dumpWi) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wi] SCAN-%s netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f",
+                    isDrop ? "DROP" : "NATIVE", t.netId, t.stringID, t.quantity, t.x, t.y, t.z);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             } else {
                 // Refresh the description (a re-stack can change qty/quality).
                 WorldTrack& tr = tit->second;
@@ -493,6 +519,15 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 tr.stringID[sizeof(tr.stringID) - 1] = '\0';
                 tr.itemType = raw[i].itemType; tr.quantity = raw[i].quantity; tr.quality = raw[i].quality;
             }
+        }
+        // Load census: log the first populated scan after a load/reload once (the
+        // natives keep arriving after this - each is baselined as it appears).
+        if (!worldSeeded_ && n > 0) {
+            worldSeeded_ = true;
+            char b[112]; _snprintf(b, sizeof(b) - 1,
+                "[wi] BASELINE seeded=%u (save-native, never-stream; first populated scan n=%u)",
+                natives, n);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
 
