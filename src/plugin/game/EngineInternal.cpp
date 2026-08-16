@@ -96,6 +96,7 @@ SaveMgrExecFn g_saveMgrExecFn = 0;
 // edge is forwarded to the host as PKT_SAVE_REQ by the Plugin instead.
 std::vector<SaveEdgeRec> g_saveEdges;
 bool g_saveSuppressAll = false;
+bool g_saveBypassEdgeOnce = false;
 SaveMgrSaveNameFn g_saveHookOrig = 0;
 
 void __fastcall saveMgrSave_hook(SaveManager* self, const std::string* name,
@@ -109,19 +110,29 @@ void __fastcall saveMgrSave_hook(SaveManager* self, const std::string* name,
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { nm[0] = '\0'; }
     const bool suppress = g_saveSuppressAll;
+    const bool bypassEdge = g_saveBypassEdgeOnce;
+    g_saveBypassEdgeOnce = false;
     if (!suppress) g_saveHookOrig(self, name, autosave);
     __try {
-        SaveEdgeRec r;
-        memset(&r, 0, sizeof(r));
-        strncpy(r.name, nm, sizeof(r.name) - 1);
-        r.autosave   = autosave ? 1 : 0;
-        r.suppressed = suppress ? 1 : 0;
-        if (g_saveEdges.size() < 8) g_saveEdges.push_back(r);
-        char b[144];
-        _snprintf(b, sizeof(b) - 1,
-                  "[save] LOCAL-SAVE name='%s' autosave=%d suppressed=%d",
-                  r.name, r.autosave, r.suppressed);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!bypassEdge) {
+            SaveEdgeRec r;
+            memset(&r, 0, sizeof(r));
+            strncpy(r.name, nm, sizeof(r.name) - 1);
+            r.autosave   = autosave ? 1 : 0;
+            r.suppressed = suppress ? 1 : 0;
+            if (g_saveEdges.size() < 8) g_saveEdges.push_back(r);
+            char b[144];
+            _snprintf(b, sizeof(b) - 1,
+                      "[save] LOCAL-SAVE name='%s' autosave=%d suppressed=%d",
+                      r.name, r.autosave, r.suppressed);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[save] FENCED-RESAVE name='%s' autosave=%d",
+                      nm, autosave ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -2096,6 +2107,9 @@ bool installSaveHook() {
 }
 
 void setSaveSuppress(bool on) { g_saveSuppressAll = on; }
+
+void setSaveEdgeBypassOnce() { g_saveBypassEdgeOnce = true; }
+void clearSaveEdgeBypass() { g_saveBypassEdgeOnce = false; }
 
 unsigned int drainSaveEdges(SaveEdge* out, unsigned int maxOut) {
     unsigned int n = 0;

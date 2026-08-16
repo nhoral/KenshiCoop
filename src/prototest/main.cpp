@@ -79,6 +79,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
     CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            159); // v42: +locked, v48: reserved byte became parentIdx (size unchanged), v51: +level (craft grade)
     CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       28); // v33: +keyKind; v46: +flags
+    CHECK_EQ("sizeof(InvSaveFencePacket)",      sizeof(InvSaveFencePacket),      13); // v60: pre-save inventory barrier
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
     CHECK_EQ("sizeof(WorldItemRemoveHeader)",   sizeof(WorldItemRemoveHeader),   6);
@@ -310,8 +311,10 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v55: runtime-fixture identity)",
-             (int)PROTOCOL_VERSION, 55);
+    CHECK_EQ("PROTOCOL_VERSION (v60: inventory save fence)",
+             (int)PROTOCOL_VERSION, 60);
+    CHECK_EQ("inventory save fence packet id",
+             (int)PKT_INV_SAVE_FENCE, 53);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -495,6 +498,7 @@ static void testRoundTrips() {
     roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
     roundTrip<DeedPacket>("DeedPacket", (u8)PKT_DEED);
     roundTrip<FixturePacket>("FixturePacket", (u8)PKT_FIXTURE);
+    roundTrip<InvSaveFencePacket>("InvSaveFencePacket", (u8)PKT_INV_SAVE_FENCE);
     roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
     roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
 
@@ -1392,6 +1396,7 @@ static void testFlushWorldStateContract() {
     CamHintPacket   ch;  std::memset(&ch,  0, sizeof(ch));
     CellClaimPacket cc;  std::memset(&cc,  0, sizeof(cc));
     InvXferAckPacket xa; std::memset(&xa,  0, sizeof(xa));
+    InvSaveFencePacket isf; std::memset(&isf, 0, sizeof(isf));
     // Session-preserving payloads.
     SaveReqPacket   srq; std::memset(&srq, 0, sizeof(srq));
     SaveBeginPacket sbg; std::memset(&sbg, 0, sizeof(sbg));
@@ -1402,7 +1407,7 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (34).
+    // --- Push one sentinel into every WORLD-STATE queue (35).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1437,6 +1442,7 @@ static void testFlushWorldStateContract() {
     in.pushCamHint(1, ch);
     in.pushCellClaim(1, cc);
     in.pushInvXferAck(1, xa);
+    in.pushInvSaveFence(1, isf);
 
     // --- Push one sentinel into every SESSION-PRESERVING queue (10).
     in.pushConnect(0);
@@ -1490,6 +1496,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("camHint",     InboundCamHint,     drainCamHints);
     WS_EMPTY("cellClaim",   InboundCellClaim,   drainCellClaims);
     WS_EMPTY("invXferAck",  InboundInvXferAck,  drainInvXferAcks);
+    WS_EMPTY("invSaveFence", InboundInvSaveFence, drainInvSaveFences);
     #undef WS_EMPTY
 
     // --- Every SESSION-PRESERVING queue must still hold its sentinel.

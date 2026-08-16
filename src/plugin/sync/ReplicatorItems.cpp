@@ -50,7 +50,26 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         }
         owned.insert(censusContainers_.begin(), censusContainers_.end());
     }
-    if (owned.empty()) return;
+    const bool fencePending = (invSaveFencePending_ != 0);
+    bool fenceReady = true;
+    u16 fenceContainers = 0;
+    u16 fenceTruncated = 0;
+    if (owned.empty()) {
+        // A valid ownership partition can contain no join-owned tab (one-tab
+        // saves). ACKing zero containers is still a completed fence.
+        if (fencePending) {
+            InvSaveFencePacket ack; memset(&ack, 0, sizeof(ack));
+            ack.type = (u8)PKT_INV_SAVE_FENCE; ack.ownerId = ownerId;
+            ack.fenceId = invSaveFencePending_;
+            net.queueInvSaveFence(ack);
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[invsave] ACK fence=%u containers=0 truncated=0 (no owned inventory)",
+                ack.fenceId);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            invSaveFencePending_ = 0;
+        }
+        return;
+    }
     // Periodic safety resend (late join / a container returning to interest). The channel
     // is RELIABLE, so this is not loss recovery - it is a cheap re-assert. With
     // INV_ITEMS_MAX at 64 a full snapshot is ~10 KB, so a censused chest farm re-asserting
@@ -76,7 +95,10 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned int cHand[5] = { it->t, it->c, it->cs, it->i, it->s };
         // Skip until the container actually resolves here (post-load it may not yet),
         // so we never blast a spurious "empty" snapshot that would wipe baked contents.
-        if (engine::resolveObjectByHand(cHand) == 0) continue;
+        if (engine::resolveObjectByHand(cHand) == 0) {
+            if (fencePending) fenceReady = false;
+            continue;
+        }
         u32 hash = 0;
         bool trunc = false;
         // includeNested (protocol 48): the ONLY capture that wants a worn container's own
@@ -113,7 +135,13 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         bool changed  = differs && settled;
         unsigned long resendMs = (n >= INV_RESEND_BIG_N) ? INV_RESEND_BIG_MS : INV_RESEND_MS;
         bool periodic = sent && !differs && (now - pub.lastSendMs >= resendMs);
-        if (!changed && !periodic) continue;
+        // Protocol 60: a save fence forces one full re-assert even when the
+        // content hash is unchanged, but only after the SAME settle guard the
+        // ordinary publisher uses. This never snapshots an item held transiently
+        // on the cursor just because the host happened to save at that moment.
+        if (fencePending && !settled) fenceReady = false;
+        bool fenceSend = fencePending && settled;
+        if (!changed && !periodic && !fenceSend) continue;
         // W2 race guard: while the gear census has an unresolved DECREASE pending for this
         // container, a drop intent for it may still be debouncing (the spatial ground query
         // fails in towns, so detectAndPublishWeaponDrops retries for up to MAX_RETRY ticks).
@@ -125,6 +153,7 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         // this reads is only ever populated by detectAndPublishWeaponDrops, which the tick
         // skips entirely when world sync is off - so the predicate is false by construction.
         if (wdPendingDrop(*it)) {
+            if (fencePending) fenceReady = false;
             static int dumpHold = -1;
             if (dumpHold < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpHold = (e && e[0] == '1') ? 1 : 0; }
             if (dumpHold) { char b[160]; _snprintf(b, sizeof(b) - 1,
@@ -152,6 +181,10 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         u8 sflags = trunc ? INV_FLAG_TRUNCATED : (u8)0;
         net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n, sflags);
         pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n; pub.lastSentUnits = units;
+        if (fenceSend) {
+            if (fenceContainers != 0xFFFFu) ++fenceContainers;
+            if (trunc && fenceTruncated != 0xFFFFu) ++fenceTruncated;
+        }
         if (changed) {
             char b[200];
             _snprintf(b, sizeof(b) - 1,
@@ -173,6 +206,21 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (dumpInv < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpInv = (e && e[0] == '1') ? 1 : 0; }
             if (dumpInv) { coop::logLine("[inv] SEND-state:"); engine::dumpInventory(gw, cHand); }
         }
+    }
+    if (fencePending && fenceReady) {
+        // Every checkpoint snapshot was queued before this marker. NetLink
+        // observes both queues atomically and sends the marker after snapshots
+        // on CH_RELIABLE, making this a real ordered delivery fence.
+        InvSaveFencePacket ack; memset(&ack, 0, sizeof(ack));
+        ack.type = (u8)PKT_INV_SAVE_FENCE; ack.ownerId = ownerId;
+        ack.fenceId = invSaveFencePending_;
+        ack.containers = fenceContainers; ack.truncated = fenceTruncated;
+        net.queueInvSaveFence(ack);
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[invsave] ACK fence=%u containers=%u truncated=%u",
+            ack.fenceId, (unsigned)ack.containers, (unsigned)ack.truncated);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        invSaveFencePending_ = 0;
     }
 }
 

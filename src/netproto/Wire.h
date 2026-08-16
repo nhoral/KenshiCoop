@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+const u16 PROTOCOL_VERSION = 60;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -76,7 +76,10 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    // Protocols 56-59 / packet ids 49-52 are reserved by the preceding
+    // host-canonical series PRs (production, doors, furniture, construction).
+    PKT_INV_SAVE_FENCE   = 53 // RELIABLE pre-save inventory checkpoint marker (protocol 60); InvSaveFencePacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -553,6 +556,33 @@ const u8 INV_FLAG_TRUNCATED = 0x01;
 // INV_FLAG_TRUNCATED becomes the rare fallback (big storage chests) rather than the
 // routine case. Bounded by the u8 `count` field (255).
 const unsigned int INV_ITEMS_MAX = 64;
+
+// ---- Protocol 60: inventory save fence -------------------------------------
+// A coordinated save is authoritative only if the host has first applied the
+// join's latest owner-authored inventory snapshots. SaveManager::save starts a
+// deferred multi-file write immediately, while an inventory edit may still be
+// waiting out the snapshot settle window or crossing the network; without a
+// fence, the host can bake the prior backpack contents and the next load erases
+// the join's newer items.
+//
+// The host sends REQ with a monotonic fenceId. The join waits until every
+// inventory it authors is stable under the ordinary cursor/removal debounce,
+// queues a full reliable snapshot for each, then queues ACK on the SAME ordered
+// reliable channel. The host therefore knows all snapshots preceding the ACK
+// have reached its inbound queues. Because snapshots and ACKs drain through
+// separate main-thread queues, it waits two complete game ticks for ingestion
+// and post-engine apply, then re-issues the native save before watching and
+// transferring that folder.
+//
+// containers/truncated are ACK diagnostics (zero in REQ). A truncated snapshot
+// remains additive-only, so the save is loss-safe but the warning stays visible.
+struct InvSaveFencePacket {
+    u8  type;       // = PKT_INV_SAVE_FENCE; Host->Join REQ, Join->Host ACK
+    u32 ownerId;    // network player id of the sender
+    u32 fenceId;    // host-monotonic request id
+    u16 containers; // ACK: number of full container snapshots queued
+    u16 truncated;  // ACK: how many carried INV_FLAG_TRUNCATED
+};
 
 // ---- Phase W1: world-item (ground drop) snapshot ---------------------------
 // Generalizes the Phase 4a content-snapshot/reconcile model from CONTAINERS to the open

@@ -47,6 +47,15 @@ struct InboundInv {
     std::vector<InvItemEntry> items;
 };
 
+// One side of the protocol-60 inventory save fence. REQ asks the join to
+// publish every stable owner-authored inventory; ACK is queued after those
+// snapshots on the same reliable ordered channel. World-state: a fence for a
+// world that was reloaded/disconnected must not trigger a save in the new one.
+struct InboundInvSaveFence {
+    u32                ownerId;
+    InvSaveFencePacket pkt;
+};
+
 // One received world-item snapshot (Phase W1): the authoritative owner (host) and the
 // netId-keyed ground items in its interest sphere. The join reconciles its local proxies
 // (spawn new / update moved / leave the rest) to match.
@@ -420,6 +429,7 @@ public:
         // without bound. ent_ = ~12 s of a 20 Hz * 17-entity stream; stealth/cam
         // are ~1 Hz refreshes. Every other queue is reliable and stays unbounded.
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
+        invSaveFence_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        wic_(worldReset_),
         npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    invXferAck_(worldReset_),
@@ -484,6 +494,11 @@ public:
         for (int k = 0; k < 5; ++k) ii.cKey[k] = cKey[k];
         if (items && count > 0) ii.items.assign(items, items + count);
         EnterCriticalSection(&cs_); inv_.push_back(ii); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one inventory save-fence request/ack, owner-tagged.
+    void pushInvSaveFence(u32 ownerId, const InvSaveFencePacket& pkt) {
+        InboundInvSaveFence isf; isf.ownerId = ownerId; isf.pkt = pkt;
+        EnterCriticalSection(&cs_); invSaveFence_.push_back(isf); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received world-item snapshot, owner-tagged.
     void pushWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count) {
@@ -709,6 +724,9 @@ public:
     void drainInv(std::deque<InboundInv>& out) {
         EnterCriticalSection(&cs_); out.swap(inv_); LeaveCriticalSection(&cs_);
     }
+    void drainInvSaveFences(std::deque<InboundInvSaveFence>& out) {
+        EnterCriticalSection(&cs_); out.swap(invSaveFence_); LeaveCriticalSection(&cs_);
+    }
     void drainWorldItems(std::deque<InboundWorldItems>& out) {
         EnterCriticalSection(&cs_); out.swap(wi_); LeaveCriticalSection(&cs_);
     }
@@ -868,6 +886,7 @@ private:
     WorldQ<InboundEntity>          ent_;
     WorldQ<InboundEvent>           evt_;
     WorldQ<InboundInv>             inv_;
+    WorldQ<InboundInvSaveFence>    invSaveFence_;
     WorldQ<InboundWorldItems>      wi_;
     WorldQ<InboundWorldRemove>     wir_;
     WorldQ<InboundWorldClaim>      wic_;

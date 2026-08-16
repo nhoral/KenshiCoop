@@ -162,6 +162,10 @@ void NetLink::queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
     pushLocked(outCs_, outInv_, oi);
 }
 
+void NetLink::queueInvSaveFence(const InvSaveFencePacket& pkt) {
+    pushLocked(outCs_, outInvSaveFence_, pkt);
+}
+
 void NetLink::queueWorldItems(u32 ownerId, const WorldItemEntry* items, unsigned int count) {
     OutWorldItems ow;
     ow.ownerId = ownerId;
@@ -572,6 +576,14 @@ void NetLink::threadLoop() {
                                 inbound_->pushInv(hdr.ownerId, hdr.keyKind, cKey,
                                                   items, hdr.count, hdr.flags);
                             }
+                        }
+                    } else if (type == PKT_INV_SAVE_FENCE) {
+                        // Protocol 60 inventory save fence. Direction determines
+                        // whether the marker is a Host request or Join completion.
+                        InvSaveFencePacket sfp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &sfp)
+                            && inbound_) {
+                            inbound_->pushInvSaveFence(sfp.ownerId, sfp);
                         }
                     } else if (type == PKT_WORLD_ITEM) {
                         // Reliable world-item snapshot (Phase W1). Delivered immediately
@@ -1089,8 +1101,14 @@ void NetLink::threadLoop() {
         // is [InvSnapshotHeader][InvItemEntry*count]; only enqueued on content-change,
         // so this channel stays quiet. Reliable so the change survives WAN loss.
         std::vector<OutInv> invs;
+        std::vector<InvSaveFencePacket> invSaveFences;
         EnterCriticalSection(&outCs_);
         invs.swap(outInv_);
+        // Swap snapshots and fence markers under ONE lock. The main thread
+        // queues every checkpoint snapshot before its ACK; this atomic batch
+        // observation plus the send order below means an ACK can never overtake
+        // a snapshot, even if the two threads meet between queue calls.
+        invSaveFences.swap(outInvSaveFence_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < invs.size(); ++i) {
             unsigned count = (unsigned)invs[i].items.size();
@@ -1113,6 +1131,20 @@ void NetLink::threadLoop() {
             if (count > 0)
                 std::memcpy(out->data + sizeof(hdr), &invs[i].items[0],
                             count * sizeof(InvItemEntry));
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+        // Same CH_RELIABLE and strictly AFTER invs: protocol 60 relies on ENet's
+        // per-channel ordering to make ACK a real snapshot-delivery fence.
+        for (size_t i = 0; i < invSaveFences.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&invSaveFences[i],
+                                                 sizeof(InvSaveFencePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {

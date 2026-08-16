@@ -66,6 +66,12 @@ bool installSaveHook();
 // JOIN under save-sync: suppress the LOCAL write entirely (the host's save is
 // authoritative; a manual edge is forwarded as PKT_SAVE_REQ instead).
 void setSaveSuppress(bool on);
+// Protocol 60 host-side fenced re-save: the next save still runs natively but
+// does not enqueue another SaveEdge (which would recursively start a new fence).
+void setSaveEdgeBypassOnce();
+// Cancels a bypass that was armed but not consumed (for example when the
+// resolved engine save entry point rejects the re-save before reaching hook).
+void clearSaveEdgeBypass();
 unsigned int drainSaveEdges(SaveEdge* out, unsigned int maxOut);
 
 // ---- Protocol 32: coordinated load ------------------------------------------

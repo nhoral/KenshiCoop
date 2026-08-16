@@ -107,6 +107,14 @@ struct SessionController {
     // Coordinated save (protocol 31).
     std::string  savePending;      // host: save name awaiting quiescence
     coop::u32    saveReqId;        // join: monotonic PKT_SAVE_REQ counter
+    // Protocol 60: host save cannot be canonical until the join's latest
+    // owner-authored inventory snapshots have crossed and been applied.
+    coop::u32    saveFenceId;       // host: monotonic request id
+    coop::u32    saveFenceWaiting;  // host: non-zero while waiting for ACK
+    coop::u32    saveFenceAckTick;  // main-loop tick ACK was observed (apply follows)
+    DWORD        saveFenceStartTick;// timeout base
+    coop::u16    saveFenceContainers;
+    coop::u16    saveFenceTruncated;
     // Push-save-on-connect bootstrap (host): when a peer connects the host bakes
     // a fresh save of its live world and, once the folder quiesces, sends the
     // join a LOAD_GO for it (not a blind stream) - the join loads it if it has an
@@ -138,7 +146,9 @@ struct SessionController {
     SessionController()
       : gameStarted(false), gameStartTick(0), autoLoadDone(false),
         titleFirstTick(0), peerPresent(false),
-        saveReqId(0), bootstrapArmed(false),
+        saveReqId(0), saveFenceId(0), saveFenceWaiting(0),
+        saveFenceAckTick(0), saveFenceStartTick(0),
+        saveFenceContainers(0), saveFenceTruncated(0), bootstrapArmed(false),
         swapStartTick(0), swapHookTicks(0),
         loadSuppressOn(false), loadIdOut(0), loadIdSeen(0), loadReqId(0),
         loadCommitBase(0), loadPumpArmTick(0) {}
@@ -152,6 +162,12 @@ DWORD&       g_titleFirstTick  = g_session.titleFirstTick;
 bool&        g_peerPresent     = g_session.peerPresent;
 std::string& g_savePending     = g_session.savePending;
 coop::u32&   g_saveReqId       = g_session.saveReqId;
+coop::u32&   g_saveFenceId     = g_session.saveFenceId;
+coop::u32&   g_saveFenceWaiting = g_session.saveFenceWaiting;
+coop::u32&   g_saveFenceAckTick = g_session.saveFenceAckTick;
+DWORD&       g_saveFenceStartTick = g_session.saveFenceStartTick;
+coop::u16&   g_saveFenceContainers = g_session.saveFenceContainers;
+coop::u16&   g_saveFenceTruncated = g_session.saveFenceTruncated;
 bool&        g_bootstrapArmed  = g_session.bootstrapArmed;
 std::string& g_bootstrapName   = g_session.bootstrapName;
 DWORD&       g_swapStartTick   = g_session.swapStartTick;
@@ -235,12 +251,21 @@ void warnIfNoPortraits(const std::string& name) {
 // a fixed order; centralizing them keeps that order from drifting between the
 // several edges that each need one.
 
+void clearInventorySaveFence() {
+    g_saveFenceWaiting = 0;
+    g_saveFenceAckTick = 0;
+    g_saveFenceStartTick = 0;
+    g_saveFenceContainers = 0;
+    g_saveFenceTruncated = 0;
+}
+
 // UI connect/disconnect teardown: the world is live (reconnect/disconnect from
 // within a running game), so despawn our minted NPC + world-item proxies before
 // clearing the maps - else a reconnect leaves orphaned duplicates or bakes them
 // into the next save. Falls back to a plain map reset if no world has ticked yet.
 void sessionResetForUi() {
     g_peerPresent = false;
+    clearInventorySaveFence();
     if (g_lastGw) g_repl.clearPeerReplicationState(g_lastGw);
     else          g_repl.resetSession();
     g_inbound.flushWorldState();
@@ -253,6 +278,7 @@ void sessionResetForUi() {
 // OWN reload edge, and the synchronous-swap backstop reuses it, so the reset
 // order (repl maps, then inbound queues) is defined in exactly one place.
 void sessionResetForWorldReload() {
+    clearInventorySaveFence();
     g_repl.resetSession();
     g_inbound.flushWorldState();
     g_net.bumpSessionEpoch(); // v44: post-reload batches supersede the old session
@@ -278,6 +304,60 @@ void armConnectPush() {
     b[sizeof(b) - 1] = '\0'; coopLog(b);
     if (!coop::engine::saveGameAs(name))
         coopErr("[boot] connect-push save FAILED to issue");
+}
+
+// Protocol 60: saving is a barrier, not just a local button edge. The native
+// call that produced the SaveEdge may already be writing, so the host asks for
+// a stable owner-authored inventory checkpoint, applies it, then re-issues the
+// same save with edge capture bypassed. Only that second write is watched and
+// transferred. This preserves Kenshi's ordinary save slot semantics (no
+// sidecar and no pre-load live-state restore).
+const DWORD INV_SAVE_FENCE_TIMEOUT_MS = 15000;
+
+void armInventorySaveFence(const std::string& name) {
+    g_savePending = name;
+    ++g_saveFenceId;
+    if (g_saveFenceId == 0) ++g_saveFenceId; // 0 means no fence
+    g_saveFenceWaiting = g_saveFenceId;
+    g_saveFenceAckTick = 0;
+    g_saveFenceStartTick = GetTickCount();
+    g_saveFenceContainers = 0;
+    g_saveFenceTruncated = 0;
+
+    coop::InvSaveFencePacket req;
+    memset(&req, 0, sizeof(req));
+    req.type = (coop::u8)coop::PKT_INV_SAVE_FENCE;
+    req.ownerId = g_net.localId();
+    req.fenceId = g_saveFenceWaiting;
+    g_net.queueInvSaveFence(req);
+    char b[144];
+    _snprintf(b, sizeof(b) - 1,
+              "[invsave] REQ->join fence=%u name='%s'",
+              req.fenceId, name.c_str());
+    b[sizeof(b) - 1] = '\0'; coopLog(b);
+}
+
+void issueInventoryFencedResave(const char* why) {
+    if (g_savePending.empty()) { clearInventorySaveFence(); return; }
+    const std::string name = g_savePending;
+    // The detour must pass this native write through but not report another
+    // SaveEdge, or the re-save recursively starts a fresh fence forever.
+    coop::engine::setSaveEdgeBypassOnce();
+    bool ok = coop::engine::saveGameAs(name);
+    // saveGameAs can fail before reaching the detour. Never let an unconsumed
+    // one-shot bypass suppress the user's next genuine save edge.
+    coop::engine::clearSaveEdgeBypass();
+    coop::savexfer::armWatch(name);
+    char b[208];
+    _snprintf(b, sizeof(b) - 1,
+              "[invsave] RESAVE fence=%u name='%s' reason=%s containers=%u "
+              "truncated=%u issued=%d",
+              g_saveFenceWaiting, name.c_str(), why ? why : "unknown",
+              (unsigned)g_saveFenceContainers, (unsigned)g_saveFenceTruncated,
+              ok ? 1 : 0);
+    b[sizeof(b) - 1] = '\0';
+    if (ok) coopLog(b); else coopErr(b);
+    clearInventorySaveFence();
 }
 
 // Drain peer connect/leave events and surface a single game-thread confirmation
@@ -324,6 +404,7 @@ void processNetEvents(GameWorld* gw) {
         // release any carry or occupancy its driven copies still hold.
         if (gw && (g_cfg.carrySync || g_cfg.furnSync)) g_repl.sweepCarries(gw);
         g_peerPresent = false;
+        clearInventorySaveFence();
         // Coordinated save: disconnected = solo again; local saves must work.
         if (!g_cfg.isHost && g_cfg.saveSync) {
             coop::engine::setSaveSuppress(false);
@@ -398,6 +479,42 @@ void pumpSaveReceive() {
 // drives a coordinated save). Received BEGIN/FILE/DONE stage + verify +
 // commit the host's folder; the ACK reports the outcome.
 void driveSaveSync() {
+    // Protocol 60 inventory fence messages ride CH_RELIABLE beside the
+    // snapshots they order. The join latches REQ for publishInventories; the
+    // host observes ACK only after every preceding snapshot was queued inbound.
+    // The two payloads use separate inbound queues, however, so an ACK can be
+    // drained just after this tick's ingestInv pass while its snapshots wait for
+    // the next pass. Applying is post-engine; waiting TWO complete main-loop
+    // ticks after ACK covers that race before re-issuing the native save.
+    std::deque<coop::InboundInvSaveFence> invFences;
+    g_inbound.drainInvSaveFences(invFences);
+    for (std::deque<coop::InboundInvSaveFence>::iterator it = invFences.begin();
+         it != invFences.end(); ++it) {
+        if (!g_cfg.isHost && it->pkt.type == (coop::u8)coop::PKT_INV_SAVE_FENCE) {
+            g_repl.requestInventorySaveFence(it->pkt.fenceId);
+            char b[112]; _snprintf(b, sizeof(b) - 1,
+                "[invsave] REQ received fence=%u", it->pkt.fenceId);
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+        } else if (g_cfg.isHost &&
+                   it->pkt.type == (coop::u8)coop::PKT_INV_SAVE_FENCE) {
+            if (it->pkt.fenceId != g_saveFenceWaiting || g_saveFenceWaiting == 0) {
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[invsave] stale ACK fence=%u waiting=%u ignored",
+                    it->pkt.fenceId, g_saveFenceWaiting);
+                b[sizeof(b) - 1] = '\0'; coopLog(b);
+                continue;
+            }
+            g_saveFenceAckTick = g_tick;
+            g_saveFenceContainers = it->pkt.containers;
+            g_saveFenceTruncated = it->pkt.truncated;
+            char b[144]; _snprintf(b, sizeof(b) - 1,
+                "[invsave] ACK<-join fence=%u containers=%u truncated=%u",
+                it->pkt.fenceId, (unsigned)it->pkt.containers,
+                (unsigned)it->pkt.truncated);
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+        }
+    }
+
     // Local save edges from the detour (max 8 queued per tick).
     coop::engine::SaveEdge edges[8];
     unsigned int nEdges = coop::engine::drainSaveEdges(edges, 8);
@@ -405,7 +522,10 @@ void driveSaveSync() {
         std::string name = edges[i].name[0] ? edges[i].name : "coopresume";
         if (g_cfg.isHost) {
             g_savePending = name;
-            coop::savexfer::armWatch(name);
+            if (g_peerPresent && g_cfg.invSync)
+                armInventorySaveFence(name);
+            else
+                coop::savexfer::armWatch(name);
         } else if (edges[i].suppressed && !edges[i].autosave) {
             coop::SaveReqPacket rq;
             memset(&rq, 0, sizeof(rq));
@@ -440,7 +560,23 @@ void driveSaveSync() {
                 coopErr("[save] join-requested save FAILED to issue");
         }
 
-        // Quiescence watch -> start the transfer once the save is on disk.
+        // ACK may have raced just behind this tick's inventory drain. By two
+        // ticks later, every snapshot that preceded it was necessarily ingested
+        // on the intervening pre-engine pass and applied on that pass's
+        // post-engine stage.
+        if (g_saveFenceWaiting != 0 && g_saveFenceAckTick != 0 &&
+            (coop::u32)(g_tick - g_saveFenceAckTick) >= 2) {
+            issueInventoryFencedResave("ack-applied");
+        } else if (g_saveFenceWaiting != 0 && g_saveFenceAckTick == 0 &&
+                   GetTickCount() - g_saveFenceStartTick >= INV_SAVE_FENCE_TIMEOUT_MS) {
+            // Availability fallback: the user's first native save already ran.
+            // Re-issue using the best state we have, but say loudly that the
+            // checkpoint was not proven instead of hanging save coordination.
+            coopErr("[invsave] checkpoint TIMEOUT; re-saving best-known host state");
+            issueInventoryFencedResave("timeout");
+        }
+
+        // Quiescence watch -> start the transfer once the fenced save is on disk.
         if (coop::savexfer::watching()) {
             unsigned int files = 0;
             unsigned __int64 bytes = 0;
@@ -537,6 +673,7 @@ void driveLoadSync(GameWorld* gw) {
             // A load supersedes any in-flight save coordination.
             coop::savexfer::abortAll();
             g_savePending.clear();
+            clearInventorySaveFence();
             coop::LoadGoPacket go;
             memset(&go, 0, sizeof(go));
             go.type        = (coop::u8)coop::PKT_LOAD_GO;

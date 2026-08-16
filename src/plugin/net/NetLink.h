@@ -56,6 +56,10 @@ public:
     // the receiver reconciles additive-only instead of deleting past the cap.
     void queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
                           const InvItemEntry* items, unsigned int count, u8 flags = 0);
+    // MAIN thread: queue one side of the protocol-60 inventory save fence.
+    // The net thread swaps this queue atomically with outInv_ and sends it
+    // AFTER those snapshots on CH_RELIABLE, preserving snapshot-before-ACK.
+    void queueInvSaveFence(const InvSaveFencePacket& pkt);
 
     // MAIN thread: queue a reliable world-item snapshot (Phase W1). The net thread
     // serializes [WorldItemSnapshotHeader][WorldItemEntry*count] and sends it on the
@@ -265,6 +269,7 @@ private:
         std::vector<InvItemEntry> items;
     };
     std::vector<OutInv>      outInv_;
+    std::vector<InvSaveFencePacket> outInvSaveFence_;
     // Reliable world-item snapshots / culls queued by the main thread (Phase W1),
     // drained + serialized by the net thread. Guarded by outCs_.
     struct OutWorldItems { u32 ownerId; std::vector<WorldItemEntry> items; };
