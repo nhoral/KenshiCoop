@@ -211,6 +211,7 @@
     <ClInclude Include="test\ScenarioTimed.h" />
     <ClInclude Include="test\ScenarioSupport.h" />
     <ClInclude Include="..\netproto\Wire.h" />
+    <ClInclude Include="..\netproto\HostIntent.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

@@ -628,8 +628,8 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                 hb.carried[3] = e.sIndex; hb.carried[4] = e.sSerial;
             }
         }
-        // Furniture occupancy (protocol 19): emit reliable enter/exit edges on
-        // BODY_IN_BED/BODY_IN_CAGE transitions, same authorship scope as carry
+        // Furniture occupancy: protocol 58 sends Join intent / Host canonical
+        // state on BODY_IN_BED/BODY_IN_CAGE transitions, same scope as carry
         // (owned members + host-streamed world NPCs). The furniture HAND is not
         // in the stream (an unconscious occupant has no task subject), so it is
         // read off the LOCAL character (inWhat) at the ENTER edge and remembered
@@ -637,7 +637,14 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         // poses (USE_BED / USE_BED_ORDER / SLEEP_ON_FLOOR): those stream their
         // TASK and the peer's copy walks in via the validated L3 fixture-pose
         // path (bed_pose) - an ENTER event would teleport it in and fight that.
-        if (furnSync_ && carryAuthor && !engine::taskIsBedPose((int)e.task)) {
+        const Key furnitureOccKey = keyOf(e);
+        std::map<Key, FurnitureRow>::iterator furnitureRowIt =
+            furnitureRows_.find(furnitureOccKey);
+        bool furnitureCorrectionPending = !hostRole_ &&
+            furnitureRowIt != furnitureRows_.end() &&
+            furnitureRowIt->second.applyPending;
+        if (furnSync_ && carryAuthor && !furnitureCorrectionPending &&
+            !engine::taskIsBedPose((int)e.task)) {
             // Chained/pole prisoner (protocol 41) rides this pipeline as kind=3
             // (readFurniture puts the OWNER hand in fr.furn). Gated by chainSync_
             // so it can be disabled without losing bed/cage sync.
@@ -645,29 +652,38 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                           ((cur & BODY_IN_CAGE) ? 2 :
                           ((chainSync_ && (cur & BODY_CHAINED)) ? 3 : 0));
             if (curKind != hb.furnKind) {
+                const Key& occKey = furnitureOccKey;
                 if (hb.furnKind != 0) {
-                    // Exit edge: subject = occupant, actor = the remembered furniture.
-                    EventPacket ev; memset(&ev, 0, sizeof(ev));
-                    ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_EXIT_FURNITURE;
-                    ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
-                    ev.sType = e.hType; ev.sContainer = e.hContainer;
-                    ev.sContainerSerial = e.hContainerSerial;
-                    ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
-                    ev.aType = hb.furn[0]; ev.aContainer = hb.furn[1];
-                    ev.aContainerSerial = hb.furn[2];
-                    ev.aIndex = hb.furn[3]; ev.aSerial = hb.furn[4];
-                    ev.arg = (f32)hb.furnKind;
-                    net.queueEvent(ev);
-                    char b[176]; _snprintf(b, sizeof(b) - 1,
-                        "[furn] SEND EXIT id=%u occ=%u,%u furn=%u,%u kind=%d",
-                        ev.eventId, e.hIndex, e.hSerial, hb.furn[3], hb.furn[4],
-                        hb.furnKind);
-                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-                    // Protocol 36 race guard: a stale in-flight PEER-ENTER
-                    // must not re-jail this body right after we freed it.
-                    ownFurnExit_[keyOf(e)] = nowPub;
+                    if (hb.furnKind == 1 || hb.furnKind == 2) {
+                        // Protocol 58: the Host publishes fact; the Join asks.
+                        if (hostRole_)
+                            queueFurnitureState(net, ownerId, occKey, false,
+                                                hb.furnKind, hb.furn, 0, 0);
+                        else
+                            queueFurnitureIntent(net, ownerId, occKey, false,
+                                                 hb.furnKind, hb.furn, nowPub);
+                    } else {
+                        // Chained/pole prisoners remain on protocol 41's reliable
+                        // event path, independent of the bed/cage authority change.
+                        EventPacket ev; memset(&ev, 0, sizeof(ev));
+                        ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_EXIT_FURNITURE;
+                        ev.ownerId = ownerId; ev.eventId = nextEventId_++;
+                        ev.sType = e.hType; ev.sContainer = e.hContainer;
+                        ev.sContainerSerial = e.hContainerSerial;
+                        ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
+                        ev.aType = hb.furn[0]; ev.aContainer = hb.furn[1];
+                        ev.aContainerSerial = hb.furn[2];
+                        ev.aIndex = hb.furn[3]; ev.aSerial = hb.furn[4];
+                        ev.arg = (f32)hb.furnKind;
+                        net.queueEvent(ev);
+                        char b[176]; _snprintf(b, sizeof(b) - 1,
+                            "[furn] SEND EXIT id=%u occ=%u,%u furn=%u,%u kind=%d",
+                            ev.eventId, e.hIndex, e.hSerial, hb.furn[3], hb.furn[4],
+                            hb.furnKind);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
                     hb.furnKind = 0;
-                    hb.furn[0] = hb.furn[1] = hb.furn[2] = hb.furn[3] = hb.furn[4] = 0;
+                    for (int fi = 0; fi < 5; ++fi) hb.furn[fi] = 0;
                 }
                 if (curKind != 0) {
                     // Enter edge: the local occupant knows WHICH furniture (inWhat).
@@ -677,24 +693,33 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
                     Character* oc = engine::resolve(e);
                     if (oc && engine::readFurniture(oc, &fr) && fr.valid &&
                         fr.kind == curKind) {
-                        EventPacket ev; memset(&ev, 0, sizeof(ev));
-                        ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_ENTER_FURNITURE;
-                        ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
-                        ev.sType = e.hType; ev.sContainer = e.hContainer;
-                        ev.sContainerSerial = e.hContainerSerial;
-                        ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
-                        ev.aType = fr.furn[0]; ev.aContainer = fr.furn[1];
-                        ev.aContainerSerial = fr.furn[2];
-                        ev.aIndex = fr.furn[3]; ev.aSerial = fr.furn[4];
-                        ev.arg = (f32)curKind;
-                        net.queueEvent(ev);
+                        if (curKind == 1 || curKind == 2) {
+                            if (hostRole_)
+                                queueFurnitureState(net, ownerId, occKey, true,
+                                                    curKind, fr.furn, 0, 0);
+                            else
+                                queueFurnitureIntent(net, ownerId, occKey, true,
+                                                     curKind, fr.furn, nowPub);
+                        } else {
+                            EventPacket ev; memset(&ev, 0, sizeof(ev));
+                            ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_ENTER_FURNITURE;
+                            ev.ownerId = ownerId; ev.eventId = nextEventId_++;
+                            ev.sType = e.hType; ev.sContainer = e.hContainer;
+                            ev.sContainerSerial = e.hContainerSerial;
+                            ev.sIndex = e.hIndex; ev.sSerial = e.hSerial;
+                            ev.aType = fr.furn[0]; ev.aContainer = fr.furn[1];
+                            ev.aContainerSerial = fr.furn[2];
+                            ev.aIndex = fr.furn[3]; ev.aSerial = fr.furn[4];
+                            ev.arg = (f32)curKind;
+                            net.queueEvent(ev);
+                            char b[176]; _snprintf(b, sizeof(b) - 1,
+                                "[furn] SEND ENTER id=%u occ=%u,%u furn=%u,%u kind=%d",
+                                ev.eventId, e.hIndex, e.hSerial, fr.furn[3], fr.furn[4],
+                                curKind);
+                            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        }
                         hb.furnKind = curKind;
                         for (int fi = 0; fi < 5; ++fi) hb.furn[fi] = fr.furn[fi];
-                        char b[176]; _snprintf(b, sizeof(b) - 1,
-                            "[furn] SEND ENTER id=%u occ=%u,%u furn=%u,%u kind=%d",
-                            ev.eventId, e.hIndex, e.hSerial, fr.furn[3], fr.furn[4],
-                            curKind);
-                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                     }
                 }
             }
@@ -754,48 +779,57 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (bufKeys2.find(hit->first) != bufKeys2.end()) continue;
             if (nowPub - hb.seenMs < FURN_GONE_MS) continue;
             const Key& ok = hit->first;
-            EventPacket ev; memset(&ev, 0, sizeof(ev));
-            ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_EXIT_FURNITURE;
-            ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
-            ev.sType = ok.t; ev.sContainer = ok.c; ev.sContainerSerial = ok.cs;
-            ev.sIndex = ok.i; ev.sSerial = ok.s;
-            ev.aType = hb.furn[0]; ev.aContainer = hb.furn[1];
-            ev.aContainerSerial = hb.furn[2];
-            ev.aIndex = hb.furn[3]; ev.aSerial = hb.furn[4];
-            ev.arg = (f32)hb.furnKind;
-            net.queueEvent(ev);
-            char b[176]; _snprintf(b, sizeof(b) - 1,
-                "[furn] SEND EXIT id=%u occ=%u,%u furn=%u,%u kind=%d (occupant left stream)",
-                ev.eventId, ok.i, ok.s, hb.furn[3], hb.furn[4], hb.furnKind);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            if (hb.furnKind == 1 || hb.furnKind == 2) {
+                if (hostRole_)
+                    queueFurnitureState(net, ownerId, ok, false, hb.furnKind,
+                                        hb.furn, 0, 0);
+                else
+                    queueFurnitureIntent(net, ownerId, ok, false, hb.furnKind,
+                                         hb.furn, nowPub);
+            } else {
+                EventPacket ev; memset(&ev, 0, sizeof(ev));
+                ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_EXIT_FURNITURE;
+                ev.ownerId = ownerId; ev.eventId = nextEventId_++;
+                ev.sType = ok.t; ev.sContainer = ok.c; ev.sContainerSerial = ok.cs;
+                ev.sIndex = ok.i; ev.sSerial = ok.s;
+                ev.aType = hb.furn[0]; ev.aContainer = hb.furn[1];
+                ev.aContainerSerial = hb.furn[2];
+                ev.aIndex = hb.furn[3]; ev.aSerial = hb.furn[4];
+                ev.arg = (f32)hb.furnKind;
+                net.queueEvent(ev);
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[furn] SEND EXIT id=%u occ=%u,%u furn=%u,%u kind=%d (occupant left stream)",
+                    ev.eventId, ok.i, ok.s, hb.furn[3], hb.furn[4], hb.furnKind);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
             hb.furnKind = 0;
             hb.furn[0] = hb.furn[1] = hb.furn[2] = hb.furn[3] = hb.furn[4] = 0;
         }
     }
 
-    // Third-party placement edges (protocol 36): drain the PEER-ENTER events
-    // applyTargets detected on peer-owned driven bodies (host = world
-    // authority; the occupant's owner applies them to its own KO'd body).
-    if (furnSync_ && !furnPeerPend_.empty()) {
-        for (unsigned int pi = 0; pi < furnPeerPend_.size(); ++pi) {
-            const PendFurnEnter& pe = furnPeerPend_[pi];
-            EventPacket ev; memset(&ev, 0, sizeof(ev));
-            ev.type = (u8)PKT_EVENT; ev.event = (u8)EVT_ENTER_FURNITURE;
-            ev.ownerId = ownerId;    ev.eventId = nextEventId_++;
-            ev.sType = pe.occ.t; ev.sContainer = pe.occ.c;
-            ev.sContainerSerial = pe.occ.cs;
-            ev.sIndex = pe.occ.i; ev.sSerial = pe.occ.s;
-            ev.aType = pe.furn[0]; ev.aContainer = pe.furn[1];
-            ev.aContainerSerial = pe.furn[2];
-            ev.aIndex = pe.furn[3]; ev.aSerial = pe.furn[4];
-            ev.arg = (f32)pe.kind;
-            net.queueEvent(ev);
-            char b[176]; _snprintf(b, sizeof(b) - 1,
-                "[furn] SEND PEER-ENTER id=%u occ=%u,%u furn=%u,%u kind=%d",
-                ev.eventId, pe.occ.i, pe.occ.s, pe.furn[3], pe.furn[4], pe.kind);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    // Host-only engine changes on a peer-owned captive (for example a guard
+    // jailing it) join the same canonical state stream as accepted intents.
+    if (furnSync_ && hostRole_ && !furnitureHostPend_.empty()) {
+        for (unsigned int pi = 0; pi < furnitureHostPend_.size(); ++pi) {
+            const PendFurnState& pe = furnitureHostPend_[pi];
+            queueFurnitureState(net, ownerId, pe.occ, pe.on, pe.kind,
+                                pe.furn, 0, 0);
         }
-        furnPeerPend_.clear();
+        furnitureHostPend_.clear();
+    }
+
+    // A Join retries the SAME sequence until an owner-scoped Host ack covers
+    // it. At rest this loop sends nothing; packet loss costs at most two seconds.
+    if (furnSync_ && !hostRole_) {
+        const unsigned long FURN_INTENT_RETRY_MS = 2000;
+        for (std::map<Key, FurnitureRow>::iterator fi = furnitureRows_.begin();
+             fi != furnitureRows_.end(); ++fi) {
+            FurnitureRow& row = fi->second;
+            if (row.pendingSeq == 0 || !hostIntentRetryDue(
+                    nowPub, row.pendingSendMs, FURN_INTENT_RETRY_MS)) continue;
+            queueFurnitureIntent(net, ownerId, fi->first, row.pendingOn,
+                                 row.pendingKind, row.pendingFurn, nowPub);
+        }
     }
     // Age out entities that left the interest set long ago (step 6): an unbounded
     // hostBody_ leaks a session's worth of passers-by. 60 s is far beyond any

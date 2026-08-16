@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+const u16 PROTOCOL_VERSION = 58;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -76,7 +76,9 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    // 49 and 50 are reserved by the sibling host-intent PRs (production/doors).
+    PKT_FURNITURE        = 51 // RELIABLE join intent / host-canonical bed+cage row (protocol 58)
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1175,6 +1177,30 @@ struct FixturePacket {
     char sid[48];  // building template GameData stringID - the match guard, so a
                    // wrong-but-nearby building can never be paired
     u8  classType; // BuildingClassType, second match guard
+};
+
+// ---- Protocol 58: host-canonical bed/cage occupancy -------------------------
+// The join sends an INTENT after its local engine performs an enter/exit. The
+// host applies that intent to its canonical copy and broadcasts the resulting
+// STATE with an owner-scoped acknowledgement. Reliable ordered delivery plus
+// monotonic sequences makes retries idempotent. Chained/pole prisoners remain
+// on the protocol-41 path; kind is deliberately restricted to bed(1)/cage(2).
+enum FurnitureWireMode {
+    FURNITURE_INTENT = 0,
+    FURNITURE_STATE  = 1
+};
+
+struct FurniturePacket {
+    u8  type;       // = PKT_FURNITURE
+    u8  mode;       // FurnitureWireMode
+    u8  on;         // desired/actual occupancy (0 exit, 1 enter)
+    u8  kind;       // 1 bed, 2 cage
+    u32 ownerId;    // sender (join for intent, host for canonical state)
+    u32 seq;        // per-sender monotonic sequence
+    u32 occupant[5];// save-stable occupant hand
+    u32 furniture[5];// save-stable bed/cage hand
+    u32 ackOwnerId; // requester whose intent this state acknowledges (0 if none)
+    u32 ackSeq;     // highest folded intent sequence for ackOwnerId
 };
 
 // ---- Protocol 27: placed-building sync --------------------------------------

@@ -147,9 +147,9 @@ public:
     // carried body is released back to the ordinary KO/down channels.
     void sweepCarries(GameWorld* gw);
 
-    // Furniture occupancy sync (protocol 19, default ON): reliable enter/exit
-    // edges + self-healing BODY_IN_BED/BODY_IN_CAGE state, executed engine-
-    // native (setBedMode/setPrisonMode) on each machine's local pair.
+    // Furniture occupancy sync (protocol 58, default ON): Join intent -> Host
+    // canonical state + owner-scoped ack, with BODY_IN_BED/BODY_IN_CAGE as a
+    // self-healing view. Applied engine-native (setBedMode/setPrisonMode).
     // KENSHICOOP_FURN_SYNC=0 disables.
     void setFurnSync(bool v) { furnSync_ = v; }
 
@@ -207,6 +207,12 @@ public:
     // onto the matching tracked body (death = held down permanently; revive clears).
     // gw is needed by the EVT_RECRUIT re-key (restoring a suppressed local body).
     void applyEvents(GameWorld* gw, Inbound& in);
+
+    // BEFORE engine: fold reliable Join bed/cage intents on the Host, or apply
+    // Host-canonical state on the Join. Also records the real role for the
+    // continuous furniture self-heal (streamNpcs_ is not host-only under cells).
+    void applyFurniturePackets(GameWorld* gw, Inbound& in, NetLink& net,
+                               u32 localId, bool isHost);
 
     // BEFORE engine: capture the locally-owned squad and publish it (host side).
     // Also detects per-entity bodyState transitions (KO/death/revive) and queues the
@@ -877,9 +883,6 @@ private:
         unsigned long furnNoSeeTick;  // first tick a locally-occupying copy's stream
                                       //   stopped reporting the occupancy bit (the
                                       //   debounced owner-side-exit detector)
-        // Third-party placement (protocol 36): last time the host authored a
-        // PEER-ENTER for this peer-owned driven body (re-author throttle).
-        unsigned long furnPeerTick;
         // Chained/pole prisoner (protocol 41): the OWNER hand last seen for this
         // body while it was locally chained, so a lost/late reliable ENTER (or
         // an AI break-out) can be self-healed by re-applying setChainedMode -
@@ -956,7 +959,7 @@ private:
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
-                   furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
+                   furnHealTick(0), furnNoSeeTick(0),
                    haveChainOwner(false), chainHealTick(0),
                    sneakTick(0), proneTick(0), crawlDrive(false),
                    velPeak(0.0f), moveSeenMs(0), wasMoving(false),
@@ -1002,7 +1005,8 @@ private:
         // edge exactly once per transition. carried = the carried body's hand
         // (readObjectHand layout), meaningful only while carrying.
         bool carrying; unsigned int carried[5];
-        // Furniture occupancy (protocol 19): last published occupancy of this
+        // Furniture occupancy (protocol 58 for bed/cage; protocol 41 for chain):
+        // last published occupancy of this
         // entity (0 none / 1 bed / 2 cage) + the furniture's hand (captured
         // from the local Character on the ENTER edge), so publishOwned can
         // emit the reliable enter/exit edge exactly once per transition and
@@ -1342,17 +1346,48 @@ private:
     struct JailObs { int kind; float x, y, z; unsigned long ms;
                      JailObs() : kind(0), x(0), y(0), z(0), ms(0) {} };
     std::map<Key, JailObs>    jailObs_;
-    // Third-party furniture placement (protocol 36): ENTER edges detected on
-    // peer-owned driven bodies in applyTargets (a guard jailing an arrested
-    // player runs purely on the host sim, so the occupant's owner can never
-    // author the designed occupant-owner edge). Buffered here because
-    // applyTargets has no NetLink; publishOwned drains them onto the wire.
-    struct PendFurnEnter { Key occ; unsigned int furn[5]; int kind; };
-    std::vector<PendFurnEnter> furnPeerPend_;
-    // When WE last authored an owner-side EXIT for an own hand: an in-flight
-    // (5 s re-author window) PEER-ENTER must not re-jail a body its owner
-    // just freed - the exit-vs-reauthor race guard.
-    std::map<Key, unsigned long> ownFurnExit_;
+    // Host-canonical bed/cage occupancy (protocol 58). One row per occupant is
+    // both the Host's authority ledger and the Join's last accepted Host row.
+    // `pending*` is the Join's optimistic local intent held until an owner-
+    // scoped ack; `apply*` retains a canonical row until the world object loads.
+    struct FurnitureRow {
+        bool seeded, on;
+        int kind;
+        unsigned int furn[5];
+        u32 stateSeqSeen;
+        bool applyPending, applyOn;
+        int applyKind;
+        unsigned int applyFurn[5];
+        u32 pendingSeq;
+        bool pendingOn;
+        int pendingKind;
+        unsigned int pendingFurn[5];
+        unsigned long pendingSendMs;
+        std::map<u32, u32> intentSeen;
+        FurnitureRow()
+            : seeded(false), on(false), kind(0), stateSeqSeen(0),
+              applyPending(false), applyOn(false), applyKind(0),
+              pendingSeq(0), pendingOn(false), pendingKind(0), pendingSendMs(0) {
+            for (int i = 0; i < 5; ++i)
+                furn[i] = applyFurn[i] = pendingFurn[i] = 0;
+        }
+    };
+    std::map<Key, FurnitureRow> furnitureRows_;
+    // applyTargets has no NetLink. Host-only third-party changes (a guard puts
+    // a peer PC in a cage) are queued here and published before the next engine
+    // tick. `on=false` is also supported so removals converge through one path.
+    struct PendFurnState { Key occ; unsigned int furn[5]; int kind; bool on; };
+    std::vector<PendFurnState> furnitureHostPend_;
+    u32 furnitureIntentSeqOut_;
+    u32 furnitureStateSeqOut_;
+    bool hostRole_;
+    void queueFurnitureIntent(NetLink& net, u32 ownerId, const Key& occ,
+                              bool on, int kind, const unsigned int furn[5],
+                              unsigned long now);
+    void queueFurnitureState(NetLink& net, u32 ownerId, const Key& occ,
+                             bool on, int kind, const unsigned int furn[5],
+                             u32 ackOwnerId, u32 ackSeq);
+    Character* characterForFurnitureKey(const Key& occ) const;
     InterpConfig          cfg_;
     float                 catchupK_;  // walk-drive gap-proportional speed gain
     float                 snapDist_;  // moving-body hard-snap distance floor (u)

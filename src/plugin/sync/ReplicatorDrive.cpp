@@ -487,7 +487,7 @@ void Replicator::applyTargets(GameWorld* gw) {
                 continue;
             }
         }
-        // ---- Furniture carve-out + self-heal (protocol 19) ----------------------
+        // ---- Furniture carve-out + self-heal (protocols 58 / 41) ----------------
         // A body in a bed/cage (streamed BODY_IN_BED/BODY_IN_CAGE, or LOCALLY
         // occupying - the local placement may lead/trail the stream by a beat) is
         // transform-owned by its furniture attach: the down override and any
@@ -541,19 +541,65 @@ void Replicator::applyTargets(GameWorld* gw) {
             }
         }
         if (furnSync_ && !engine::taskIsBedPose((int)out.task)) {
-            // Chained/pole prisoner (protocol 41) rides this carve-out as
-            // kind=3 (Character::isChained). Gated by chainSync_ so it can be
-            // turned off without disabling bed/cage occupancy.
-            int streamKind = (out.bodyState & BODY_IN_BED) ? 1
-                           : ((out.bodyState & BODY_IN_CAGE) ? 2
-                           : ((chainSync_ && (out.bodyState & BODY_CHAINED)) ? 3 : 0));
             engine::FurnitureRead lfr;
             bool haveFr = engine::readFurniture(c, &lfr);
             int localKind = (haveFr && lfr.valid) ? lfr.kind : 0;
             if (localKind == 3 && !chainSync_) localKind = 0;
+
+            // Protocol 58: on the Host, the continuous owner stream is evidence,
+            // never authority, for bed/cage bits. First fold any real Host-engine
+            // change (including a guard placing/removing a captive), then rebuild
+            // those two bits from the canonical row. This closes the bypass where
+            // a fast Join body packet could undo a reliable Host verdict.
+            u16 furnitureState = out.bodyState;
+            Key furnitureKey = keyOf(out);
+            if (hostRole_) {
+                FurnitureRow& row = furnitureRows_[furnitureKey];
+                int localSeatKind = (localKind == 1 || localKind == 2) ? localKind : 0;
+                if (!row.seeded) {
+                    row.seeded = true; row.on = localSeatKind != 0;
+                    row.kind = localSeatKind;
+                    for (int fi = 0; fi < 5; ++fi)
+                        row.furn[fi] = localSeatKind ? lfr.furn[fi] : 0;
+                } else {
+                    bool changed = (row.on ? row.kind : 0) != localSeatKind;
+                    for (int fi = 0; !changed && localSeatKind && fi < 5; ++fi)
+                        changed = row.furn[fi] != lfr.furn[fi];
+                    if (changed) {
+                        // Host simulation changed the actual attachment. Queue an
+                        // EXIT for the old anchor before an ENTER for a new one so
+                        // even the rare direct cage->bed switch remains applicable.
+                        if (row.on) {
+                            PendFurnState pe;
+                            pe.occ = furnitureKey; pe.on = false; pe.kind = row.kind;
+                            for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = row.furn[fi];
+                            furnitureHostPend_.push_back(pe);
+                        }
+                        if (localSeatKind) {
+                            PendFurnState pe;
+                            pe.occ = furnitureKey; pe.on = true; pe.kind = localSeatKind;
+                            for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = lfr.furn[fi];
+                            furnitureHostPend_.push_back(pe);
+                        }
+                        row.on = localSeatKind != 0; row.kind = localSeatKind;
+                        for (int fi = 0; fi < 5; ++fi)
+                            row.furn[fi] = localSeatKind ? lfr.furn[fi] : 0;
+                    }
+                }
+                furnitureState &= (u16)~(BODY_IN_BED | BODY_IN_CAGE);
+                if (row.on && row.kind == 1) furnitureState |= BODY_IN_BED;
+                if (row.on && row.kind == 2) furnitureState |= BODY_IN_CAGE;
+            }
+            // Chained/pole prisoner (protocol 41) rides this carve-out as
+            // kind=3 (Character::isChained). Gated by chainSync_ so it can be
+            // turned off without disabling bed/cage occupancy.
+            int streamKind = (furnitureState & BODY_IN_BED) ? 1
+                           : ((furnitureState & BODY_IN_CAGE) ? 2
+                           : ((chainSync_ && (furnitureState & BODY_CHAINED)) ? 3 : 0));
             // Jail put-to-work desync spike (KENSHICOOP_JAIL_PROBE, read-only):
             // the DRIVEN view of a peer-owned captive (the host's copy of the
-            // join's jailed PC). streamKind is what the owner reports;
+            // join's jailed PC). On the Join streamKind is what the Host reports;
+            // on the Host it is the canonical row rebuilt above.
             // localKind is where our copy actually sits. A streamKind=2/3 with
             // localKind=0 (or vice-versa) is the twitch. Pairs with side=own.
             if (jailProbe_ && (streamKind != 0 || localKind != 0)) {
@@ -596,7 +642,7 @@ void Replicator::applyTargets(GameWorld* gw) {
             // unified drive owns transform AND task for chained bodies (it
             // AI-suspends driven bodies itself; applyRest reproduces the
             // host's work pose at rest). Cage/bed (kinds 1-2) remain true
-            // transform anchors below - BUT only when the OWNER streams them.
+            // transform anchors below, driven by protocol 58's Host row.
             if (streamKind == 3) {
                 // Unvouched local bed/cage while the owner streams chained-
                 // not-caged (world_parity camp, Flashbox): the host's guards
@@ -739,44 +785,9 @@ void Replicator::applyTargets(GameWorld* gw) {
                     out.hIndex, out.hSerial, ok ? 1 : 0);
                 bfe[sizeof(bfe) - 1] = '\0'; coop::logLine(bfe);
             } else if (localKind != 0) {
-                // Third-party placement authority (protocol 36): a HOST-sim
-                // actor (a guard jailing an arrested player) put this PEER-
-                // OWNED squad body into furniture. The occupant's owner never
-                // sees the action, so the occupant-owner ENTER can't fire -
-                // the owner's stream keeps reporting no bit and the debounced
-                // HEAL EXIT below ejected the body every 3 s ("the host kept
-                // taking it out of the cage", 2026-07-09). The host is the
-                // world authority for NPC actions: author the ENTER for the
-                // owner (buffered; publishOwned sends), HOLD the self-heal
-                // exit while it crosses, and re-author every FURN_PEER_MS
-                // until the owner's stream carries the bit. KO'd/down bodies
-                // only - a conscious voluntary use stays owner-authored, which
-                // (protocol 53) is why the crawlers are excluded by name: a
-                // crippled body reads Character::isDown() while conscious, so
-                // plain bodyIsDown would have us author bed-enters for someone
-                // who crawled past a bed under their own control.
-                bool downish = coop::bodyDownNotCrawling(out.bodyState) ||
-                               d.koLatched || d.deathLatched ||
-                               coop::bodyDownNotCrawling(engine::readBodyState(c));
-                if (streamNpcs_ && isSquad && downish) {
-                    if (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS) {
-                        d.furnPeerTick = now;
-                        PendFurnEnter pe;
-                        pe.occ = keyOf(out);
-                        for (int fi = 0; fi < 5; ++fi) pe.furn[fi] = lfr.furn[fi];
-                        pe.kind = localKind;
-                        furnPeerPend_.push_back(pe);
-                        char b[160]; _snprintf(b, sizeof(b) - 1,
-                            "[furn] PEER-ENTER author occ=%u,%u furn=%u,%u kind=%d",
-                            out.hIndex, out.hSerial, lfr.furn[3], lfr.furn[4],
-                            localKind);
-                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-                    }
-                    d.furnNoSeeTick = 0; // never self-heal-eject a host placement
-                    d.parked = false; d.haveDest = false;
-                    if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
-                    continue;
-                }
+                // Join-only local attachment without a Host row: debounce before
+                // ejecting it. On the Host, real local changes were folded into
+                // the canonical row above and never reach this branch.
                 if (d.furnNoSeeTick == 0) {
                     d.furnNoSeeTick = now;
                 } else if ((now - d.furnNoSeeTick) > FURN_EXIT_MS) {

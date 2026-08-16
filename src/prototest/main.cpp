@@ -25,6 +25,7 @@
 
 #include "../netproto/Wire.h"
 #include "../netproto/ContentHash.h"
+#include "../netproto/HostIntent.h"
 #include "../plugin/sync/Interp.h"
 #include "../plugin/core/OwnRanks.h"
 #include "../plugin/core/SteamId.h"
@@ -118,6 +119,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(DeedPacket)",              sizeof(DeedPacket),              78); // v54: deeds
     CHECK_EQ("sizeof(FixturePacket)",           sizeof(FixturePacket),           90); // v55: fixture identity
+    CHECK_EQ("sizeof(FurniturePacket)",         sizeof(FurniturePacket),         60); // v58: bed/cage intent+state
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
     CHECK_EQ("sizeof(CellClaimPacket)",         sizeof(CellClaimPacket),         21); // v49: cell claim
     CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        18); // v50: transfer verdict
@@ -310,8 +312,10 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v55: runtime-fixture identity)",
-             (int)PROTOCOL_VERSION, 55);
+    CHECK_EQ("PROTOCOL_VERSION (v58: host-canonical furniture)",
+             (int)PROTOCOL_VERSION, 58);
+    CHECK_EQ("PKT_FURNITURE reserved id", (int)PKT_FURNITURE, 51);
+    CHECK("furniture modes distinct", FURNITURE_INTENT != FURNITURE_STATE);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -495,6 +499,7 @@ static void testRoundTrips() {
     roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
     roundTrip<DeedPacket>("DeedPacket", (u8)PKT_DEED);
     roundTrip<FixturePacket>("FixturePacket", (u8)PKT_FIXTURE);
+    roundTrip<FurniturePacket>("FurniturePacket", (u8)PKT_FURNITURE);
     roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
     roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
 
@@ -1382,6 +1387,7 @@ static void testFlushWorldStateContract() {
     ResearchPacket  rp;  std::memset(&rp,  0, sizeof(rp));
     DeedPacket      de;  std::memset(&de,  0, sizeof(de));
     FixturePacket   fx;  std::memset(&fx,  0, sizeof(fx));
+    FurniturePacket fn;  std::memset(&fn,  0, sizeof(fn));
     BuildPlacePacket  bp; std::memset(&bp,  0, sizeof(bp));
     BuildStatePacket  bs; std::memset(&bs,  0, sizeof(bs));
     BuildDoorPacket   bd; std::memset(&bd,  0, sizeof(bd));
@@ -1402,7 +1408,7 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (34).
+    // --- Push one sentinel into every WORLD-STATE queue (35).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1427,6 +1433,7 @@ static void testFlushWorldStateContract() {
     in.pushResearch(1, rp);
     in.pushDeed(1, de);
     in.pushFixture(1, fx);
+    in.pushFurniture(1, fn);
     in.pushBuildPlace(1, bp);
     in.pushBuildState(1, bs);
     in.pushBuildDoor(1, bd);
@@ -1480,6 +1487,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("research",    InboundResearch,    drainResearch);
     WS_EMPTY("deed",        InboundDeed,        drainDeed);
     WS_EMPTY("fixture",     InboundFixture,     drainFixture);
+    WS_EMPTY("furniture",   InboundFurniture,   drainFurniture);
     WS_EMPTY("buildPlace",  InboundBuildPlace,  drainBuildPlace);
     WS_EMPTY("buildState",  InboundBuildState,  drainBuildState);
     WS_EMPTY("buildDoor",   InboundBuildDoor,   drainBuildDoor);
@@ -1766,6 +1774,30 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+static void testHostIntentPolicy() {
+    std::printf("== host-canonical intent sequencing ==\n");
+    CHECK("intent seq zero rejected", !hostIntentIsNew(0, 0));
+    CHECK("first intent accepted", hostIntentIsNew(0, 1));
+    CHECK("newer intent accepted", hostIntentIsNew(7, 8));
+    CHECK("duplicate intent folded once", !hostIntentIsNew(7, 7));
+    CHECK("older intent rejected", !hostIntentIsNew(7, 6));
+
+    CHECK("owner-scoped ack covers pending",
+          hostIntentAckCovers(2, 9, 2, 9));
+    CHECK("newer owner-scoped ack covers pending",
+          hostIntentAckCovers(2, 9, 2, 10));
+    CHECK("other owner's ack cannot clear pending",
+          !hostIntentAckCovers(2, 9, 3, 10));
+    CHECK("older ack cannot clear pending",
+          !hostIntentAckCovers(2, 9, 2, 8));
+    CHECK("no pending intent cannot be acked",
+          !hostIntentAckCovers(2, 0, 2, 10));
+
+    CHECK("unsent intent is due", hostIntentRetryDue(1000, 0, 2000));
+    CHECK("intent holds before retry", !hostIntentRetryDue(2999, 1000, 2000));
+    CHECK("intent retries on boundary", hostIntentRetryDue(3000, 1000, 2000));
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1774,6 +1806,7 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testHostIntentPolicy();
     testRoundTrips();
     testFraming();
     testSaveCrc();

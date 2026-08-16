@@ -226,6 +226,8 @@ void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pk
 
 void NetLink::queueFixture(const FixturePacket& pkt) { pushLocked(outCs_, outFixture_, pkt); }
 
+void NetLink::queueFurniture(const FurniturePacket& pkt) { pushLocked(outCs_, outFurniture_, pkt); }
+
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
 void NetLink::queueBuildState(const BuildStatePacket& pkt) { pushLocked(outCs_, outBuildState_, pkt); }
@@ -787,6 +789,18 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fxp)
                             && inbound_) {
                             inbound_->pushFixture(fxp.ownerId, fxp);
+                        }
+                    } else if (type == PKT_FURNITURE) {
+                        // Reliable join intent / host-canonical bed+cage row (v58).
+                        FurniturePacket fp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &fp)
+                            && inbound_) {
+                            // Unlike legacy owner-tagged rows, intents need the
+                            // transport identity so a payload cannot impersonate
+                            // another owner. The server is always owner 0.
+                            u32 senderId = isHost_
+                                ? (u32)(size_t)ev.peer->data : (u32)0;
+                            inbound_->pushFurniture(senderId, fp);
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -1523,6 +1537,25 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < fixPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&fixPkts[i], sizeof(FixturePacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Bed/cage intent and canonical state share one reliable ordered shape
+        // (protocol 58). The join sends intents to the server; the host only
+        // queues canonical rows and therefore broadcasts them.
+        std::vector<FurniturePacket> furniturePkts;
+        EnterCriticalSection(&outCs_);
+        furniturePkts.swap(outFurniture_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < furniturePkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&furniturePkts[i], sizeof(FurniturePacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

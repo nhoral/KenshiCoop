@@ -66,6 +66,7 @@ Replicator::Replicator()
       attnFlips_(0), attnWinMs_(0), attnBaseSupp_(0), attnBaseCull_(0),
       attnBaseProxy_(0), attnVetoMs_(0), attnVetoRawN_(0), attnVetoMask_(0),
       auditRows_(false), jailProbe_(false), jailObserve_(false),
+      furnitureIntentSeqOut_(1), furnitureStateSeqOut_(1), hostRole_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedCombatCap_(true),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
@@ -236,8 +237,10 @@ void Replicator::resetSession() {
     attnVetoMs_ = 0;
     attnVetoRawN_ = 0;
     attnVetoMask_ = 0;
-    furnPeerPend_.clear();
-    ownFurnExit_.clear();
+    furnitureRows_.clear();
+    furnitureHostPend_.clear();
+    furnitureIntentSeqOut_ = 1;
+    furnitureStateSeqOut_ = 1;
     // Session maps + change-gate baselines (they describe the OLD world; the
     // reloaded save re-seeds them on first sample).
     ownBuilds_.clear();

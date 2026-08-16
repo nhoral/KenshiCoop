@@ -33,6 +33,7 @@
 #include "../core/DeathLatch.h" // rekeyCarryLatch (down/death latch carry on re-key)
 #include "ChangeGate.h" // Phase 6: shared change-gated send/accept policy
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
+#include "../../netproto/HostIntent.h" // monotonic intent/ack/retry policy
 #include "../CoopLog.h"
 
 #include <windows.h> // GetTickCount
@@ -183,12 +184,10 @@ const unsigned long ATTR_WINDOW_MS = 3000; // remember a combatant's victim this
 const unsigned long CARRY_HEAL_MS = 1500; // min gap between self-heal pickups
 const unsigned long CARRY_DROP_MS = 3000; // stream must stop reporting the carry
                                           // this long before the local copy drops
-// Furniture occupancy sync (protocol 19): same shape as the carry self-heal.
+// Furniture occupancy sync (protocol 58): same shape as the carry self-heal.
 const unsigned long FURN_HEAL_MS = 1500;  // min gap between self-heal enters
 const unsigned long FURN_EXIT_MS = 3000;  // stream must stop reporting occupancy
                                           // this long before the local copy exits
-const unsigned long FURN_PEER_MS = 5000;  // third-party PEER-ENTER re-author gap
-                                          // (protocol 36: guard jails a peer PC)
 const float FURN_MATCH_DIST = 6.0f;       // self-heal fixture search radius around
                                           // the streamed occupant position
 // Stealth sync (protocol 20). The posture is CONTINUOUS state (a pure bool in

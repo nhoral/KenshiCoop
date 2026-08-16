@@ -1063,6 +1063,9 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // Phase 4a: drain received container-contents snapshots into the per-container
         // cache (reconciled after the engine tick by applyInventories).
         g_repl.ingestInv(g_inbound);
+        // Fold reliable bed/cage intents before the generic event channel. The
+        // Host's canonical decision is therefore visible to publish/drive in this tick.
+        g_repl.applyFurniturePackets(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
         // Both clients latch reliable transition events (KO/death/revive) for the bodies
         // they drive, before apply (a side can emit an event for its own owned body and
         // the peer that drives that body must honour it).
