@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+const u16 PROTOCOL_VERSION = 59;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -53,10 +53,10 @@ enum PacketType {
     PKT_FACTION          = 22,// RELIABLE player-faction relation row (protocol 24); FactionPacket
     PKT_TIME             = 23,// RELIABLE host-authoritative game clock (protocol 25); TimePacket
     PKT_DOOR             = 24,// RELIABLE baked-door open/lock state row (protocol 26); DoorPacket
-    PKT_BUILD_PLACE      = 25,// RELIABLE placed-building describe/mint (protocol 27); BuildPlacePacket
-    PKT_BUILD_STATE      = 26,// RELIABLE placer-authoritative construction progress (protocol 27); BuildStatePacket
+    PKT_BUILD_PLACE      = 25,// RELIABLE Host-canonical placed-building result; BuildPlacePacket
+    PKT_BUILD_STATE      = 26,// RELIABLE Host-canonical construction progress; BuildStatePacket
     PKT_BUILD_DOOR       = 27,// RELIABLE placed-building door row, translated key (protocol 28); BuildDoorPacket
-    PKT_BUILD_REMOVE     = 28,// RELIABLE placer-authoritative building removal (protocol 28); BuildRemovePacket
+    PKT_BUILD_REMOVE     = 28,// RELIABLE Host-canonical building removal; BuildRemovePacket
     PKT_SAVE_REQ         = 29,// RELIABLE join save request (join -> host, protocol 31); SaveReqPacket
     PKT_SAVE_BEGIN       = 30,// RELIABLE save-transfer announce (host -> join, protocol 31); SaveBeginPacket
     PKT_SAVE_FILE        = 31,// RELIABLE save-file chunk (host -> join, protocol 31); SaveFileHeader + path + payload
@@ -76,7 +76,9 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    // 49-51 are reserved by the sibling production, door and furniture intent PRs.
+    PKT_BUILD_INTENT     = 52 // RELIABLE join -> host place/remove request (protocol 59); BuildIntentPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1182,9 +1184,9 @@ struct FixturePacket {
 // session (build_probe: minted-site hand intersection across clients is zero),
 // so the wire key is the PLACER's local hand and the receiver keeps a
 // key -> local-hand translation map, exactly the protocol-21 proxy precedent
-// for structures. The PLACER is the authority for its building's construction
-// progress (the describe/mint edge names the authority implicitly - whoever
-// announced the key streams its state).
+// for structures. Protocol 59 keeps that identity but makes the HOST the only
+// authority for existence, construction progress and removal. A Join placement
+// is an optimistic local preview plus an idempotent request, never a state row.
 //
 // PLACE announces one local placement (the UI commit detour on
 // PreviewBuilding::placeFinalPreviewBuilding, or a programmatic scenario
@@ -1196,8 +1198,8 @@ struct FixturePacket {
 // resends) are deduped by the translation map.
 struct BuildPlacePacket {
     u8  type;      // = PKT_BUILD_PLACE
-    u32 ownerId;   // network player id of the sender (the placer = the authority)
-    u32 seq;       // per-sender monotonic (diagnostics/ordering)
+    u32 ownerId;   // network player id of the sender (always the Host in v59)
+    u32 seq;       // Host-monotonic canonical-state sequence
     // the placed building's hand IN THE PLACER'S SESSION (the wire key)
     u32 key[5];
     char sid[48];  // building template GameData stringID
@@ -1206,10 +1208,14 @@ struct BuildPlacePacket {
     f32 z;
     f32 yaw;       // radians
     u8  fromUi;    // 1 = real build-mode commit, 0 = programmatic (diagnostics)
+    u8  accepted;  // 1 = canonical building exists, 0 = Host rejected the intent
+    u32 ackOwnerId;// Join whose latest placement intent this row answers
+    u32 ackSeq;    // 0 = unsolicited state; otherwise covers <= this intent seq
 };
 
-// One construction-progress row for a building the SENDER placed (keyed by
-// the sender's hand = the PLACE key). Change-gated ~1 Hz with a 10 s safety
+// One Host-canonical construction-progress row. The stable session key remains
+// the original placer's hand, but only the Host samples and publishes progress.
+// Change-gated ~1 Hz with a 10 s safety
 // resend while incomplete; complete=1 latches (the engine self-completes at
 // progress >= 1.0 through its own setter - scaffold off, navmesh updated).
 // A receiver whose translation map lacks the key skips the row silently
@@ -1217,8 +1223,8 @@ struct BuildPlacePacket {
 // latter transient).
 struct BuildStatePacket {
     u8  type;      // = PKT_BUILD_STATE
-    u32 ownerId;   // network player id of the sender (the placer)
-    u32 seq;       // per-sender monotonic (stale-row guard)
+    u32 ownerId;   // network player id of the sender (the Host)
+    u32 seq;       // Host-monotonic (stale-row guard)
     u32 key[5];    // the PLACER's hand for the building (translation-map key)
     f32 progress;  // ConstructionState::constructionProgress (0..1 while building)
     u8  complete;  // 1 = ConstructionState::isComplete (latched)
@@ -1245,17 +1251,41 @@ struct BuildDoorPacket {
     u8  locked;    // 1 = DoorLock engaged (applied only when the door has one)
 };
 
-// Placer-authoritative removal of a session-placed building: the dismantle
-// detour (UI path) or a programmatic destroy queues the edge; the receiver
-// destroys its mapped proxy through the engine's own GameWorld::destroy and
-// tombstones the translation entry (later rows for the key skip silently).
-// Only buildings in the session's build maps ever stream removal - baked
-// buildings are untouched by this channel.
+// Host-canonical removal result for a session-placed building. A Join asks with
+// BuildIntentPacket and keeps retrying the same seq until this state acks it.
 struct BuildRemovePacket {
     u8  type;    // = PKT_BUILD_REMOVE
-    u32 ownerId; // network player id of the sender (the placer)
-    u32 seq;     // per-sender monotonic
+    u32 ownerId; // network player id of the sender (the Host)
+    u32 seq;     // Host-monotonic canonical-state sequence
     u32 key[5];  // the PLACER's hand for the removed building
+    u8  accepted;// 1 = Host canonical state is removed, 0 = unknown/rejected key
+    u32 ackOwnerId;
+    u32 ackSeq;
+};
+
+enum BuildIntentOp {
+    BUILD_INTENT_PLACE  = 1,
+    BUILD_INTENT_REMOVE = 2
+};
+
+// Protocol 59 Join -> Host request. Placement is intentionally optimistic: the
+// Join has already committed its local preview, and the stable key is that local
+// hand. The Host validates and mints its canonical copy under the same wire key,
+// then acknowledges with BuildPlacePacket. Removal likewise reports a local UI
+// dismantle, but only the Host publishes the canonical tombstone. Reliable
+// retries reuse seq, making both operations idempotent.
+struct BuildIntentPacket {
+    u8  type;      // = PKT_BUILD_INTENT
+    u32 ownerId;   // requesting Join's network player id
+    u32 seq;       // per-Join monotonic; retries reuse the same seq
+    u8  op;        // BuildIntentOp
+    u32 key[5];    // original placer's stable session key
+    char sid[48];  // PLACE only
+    f32 x;
+    f32 y;
+    f32 z;
+    f32 yaw;
+    u8  fromUi;    // PLACE only
 };
 
 // ---- Protocol 20: stealth detection-map snapshot ---------------------------

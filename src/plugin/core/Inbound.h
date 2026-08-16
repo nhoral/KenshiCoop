@@ -222,6 +222,13 @@ struct InboundBuildRemove {
     BuildRemovePacket pkt;
 };
 
+// One reliable Join -> Host placement/removal request (protocol 59). ownerId is
+// stamped from the actual ENet peer rather than trusted from the packet body.
+struct InboundBuildIntent {
+    u32               ownerId;
+    BuildIntentPacket pkt;
+};
+
 // One received machine state row (protocol 33): the HOST's authoritative
 // power/production/farm state for a machine; the join resolves the key
 // (baked hand or protocol-27 placer key) and applies through the engine's
@@ -431,7 +438,8 @@ public:
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
-        buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
+        buildDoor_(worldReset_),  buildRemove_(worldReset_), buildIntent_(worldReset_),
+        stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
         cellClaim_(worldReset_, 64) {
         InitializeCriticalSection(&cs_);
@@ -625,6 +633,11 @@ public:
         InboundBuildRemove ibr; ibr.ownerId = ownerId; ibr.pkt = pkt;
         EnterCriticalSection(&cs_); buildRemove_.push_back(ibr); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one reliable Join -> Host build request (protocol 59).
+    void pushBuildIntent(u32 ownerId, const BuildIntentPacket& pkt) {
+        InboundBuildIntent ibi; ibi.ownerId = ownerId; ibi.pkt = pkt;
+        EnterCriticalSection(&cs_); buildIntent_.push_back(ibi); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received stealth detection-map snapshot, owner-tagged.
     void pushStealth(u32 ownerId, const StealthPacket& pkt) {
         InboundStealth isl; isl.ownerId = ownerId; isl.pkt = pkt;
@@ -781,6 +794,9 @@ public:
     void drainBuildRemove(std::deque<InboundBuildRemove>& out) {
         EnterCriticalSection(&cs_); out.swap(buildRemove_); LeaveCriticalSection(&cs_);
     }
+    void drainBuildIntents(std::deque<InboundBuildIntent>& out) {
+        EnterCriticalSection(&cs_); out.swap(buildIntent_); LeaveCriticalSection(&cs_);
+    }
     void drainMoney(std::deque<InboundMoney>& out) {
         EnterCriticalSection(&cs_); out.swap(money_); LeaveCriticalSection(&cs_);
     }
@@ -894,6 +910,7 @@ private:
     WorldQ<InboundBuildState>      buildState_;
     WorldQ<InboundBuildDoor>       buildDoor_;
     WorldQ<InboundBuildRemove>     buildRemove_;
+    WorldQ<InboundBuildIntent>     buildIntent_;
     WorldQ<InboundStealth>         stealth_;
     WorldQ<InboundSpawnReq>        spawnReq_;
     WorldQ<InboundSpawnInfo>       spawnInfo_;

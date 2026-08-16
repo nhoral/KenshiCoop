@@ -30,6 +30,7 @@
 #include "../plugin/core/SteamId.h"
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
+#include "../plugin/core/HostIntent.h" // protocol 59 reusable intent/ack policy
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
@@ -101,10 +102,11 @@ static void testSizes() {
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
     CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              17);
     CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              31);
-    CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),        94);
+    CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),       103);
     CHECK_EQ("sizeof(BuildStatePacket)",        sizeof(BuildStatePacket),        34);
     CHECK_EQ("sizeof(BuildDoorPacket)",         sizeof(BuildDoorPacket),         32);
-    CHECK_EQ("sizeof(BuildRemovePacket)",       sizeof(BuildRemovePacket),       29);
+    CHECK_EQ("sizeof(BuildRemovePacket)",       sizeof(BuildRemovePacket),       38);
+    CHECK_EQ("sizeof(BuildIntentPacket)",       sizeof(BuildIntentPacket),       95);
     CHECK_EQ("sizeof(SaveReqPacket)",           sizeof(SaveReqPacket),           57);
     CHECK_EQ("sizeof(SaveBeginPacket)",         sizeof(SaveBeginPacket),         67);
     CHECK_EQ("sizeof(SaveFileHeader)",          sizeof(SaveFileHeader),          19);
@@ -310,8 +312,13 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v55: runtime-fixture identity)",
-             (int)PROTOCOL_VERSION, 55);
+    CHECK_EQ("PROTOCOL_VERSION (v59: host-canonical build intents)",
+             (int)PROTOCOL_VERSION, 59);
+    CHECK("PKT_BUILD_INTENT reserves series slot 52",
+          (int)PKT_BUILD_INTENT == 52 && PKT_BUILD_INTENT != PKT_BUILD_PLACE &&
+          PKT_BUILD_INTENT != PKT_BUILD_REMOVE && PKT_BUILD_INTENT != PKT_FIXTURE);
+    CHECK("build intent operations distinct",
+          BUILD_INTENT_PLACE != BUILD_INTENT_REMOVE && BUILD_INTENT_PLACE != 0);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -482,6 +489,7 @@ static void testRoundTrips() {
     roundTrip<BuildStatePacket>("BuildStatePacket", (u8)PKT_BUILD_STATE);
     roundTrip<BuildDoorPacket>("BuildDoorPacket", (u8)PKT_BUILD_DOOR);
     roundTrip<BuildRemovePacket>("BuildRemovePacket", (u8)PKT_BUILD_REMOVE);
+    roundTrip<BuildIntentPacket>("BuildIntentPacket", (u8)PKT_BUILD_INTENT);
     roundTrip<StealthPacket>("StealthPacket", (u8)PKT_STEALTH);
     roundTrip<SpawnReqPacket>("SpawnReqPacket", (u8)PKT_SPAWN_REQ);
     roundTrip<SpawnInfoPacket>("SpawnInfoPacket", (u8)PKT_SPAWN_INFO);
@@ -1386,6 +1394,7 @@ static void testFlushWorldStateContract() {
     BuildStatePacket  bs; std::memset(&bs,  0, sizeof(bs));
     BuildDoorPacket   bd; std::memset(&bd,  0, sizeof(bd));
     BuildRemovePacket br; std::memset(&br,  0, sizeof(br));
+    BuildIntentPacket bi; std::memset(&bi,  0, sizeof(bi));
     StealthPacket   sl;  std::memset(&sl,  0, sizeof(sl));
     SpawnReqPacket  sq;  std::memset(&sq,  0, sizeof(sq));
     SpawnInfoPacket si;  std::memset(&si,  0, sizeof(si));
@@ -1431,6 +1440,7 @@ static void testFlushWorldStateContract() {
     in.pushBuildState(1, bs);
     in.pushBuildDoor(1, bd);
     in.pushBuildRemove(1, br);
+    in.pushBuildIntent(1, bi);
     in.pushStealth(1, sl);
     in.pushSpawnReq(1, sq);
     in.pushSpawnInfo(1, si);
@@ -1484,6 +1494,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("buildState",  InboundBuildState,  drainBuildState);
     WS_EMPTY("buildDoor",   InboundBuildDoor,   drainBuildDoor);
     WS_EMPTY("buildRemove", InboundBuildRemove, drainBuildRemove);
+    WS_EMPTY("buildIntent", InboundBuildIntent, drainBuildIntents);
     WS_EMPTY("stealth",     InboundStealth,     drainStealth);
     WS_EMPTY("spawnReq",    InboundSpawnReq,    drainSpawnReqs);
     WS_EMPTY("spawnInfo",   InboundSpawnInfo,   drainSpawnInfos);
@@ -1765,6 +1776,32 @@ static void testChangeGate() {
     CHECK("door change no throttle",
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
+// ---- Reusable Host-canonical intent contract (protocol 59) -----------------
+static void testHostIntentPolicy() {
+    std::printf("== host-canonical build intent policy ==\n");
+    CHECK("intent sequence starts at one", hostIntentIsNew(0u, 1u));
+    CHECK("intent duplicate is idempotent", !hostIntentIsNew(7u, 7u));
+    CHECK("intent older row is stale", !hostIntentIsNew(7u, 6u));
+    CHECK("intent newer row accepted", hostIntentIsNew(7u, 8u));
+    CHECK("intent zero is reserved", !hostIntentIsNew(0u, 0u));
+
+    CHECK("ack settles matching owner+seq",
+          hostIntentAckCovers(22u, 5u, 22u, 5u));
+    CHECK("later ack covers pending",
+          hostIntentAckCovers(22u, 5u, 22u, 6u));
+    CHECK("other owner's ack cannot settle",
+          !hostIntentAckCovers(22u, 5u, 23u, 99u));
+    CHECK("older ack cannot settle",
+          !hostIntentAckCovers(22u, 5u, 22u, 4u));
+    CHECK("no pending intent cannot settle",
+          !hostIntentAckCovers(22u, 0u, 22u, 9u));
+
+    CHECK("intent first send due", hostIntentRetryDue(1000ul, 0ul, 2000ul));
+    CHECK("intent retry held before deadline",
+          !hostIntentRetryDue(2999ul, 1000ul, 2000ul));
+    CHECK("intent retry due at deadline",
+          hostIntentRetryDue(3000ul, 1000ul, 2000ul));
+}
 
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
@@ -1774,6 +1811,7 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testHostIntentPolicy();
     testRoundTrips();
     testFraming();
     testSaveCrc();

@@ -234,6 +234,8 @@ void NetLink::queueBuildDoor(const BuildDoorPacket& pkt) { pushLocked(outCs_, ou
 
 void NetLink::queueBuildRemove(const BuildRemovePacket& pkt) { pushLocked(outCs_, outBuildRemove_, pkt); }
 
+void NetLink::queueBuildIntent(const BuildIntentPacket& pkt) { pushLocked(outCs_, outBuildIntent_, pkt); }
+
 void NetLink::queueStealth(const StealthPacket& pkt) { pushLocked(outCs_, outStealth_, pkt); }
 
 void NetLink::queueCamHint(const CamHintPacket& pkt) { pushLocked(outCs_, outCamHint_, pkt); }
@@ -813,12 +815,22 @@ void NetLink::threadLoop() {
                             inbound_->pushBuildDoor(bd.ownerId, bd);
                         }
                     } else if (type == PKT_BUILD_REMOVE) {
-                        // Reliable placer-authoritative building removal
-                        // (protocol 28).
+                        // Reliable Host-canonical building removal (protocol 59).
                         BuildRemovePacket br;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &br)
                             && inbound_) {
                             inbound_->pushBuildRemove(br.ownerId, br);
+                        }
+                    } else if (type == PKT_BUILD_INTENT) {
+                        // Reliable idempotent placement/removal request
+                        // (protocol 59, Join -> Host). Stamp the actual peer id;
+                        // the game thread rejects a forged packet owner.
+                        BuildIntentPacket bi;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &bi)
+                            && inbound_) {
+                            u32 senderId = isHost_
+                                ? (u32)(size_t)ev.peer->data : (u32)0;
+                            inbound_->pushBuildIntent(senderId, bi);
                         }
                     } else if (type == PKT_STEALTH) {
                         // Unreliable stealth detection-map snapshot (protocol 20).
@@ -1533,13 +1545,8 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Drain + send any queued placed-building announcements + progress
-        // rows on CH_RELIABLE (protocol 27). PLACE is a one-shot describe/mint
-        // edge (a lost one strands an invisible building on the peer - the
-        // protocol-21 lesson); STATE rows are change-gated by the Replicator
-        // (~1 Hz sample, 10 s safety resend while incomplete), so the channel
-        // is silent once every site completes. Same-channel ordered-reliable
-        // guarantees a STATE row never arrives before its PLACE.
+        // Drain + send Host-canonical placed-building announcements + progress
+        // rows on CH_RELIABLE (protocol 59). The Join never publishes state.
         std::vector<BuildPlacePacket> buildPlacePkts;
         std::vector<BuildStatePacket> buildStatePkts;
         EnterCriticalSection(&outCs_);
@@ -1551,8 +1558,6 @@ void NetLink::threadLoop() {
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
             }
@@ -1562,8 +1567,6 @@ void NetLink::threadLoop() {
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
             }
@@ -1591,13 +1594,29 @@ void NetLink::threadLoop() {
                 enet_packet_destroy(out);
             }
         }
+
+        // Join build intents are silent at rest; a pending request retries the
+        // same idempotent sequence after two seconds until canonical state acks.
+        std::vector<BuildIntentPacket> buildIntentPkts;
+        EnterCriticalSection(&outCs_);
+        buildIntentPkts.swap(outBuildIntent_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < buildIntentPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&buildIntentPkts[i],
+                                                 sizeof(BuildIntentPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (!isHost_ && serverPeer_ &&
+                serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
         for (size_t i = 0; i < buildRemovePkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&buildRemovePkts[i], sizeof(BuildRemovePacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
             }

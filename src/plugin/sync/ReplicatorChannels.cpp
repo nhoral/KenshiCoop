@@ -11,6 +11,7 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/HostIntent.h"
 
 namespace coop {
 
@@ -1510,9 +1511,12 @@ bool Replicator::localHandForBuildKey(const Key& wire, unsigned int out[5]) cons
 void Replicator::publishBuilds(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
+    const unsigned long now = nowMs();
+    const unsigned long INTENT_RETRY_MS = 2000;
 
-    // 1. Local placement edges -> PLACE announcements (drained every tick so
-    // the edge queue never backs up; the detour caps it at 32 anyway).
+    // Local placement edges are optimistic on the Join: its committed preview
+    // supplies the stable session key, while the Host decides whether that key
+    // becomes canonical. Host-local placements are canonical immediately.
     engine::BuildEdge edges[8];
     unsigned int n = engine::drainBuildEdges(edges, 8);
     for (unsigned int i = 0; i < n; ++i) {
@@ -1525,60 +1529,142 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
         BuildPlacePacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_BUILD_PLACE;
-        pkt.ownerId = ownerId;
-        pkt.seq     = buildSeqOut_++;
+        pkt.ownerId = ctx.isHost ? ownerId : 0;
+        pkt.seq     = ctx.isHost ? buildSeqOut_++ : 0;
         for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = e.hand[h];
         strncpy(pkt.sid, e.sid, sizeof(pkt.sid) - 1);
         pkt.sid[sizeof(pkt.sid) - 1] = '\0';
         pkt.x = e.x; pkt.y = e.y; pkt.z = e.z; pkt.yaw = e.yaw;
         pkt.fromUi = (u8)(e.fromUi ? 1 : 0);
+        pkt.accepted = 1;
+        pkt.ackOwnerId = 0; pkt.ackSeq = 0;
         // Protocol 30: retain the announcement so a connect-edge resync can
         // re-send it to a late joiner (the one-shot edge, made repeatable).
         memcpy(&ob.ann, &pkt, sizeof(pkt));
         ob.haveAnn = true;
-        net.queueBuildPlace(pkt);
+        if (ctx.isHost) {
+            net.queueBuildPlace(pkt);
+        } else if (ob.pendingPlaceSeq == 0) {
+            ob.pendingPlaceSeq = buildIntentSeqOut_++;
+            ob.pendingPlaceSendMs = 0; // retry pass below sends immediately
+        }
         char b[224];
         _snprintf(b, sizeof(b) - 1,
-                  "[build] PLACE-SEND key=%u.%u.%u.%u.%u sid='%s' ui=%u "
-                  "pos=%.1f,%.1f,%.1f seq=%u",
+                  ctx.isHost
+                    ? "[build] PLACE-SEND key=%u.%u.%u.%u.%u sid='%s' ui=%u "
+                      "pos=%.1f,%.1f,%.1f seq=%u"
+                    : "[build] PLACE-PENDING key=%u.%u.%u.%u.%u sid='%s' ui=%u "
+                      "pos=%.1f,%.1f,%.1f seq=%u",
                   pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
-                  pkt.sid, pkt.fromUi, pkt.x, pkt.y, pkt.z, pkt.seq);
+                  pkt.sid, pkt.fromUi, pkt.x, pkt.y, pkt.z,
+                  ctx.isHost ? pkt.seq : ob.pendingPlaceSeq);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // 1b. Removal edges (protocol 28): the dismantle detour (UI path) and the
-    // programmatic destroy both queue hands here. Only buildings WE placed
-    // stream a REMOVE (placer-authoritative); a dismantle of a baked building
-    // or of a peer's proxy logs at the detour but stays local.
+    // A local dismantle may name our original site OR a minted Host placement.
+    // Translate either one into the stable wire key before authoring state or
+    // intent. Baked buildings remain outside this session-build channel.
     unsigned int rmEdges[8][5];
     unsigned int rn = engine::drainRemoveEdges(rmEdges, 8);
     for (unsigned int i = 0; i < rn; ++i) {
-        Key k; k.t = rmEdges[i][0]; k.c = rmEdges[i][1]; k.cs = rmEdges[i][2];
-        k.i = rmEdges[i][3]; k.s = rmEdges[i][4];
-        std::map<Key, OwnBuild>::iterator f = ownBuilds_.find(k);
-        if (f == ownBuilds_.end() || f->second.removed) continue;
-        f->second.removed = true;
+        Key local; local.t = rmEdges[i][0]; local.c = rmEdges[i][1];
+        local.cs = rmEdges[i][2]; local.i = rmEdges[i][3]; local.s = rmEdges[i][4];
+        Key k = local;
+        std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+        std::map<Key, PeerBuild>::iterator peer = peerBuilds_.end();
+        if (own == ownBuilds_.end()) {
+            std::map<Key, Key>::iterator rev = mintByLocal_.find(local);
+            if (rev == mintByLocal_.end()) continue;
+            k = rev->second;
+            own = ownBuilds_.find(k);
+            peer = peerBuilds_.find(k);
+        }
+        bool alreadyRemoved = false;
+        if (own != ownBuilds_.end()) {
+            alreadyRemoved = own->second.removed;
+            own->second.removed = true;
+        } else if (peer != peerBuilds_.end()) {
+            alreadyRemoved = peer->second.removed;
+            peer->second.removed = true;
+        } else {
+            continue;
+        }
+        if (alreadyRemoved) continue;
         if (!bdoorSync_) continue; // A/B hatch: edge observed, nothing streams
-        BuildRemovePacket pkt;
-        memset(&pkt, 0, sizeof(pkt));
-        pkt.type    = (u8)PKT_BUILD_REMOVE;
-        pkt.ownerId = ownerId;
-        pkt.seq     = buildSeqOut_++;
-        for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = rmEdges[i][h];
-        net.queueBuildRemove(pkt);
-        char b[160];
-        _snprintf(b, sizeof(b) - 1,
-                  "[build] REMOVE-SEND key=%u.%u.%u.%u.%u seq=%u",
-                  pkt.key[0], pkt.key[1], pkt.key[2], pkt.key[3], pkt.key[4],
-                  pkt.seq);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (ctx.isHost) {
+            BuildRemovePacket pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.type = (u8)PKT_BUILD_REMOVE; pkt.ownerId = ownerId;
+            pkt.seq = buildSeqOut_++; pkt.accepted = 1;
+            pkt.key[0] = k.t; pkt.key[1] = k.c; pkt.key[2] = k.cs;
+            pkt.key[3] = k.i; pkt.key[4] = k.s;
+            net.queueBuildRemove(pkt);
+            char b[160];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] REMOVE-SEND key=%u.%u.%u.%u.%u seq=%u",
+                      k.t, k.c, k.cs, k.i, k.s, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            BuildRemovePending& pending = buildRemovePending_[k];
+            if (pending.seq == 0) pending.seq = buildIntentSeqOut_++;
+            pending.lastSendMs = 0;
+        }
     }
 
-    // 2. Progress rows for buildings WE placed (~1 Hz, change-gated + 10 s
-    // safety resend while incomplete; the final complete row latches).
+    // Join retries are quiet once acknowledged. PLACE and REMOVE use the same
+    // request packet and monotonically increasing per-Join sequence space.
+    if (!ctx.isHost) {
+        for (std::map<Key, OwnBuild>::iterator it = ownBuilds_.begin();
+             it != ownBuilds_.end(); ++it) {
+            OwnBuild& ob = it->second;
+            if (!ob.haveAnn || ob.pendingPlaceSeq == 0 ||
+                !hostIntentRetryDue(now, ob.pendingPlaceSendMs, INTENT_RETRY_MS))
+                continue;
+            BuildIntentPacket p; memset(&p, 0, sizeof(p));
+            p.type = (u8)PKT_BUILD_INTENT; p.ownerId = ownerId;
+            p.seq = ob.pendingPlaceSeq; p.op = (u8)BUILD_INTENT_PLACE;
+            memcpy(p.key, ob.ann.key, sizeof(p.key));
+            strncpy(p.sid, ob.ann.sid, sizeof(p.sid) - 1);
+            p.x = ob.ann.x; p.y = ob.ann.y; p.z = ob.ann.z; p.yaw = ob.ann.yaw;
+            p.fromUi = ob.ann.fromUi;
+            bool retry = ob.pendingPlaceSendMs != 0;
+            ob.pendingPlaceSendMs = now;
+            net.queueBuildIntent(p);
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] PLACE-INTENT key=%u.%u.%u.%u.%u seq=%u retry=%d",
+                      p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                      p.seq, retry ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        for (std::map<Key, BuildRemovePending>::iterator it = buildRemovePending_.begin();
+             it != buildRemovePending_.end(); ++it) {
+            BuildRemovePending& pending = it->second;
+            if (pending.seq == 0 ||
+                !hostIntentRetryDue(now, pending.lastSendMs, INTENT_RETRY_MS))
+                continue;
+            BuildIntentPacket p; memset(&p, 0, sizeof(p));
+            p.type = (u8)PKT_BUILD_INTENT; p.ownerId = ownerId;
+            p.seq = pending.seq; p.op = (u8)BUILD_INTENT_REMOVE;
+            p.key[0] = it->first.t; p.key[1] = it->first.c;
+            p.key[2] = it->first.cs; p.key[3] = it->first.i; p.key[4] = it->first.s;
+            bool retry = pending.lastSendMs != 0;
+            pending.lastSendMs = now;
+            net.queueBuildIntent(p);
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] REMOVE-INTENT key=%u.%u.%u.%u.%u seq=%u retry=%d",
+                      p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
+                      p.seq, retry ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        return; // Join never publishes canonical construction progress
+    }
+
+    // Host progress rows (~1 Hz, change-gated + 10 s safety resend while
+    // incomplete; the final complete row latches).
     const unsigned long SAMPLE_MS = tuning_.buildSampleMs;
     const unsigned long RESEND_MS = tuning_.buildResendMs;
-    unsigned long now = nowMs();
     if (!sync::gateSampleDue(now, buildSampleMs_, SAMPLE_MS)) return;
     buildSampleMs_ = now;
     const float EPS = 0.005f;
@@ -1604,7 +1690,9 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
         pkt.type     = (u8)PKT_BUILD_STATE;
         pkt.ownerId  = ownerId;
         pkt.seq      = buildSeqOut_++;
-        for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = ob.hand[h];
+        pkt.key[0] = it->first.t; pkt.key[1] = it->first.c;
+        pkt.key[2] = it->first.cs; pkt.key[3] = it->first.i;
+        pkt.key[4] = it->first.s;
         pkt.progress = cur.progress;
         pkt.complete = (u8)(cur.complete ? 1 : 0);
         net.queueBuildState(pkt);
@@ -1620,71 +1708,215 @@ void Replicator::publishBuilds(const SyncContext& ctx) {
     }
 }
 
+static bool validBuildPlaceIntent(const BuildIntentPacket& p) {
+    if (!p.sid[0] || !memchr(p.sid, '\0', sizeof(p.sid)) || p.fromUi > 1)
+        return false;
+    bool haveKey = false;
+    for (unsigned int i = 0; i < 5; ++i) if (p.key[i] != 0) haveKey = true;
+    if (!haveKey) return false;
+    const float POS_LIMIT = 1000000.0f;
+    if (!(p.x >= -POS_LIMIT && p.x <= POS_LIMIT) ||
+        !(p.y >= -POS_LIMIT && p.y <= POS_LIMIT) ||
+        !(p.z >= -POS_LIMIT && p.z <= POS_LIMIT) ||
+        !(p.yaw >= -1000.0f && p.yaw <= 1000.0f))
+        return false; // comparisons reject NaN and infinities too
+    return true;
+}
+
+void Replicator::applyBuildIntents(const SyncContext& ctx) {
+    std::deque<InboundBuildIntent> got;
+    ctx.in->drainBuildIntents(got);
+    if (got.empty() || !ctx.isHost || !buildSync_) return;
+    for (std::deque<InboundBuildIntent>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const BuildIntentPacket& p = it->pkt;
+        if (p.seq == 0 || p.ownerId == 0 || it->ownerId != p.ownerId ||
+            (p.op != BUILD_INTENT_PLACE && p.op != BUILD_INTENT_REMOVE))
+            continue;
+        Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
+        k.i = p.key[3]; k.s = p.key[4];
+        std::pair<u32, Key> requestKey = std::make_pair(p.ownerId, k);
+
+        if (p.op == BUILD_INTENT_PLACE) {
+            u32& seen = buildPlaceIntentSeen_[requestKey];
+            std::map<Key, OwnBuild>::iterator found = ownBuilds_.find(k);
+            bool accepted = found != ownBuilds_.end() && !found->second.removed;
+            int rc = accepted ? 1 : 0;
+            if (hostIntentIsNew(seen, p.seq)) {
+                if (found == ownBuilds_.end() && validBuildPlaceIntent(p)) {
+                    unsigned int localHand[5] = { 0, 0, 0, 0, 0 };
+                    rc = engine::placeBuildingAt(ctx.gw, p.sid, p.x, p.y, p.z,
+                                                 p.yaw, false, localHand);
+                    if (rc == 1) {
+                        OwnBuild& ob = ownBuilds_[k];
+                        memcpy(ob.hand, localHand, sizeof(ob.hand));
+                        memset(&ob.ann, 0, sizeof(ob.ann));
+                        ob.ann.type = (u8)PKT_BUILD_PLACE;
+                        ob.ann.ownerId = ctx.localId;
+                        memcpy(ob.ann.key, p.key, sizeof(ob.ann.key));
+                        strncpy(ob.ann.sid, p.sid, sizeof(ob.ann.sid) - 1);
+                        ob.ann.x = p.x; ob.ann.y = p.y; ob.ann.z = p.z;
+                        ob.ann.yaw = p.yaw; ob.ann.fromUi = p.fromUi;
+                        ob.ann.accepted = 1; ob.haveAnn = true;
+                        Key local; local.t = localHand[0]; local.c = localHand[1];
+                        local.cs = localHand[2]; local.i = localHand[3];
+                        local.s = localHand[4];
+                        mintByLocal_[local] = k;
+                        found = ownBuilds_.find(k);
+                        accepted = true;
+                    }
+                }
+                // A placement rejection is final for this exact request. The
+                // Join removes its optimistic copy instead of retrying forever.
+                seen = p.seq;
+            }
+
+            BuildPlacePacket state;
+            memset(&state, 0, sizeof(state));
+            if (accepted && found != ownBuilds_.end() && found->second.haveAnn)
+                memcpy(&state, &found->second.ann, sizeof(state));
+            else {
+                memcpy(state.key, p.key, sizeof(state.key));
+                strncpy(state.sid, p.sid, sizeof(state.sid) - 1);
+                state.x = p.x; state.y = p.y; state.z = p.z;
+                state.yaw = p.yaw; state.fromUi = p.fromUi;
+            }
+            state.type = (u8)PKT_BUILD_PLACE;
+            state.ownerId = ctx.localId; state.seq = buildSeqOut_++;
+            state.accepted = accepted ? 1 : 0;
+            state.ackOwnerId = p.ownerId; state.ackSeq = seen;
+            ctx.net->queueBuildPlace(state);
+            char b[224];
+            _snprintf(b, sizeof(b) - 1,
+                      "[build] PLACE-INTENT-APPLY key=%u.%u.%u.%u.%u owner=%u "
+                      "req=%u accepted=%d rc=%d ack=%u",
+                      k.t, k.c, k.cs, k.i, k.s, p.ownerId, p.seq,
+                      accepted ? 1 : 0, rc, seen);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+
+        u32& seen = buildRemoveIntentSeen_[requestKey];
+        std::map<Key, OwnBuild>::iterator found = ownBuilds_.find(k);
+        bool accepted = found != ownBuilds_.end() && found->second.removed;
+        bool transientFailure = false;
+        if (hostIntentIsNew(seen, p.seq)) {
+            if (!bdoorSync_ || found == ownBuilds_.end()) {
+                seen = p.seq; // permanent unknown/disabled rejection
+            } else if (found->second.removed) {
+                accepted = true; seen = p.seq;
+            } else {
+                bool ok = engine::destroyBuildingByHand(ctx.gw, found->second.hand);
+                if (ok) {
+                    found->second.removed = true;
+                    accepted = true; seen = p.seq;
+                } else {
+                    transientFailure = true; // ack=0 leaves the same seq pending
+                }
+            }
+        }
+        BuildRemovePacket state;
+        memset(&state, 0, sizeof(state));
+        state.type = (u8)PKT_BUILD_REMOVE; state.ownerId = ctx.localId;
+        state.seq = buildSeqOut_++;
+        state.key[0] = k.t; state.key[1] = k.c; state.key[2] = k.cs;
+        state.key[3] = k.i; state.key[4] = k.s;
+        state.accepted = accepted ? 1 : 0;
+        state.ackOwnerId = p.ownerId;
+        state.ackSeq = transientFailure ? 0 : seen;
+        ctx.net->queueBuildRemove(state);
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+                  "[build] REMOVE-INTENT-APPLY key=%u.%u.%u.%u.%u owner=%u "
+                  "req=%u accepted=%d ack=%u",
+                  k.t, k.c, k.cs, k.i, k.s, p.ownerId, p.seq,
+                  accepted ? 1 : 0, state.ackSeq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::applyBuilds(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
-    // Announcements first (same-channel ordered-reliable means a STATE row
-    // never precedes its PLACE on the wire; keep that property here too).
-    std::deque<InboundBuildPlace> places;
-    in.drainBuildPlace(places);
-    std::deque<InboundBuildState> states;
-    in.drainBuildState(states);
-    if (!buildSync_) return;
+    std::deque<InboundBuildPlace> places; in.drainBuildPlace(places);
+    std::deque<InboundBuildState> states; in.drainBuildState(states);
+    std::deque<InboundBuildRemove> removes; in.drainBuildRemove(removes);
+    if (!buildSync_ || ctx.isHost) return; // Host is the sole state publisher
+
+    // Canonical placement first. If this key is the Join's optimistic local
+    // placement, adopt it in-place; otherwise mint the Host's placement.
     for (std::deque<InboundBuildPlace>::iterator it = places.begin();
          it != places.end(); ++it) {
         const BuildPlacePacket& p = it->pkt;
-        if (p.sid[0] == '\0') continue;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        if (peerBuilds_.find(k) != peerBuilds_.end())
-            continue; // already minted (or mint already refused) - dedupe
+        std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+        bool settled = own != ownBuilds_.end() &&
+            hostIntentAckCovers(ctx.localId, own->second.pendingPlaceSeq,
+                                p.ackOwnerId, p.ackSeq);
+        if (!p.accepted) {
+            if (!settled) continue;
+            own->second.pendingPlaceSeq = 0;
+            own->second.pendingPlaceSendMs = 0;
+            if (!own->second.removed) {
+                engine::destroyBuildingByHand(gw, own->second.hand);
+                own->second.removed = true;
+            }
+            coop::logLine("[build] PLACE-REJECT optimistic site removed");
+            continue;
+        }
+        if (own != ownBuilds_.end()) {
+            if (settled) {
+                own->second.pendingPlaceSeq = 0;
+                own->second.pendingPlaceSendMs = 0;
+            }
+            continue; // the local committed preview is already this building
+        }
+        if (!p.sid[0] || peerBuilds_.find(k) != peerBuilds_.end()) continue;
         PeerBuild& pb = peerBuilds_[k];
-        // Mint INCOMPLETE always: the placer's STATE rows drive progress from
-        // here (a real UI placement starts at 0 anyway).
         int rc = engine::placeBuildingAt(gw, p.sid, p.x, p.y, p.z, p.yaw,
-                                         /*completed*/false, pb.localHand);
+                                         false, pb.localHand);
         pb.minted = (rc == 1) ? 1 : 0;
         if (pb.minted) {
-            // Reverse translation (protocol 28): the door sampler and the
-            // protocol-26 filter recognize this proxy by its LOCAL hand.
-            Key lk; lk.t = pb.localHand[0]; lk.c = pb.localHand[1];
-            lk.cs = pb.localHand[2]; lk.i = pb.localHand[3]; lk.s = pb.localHand[4];
-            mintByLocal_[lk] = k;
+            Key local; local.t = pb.localHand[0]; local.c = pb.localHand[1];
+            local.cs = pb.localHand[2]; local.i = pb.localHand[3];
+            local.s = pb.localHand[4]; mintByLocal_[local] = k;
         }
         char b[240];
         _snprintf(b, sizeof(b) - 1,
                   "[build] MINT key=%u.%u.%u.%u.%u sid='%s' ui=%u rc=%d "
                   "local=%u.%u.%u.%u.%u",
                   p.key[0], p.key[1], p.key[2], p.key[3], p.key[4],
-                  p.sid, p.fromUi, rc,
-                  pb.localHand[0], pb.localHand[1], pb.localHand[2],
-                  pb.localHand[3], pb.localHand[4]);
+                  p.sid, p.fromUi, rc, pb.localHand[0], pb.localHand[1],
+                  pb.localHand[2], pb.localHand[3], pb.localHand[4]);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
+
     for (std::deque<InboundBuildState>::iterator it = states.begin();
          it != states.end(); ++it) {
         const BuildStatePacket& p = it->pkt;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
-        if (f == peerBuilds_.end() || !f->second.minted)
-            continue; // mint refused or key unknown - skip silently
-        PeerBuild& pb = f->second;
-        if (pb.removed) continue; // tombstoned (REMOVE already applied)
-        if (!sync::gateSeqAccept(pb.seqSeen, p.seq)) continue; // stale/dup row
-        pb.seqSeen = p.seq;
+        const unsigned int* localHand = 0; u32* seqSeen = 0;
+        std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+        if (own != ownBuilds_.end() && !own->second.removed) {
+            localHand = own->second.hand; seqSeen = &own->second.seqSeen;
+        } else {
+            std::map<Key, PeerBuild>::iterator peer = peerBuilds_.find(k);
+            if (peer != peerBuilds_.end() && peer->second.minted && !peer->second.removed) {
+                localHand = peer->second.localHand; seqSeen = &peer->second.seqSeen;
+            }
+        }
+        if (!localHand || !seqSeen || !sync::gateSeqAccept(*seqSeen, p.seq)) continue;
+        *seqSeen = p.seq;
         engine::BuildRead cur;
-        if (engine::readBuildingByHand(pb.localHand, &cur)) {
+        if (engine::readBuildingByHand(localHand, &cur)) {
             float d = cur.progress - p.progress;
-            bool progClose = (d < 0.005f && d > -0.005f);
-            if (progClose && cur.complete == (int)p.complete)
-                continue; // already converged (resend)
-            if (cur.complete) continue; // completion is latched locally
+            if (d < 0.005f && d > -0.005f && cur.complete == (int)p.complete)
+                continue;
+            if (cur.complete) continue;
         }
         engine::BuildRead post;
-        // The placer's own isComplete drives completion here - see the note on
-        // writeBuildProgressByHand. Inferring it from progress crossing 1.0
-        // finished the peer's copy long before the placer's.
-        bool ok = engine::writeBuildProgressByHand(pb.localHand, p.progress,
+        bool ok = engine::writeBuildProgressByHand(localHand, p.progress,
                                                    p.complete != 0, &post);
         char b[208];
         _snprintf(b, sizeof(b) - 1,
@@ -1696,31 +1928,41 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
-    // Removals (protocol 28, placer-authoritative): destroy the mapped proxy
-    // through the engine's own GameWorld::destroy and tombstone the entry so
-    // any late STATE/DOOR rows for the key skip silently. Gated on bdoorSync
-    // (the removal channel ships with the placed-door slice).
-    std::deque<InboundBuildRemove> removes;
-    in.drainBuildRemove(removes);
     if (!bdoorSync_) return;
     for (std::deque<InboundBuildRemove>::iterator it = removes.begin();
          it != removes.end(); ++it) {
         const BuildRemovePacket& p = it->pkt;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        std::map<Key, PeerBuild>::iterator f = peerBuilds_.find(k);
-        if (f == peerBuilds_.end() || !f->second.minted || f->second.removed)
-            continue; // never minted here or already gone - nothing to remove
-        PeerBuild& pb = f->second;
-        pb.removed = true;
-        bool ok = engine::destroyBuildingByHand(gw, pb.localHand);
+        std::map<Key, BuildRemovePending>::iterator pending = buildRemovePending_.find(k);
+        if (pending != buildRemovePending_.end() &&
+            hostIntentAckCovers(ctx.localId, pending->second.seq,
+                                p.ackOwnerId, p.ackSeq))
+            buildRemovePending_.erase(pending);
+        if (!p.accepted) continue;
+
+        unsigned int localHand[5] = { 0, 0, 0, 0, 0 };
+        bool have = false; bool already = false;
+        std::map<Key, OwnBuild>::iterator own = ownBuilds_.find(k);
+        if (own != ownBuilds_.end()) {
+            memcpy(localHand, own->second.hand, sizeof(localHand));
+            already = own->second.removed; own->second.removed = true; have = true;
+        } else {
+            std::map<Key, PeerBuild>::iterator peer = peerBuilds_.find(k);
+            if (peer != peerBuilds_.end() && peer->second.minted) {
+                memcpy(localHand, peer->second.localHand, sizeof(localHand));
+                already = peer->second.removed; peer->second.removed = true; have = true;
+            }
+        }
+        if (!have) continue;
+        bool ok = already || engine::destroyBuildingByHand(gw, localHand);
         char b[192];
         _snprintf(b, sizeof(b) - 1,
                   "[build] REMOVE-RECV key=%u.%u.%u.%u.%u ok=%d "
                   "local=%u.%u.%u.%u.%u seq=%u",
                   p.key[0], p.key[1], p.key[2], p.key[3], p.key[4], ok ? 1 : 0,
-                  pb.localHand[0], pb.localHand[1], pb.localHand[2],
-                  pb.localHand[3], pb.localHand[4], p.seq);
+                  localHand[0], localHand[1], localHand[2], localHand[3],
+                  localHand[4], p.seq);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1745,6 +1987,9 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         ChFn               apply;
         bool               hostAuth; // true = host publishes / join applies
     };
+    // Requests must land before this tick's Host sample so the resulting
+    // placement/removal and progress state are published in canonical order.
+    if (ctx.isHost && buildSync_) applyBuildIntents(ctx);
     static const Desc kCh[] = {
         { &Replicator::factionSync_,  0,                     &Replicator::publishFactions,   &Replicator::applyFactions,   false },
         { &Replicator::doorSync_,     0,                     &Replicator::publishDoors,      &Replicator::applyDoors,      false },
@@ -1791,12 +2036,16 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
                 pkt.type    = (u8)PKT_BUILD_REMOVE;
                 pkt.ownerId = ownerId;
                 pkt.seq     = buildSeqOut_++;
-                for (unsigned int h = 0; h < 5; ++h) pkt.key[h] = ob.hand[h];
+                pkt.key[0] = it->first.t; pkt.key[1] = it->first.c;
+                pkt.key[2] = it->first.cs; pkt.key[3] = it->first.i;
+                pkt.key[4] = it->first.s; pkt.accepted = 1;
                 net.queueBuildRemove(pkt);
                 ++nRemove;
             } else {
                 ob.ann.ownerId = ownerId;
                 ob.ann.seq     = buildSeqOut_++;
+                ob.ann.accepted = 1;
+                ob.ann.ackOwnerId = 0; ob.ann.ackSeq = 0;
                 net.queueBuildPlace(ob.ann);
                 // Un-latch the STATE row: the next publishBuilds sample sees
                 // "changed" against the reset baseline and sends one fresh

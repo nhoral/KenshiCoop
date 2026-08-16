@@ -437,22 +437,20 @@ public:
     // Door-state sync master enable (KENSHICOOP_DOOR_SYNC).
     void setDoorSync(bool v) { doorSync_ = v; }
 
-    // BEFORE engine (protocol 27, both clients): drain local placement edges
-    // (the placeFinalPreviewBuilding detour + programmatic scenario places)
-    // into PKT_BUILD_PLACE announcements keyed by OUR hand, then sample every
-    // building WE placed (~1 Hz) and stream change-gated PKT_BUILD_STATE
-    // progress rows (10 s safety resend while incomplete; the final
-    // complete=1 row latches the channel silent for that site).
+    // BEFORE engine (protocol 27/59): drain local placement/removal edges. The
+    // Host registers them directly as canonical state; the Join sends reliable
+    // idempotent intents and retries until explicitly acknowledged. Only the
+    // Host samples and publishes construction progress.
     void publishBuilds(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 27): drain received announcements - each new
-    // key mints a local construction site through the same createBuilding
-    // factory (town-rule-free, probe-proven) and enters the key -> local-hand
-    // translation map (a refused mint is remembered so resends don't retry) -
-    // then apply received progress rows through the engine's own
-    // setConstructionProgress via that map (per-key seq guard drops stale
-    // rows; unknown keys are skipped silently).
+    // BEFORE engine (Join, protocol 27/59): apply Host-canonical placement,
+    // progress and removal state. A placement ack adopts the Join's optimistic
+    // local site instead of minting a duplicate.
     void applyBuilds(const SyncContext& ctx);
+
+    // BEFORE canonical build state (Host, protocol 59): validate and fold Join
+    // place/remove intents exactly once, then publish the actual result + ack.
+    void applyBuildIntents(const SyncContext& ctx);
 
     // Placed-building sync master enable (KENSHICOOP_BUILD_SYNC).
     void setBuildSync(bool v) { buildSync_ = v; }
@@ -1974,17 +1972,14 @@ private:
     u32           doorSeqOut_;
     unsigned long doorSampleMs_;
     bool          doorSync_;
-    // Protocol 27 placed-building sync. OwnBuild = a building WE placed
-    // (registered from the local placement edge; we are its progress
-    // authority): lastProg/lastComplete = change gate, lastSendMs = safety
-    // resend, doneSent latches the channel silent once the final complete row
-    // went out. PeerBuild = a building the PEER placed (learned from
-    // PKT_BUILD_PLACE): the key -> local-hand translation entry; minted=0
-    // remembers a refused mint so resends don't retry the factory forever;
-    // seqSeen = stale STATE-row guard.
+    // Protocol 27/59 placed-building sync. OwnBuild is a locally existing site
+    // whose wire key originated here OR which the Host adopted as canonical.
+    // PeerBuild is a Host placement minted by the Join. Only the Host uses the
+    // progress send fields; the Join uses pendingPlace* until the Host acks.
     struct OwnBuild {
         unsigned int hand[5];
         float lastProg; int lastComplete; unsigned long lastSendMs;
+        u32 seqSeen;
         bool doneSent;
         bool removed; // dismantled/destroyed + REMOVE announced: silent forever
         // Protocol 30: the PLACE announcement captured at edge-drain time, so
@@ -1992,8 +1987,11 @@ private:
         // (the template sid lives in the edge, not on the Building).
         BuildPlacePacket ann;
         bool haveAnn;
+        u32 pendingPlaceSeq;
+        unsigned long pendingPlaceSendMs;
         OwnBuild() : lastProg(-1.0f), lastComplete(-1), lastSendMs(0),
-                     doneSent(false), removed(false), haveAnn(false) {
+                     seqSeen(0), doneSent(false), removed(false), haveAnn(false),
+                     pendingPlaceSeq(0), pendingPlaceSendMs(0) {
             memset(hand, 0, sizeof(hand));
             memset(&ann, 0, sizeof(ann));
         }
@@ -2006,6 +2004,15 @@ private:
     };
     std::map<Key, OwnBuild>  ownBuilds_;
     std::map<Key, PeerBuild> peerBuilds_;
+    struct BuildRemovePending {
+        u32 seq; unsigned long lastSendMs;
+        BuildRemovePending() : seq(0), lastSendMs(0) {}
+    };
+    std::map<Key, BuildRemovePending> buildRemovePending_;
+    // Host-side per-requester high-water marks: a retry never mints/destroys
+    // twice, but still receives a fresh canonical acknowledgement.
+    std::map<std::pair<u32, Key>, u32> buildPlaceIntentSeen_;
+    std::map<std::pair<u32, Key>, u32> buildRemoveIntentSeen_;
     // Reverse translation (protocol 28): local minted building hand -> the
     // placer's wire key. Lets the door sampler express a MINTED proxy's door
     // in the placer's key space, and the protocol-26 filter recognize placed
@@ -2025,6 +2032,7 @@ private:
     bool buildKeyForLocalHand(const Key& local, Key& outWire) const;
     bool localHandForBuildKey(const Key& wire, unsigned int out[5]) const;
     u32           buildSeqOut_;
+    u32           buildIntentSeqOut_;
     unsigned long buildSampleMs_;
     bool          buildSync_;
     // Protocol 28 placed-door rows, keyed by (placer building key, door

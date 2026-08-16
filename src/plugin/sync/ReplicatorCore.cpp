@@ -82,7 +82,7 @@ Replicator::Replicator()
       claimSendMs_(0), claimAssertMs_(0), claimMapMs_(0),
       facSeqOut_(1), facSampleMs_(0), factionSync_(true),
       doorSeqOut_(1), doorSampleMs_(0), doorSync_(true),
-      buildSeqOut_(1), buildSampleMs_(0), buildSync_(true),
+      buildSeqOut_(1), buildIntentSeqOut_(1), buildSampleMs_(0), buildSync_(true),
       bdoorSeqOut_(1), bdoorSampleMs_(0), bdoorSync_(true),
       hungerSync_(true),
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
@@ -242,6 +242,9 @@ void Replicator::resetSession() {
     // reloaded save re-seeds them on first sample).
     ownBuilds_.clear();
     peerBuilds_.clear();
+    buildRemovePending_.clear();
+    buildPlaceIntentSeen_.clear();
+    buildRemoveIntentSeen_.clear();
     mintByLocal_.clear();
     bdoorRows_.clear();
     doorRows_.clear();
