@@ -131,6 +131,8 @@ public:
     // MAIN thread: queue a reliable host-authoritative machine state row
     // (protocol 33). Change-gated + safety-resent by the caller.
     void queueProd(const ProdPacket& pkt);
+    // MAIN thread: queue a reliable recipe intent (protocol 56, join -> host).
+    void queueProdIntent(const ProdIntentPacket& pkt);
     // MAIN thread: queue a reliable host-authoritative known-research row
     // (protocol 38). First-sight sent + safety-resent by the caller.
     void queueResearch(const ResearchPacket& pkt);
@@ -300,6 +302,7 @@ private:
     std::vector<DoorPacket>      outDoor_;
     // Reliable machine state rows (protocol 33). Guarded by outCs_.
     std::vector<ProdPacket>      outProd_;
+    std::vector<ProdIntentPacket> outProdIntent_;
     // Reliable known-research rows (protocol 38). Guarded by outCs_.
     std::vector<ResearchPacket>  outResearch_;
     // Reliable property-deed ownership rows (protocol 54). Guarded by outCs_.

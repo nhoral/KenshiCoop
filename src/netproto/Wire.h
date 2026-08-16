@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+const u16 PROTOCOL_VERSION = 56;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -76,7 +76,8 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_PROD_INTENT      = 49 // RELIABLE recipe intent (join -> host, protocol 56); ProdIntentPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1465,7 +1466,7 @@ struct LoadNackPacket {
     char name[48];    // save name ('\0'-padded)
 };
 
-// ---- Protocol 33: production machine sync ------------------------------------
+// ---- Protocol 33/56: production state + host-validated recipe intent ----------
 // One machine state row, HOST-authoritative (world-simulation precedent: the
 // host's engine is the one whose production/power/farming ticks count; the
 // join's copies are quieted by convergence, not suppression - its machines
@@ -1488,6 +1489,7 @@ struct ProdPacket {
     i8  powerOn;   // 0/1; -1 = unreadable (not applied)
     i8  prodState; // ProductionBuilding::ProductionState; -1 = not carried
     f32 outAmount; // output buffer amount; -1 = not carried
+    u32 outType;     // output GameData::type (0 when outSid is not carried)
     char outSid[48]; // output item template sid ("" = not carried) - lets the
                    // receiver MATERIALIZE a still-null buffer with the same
                    // item via the native setProductionItem lever
@@ -1496,6 +1498,25 @@ struct ProdPacket {
     f32 died;
     f32 growStart;
     f32 harvested; // int on the engine side; carried as f32 (-1 = not a farm)
+    u32 ackOwnerId; // sender whose latest recipe intent this state answers
+    u32 ackSeq;     // 0 = no intent answered; otherwise covers <= this seq
+};
+
+// Join -> host: request a recipe change on one canonical production machine.
+// This is an INTENT, never a second state writer: the host resolves the key,
+// validates the exact GameData identity and that changing recipes cannot discard
+// a non-empty output buffer, applies through setProductionItem, then answers by
+// publishing ProdPacket with ackOwnerId/ackSeq and the resulting canonical state.
+// Reliable ordered delivery plus monotonic seq makes retries idempotent; the join
+// may resend the same seq while waiting for an acknowledgement.
+struct ProdIntentPacket {
+    u8  type;       // = PKT_PROD_INTENT
+    u32 ownerId;    // network player id of the requesting join
+    u32 seq;        // monotonic per-session intent sequence (starts at 1)
+    u8  keyKind;    // same identity scheme as ProdPacket
+    u32 key[5];
+    u32 recipeType; // exact GameData::type of recipeSid
+    char recipeSid[48];
 };
 
 // ---- Protocol 38: research tech-tree sync -------------------------------------

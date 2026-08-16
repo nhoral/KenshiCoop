@@ -892,6 +892,57 @@ inline int qProd(float v) {
 }
 } // namespace
 
+void Replicator::prodWireKeyForLocal(const Key& local, bool reverseFixture,
+                                     int& keyKind, Key& wire) const {
+    keyKind = 0; wire = local;
+    if (ownBuilds_.find(local) != ownBuilds_.end()) {
+        keyKind = 1;
+        return;
+    }
+    std::map<Key, Key>::const_iterator mint = mintByLocal_.find(local);
+    if (mint != mintByLocal_.end()) {
+        keyKind = 1; wire = mint->second;
+        return;
+    }
+    if (!reverseFixture) return; // host's raw fixture key is canonical
+    // Runtime terrain fixtures (notably mines) are not protocol-27 builds but
+    // still have different hands. fixtureMap_ is wire(host/peer) -> local, so
+    // reverse it for a join-authored intent.
+    for (std::map<Key, FixtureRow>::const_iterator it = fixtureMap_.begin();
+         it != fixtureMap_.end(); ++it) {
+        if (!it->second.resolved) continue;
+        const unsigned int* h = it->second.hand;
+        if (h[0] == local.t && h[1] == local.c && h[2] == local.cs &&
+            h[3] == local.i && h[4] == local.s) {
+            wire = it->first;
+            return;
+        }
+    }
+}
+
+bool Replicator::localHandForProdKey(int keyKind, const Key& wire,
+                                     unsigned int out[5]) const {
+    if (!out) return false;
+    if (keyKind == 0) {
+        if (localHandForFixtureKey(wire, out)) return true;
+        out[0] = wire.t; out[1] = wire.c; out[2] = wire.cs;
+        out[3] = wire.i; out[4] = wire.s;
+        return true;
+    }
+    if (keyKind != 1) return false;
+    std::map<Key, OwnBuild>::const_iterator ob = ownBuilds_.find(wire);
+    if (ob != ownBuilds_.end()) {
+        if (ob->second.removed) return false;
+        memcpy(out, ob->second.hand, sizeof(unsigned int) * 5);
+        return true;
+    }
+    std::map<Key, PeerBuild>::const_iterator pb = peerBuilds_.find(wire);
+    if (pb == peerBuilds_.end() || pb->second.minted != 1 || pb->second.removed)
+        return false;
+    memcpy(out, pb->second.localHand, sizeof(unsigned int) * 5);
+    return true;
+}
+
 void Replicator::publishProd(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!prodSync_) return;
@@ -912,13 +963,8 @@ void Replicator::publishProd(const SyncContext& ctx) {
         // key (our own placement keys by OUR hand; a minted proxy of the
         // join's placement translates through the reverse map). Everything
         // else is a BAKED machine with a save-stable hand.
-        int keyKind = 0; Key wk = lk;
-        if (ownBuilds_.find(lk) != ownBuilds_.end()) {
-            keyKind = 1;
-        } else {
-            std::map<Key, Key>::iterator mit = mintByLocal_.find(lk);
-            if (mit != mintByLocal_.end()) { keyKind = 1; wk = mit->second; }
-        }
+        int keyKind = 0; Key wk;
+        prodWireKeyForLocal(lk, /*reverseFixture*/false, keyKind, wk);
         ProdRow& pr = prodRows_[std::make_pair(keyKind, wk)];
         int qOut = qProd(r.outAmount);
         int qIn0 = qProd(r.nInputs > 0 ? r.inAmount[0] : -1.0f);
@@ -926,6 +972,9 @@ void Replicator::publishProd(const SyncContext& ctx) {
         int qGr  = qProd(r.grown), qDi = qProd(r.died);
         int qGs  = qProd(r.growStart), qHv = qProd((float)r.harvested);
         bool changed = !pr.sent ||
+                       pr.knownType != r.outType || pr.knownSid != r.outSid ||
+                       pr.sentAckOwnerId != pr.ackOwnerId ||
+                       pr.sentAckSeq != pr.ackSeq ||
                        r.powerOn != pr.knownPower ||
                        r.productionState != pr.knownState ||
                        qOut != pr.qOut || qIn0 != pr.qIn0 || qIn1 != pr.qIn1 ||
@@ -939,6 +988,8 @@ void Replicator::publishProd(const SyncContext& ctx) {
         bool first = !pr.sent;
         pr.sent = true; pr.lastSendMs = now;
         pr.knownPower = r.powerOn; pr.knownState = r.productionState;
+        pr.knownType = r.outType; pr.knownSid = r.outSid;
+        pr.haveCanonical = true; pr.canonicalRecipeApplied = true;
         pr.qOut = qOut; pr.qIn0 = qIn0; pr.qIn1 = qIn1;
         pr.qGrown = qGr; pr.qDied = qDi; pr.qGrowStart = qGs; pr.qHarv = qHv;
         ProdPacket pkt;
@@ -953,12 +1004,17 @@ void Replicator::publishProd(const SyncContext& ctx) {
         pkt.powerOn   = (i8)r.powerOn;
         pkt.prodState = (i8)r.productionState;
         pkt.outAmount = r.outAmount;
+        pkt.outType   = r.outType;
         strncpy(pkt.outSid, r.outSid, sizeof(pkt.outSid) - 1);
         pkt.outSid[sizeof(pkt.outSid) - 1] = '\0';
         pkt.inAmount[0] = (r.nInputs > 0) ? r.inAmount[0] : -1.0f;
         pkt.inAmount[1] = (r.nInputs > 1) ? r.inAmount[1] : -1.0f;
         pkt.grown = r.grown; pkt.died = r.died; pkt.growStart = r.growStart;
         pkt.harvested = (float)r.harvested;
+        pkt.ackOwnerId = pr.ackOwnerId;
+        pkt.ackSeq     = pr.ackSeq;
+        pr.sentAckOwnerId = pr.ackOwnerId;
+        pr.sentAckSeq = pr.ackSeq;
         net.queueProd(pkt);
         if (changed) { // resends stay silent; the change is the signal
             char b[256];
@@ -975,6 +1031,116 @@ void Replicator::publishProd(const SyncContext& ctx) {
     }
 }
 
+void Replicator::publishProdIntents(const SyncContext& ctx) {
+    if (!prodSync_ || ctx.isHost) return;
+    const unsigned long SAMPLE_MS = 200; // UI response; change-gated, no idle wire traffic
+    const unsigned long RETRY_MS  = 2000;
+    unsigned long now = nowMs();
+    if (!sync::gateSampleDue(now, prodIntentSampleMs_, SAMPLE_MS)) return;
+    prodIntentSampleMs_ = now;
+
+    const unsigned int MAX_MACH = 48;
+    static engine::ProdRead rows[MAX_MACH];
+    unsigned int n = engine::enumMachinesNear(ctx.gw, 100.0f, rows, MAX_MACH);
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::ProdRead& r = rows[i];
+        if (!r.outSid[0]) continue; // no exact recipe identity to request
+        Key local; local.t = r.hand[0]; local.c = r.hand[1]; local.cs = r.hand[2];
+        local.i = r.hand[3]; local.s = r.hand[4];
+        int keyKind = 0; Key wire;
+        prodWireKeyForLocal(local, /*reverseFixture*/true, keyKind, wire);
+        ProdRow& pr = prodRows_[std::make_pair(keyKind, wire)];
+        if (!pr.haveCanonical) continue; // never turn first sight into a command
+        if (!pr.canonicalRecipeApplied && pr.pendingSeq == 0)
+            continue; // a failed host-state apply is not a local UI click
+
+        bool sameCanonical = pr.knownType == r.outType && pr.knownSid == r.outSid;
+        bool samePending = pr.pendingSeq != 0 &&
+                           pr.pendingType == r.outType && pr.pendingSid == r.outSid;
+        bool isNewChoice = pr.pendingSeq == 0 ? !sameCanonical : !samePending;
+        if (!isNewChoice && pr.pendingSeq == 0) continue;
+        if (!isNewChoice &&
+            !hostIntentRetryDue(now, pr.pendingSendMs, RETRY_MS))
+            continue;
+
+        if (isNewChoice) {
+            pr.pendingSeq = prodIntentSeqOut_++;
+            pr.pendingType = r.outType;
+            pr.pendingSid = r.outSid;
+        }
+        ProdIntentPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type = (u8)PKT_PROD_INTENT;
+        pkt.ownerId = ctx.localId;
+        pkt.seq = pr.pendingSeq;
+        pkt.keyKind = (u8)keyKind;
+        pkt.key[0] = wire.t; pkt.key[1] = wire.c; pkt.key[2] = wire.cs;
+        pkt.key[3] = wire.i; pkt.key[4] = wire.s;
+        pkt.recipeType = pr.pendingType;
+        strncpy(pkt.recipeSid, pr.pendingSid.c_str(), sizeof(pkt.recipeSid) - 1);
+        pr.pendingSendMs = now;
+        ctx.net->queueProdIntent(pkt);
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[prod] INTENT SEND key=%u.%u.%u.%u.%u kind=%d recipe='%s' "
+                  "type=%u seq=%u retry=%d",
+                  wire.t, wire.c, wire.cs, wire.i, wire.s, keyKind,
+                  pkt.recipeSid, pkt.recipeType, pkt.seq, isNewChoice ? 0 : 1);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyProdIntents(const SyncContext& ctx) {
+    std::deque<InboundProdIntent> got;
+    ctx.in->drainProdIntents(got);
+    if (got.empty() || !prodSync_ || !ctx.isHost) return;
+    for (std::deque<InboundProdIntent>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const ProdIntentPacket& p = it->pkt;
+        char sid[sizeof(p.recipeSid)];
+        memcpy(sid, p.recipeSid, sizeof(sid)); sid[sizeof(sid) - 1] = '\0';
+        if (p.keyKind > 1 || p.seq == 0 || !sid[0]) continue;
+        Key wire; wire.t = p.key[0]; wire.c = p.key[1]; wire.cs = p.key[2];
+        wire.i = p.key[3]; wire.s = p.key[4];
+        ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wire)];
+
+        // A repeated reliable request is a request for the ACK, not a second
+        // mutation. Force the canonical row out again and do nothing else.
+        if (pr.ackOwnerId == p.ownerId &&
+            !hostIntentIsNew(pr.ackSeq, p.seq)) {
+            pr.sentAckOwnerId = 0; pr.sentAckSeq = 0; prodSampleMs_ = 0;
+            continue;
+        }
+        unsigned int hand[5];
+        if (!localHandForProdKey((int)p.keyKind, wire, hand))
+            continue; // defer: the join retries if/when the machine is loaded
+        engine::ProdRead cur;
+        if (!engine::readMachineByHand(hand, &cur) || !cur.complete)
+            continue;
+        bool same = cur.outType == p.recipeType && strcmp(cur.outSid, sid) == 0;
+        bool ok = same;
+        engine::ProdRead after;
+        if (!same)
+            ok = engine::writeMachineRecipeByHand(ctx.gw, hand, sid, p.recipeType,
+                                                   0.0f, /*requireEmpty*/true,
+                                                   &after);
+
+        // Accept and reject are both final verdicts. Echoing the ack beside the
+        // actual state lets the join distinguish "not processed yet" from a
+        // validated rejection and roll back through the normal state path.
+        pr.ackOwnerId = p.ownerId; pr.ackSeq = p.seq;
+        prodSampleMs_ = 0; // ack fields make the verdict publish this tick
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[prod] INTENT %s key=%u.%u.%u.%u.%u kind=%u recipe='%s' "
+                  "type=%u old='%s' amount=%.3f seq=%u",
+                  ok ? "ACCEPT" : "REJECT", wire.t, wire.c, wire.cs, wire.i,
+                  wire.s, (unsigned)p.keyKind, sid, p.recipeType, cur.outSid,
+                  cur.outAmount, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::applyProd(const SyncContext& ctx) {
     Inbound& in = *ctx.in;
     std::deque<InboundProd> got;
@@ -988,31 +1154,23 @@ void Replicator::applyProd(const SyncContext& ctx) {
         ProdRow& pr = prodRows_[std::make_pair((int)p.keyKind, wk)];
         if (!sync::gateSeqAccept(pr.seqSeen, p.seq)) continue; // stale/dup row
         pr.seqSeen = p.seq;
+        char canonicalSid[sizeof(p.outSid)];
+        memcpy(canonicalSid, p.outSid, sizeof(canonicalSid));
+        canonicalSid[sizeof(canonicalSid) - 1] = '\0';
+        bool settled = hostIntentAckCovers(ctx.localId, pr.pendingSeq,
+                                           p.ackOwnerId, p.ackSeq);
+        if (settled) {
+            pr.pendingSeq = 0; pr.pendingType = 0; pr.pendingSid.clear();
+            pr.pendingSendMs = 0;
+        }
+        bool holdRecipe = pr.pendingSeq != 0; // do not bounce an unacked UI click
+        pr.knownType = p.outType; pr.knownSid = canonicalSid;
+        pr.haveCanonical = true;
         // Resolve the wire key to OUR machine's hand: baked hands resolve
         // directly; a placer key is either a building WE placed (our own
         // hand) or one we MINTED for the host's placement (translation map).
         unsigned int hand[5];
-        if (p.keyKind == 0) {
-            // A baked hand resolves directly, but a MINE's does not: it is a
-            // per-client instance for a terrain node, so the host's key names
-            // nothing here and every buffer row for it used to be dropped -
-            // the "mine inventory does not sync" half of the report. Prefer the
-            // protocol-55 pairing, fall back to the raw hand.
-            if (!localHandForFixtureKey(wk, hand))
-                for (unsigned int h = 0; h < 5; ++h) hand[h] = p.key[h];
-        } else {
-            std::map<Key, OwnBuild>::iterator ob = ownBuilds_.find(wk);
-            if (ob != ownBuilds_.end()) {
-                if (ob->second.removed) continue;
-                memcpy(hand, ob->second.hand, sizeof(hand));
-            } else {
-                std::map<Key, PeerBuild>::iterator pb = peerBuilds_.find(wk);
-                if (pb == peerBuilds_.end() || pb->second.minted != 1 ||
-                    pb->second.removed)
-                    continue; // unknown / refused / tombstoned key
-                memcpy(hand, pb->second.localHand, sizeof(hand));
-            }
-        }
+        if (!localHandForProdKey((int)p.keyKind, wk, hand)) continue;
         engine::ProdRead cur;
         if (!engine::readMachineByHand(hand, &cur))
             continue; // out-of-interest / not resolvable here - accepted edge
@@ -1022,8 +1180,26 @@ void Replicator::applyProd(const SyncContext& ctx) {
         int wantPower = -1;
         if (p.powerOn >= 0 && cur.powerOn >= 0 && (int)p.powerOn != cur.powerOn)
             wantPower = (int)p.powerOn;
+        // Recipe identity is part of canonical state in v56. Apply it before
+        // the amount write, except while our own request is still unacknowledged.
+        bool recipeDiff = canonicalSid[0] &&
+                          (cur.outType != p.outType || strcmp(cur.outSid, canonicalSid) != 0);
+        bool needMaterialize = canonicalSid[0] && p.outAmount >= 0.0f &&
+                               cur.outAmount < 0.0f;
+        if (!holdRecipe && (recipeDiff || needMaterialize)) {
+            engine::ProdRead recipeAfter;
+            if (engine::writeMachineRecipeByHand(ctx.gw, hand, canonicalSid,
+                                                  p.outType, p.outAmount,
+                                                  /*requireEmpty*/false,
+                                                  &recipeAfter))
+                cur = recipeAfter;
+        }
+        bool recipeConverged = !canonicalSid[0] ||
+                               (cur.outType == p.outType &&
+                                strcmp(cur.outSid, canonicalSid) == 0);
+        pr.canonicalRecipeApplied = recipeConverged;
         float outWant = -1.0f;
-        if (p.outAmount >= 0.0f &&
+        if (!holdRecipe && recipeConverged && p.outAmount >= 0.0f &&
             qProd(p.outAmount) != qProd(cur.outAmount >= 0.0f ? cur.outAmount : 0.0f))
             outWant = p.outAmount;
         float inWant[2] = { -1.0f, -1.0f };
@@ -1050,9 +1226,9 @@ void Replicator::applyProd(const SyncContext& ctx) {
         // proven materializing lever), then land the exact amount directly
         // (setProductionItem splits stack into inventory; the direct write
         // is what makes the buffer byte-match the host's).
-        if (outWant >= 0.0f && cur.outAmount < 0.0f)
-            engine::writeMachineByHand(hand, -1, outWant, /*useSetItem*/true,
-                                       0, 0, 0);
+        if (outWant >= 0.0f && cur.outAmount < 0.0f && canonicalSid[0])
+            engine::writeMachineRecipeByHand(ctx.gw, hand, canonicalSid, p.outType,
+                                              outWant, /*requireEmpty*/false, 0);
         engine::ProdRead after;
         bool ok = engine::writeMachineByHand(hand, wantPower, outWant,
                                              /*useSetItem*/false,
@@ -1757,6 +1933,13 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
         { &Replicator::deedSync_,     0,                     &Replicator::publishDeeds,      &Replicator::applyDeeds,      false }
     };
+    // Protocol 56 command path brackets the ordinary host-authoritative state
+    // row: join observes its UI choice before an older host row can reconcile it;
+    // host validates queued intents before it samples/publishes canonical state.
+    if (prodSync_) {
+        if (ctx.isHost) applyProdIntents(ctx);
+        else            publishProdIntents(ctx);
+    }
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
     for (int i = 0; i < n; ++i) {
         const Desc& d = kCh[i];

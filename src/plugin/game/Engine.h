@@ -1954,6 +1954,7 @@ struct ProdRead {
     float miningLevel;    // _resourceMiningLevel (ore drills / mines)
     // output buffer (StorageBuilding::productionItem; sid "" / -1 = no buffer)
     char  outSid[48];     // output item template GameData stringID
+    unsigned int outType; // output item template GameData::type
     float outAmount;      // productionItem->amount (stack + progress toward next)
     int   outCap;         // productionItem->maxCapacity
     // input buffers (ProductionBuilding::consumptionItems, first 2; -1 = absent)
@@ -1978,6 +1979,15 @@ unsigned int enumMachinesNear(GameWorld* gw, float radius, ProdRead* out,
 // SEH-guarded single-machine read by local hand. Returns false when the hand
 // does not resolve locally or is not a machine-class building.
 bool readMachineByHand(const unsigned int mHand[5], ProdRead* out);
+// Apply an exact recipe identity through ProductionBuilding::setProductionItem.
+// requireEmpty=true is the host-validation mode: a different recipe is refused
+// while the canonical output buffer holds any amount, so accepting a remote
+// click can never destroy produced items. amount is stack+progress (negative ->
+// zero). Returns true only when a post-read proves the requested sid+type landed.
+bool writeMachineRecipeByHand(GameWorld* gw, const unsigned int mHand[5],
+                              const char* recipeSid, unsigned int recipeType,
+                              float amount, bool requireEmpty,
+                              ProdRead* outAfter);
 // SEH-guarded machine write through the engine's own levers. All fields are
 // optional (sentinel = leave untouched):
 //   wantPower  - -1 leave, 0/1 switchPowerOn (vtable, the engine's own toggle)

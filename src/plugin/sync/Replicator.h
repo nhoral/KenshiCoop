@@ -25,6 +25,7 @@
 #include "Interp.h"
 #include "../../netproto/Wire.h"
 #include "../core/Inbound.h"
+#include "../core/HostIntent.h"
 #include "../net/NetLink.h"
 #include "SyncContext.h" // Phase 6: per-tick channel call environment
 #include "SyncTuning.h"  // Phase 6d: owned per-channel send-cadence tunables
@@ -499,6 +500,13 @@ public:
     // drops stale rows; unresolvable keys skip silently (out-of-interest).
     void applyProd(const SyncContext& ctx);
 
+    // Protocol 56 recipe command path. The join detects only a recipe identity
+    // that differs from its last canonical host row and sends an idempotent
+    // intent; the host drains/validates those intents before publishing state.
+    // This keeps one writer while allowing the join to use the crafting UI.
+    void publishProdIntents(const SyncContext& ctx);
+    void applyProdIntents(const SyncContext& ctx);
+
     // Production machine sync master enable (KENSHICOOP_PROD_SYNC).
     void setProdSync(bool v) { prodSync_ = v; }
 
@@ -653,6 +661,7 @@ public:
     // launched state while PRESERVING: the config gates (set* levers), the
     // ownership partition (ownRanks_), and every OUTBOUND sequence counter
     // (facSeqOut_, doorSeqOut_, buildSeqOut_, bdoorSeqOut_, prodSeqOut_,
+    // prodIntentSeqOut_,
     // speedSeqOut_, timeSeqOut_, nextEventId_/netId/dropId/pickupId/treatId)
     // - a peer that
     // did NOT reload keeps its per-sender stale-row guards, so restarting a
@@ -2041,7 +2050,7 @@ private:
     bool          bdoorSync_;
     // Protocol 29: hunger fold-in enable (rides the medical snapshot).
     bool          hungerSync_;
-    // Protocol 33 machine rows, keyed by the WIRE identity (keyKind, key) so
+    // Protocol 33/56 machine rows, keyed by the WIRE identity (keyKind, key) so
     // a baked hand can never collide with a placer key. HOST: lastSend* =
     // the change gate + safety resend (sent = the row went out at least
     // once - first sight sends, see publishProd). JOIN: seqSeen = stale-row
@@ -2050,16 +2059,35 @@ private:
         int knownPower; int knownState;
         int qOut; int qIn0; int qIn1;          // quantized amounts (x100)
         int qGrown; int qDied; int qGrowStart; int qHarv;
+        std::string knownSid; u32 knownType; // last canonical recipe identity
         unsigned long lastSendMs;
-        u32 seqSeen; bool sent;
+        u32 seqSeen; bool sent; bool haveCanonical; bool canonicalRecipeApplied;
+        // Host: latest processed intent answer echoed in ProdPacket. Join:
+        // optimistic request held until that explicit answer covers pendingSeq.
+        u32 ackOwnerId; u32 ackSeq;
+        u32 sentAckOwnerId; u32 sentAckSeq;
+        u32 pendingSeq; u32 pendingType; std::string pendingSid;
+        unsigned long pendingSendMs;
         ProdRow() : knownPower(-2), knownState(-2), qOut(-200), qIn0(-200),
                     qIn1(-200), qGrown(-200), qDied(-200), qGrowStart(-200),
-                    qHarv(-200), lastSendMs(0), seqSeen(0), sent(false) {}
+                    qHarv(-200), knownType(0), lastSendMs(0), seqSeen(0),
+                    sent(false), haveCanonical(false), canonicalRecipeApplied(false),
+                    ackOwnerId(0), ackSeq(0), sentAckOwnerId(0), sentAckSeq(0),
+                    pendingSeq(0), pendingType(0), pendingSendMs(0) {}
     };
     std::map<std::pair<int, Key>, ProdRow> prodRows_;
     u32           prodSeqOut_;
     unsigned long prodSampleMs_;
+    u32           prodIntentSeqOut_;
+    unsigned long prodIntentSampleMs_;
     bool          prodSync_;
+    // Translate between a local machine hand and protocol 33's canonical wire
+    // key. The reverse fixture scan is needed for join-authored intents on mines,
+    // whose runtime hands differ even though they are not player-placed builds.
+    void prodWireKeyForLocal(const Key& local, bool reverseFixture,
+                             int& keyKind, Key& wire) const;
+    bool localHandForProdKey(int keyKind, const Key& wire,
+                             unsigned int out[5]) const;
     // Protocol 38 known-research rows, keyed by the RESEARCH stringID (the
     // cross-client-stable wire identity, spike 401). HOST: sent/lastSendMs =
     // first-sight send + safety resend. JOIN: seqSeen = stale-row guard,

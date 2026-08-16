@@ -85,7 +85,8 @@ Replicator::Replicator()
       buildSeqOut_(1), buildSampleMs_(0), buildSync_(true),
       bdoorSeqOut_(1), bdoorSampleMs_(0), bdoorSync_(true),
       hungerSync_(true),
-      prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
+      prodSeqOut_(1), prodSampleMs_(0), prodIntentSeqOut_(1),
+      prodIntentSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
       deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       fixtureSeqOut_(1), fixtureSampleMs_(0), fixtureSync_(true),
@@ -321,6 +322,7 @@ void Replicator::resetSession() {
     // Sample-cadence clocks restart.
     facSampleMs_ = doorSampleMs_ = buildSampleMs_ = bdoorSampleMs_ = 0;
     prodSampleMs_ = 0;
+    prodIntentSampleMs_ = 0;
     researchSampleMs_ = 0;
     deedSampleMs_ = 0;
     deedAuditMs_ = 0;

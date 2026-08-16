@@ -231,6 +231,13 @@ struct InboundProd {
     ProdPacket pkt;
 };
 
+// One received recipe intent (protocol 56): the join asks, the host remains the
+// only machine-state writer and answers through the ordinary ProdPacket stream.
+struct InboundProdIntent {
+    u32              ownerId;
+    ProdIntentPacket pkt;
+};
+
 // One received known-research row (protocol 38): the HOST reports a RESEARCH
 // stringID as known; the join applies via Research::startResearch (idempotent
 // against already-known sids).
@@ -429,6 +436,7 @@ public:
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
+        prodIntent_(worldReset_),
         research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
@@ -589,6 +597,11 @@ public:
     void pushProd(u32 ownerId, const ProdPacket& pkt) {
         InboundProd ip; ip.ownerId = ownerId; ip.pkt = pkt;
         EnterCriticalSection(&cs_); prod_.push_back(ip); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one join -> host recipe intent (protocol 56), owner-tagged.
+    void pushProdIntent(u32 ownerId, const ProdIntentPacket& pkt) {
+        InboundProdIntent ip; ip.ownerId = ownerId; ip.pkt = pkt;
+        EnterCriticalSection(&cs_); prodIntent_.push_back(ip); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received known-research row (protocol 38), owner-tagged.
     void pushResearch(u32 ownerId, const ResearchPacket& pkt) {
@@ -760,6 +773,9 @@ public:
     void drainProd(std::deque<InboundProd>& out) {
         EnterCriticalSection(&cs_); out.swap(prod_); LeaveCriticalSection(&cs_);
     }
+    void drainProdIntents(std::deque<InboundProdIntent>& out) {
+        EnterCriticalSection(&cs_); out.swap(prodIntent_); LeaveCriticalSection(&cs_);
+    }
     void drainResearch(std::deque<InboundResearch>& out) {
         EnterCriticalSection(&cs_); out.swap(research_); LeaveCriticalSection(&cs_);
     }
@@ -887,6 +903,7 @@ private:
     WorldQ<InboundTime>            time_;
     WorldQ<InboundDoor>            door_;
     WorldQ<InboundProd>            prod_;
+    WorldQ<InboundProdIntent>      prodIntent_;
     WorldQ<InboundResearch>        research_;
     WorldQ<InboundDeed>            deed_;
     WorldQ<InboundFixture>         fixture_;

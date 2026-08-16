@@ -1170,6 +1170,7 @@ static void fillProdRead(Building* b, ProdRead* r) {
             r->outAmount = outBuf->amount;
             r->outCap    = outBuf->maxCapacity;
             if (outBuf->item) {
+                r->outType = (unsigned int)outBuf->item->type;
                 strncpy(r->outSid, outBuf->item->stringID.c_str(),
                         sizeof(r->outSid) - 1);
                 r->outSid[sizeof(r->outSid) - 1] = '\0';
@@ -1184,6 +1185,7 @@ static void fillProdRead(Building* b, ProdRead* r) {
                 ? g_machProdDataCraftFn : g_machProdDataBaseFn;
             GameData* pd = pf ? pf(b) : 0;
             if (pd) {
+                r->outType = (unsigned int)pd->type;
                 strncpy(r->outSid, pd->stringID.c_str(), sizeof(r->outSid) - 1);
                 r->outSid[sizeof(r->outSid) - 1] = '\0';
             }
@@ -1260,6 +1262,47 @@ bool readMachineByHand(const unsigned int mHand[5], ProdRead* out) {
         fillProdRead(b, out);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writeMachineRecipeByHand(GameWorld* gw, const unsigned int mHand[5],
+                              const char* recipeSid, unsigned int recipeType,
+                              float amount, bool requireEmpty,
+                              ProdRead* outAfter) {
+    if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
+    if (!gw || !mHand || !recipeSid || !recipeSid[0] || !g_machSetProdItemFn)
+        return false;
+    GameData* recipe = findItemTemplateImpl(gw, recipeSid, recipeType);
+    if (!recipe || recipe->stringID != recipeSid ||
+        (unsigned int)recipe->type != recipeType)
+        return false; // exact stable identity only; never fall back by display name
+    RootObject* ro = resolveObjectByHand(mHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        int ct = (int)b->classType;
+        if (!isProductionClassType(ct) || !b->_buildState.isComplete) return false;
+        ProductionBuilding* pb = static_cast<ProductionBuilding*>(b);
+        StorageBuilding::ConsumptionItem* cur = pb->productionItem;
+        bool same = cur && cur->item &&
+                    cur->item->stringID == recipeSid &&
+                    (unsigned int)cur->item->type == recipeType;
+        // Host validation: never replace a different, non-empty canonical
+        // buffer. That would turn a remote UI click into item destruction.
+        if (requireEmpty && !same && cur && cur->amount > 0.005f)
+            return false;
+        float useAmount = amount >= 0.0f ? amount : 0.0f;
+        int stack = (int)useAmount;
+        float progress = useAmount - (float)stack;
+        g_machSetProdItemFn(pb, recipe, stack, progress);
+        ProdRead verify;
+        fillProdRead(b, &verify);
+        if (outAfter) *outAfter = verify;
+        return verify.outType == recipeType &&
+               strcmp(verify.outSid, recipeSid) == 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[prod] recipe-write SEH-except");
+        return false;
+    }
 }
 
 bool writeMachineByHand(const unsigned int mHand[5], int wantPower,

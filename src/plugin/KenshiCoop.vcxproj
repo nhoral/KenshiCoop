@@ -201,6 +201,7 @@
     <ClInclude Include="CoopLog.h" />
     <ClInclude Include="core\Config.h" />
     <ClInclude Include="core\Inbound.h" />
+    <ClInclude Include="core\HostIntent.h" />
     <ClInclude Include="net\NetLink.h" />
     <ClInclude Include="net\SteamP2P.h" />
     <ClInclude Include="game\Engine.h" />

@@ -219,6 +219,9 @@ void NetLink::queueTime(const TimePacket& pkt) { pushLocked(outCs_, outTime_, pk
 void NetLink::queueDoor(const DoorPacket& pkt) { pushLocked(outCs_, outDoor_, pkt); }
 
 void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pkt); }
+void NetLink::queueProdIntent(const ProdIntentPacket& pkt) {
+    pushLocked(outCs_, outProdIntent_, pkt);
+}
 
 void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outResearch_, pkt); }
 
@@ -763,6 +766,15 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pp)
                             && inbound_) {
                             inbound_->pushProd(pp.ownerId, pp);
+                        }
+                    } else if (type == PKT_PROD_INTENT) {
+                        // Reliable idempotent recipe request (protocol 56,
+                        // join -> host). The host validates; this packet never
+                        // writes machine state directly on the receiver thread.
+                        ProdIntentPacket pi;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &pi)
+                            && inbound_) {
+                            inbound_->pushProdIntent(pi.ownerId, pi);
                         }
                     } else if (type == PKT_RESEARCH) {
                         // Reliable host-authoritative known-research row
@@ -1468,6 +1480,24 @@ void NetLink::threadLoop() {
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send join recipe intents. At rest this vector is empty; while
+        // an acknowledgement is missing the same seq may be retried safely.
+        std::vector<ProdIntentPacket> prodIntentPkts;
+        EnterCriticalSection(&outCs_);
+        prodIntentPkts.swap(outProdIntent_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < prodIntentPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&prodIntentPkts[i],
+                                                 sizeof(ProdIntentPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (!isHost_ && serverPeer_ &&
+                serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
