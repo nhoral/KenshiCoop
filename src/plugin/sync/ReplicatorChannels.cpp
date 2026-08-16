@@ -11,6 +11,7 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/BuildOwnership.h"
 
 namespace coop {
 
@@ -1168,6 +1169,17 @@ void Replicator::publishDeeds(const SyncContext& ctx) {
         const engine::DeedRead& r = rows[i];
         Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
         k.i = r.hand[3]; k.s = r.hand[4];
+        // Raw deed hands are cross-client identities only for save-resident
+        // buildings.  A protocol-27 placement has a different runtime hand on
+        // each client and its ownership is established when the peer copy is
+        // minted below.  Publishing that local hand as a deed can resolve to
+        // nothing (or, worse, an unrelated runtime object) on the peer.
+        Key buildWire;
+        const bool sessionPlaced = buildKeyForLocalHand(k, buildWire);
+        if (!deedMayPublishRawHand(sessionPlaced)) {
+            deedRows_.erase(k); // also remove a row seeded by older code
+            continue;
+        }
         live.insert(k);
         DeedRow& dr = deedRows_[k];
         bool changed = (dr.knownOwned != 1);
@@ -1283,6 +1295,12 @@ void Replicator::applyDeeds(const SyncContext& ctx) {
         const DeedPacket& p = it->pkt;
         Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
         k.i = p.hand[3]; k.s = p.hand[4];
+        // A mixed-version peer may still publish a runtime placed-building
+        // hand through the deed channel.  Protocol 27 owns that identity; do
+        // not let a raw-hand deed collide with a local runtime object.
+        if (ownBuilds_.find(k) != ownBuilds_.end() ||
+            peerBuilds_.find(k) != peerBuilds_.end())
+            continue;
         DeedRow& dr = deedRows_[k];
         if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
         dr.seqSeen = p.seq;
@@ -1507,6 +1525,41 @@ bool Replicator::localHandForBuildKey(const Key& wire, unsigned int out[5]) cons
     return false; // unknown / refused / tombstoned key
 }
 
+bool Replicator::ensurePeerBuildOwnership(GameWorld* gw, const Key& wire,
+                                          PeerBuild& pb) {
+    if (!peerBuildNeedsOwnership(pb.minted, pb.removed,
+                                 pb.ownershipApplied))
+        return pb.ownershipApplied;
+
+    // The native factory was given the local player faction.  Prefer that
+    // result and avoid inserting every placed chair/bench into the separate
+    // property-deed set when the normal creation path already made it owned.
+    engine::DeedRead cur;
+    if (engine::readDeedByHand(gw, pb.localHand, &cur) && cur.owned == 1) {
+        pb.ownershipApplied = true;
+        return true;
+    }
+
+    // Backstop for engine/template variants where the factory sets only part
+    // of the ownership state.  This is idempotent and uses the same proven
+    // state write as protocol 54 without replaying a purchase or charging cats.
+    engine::DeedRead post;
+    bool ok = engine::writeDeedByHand(gw, pb.localHand, /*wantOwned*/1,
+                                      /*ownerSid*/"", &post);
+    pb.ownershipApplied = ok && post.owned == 1;
+
+    char b[224];
+    _snprintf(b, sizeof(b) - 1,
+              "[build] OWNER-CLAIM key=%u.%u.%u.%u.%u "
+              "local=%u.%u.%u.%u.%u ok=%d owned=%d",
+              wire.t, wire.c, wire.cs, wire.i, wire.s,
+              pb.localHand[0], pb.localHand[1], pb.localHand[2],
+              pb.localHand[3], pb.localHand[4], ok ? 1 : 0,
+              ok ? post.owned : -1);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return pb.ownershipApplied;
+}
+
 void Replicator::publishBuilds(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
@@ -1635,8 +1688,14 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
         if (p.sid[0] == '\0') continue;
         Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
         k.i = p.key[3]; k.s = p.key[4];
-        if (peerBuilds_.find(k) != peerBuilds_.end())
+        std::map<Key, PeerBuild>::iterator existing = peerBuilds_.find(k);
+        if (existing != peerBuilds_.end()) {
+            // A PLACE safety resend is also an ownership retry.  The factory
+            // mint may succeed one tick before the ownership subsystem is
+            // ready; deduping the packet must not leave a permanent orphan.
+            ensurePeerBuildOwnership(gw, k, existing->second);
             continue; // already minted (or mint already refused) - dedupe
+        }
         PeerBuild& pb = peerBuilds_[k];
         // Mint INCOMPLETE always: the placer's STATE rows drive progress from
         // here (a real UI placement starts at 0 anyway).
@@ -1649,6 +1708,7 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
             Key lk; lk.t = pb.localHand[0]; lk.c = pb.localHand[1];
             lk.cs = pb.localHand[2]; lk.i = pb.localHand[3]; lk.s = pb.localHand[4];
             mintByLocal_[lk] = k;
+            ensurePeerBuildOwnership(gw, k, pb);
         }
         char b[240];
         _snprintf(b, sizeof(b) - 1,
@@ -1670,6 +1730,9 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
             continue; // mint refused or key unknown - skip silently
         PeerBuild& pb = f->second;
         if (pb.removed) continue; // tombstoned (REMOVE already applied)
+        // Retry before the seq gate: even a duplicate safety row is useful if
+        // the previous ownership write ran before the engine was ready.
+        ensurePeerBuildOwnership(gw, k, pb);
         if (!sync::gateSeqAccept(pb.seqSeen, p.seq)) continue; // stale/dup row
         pb.seqSeen = p.seq;
         engine::BuildRead cur;

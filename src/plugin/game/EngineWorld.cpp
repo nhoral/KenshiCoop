@@ -962,8 +962,16 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
         // engine NESTS a createBuilding per extra floor inside this call - those
         // nested ones re-enter the capture hook and would echo this mint back.
         ++g_buildCaptureSuppress;
+        // Protocol-27 copies represent a PLAYER placement.  Passing a null
+        // owner created a visually present but orphaned workbench on the peer:
+        // Kenshi then rejected normal use as though nobody owned it.  Give the
+        // factory this client's corresponding player faction, matching the
+        // native build-menu creation path.  applyBuilds verifies the result and
+        // falls back to the deed state writer if this engine path leaves only a
+        // partial ownership state.
+        Faction* playerOwner = playerFactionOf(gw);
         Building* bld = g_createBldgFn(
-            gw->theFactory, tmpl, pos, /*town*/0, /*owner*/0, rot, /*cb*/0,
+            gw->theFactory, tmpl, pos, /*town*/0, playerOwner, rot, /*cb*/0,
             /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
             /*invisible*/false, completed, /*isFoliage*/false,
             /*floor*/0, /*isOutsideFurniture*/false);

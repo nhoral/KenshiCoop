@@ -199,6 +199,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CoopLog.h" />
+    <ClInclude Include="core\BuildOwnership.h" />
     <ClInclude Include="core\Config.h" />
     <ClInclude Include="core\Inbound.h" />
     <ClInclude Include="net\NetLink.h" />

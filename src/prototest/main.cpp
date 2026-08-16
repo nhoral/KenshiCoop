@@ -34,6 +34,7 @@
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
+#include "../plugin/core/BuildOwnership.h" // protocol-27 peer-copy ownership policy
 #include "../plugin/sync/SaveXfer.h"     // Part A: real save-transfer receiver end-to-end
 
 #include <set>
@@ -50,6 +51,7 @@ namespace coop {
     void logLine(const char*) {}
     void logErrLine(const char*) {}
 }
+
 
 static int g_failed = 0;
 static int g_total  = 0;
@@ -1766,6 +1768,28 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+static void testBuildOwnershipPolicy() {
+    std::printf("== placed-building ownership policy ==\n");
+
+    CHECK("successful peer mint needs an ownership claim",
+          peerBuildNeedsOwnership(/*minted*/1, /*removed*/false,
+                                  /*ownershipApplied*/false));
+    CHECK("refused mint cannot be claimed",
+          !peerBuildNeedsOwnership(/*minted*/0, /*removed*/false,
+                                   /*ownershipApplied*/false));
+    CHECK("removed proxy is never reclaimed",
+          !peerBuildNeedsOwnership(/*minted*/1, /*removed*/true,
+                                   /*ownershipApplied*/false));
+    CHECK("confirmed ownership latches",
+          !peerBuildNeedsOwnership(/*minted*/1, /*removed*/false,
+                                   /*ownershipApplied*/true));
+
+    CHECK("save-resident building may publish a raw deed hand",
+          deedMayPublishRawHand(/*sessionPlaced*/false));
+    CHECK("session placement must use its translated build key",
+          !deedMayPublishRawHand(/*sessionPlaced*/true));
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1789,6 +1813,7 @@ int main() {
     testInboundLifecycle();
     testFlushWorldStateContract();
     testTeardownOrdering();
+    testBuildOwnershipPolicy();
     std::printf("\nprototest: %d/%d checks passed%s\n",
                 g_total - g_failed, g_total, g_failed ? " - FAIL" : " - PASS");
     return g_failed;

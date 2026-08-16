@@ -2002,7 +2002,15 @@ private:
         unsigned int localHand[5];
         int minted; u32 seqSeen;
         bool removed; // proxy destroyed on a REMOVE: tombstone (rows skip)
-        PeerBuild() : minted(0), seqSeen(0), removed(false) { memset(localHand, 0, sizeof(localHand)); }
+        // Latch only after the engine confirms the local copy is player-owned.
+        // The factory receives the local player faction; the deed writer is a
+        // fallback for partial initialization.  Until confirmation, PLACE
+        // resends and STATE rows retry the check/claim.
+        bool ownershipApplied;
+        PeerBuild() : minted(0), seqSeen(0), removed(false),
+                      ownershipApplied(false) {
+            memset(localHand, 0, sizeof(localHand));
+        }
     };
     std::map<Key, OwnBuild>  ownBuilds_;
     std::map<Key, PeerBuild> peerBuilds_;
@@ -2024,6 +2032,8 @@ private:
     //     whether we placed it (ownBuilds_) or minted it (peerBuilds_).
     bool buildKeyForLocalHand(const Key& local, Key& outWire) const;
     bool localHandForBuildKey(const Key& wire, unsigned int out[5]) const;
+    bool ensurePeerBuildOwnership(GameWorld* gw, const Key& wire,
+                                  PeerBuild& peerBuild);
     u32           buildSeqOut_;
     unsigned long buildSampleMs_;
     bool          buildSync_;
