@@ -11,6 +11,7 @@
 // PowerShell oracles (see resources/CODE_MAP.md, log-tag index).
 
 #include "ReplicatorUtil.h"
+#include "../core/HostIntent.h"
 
 namespace coop {
 
@@ -790,8 +791,11 @@ void Replicator::applyFactions(const SyncContext& ctx) {
 void Replicator::publishDoors(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!doorSync_) return;
-    const unsigned long SAMPLE_MS = tuning_.doorSampleMs;  // doors move in clicks; 1 Hz is plenty
+    // The Join samples UI intent quickly; the Host keeps the historical state
+    // census cadence. Both paths remain change-gated and idle at zero packets.
+    const unsigned long SAMPLE_MS = ctx.isHost ? tuning_.doorSampleMs : 200;
     const unsigned long RESEND_MS = tuning_.doorResendMs;  // safety resend for rows we ever sent
+    const unsigned long RETRY_MS  = 2000;
     unsigned long now = nowMs();
     if (!sync::gateSampleDue(now, doorSampleMs_, SAMPLE_MS)) return;
     doorSampleMs_ = now;
@@ -821,6 +825,41 @@ void Replicator::publishDoors(const SyncContext& ctx) {
             continue;
         }
         bool changed = (r.open != dr.knownOpen) || (r.locked != dr.knownLocked);
+        if (!ctx.isHost) {
+            bool samePending = dr.pendingSeq != 0 &&
+                               dr.pendingOpen == r.open &&
+                               dr.pendingLocked == r.locked;
+            bool newChoice = dr.pendingSeq == 0 ? changed : !samePending;
+            if (!newChoice && dr.pendingSeq == 0) continue;
+            if (!newChoice &&
+                !hostIntentRetryDue(now, dr.pendingSendMs, RETRY_MS))
+                continue;
+            if (newChoice) {
+                dr.pendingSeq = doorSeqOut_++;
+                dr.pendingOpen = r.open;
+                dr.pendingLocked = r.locked;
+            }
+            DoorIntentPacket intent;
+            memset(&intent, 0, sizeof(intent));
+            intent.type = (u8)PKT_DOOR_INTENT;
+            intent.ownerId = ownerId;
+            intent.seq = dr.pendingSeq;
+            intent.keyKind = 0;
+            for (unsigned int h = 0; h < 5; ++h) intent.key[h] = r.hand[h];
+            intent.open = (u8)(dr.pendingOpen ? 1 : 0);
+            intent.locked = (u8)(dr.pendingLocked ? 1 : 0);
+            dr.pendingSendMs = now;
+            net.queueDoorIntent(intent);
+            char b[184];
+            _snprintf(b, sizeof(b) - 1,
+                      "[door] INTENT SEND hand=%u.%u.%u.%u.%u open=%u "
+                      "locked=%u seq=%u retry=%d",
+                      intent.key[0], intent.key[1], intent.key[2], intent.key[3],
+                      intent.key[4], intent.open, intent.locked, intent.seq,
+                      newChoice ? 0 : 1);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
         // Doors seed their baseline silently above, so a never-sent row holds
         // (resendUnsent = false); only a real change or a post-send safety
         // resend crosses. No burst throttle - the 1 Hz sample gate paces it.
@@ -836,6 +875,8 @@ void Replicator::publishDoors(const SyncContext& ctx) {
         for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
         pkt.open    = (u8)(r.open ? 1 : 0);
         pkt.locked  = (u8)(r.locked ? 1 : 0);
+        pkt.ackOwnerId = 0;
+        pkt.ackSeq = 0;
         net.queueDoor(pkt);
         if (changed) { // resends stay silent; the change is the signal
             char b[160];
@@ -861,10 +902,19 @@ void Replicator::applyDoors(const SyncContext& ctx) {
         DoorRow& dr = doorRows_[k];
         if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
         dr.seqSeen = p.seq;
-        // Updating the baseline FIRST is the echo guard: the local change this
-        // write causes must not be re-detected as ours next sample.
+        bool settled = hostIntentAckCovers(ctx.localId, dr.pendingSeq,
+                                           p.ackOwnerId, p.ackSeq);
+        if (settled) {
+            dr.pendingSeq = 0; dr.pendingOpen = dr.pendingLocked = -1;
+            dr.pendingSendMs = 0;
+        }
+        bool hold = dr.pendingSeq != 0;
+        // Always learn the canonical baseline. Until our explicit ack arrives,
+        // keep the optimistic local interaction visible instead of bouncing it
+        // through an older Host row.
         dr.knownOpen = (int)p.open; dr.knownLocked = (int)p.locked;
         dr.seeded = true;
+        if (hold) continue;
         engine::DoorRead cur;
         if (!engine::readDoorByHand(p.hand, &cur))
             continue; // out-of-interest or runtime door - accepted edge
@@ -878,6 +928,105 @@ void Replicator::applyDoors(const SyncContext& ctx) {
                   "[door] RECV hand=%u.%u.%u.%u.%u open=%u locked=%u was=%d/%d ok=%d seq=%u",
                   p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
                   p.open, p.locked, cur.open, cur.locked, ok ? 1 : 0, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyDoorIntents(const SyncContext& ctx) {
+    std::deque<InboundDoorIntent> got;
+    ctx.in->drainDoorIntents(got);
+    if (got.empty() || !ctx.isHost) return;
+    const unsigned long now = nowMs();
+    for (std::deque<InboundDoorIntent>::iterator it = got.begin();
+         it != got.end(); ++it) {
+        const DoorIntentPacket& p = it->pkt;
+        if (p.seq == 0 || p.ownerId == 0 || p.ownerId == ctx.localId ||
+            p.keyKind > 1)
+            continue;
+        Key k; k.t = p.key[0]; k.c = p.key[1]; k.cs = p.key[2];
+        k.i = p.key[3]; k.s = p.key[4];
+        engine::DoorRead cur;
+        bool resolved = false;
+        if (p.keyKind == 0) {
+            if (!doorSync_) continue;
+            resolved = engine::readDoorByHand(p.key, &cur);
+        } else {
+            if (!buildSync_ || !bdoorSync_ || p.doorIndex >= 4) continue;
+            unsigned int buildHand[5];
+            if (localHandForBuildKey(k, buildHand))
+                resolved = engine::readDoorOfBuilding(buildHand, p.doorIndex, &cur);
+        }
+        if (!resolved) continue; // retry may succeed when the target loads
+
+        bool fresh = false;
+        bool ok = false;
+        engine::DoorRead actual = cur;
+        if (p.keyKind == 0) {
+            DoorRow& row = doorRows_[k];
+            u32& seen = row.intentSeen[p.ownerId];
+            fresh = hostIntentIsNew(seen, p.seq);
+            if (fresh) {
+                seen = p.seq;
+                bool valid = p.open <= 1 && p.locked <= 1 &&
+                             (!p.locked || cur.hasLock);
+                if (valid) {
+                    ok = engine::writeDoorByHand(cur.hand, (int)p.open,
+                                                 cur.hasLock ? (int)p.locked : -1,
+                                                 &actual);
+                    if (!ok && !engine::readDoorByHand(cur.hand, &actual))
+                        actual = cur;
+                }
+            }
+            row.knownOpen = actual.open; row.knownLocked = actual.locked;
+            row.seeded = true; row.lastSendMs = now;
+            DoorPacket state;
+            memset(&state, 0, sizeof(state));
+            state.type = (u8)PKT_DOOR; state.ownerId = ctx.localId;
+            state.seq = doorSeqOut_++;
+            for (unsigned int h = 0; h < 5; ++h) state.hand[h] = actual.hand[h];
+            state.open = (u8)(actual.open ? 1 : 0);
+            state.locked = (u8)(actual.locked ? 1 : 0);
+            state.ackOwnerId = p.ownerId; state.ackSeq = p.seq;
+            ctx.net->queueDoor(state);
+        } else {
+            BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
+            u32& seen = row.intentSeen[p.ownerId];
+            fresh = hostIntentIsNew(seen, p.seq);
+            if (fresh) {
+                seen = p.seq;
+                bool valid = p.open <= 1 && p.locked <= 1 &&
+                             (!p.locked || cur.hasLock);
+                if (valid) {
+                    ok = engine::writeDoorByHand(cur.hand, (int)p.open,
+                                                 cur.hasLock ? (int)p.locked : -1,
+                                                 &actual);
+                    if (!ok && !engine::readDoorByHand(cur.hand, &actual))
+                        actual = cur;
+                }
+            }
+            row.knownOpen = actual.open; row.knownLocked = actual.locked;
+            row.seeded = true; row.lastSendMs = now;
+            BuildDoorPacket state;
+            memset(&state, 0, sizeof(state));
+            state.type = (u8)PKT_BUILD_DOOR; state.ownerId = ctx.localId;
+            state.seq = bdoorSeqOut_++;
+            state.bkey[0] = k.t; state.bkey[1] = k.c; state.bkey[2] = k.cs;
+            state.bkey[3] = k.i; state.bkey[4] = k.s;
+            state.doorIndex = p.doorIndex;
+            state.open = (u8)(actual.open ? 1 : 0);
+            state.locked = (u8)(actual.locked ? 1 : 0);
+            state.ackOwnerId = p.ownerId; state.ackSeq = p.seq;
+            ctx.net->queueBuildDoor(state);
+        }
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "[door] INTENT %s kind=%u key=%u.%u.%u.%u.%u idx=%u "
+                  "want=%u/%u actual=%d/%d seq=%u duplicate=%d",
+                  !fresh ? "DUP-ACK" : (ok ? "ACCEPT" : "REJECT"),
+                  (unsigned)p.keyKind,
+                  k.t, k.c, k.cs, k.i, k.s, (unsigned)p.doorIndex,
+                  (unsigned)p.open, (unsigned)p.locked, actual.open,
+                  actual.locked, p.seq, fresh ? 0 : 1);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1745,11 +1894,21 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         ChFn               apply;
         bool               hostAuth; // true = host publishes / join applies
     };
+    // Protocol 57 command path runs before canonical state sampling: the Join
+    // captures its local interaction promptly, while the Host validates queued
+    // intents before it samples/publishes the resulting door state.
+    if (ctx.isHost) {
+        if (doorSync_ || (buildSync_ && bdoorSync_))
+            applyDoorIntents(ctx);
+    } else {
+        if (doorSync_) publishDoors(ctx);
+        if (buildSync_ && bdoorSync_) publishBuildDoors(ctx);
+    }
     static const Desc kCh[] = {
         { &Replicator::factionSync_,  0,                     &Replicator::publishFactions,   &Replicator::applyFactions,   false },
-        { &Replicator::doorSync_,     0,                     &Replicator::publishDoors,      &Replicator::applyDoors,      false },
+        { &Replicator::doorSync_,     0,                     &Replicator::publishDoors,      &Replicator::applyDoors,      true  },
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
-        { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
+        { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, true },
         // Ahead of prod deliberately: prod rows resolve THROUGH the fixture map,
         // so a pairing that arrives this tick is usable by the very next row.
         { &Replicator::fixtureSync_,  0,                     &Replicator::publishFixtures,   &Replicator::applyFixtures,   false },
@@ -1864,8 +2023,9 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
 void Replicator::publishBuildDoors(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!bdoorSync_) return;
-    const unsigned long SAMPLE_MS = tuning_.bdoorSampleMs; // the protocol-26 door cadence
+    const unsigned long SAMPLE_MS = ctx.isHost ? tuning_.bdoorSampleMs : 200;
     const unsigned long RESEND_MS = tuning_.bdoorResendMs; // safety resend for rows ever sent
+    const unsigned long RETRY_MS  = 2000;
     unsigned long now = nowMs();
     if (!sync::gateSampleDue(now, bdoorSampleMs_, SAMPLE_MS)) return;
     bdoorSampleMs_ = now;
@@ -1901,6 +2061,45 @@ void Replicator::publishBuildDoors(const SyncContext& ctx) {
                 }
                 bool changed = (dr.open != row.knownOpen) ||
                                (dr.locked != row.knownLocked);
+                if (!ctx.isHost) {
+                    bool samePending = row.pendingSeq != 0 &&
+                                       row.pendingOpen == dr.open &&
+                                       row.pendingLocked == dr.locked;
+                    bool newChoice = row.pendingSeq == 0 ? changed : !samePending;
+                    if (!newChoice && row.pendingSeq == 0) continue;
+                    if (!newChoice &&
+                        !hostIntentRetryDue(now, row.pendingSendMs, RETRY_MS))
+                        continue;
+                    if (newChoice) {
+                        row.pendingSeq = bdoorSeqOut_++;
+                        row.pendingOpen = dr.open;
+                        row.pendingLocked = dr.locked;
+                    }
+                    DoorIntentPacket intent;
+                    memset(&intent, 0, sizeof(intent));
+                    intent.type = (u8)PKT_DOOR_INTENT;
+                    intent.ownerId = ownerId;
+                    intent.seq = row.pendingSeq;
+                    intent.keyKind = 1;
+                    intent.key[0] = wireKey->t; intent.key[1] = wireKey->c;
+                    intent.key[2] = wireKey->cs; intent.key[3] = wireKey->i;
+                    intent.key[4] = wireKey->s;
+                    intent.doorIndex = (u8)di;
+                    intent.open = (u8)(row.pendingOpen ? 1 : 0);
+                    intent.locked = (u8)(row.pendingLocked ? 1 : 0);
+                    row.pendingSendMs = now;
+                    net.queueDoorIntent(intent);
+                    char b[192];
+                    _snprintf(b, sizeof(b) - 1,
+                              "[bdoor] INTENT SEND key=%u.%u.%u.%u.%u idx=%u "
+                              "open=%u locked=%u seq=%u retry=%d",
+                              intent.key[0], intent.key[1], intent.key[2],
+                              intent.key[3], intent.key[4], intent.doorIndex,
+                              intent.open, intent.locked, intent.seq,
+                              newChoice ? 0 : 1);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    continue;
+                }
                 // Seeded silently above (resendUnsent=false); like protocol-26
                 // doors, only a real toggle or a post-send resend crosses.
                 if (!sync::gateShouldSend(changed, now, row.lastSendMs,
@@ -1920,6 +2119,8 @@ void Replicator::publishBuildDoors(const SyncContext& ctx) {
                 pkt.doorIndex = (u8)di;
                 pkt.open    = (u8)(dr.open ? 1 : 0);
                 pkt.locked  = (u8)(dr.locked ? 1 : 0);
+                pkt.ackOwnerId = 0;
+                pkt.ackSeq = 0;
                 net.queueBuildDoor(pkt);
                 if (changed) { // resends stay silent; the change is the signal
                     char b[176];
@@ -1958,10 +2159,16 @@ void Replicator::applyBuildDoors(const SyncContext& ctx) {
         BdoorRow& row = bdoorRows_[std::make_pair(k, (int)p.doorIndex)];
         if (!sync::gateSeqAccept(row.seqSeen, p.seq)) continue; // stale/dup row
         row.seqSeen = p.seq;
-        // Updating the baseline FIRST is the echo guard: the local change this
-        // write causes must not be re-detected as ours next sample.
+        bool settled = hostIntentAckCovers(ctx.localId, row.pendingSeq,
+                                           p.ackOwnerId, p.ackSeq);
+        if (settled) {
+            row.pendingSeq = 0; row.pendingOpen = row.pendingLocked = -1;
+            row.pendingSendMs = 0;
+        }
+        bool hold = row.pendingSeq != 0;
         row.knownOpen = (int)p.open; row.knownLocked = (int)p.locked;
         row.seeded = true;
+        if (hold) continue;
         if (!localHand) continue; // unknown/tombstoned key - skip silently
         engine::DoorRead cur;
         if (!engine::readDoorOfBuilding(localHand, p.doorIndex, &cur))

@@ -217,6 +217,9 @@ void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFac
 void NetLink::queueTime(const TimePacket& pkt) { pushLocked(outCs_, outTime_, pkt); }
 
 void NetLink::queueDoor(const DoorPacket& pkt) { pushLocked(outCs_, outDoor_, pkt); }
+void NetLink::queueDoorIntent(const DoorIntentPacket& pkt) {
+    pushLocked(outCs_, outDoorIntent_, pkt);
+}
 
 void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pkt); }
 
@@ -749,12 +752,20 @@ void NetLink::threadLoop() {
                             inbound_->pushTime(ti.ownerId, ti);
                         }
                     } else if (type == PKT_DOOR) {
-                        // Reliable baked-door state row (protocol 26):
-                        // symmetric change-gated, disambiguated on apply.
+                        // Reliable Host-canonical baked-door state row
+                        // (protocol 26/57).
                         DoorPacket dp;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dp)
                             && inbound_) {
                             inbound_->pushDoor(dp.ownerId, dp);
+                        }
+                    } else if (type == PKT_DOOR_INTENT) {
+                        // Reliable idempotent door request (protocol 57,
+                        // Join -> Host). The game thread validates and mutates.
+                        DoorIntentPacket di;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &di)
+                            && inbound_) {
+                            inbound_->pushDoorIntent(di.ownerId, di);
                         }
                     } else if (type == PKT_PROD) {
                         // Reliable host-authoritative machine state row
@@ -1434,8 +1445,8 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Drain + send any queued baked-door state rows on CH_RELIABLE
-        // (protocol 26). Change-gated by the Replicator; a settled town is
+        // Drain + send any queued Host-canonical baked-door state rows on
+        // CH_RELIABLE (protocol 26/57). Change-gated by the Replicator; a settled town is
         // silent. A lost row would leave a door diverged until the safety
         // resend, so reliable is the right channel.
         std::vector<DoorPacket> doorPkts;
@@ -1448,6 +1459,24 @@ void NetLink::threadLoop() {
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send Join door intents on CH_RELIABLE. This vector is empty
+        // at rest; while an acknowledgement is missing the same seq may retry.
+        std::vector<DoorIntentPacket> doorIntentPkts;
+        EnterCriticalSection(&outCs_);
+        doorIntentPkts.swap(outDoorIntent_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < doorIntentPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&doorIntentPkts[i],
+                                                 sizeof(DoorIntentPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (!isHost_ && serverPeer_ &&
+                serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);

@@ -25,7 +25,10 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 55;
+// v56 / packet 49 are reserved by sibling PR #75 (production intents). This
+// branch is the next independently-reviewable step in that series; after #75
+// lands it rebases without renumbering the door contract below.
+const u16 PROTOCOL_VERSION = 57;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -76,7 +79,9 @@ enum PacketType {
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
     PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
     PKT_DEED             = 47,// RELIABLE property-ownership row (protocol 54); DeedPacket
-    PKT_FIXTURE          = 48 // RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    PKT_FIXTURE          = 48,// RELIABLE runtime-fixture identity row (protocol 55); FixturePacket
+    // 49 = PKT_PROD_INTENT in sibling PR #75 (protocol 56), deliberately reserved.
+    PKT_DOOR_INTENT      = 50 // RELIABLE join -> host open/lock request (protocol 57); DoorIntentPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1052,27 +1057,25 @@ struct TimePacket {
     f64 gameHours; // absolute in-game clock, total hours
 };
 
-// ---- Protocol 26: baked-door open/lock state ----------------------------------
+// ---- Protocol 26/57: host-canonical baked-door open/lock state ----------------
 // One door/gate state row, keyed by the door Building's save-stable hand (the
 // furniture/bed identity precedent - door_probe run 160041 confirmed census
-// intersection on the shared save). SYMMETRIC change-gated channel: each
-// client samples doors near its interest centers ~1 Hz, streams rows whose
-// (open, locked) moved vs a seeded per-hand baseline, and applies received
-// rows through the engine's own openDoor/closeDoor/lockDoor/unlockDoor -
-// updating the baseline BEFORE the write, so an applied row is never
-// re-detected as a local change (echo-free). seq is per-sender monotonic so
-// a stale row never overwrites a newer one. open is the collapsed DESTINATION
-// state (OPENING counts as open, CLOSING as closed) so a door mid-swing never
-// publishes a transient. A receiver that cannot resolve the hand skips the
-// row silently (out-of-interest or a runtime-placed door - accepted edge).
+// intersection on the shared save). The HOST is the only state writer. A Join
+// sends DoorIntentPacket when its local UI/engine changes a door, the Host
+// resolves + validates + applies it, then publishes the resulting canonical row
+// with an explicit acknowledgement. seq is Host-monotonic. open is the collapsed
+// DESTINATION state (OPENING counts as open, CLOSING as closed), so a door
+// mid-swing never publishes a transient.
 struct DoorPacket {
     u8  type;      // = PKT_DOOR
-    u32 ownerId;   // network player id of the sender
-    u32 seq;       // per-sender monotonic (stale-row guard)
+    u32 ownerId;   // Host network player id
+    u32 seq;       // Host-monotonic canonical-state sequence
     // door hand [type, container, containerSerial, index, serial]
     u32 hand[5];
     u8  open;      // 1 = open/opening
     u8  locked;    // 1 = DoorLock engaged (only applied when the door has a lock)
+    u32 ackOwnerId;// Join whose latest intent this canonical row answers
+    u32 ackSeq;    // 0 = unsolicited state; otherwise covers <= this intent seq
 };
 
 // ---- Protocol 54: property-deed (building ownership) ------------------------
@@ -1231,18 +1234,35 @@ struct BuildStatePacket {
 // translation identity: the factory mints doors in template order, so
 // (PLACER's building hand, index in Building::doors) names the same physical
 // door on both clients once resolved through the protocol-27 build maps.
-// Symmetric change-gated rows, the protocol-26 door shape on the translated
-// key: both clients sample their placed/minted buildings' doors ~1 Hz and
-// stream rows whose (open, locked) moved vs the seeded baseline; the baseline
-// updates BEFORE the apply write (echo-free); per-sender seq drops stale rows.
+// Host-canonical rows, the protocol-26/57 door shape on the translated key.
+// A Join requests changes with DoorIntentPacket; only the Host publishes state.
 struct BuildDoorPacket {
     u8  type;      // = PKT_BUILD_DOOR
-    u32 ownerId;   // network player id of the sender
-    u32 seq;       // per-sender monotonic (stale-row guard)
+    u32 ownerId;   // Host network player id
+    u32 seq;       // Host-monotonic canonical-state sequence
     u32 bkey[5];   // the PLACER's hand for the owning building (map key)
     u8  doorIndex; // position in the building's ordered doors list
     u8  open;      // 1 = open/opening (collapsed destination state)
     u8  locked;    // 1 = DoorLock engaged (applied only when the door has one)
+    u32 ackOwnerId;// Join whose latest intent this canonical row answers
+    u32 ackSeq;    // 0 = unsolicited state; otherwise covers <= this intent seq
+};
+
+// Protocol 57 Join -> Host request for either door identity. keyKind=0 names a
+// baked door directly by hand; keyKind=1 names a session-placed building plus
+// doorIndex. The request carries a complete desired pair because one local
+// interaction can unlock+open (or close+lock) between 200 ms samples. It is an
+// intent, never a second state writer: the Host validates and replies through
+// DoorPacket/BuildDoorPacket with the actual resulting state and ack fields.
+struct DoorIntentPacket {
+    u8  type;       // = PKT_DOOR_INTENT
+    u32 ownerId;    // requesting Join's network player id
+    u32 seq;        // per-Join monotonic; retries reuse the same seq
+    u8  keyKind;    // 0 = baked door hand, 1 = placed building key + doorIndex
+    u32 key[5];
+    u8  doorIndex;  // ignored for keyKind=0
+    u8  open;       // desired collapsed destination state (0/1)
+    u8  locked;     // desired lock bit (0/1; 1 rejected when no lock exists)
 };
 
 // Placer-authoritative removal of a session-placed building: the dismantle

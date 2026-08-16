@@ -487,6 +487,15 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
         DoorStuff* d = static_cast<DoorStuff*>(b);
         DoorState st = d->state;
         int curOpen = (st == DOORSTATE_OPEN || st == DOORSTATE_OPENING) ? 1 : 0;
+        int curLocked = (d->doorLock && g_doorIsLockedFn &&
+                         g_doorIsLockedFn(d)) ? 1 : 0;
+        // Combined unlock+open must unlock first; asking a locked door to open
+        // can make the polite path refuse and unnecessarily hit the force path.
+        if (wantLocked == 0 && curLocked && d->doorLock &&
+            g_doorUnlockFn) {
+            g_doorUnlockFn(d);
+            curLocked = 0;
+        }
         if (wantOpen != curOpen) {
             // Polite path first (animation + navmesh + sound - what a local
             // click does); the blunt UT force paths only when it refuses.
@@ -497,13 +506,18 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
             }
         }
         if (wantLocked >= 0 && d->doorLock && g_doorLockFn && g_doorUnlockFn) {
-            int curLocked = (g_doorIsLockedFn && g_doorIsLockedFn(d)) ? 1 : 0;
+            curLocked = (g_doorIsLockedFn && g_doorIsLockedFn(d)) ? 1 : 0;
             if (wantLocked != curLocked) {
                 if (wantLocked) g_doorLockFn(d); else g_doorUnlockFn(d);
             }
         }
-        if (outAfter) fillDoorRead(d, outAfter);
-        return true;
+        DoorRead after;
+        fillDoorRead(d, &after);
+        if (outAfter) *outAfter = after;
+        bool openOk = wantOpen < 0 || after.open == wantOpen;
+        bool lockOk = wantLocked < 0 ||
+                      (after.hasLock && after.locked == wantLocked);
+        return openOk && lockOk;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         coop::logLine("[door] write SEH-except");
         return false;

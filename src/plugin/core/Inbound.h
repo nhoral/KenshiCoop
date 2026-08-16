@@ -192,6 +192,13 @@ struct InboundDoor {
     DoorPacket pkt;
 };
 
+// One received Join -> Host door intent (protocol 57). keyKind selects a baked
+// door hand or a placed-building key + door index; only the Host mutates state.
+struct InboundDoorIntent {
+    u32              ownerId;
+    DoorIntentPacket pkt;
+};
+
 // One received placed-building announcement (protocol 27): the sender placed
 // a building; the receiver mints a local construction site and maps the
 // sender's key to its own local hand.
@@ -428,7 +435,8 @@ public:
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
         faction_(worldReset_),
-        time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
+        time_(worldReset_),       door_(worldReset_),       doorIntent_(worldReset_),
+        prod_(worldReset_),
         research_(worldReset_),   deed_(worldReset_),       fixture_(worldReset_),
         buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
@@ -584,6 +592,11 @@ public:
     void pushDoor(u32 ownerId, const DoorPacket& pkt) {
         InboundDoor ido; ido.ownerId = ownerId; ido.pkt = pkt;
         EnterCriticalSection(&cs_); door_.push_back(ido); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one reliable Join -> Host door request (protocol 57).
+    void pushDoorIntent(u32 ownerId, const DoorIntentPacket& pkt) {
+        InboundDoorIntent idi; idi.ownerId = ownerId; idi.pkt = pkt;
+        EnterCriticalSection(&cs_); doorIntent_.push_back(idi); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received machine state row (protocol 33), owner-tagged.
     void pushProd(u32 ownerId, const ProdPacket& pkt) {
@@ -757,6 +770,9 @@ public:
     void drainDoor(std::deque<InboundDoor>& out) {
         EnterCriticalSection(&cs_); out.swap(door_); LeaveCriticalSection(&cs_);
     }
+    void drainDoorIntents(std::deque<InboundDoorIntent>& out) {
+        EnterCriticalSection(&cs_); out.swap(doorIntent_); LeaveCriticalSection(&cs_);
+    }
     void drainProd(std::deque<InboundProd>& out) {
         EnterCriticalSection(&cs_); out.swap(prod_); LeaveCriticalSection(&cs_);
     }
@@ -886,6 +902,7 @@ private:
     WorldQ<InboundFaction>         faction_;
     WorldQ<InboundTime>            time_;
     WorldQ<InboundDoor>            door_;
+    WorldQ<InboundDoorIntent>      doorIntent_;
     WorldQ<InboundProd>            prod_;
     WorldQ<InboundResearch>        research_;
     WorldQ<InboundDeed>            deed_;

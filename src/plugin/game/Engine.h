@@ -1744,12 +1744,13 @@ unsigned int enumDoorsNear(GameWorld* gw, float radius, DoorRead* out, unsigned 
 // SEH-guarded single-door read by hand. Returns false when the hand does not
 // resolve locally or is not a door.
 bool readDoorByHand(const unsigned int dHand[5], DoorRead* out);
-// SEH-guarded door write through the engine's own action entries:
-// openDoor/closeDoor (the polite path - animation, navmesh, sound), falling
-// back to _forceDoorOpenUT/_forceDoorClosedUT when the polite call refuses;
-// lockDoor/unlockDoor for the lock bit (skipped when the door has no lock).
-// wantLocked < 0 leaves the lock untouched. Returns false on resolve failure
-// or fault; *outAfter reports the post-write DoorRead when non-null.
+// SEH-guarded door write through the engine's own action entries. Unlock is
+// applied before an open/close request and lock after it, so combined
+// unlock+open / close+lock intents use a coherent order. Polite openDoor/
+// closeDoor runs first (animation, navmesh, sound), with the UT force path only
+// when it refuses. wantLocked < 0 leaves the lock untouched. Returns true only
+// when a post-read proves every requested field converged; *outAfter always
+// reports that post-write state when non-null.
 bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
                      DoorRead* outAfter);
 

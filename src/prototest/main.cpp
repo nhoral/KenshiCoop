@@ -31,6 +31,7 @@
 #include "../plugin/core/WorkPose.h"
 #include "../plugin/core/DeathLatch.h"
 #include "../plugin/core/Inbound.h" // Phase 0 queue-lifecycle fixes (header-only)
+#include "../plugin/core/HostIntent.h" // protocol 57 reusable intent/ack policy
 #include "../plugin/game/EngineFaults.h" // Phase 5c: fault throttle (pure inline)
 #include "../plugin/game/EngineCaps.h"   // Phase 5d: capability registry (pure inline)
 #include "../plugin/sync/ChangeGate.h"   // Phase 6: change-gated send/accept policy
@@ -100,10 +101,11 @@ static void testSizes() {
     CHECK_EQ("sizeof(MoneyDeltaPacket)",        sizeof(MoneyDeltaPacket),        13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
     CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              17);
-    CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              31);
+    CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              39);
+    CHECK_EQ("sizeof(DoorIntentPacket)",        sizeof(DoorIntentPacket),        33);
     CHECK_EQ("sizeof(BuildPlacePacket)",        sizeof(BuildPlacePacket),        94);
     CHECK_EQ("sizeof(BuildStatePacket)",        sizeof(BuildStatePacket),        34);
-    CHECK_EQ("sizeof(BuildDoorPacket)",         sizeof(BuildDoorPacket),         32);
+    CHECK_EQ("sizeof(BuildDoorPacket)",         sizeof(BuildDoorPacket),         40);
     CHECK_EQ("sizeof(BuildRemovePacket)",       sizeof(BuildRemovePacket),       29);
     CHECK_EQ("sizeof(SaveReqPacket)",           sizeof(SaveReqPacket),           57);
     CHECK_EQ("sizeof(SaveBeginPacket)",         sizeof(SaveBeginPacket),         67);
@@ -310,8 +312,11 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v55: runtime-fixture identity)",
-             (int)PROTOCOL_VERSION, 55);
+    CHECK_EQ("PROTOCOL_VERSION (v57: host-validated door intents)",
+             (int)PROTOCOL_VERSION, 57);
+    CHECK("PKT_DOOR_INTENT reserves series slot 50",
+          (int)PKT_DOOR_INTENT == 50 && PKT_DOOR_INTENT != PKT_DOOR &&
+          PKT_DOOR_INTENT != PKT_BUILD_DOOR && PKT_DOOR_INTENT != PKT_FIXTURE);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap
@@ -478,6 +483,7 @@ static void testRoundTrips() {
     roundTrip<FactionPacket>("FactionPacket", (u8)PKT_FACTION);
     roundTrip<TimePacket>("TimePacket", (u8)PKT_TIME);
     roundTrip<DoorPacket>("DoorPacket", (u8)PKT_DOOR);
+    roundTrip<DoorIntentPacket>("DoorIntentPacket", (u8)PKT_DOOR_INTENT);
     roundTrip<BuildPlacePacket>("BuildPlacePacket", (u8)PKT_BUILD_PLACE);
     roundTrip<BuildStatePacket>("BuildStatePacket", (u8)PKT_BUILD_STATE);
     roundTrip<BuildDoorPacket>("BuildDoorPacket", (u8)PKT_BUILD_DOOR);
@@ -1378,6 +1384,7 @@ static void testFlushWorldStateContract() {
     FactionPacket   fa;  std::memset(&fa,  0, sizeof(fa));
     TimePacket      ti;  std::memset(&ti,  0, sizeof(ti));
     DoorPacket      dp;  std::memset(&dp,  0, sizeof(dp));
+    DoorIntentPacket di; std::memset(&di,  0, sizeof(di));
     ProdPacket      pr;  std::memset(&pr,  0, sizeof(pr));
     ResearchPacket  rp;  std::memset(&rp,  0, sizeof(rp));
     DeedPacket      de;  std::memset(&de,  0, sizeof(de));
@@ -1402,7 +1409,7 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (34).
+    // --- Push one sentinel into every WORLD-STATE queue (35).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1423,6 +1430,7 @@ static void testFlushWorldStateContract() {
     in.pushFaction(1, fa);
     in.pushTime(1, ti);
     in.pushDoor(1, dp);
+    in.pushDoorIntent(1, di);
     in.pushProd(1, pr);
     in.pushResearch(1, rp);
     in.pushDeed(1, de);
@@ -1476,6 +1484,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("faction",     InboundFaction,     drainFaction);
     WS_EMPTY("time",        InboundTime,        drainTime);
     WS_EMPTY("door",        InboundDoor,        drainDoor);
+    WS_EMPTY("doorIntent",  InboundDoorIntent,  drainDoorIntents);
     WS_EMPTY("prod",        InboundProd,        drainProd);
     WS_EMPTY("research",    InboundResearch,    drainResearch);
     WS_EMPTY("deed",        InboundDeed,        drainDeed);
@@ -1766,6 +1775,33 @@ static void testChangeGate() {
           gateShouldSend(true, 80001, 80000, 0, 10000, false));
 }
 
+// ---- Reusable Host-canonical intent contract (protocol 57) --------------------
+static void testHostIntentPolicy() {
+    std::printf("== host-canonical intent policy ==\n");
+    CHECK("intent sequence starts at one", hostIntentIsNew(0u, 1u));
+    CHECK("intent duplicate is idempotent", !hostIntentIsNew(7u, 7u));
+    CHECK("intent older row is stale", !hostIntentIsNew(7u, 6u));
+    CHECK("intent newer row accepted", hostIntentIsNew(7u, 8u));
+    CHECK("intent zero is reserved", !hostIntentIsNew(0u, 0u));
+
+    CHECK("ack settles matching owner+seq",
+          hostIntentAckCovers(22u, 5u, 22u, 5u));
+    CHECK("later ack covers pending",
+          hostIntentAckCovers(22u, 5u, 22u, 6u));
+    CHECK("other owner's ack cannot settle",
+          !hostIntentAckCovers(22u, 5u, 23u, 99u));
+    CHECK("older ack cannot settle",
+          !hostIntentAckCovers(22u, 5u, 22u, 4u));
+    CHECK("no pending intent cannot settle",
+          !hostIntentAckCovers(22u, 0u, 22u, 9u));
+
+    CHECK("intent first send due", hostIntentRetryDue(1000ul, 0ul, 2000ul));
+    CHECK("intent retry held before deadline",
+          !hostIntentRetryDue(2999ul, 1000ul, 2000ul));
+    CHECK("intent retry due at deadline",
+          hostIntentRetryDue(3000ul, 1000ul, 2000ul));
+}
+
 int main() {
     std::printf("prototest: KenshiCoop wire/hash/interp unit layer (protocol v%u)\n",
                 (unsigned)PROTOCOL_VERSION);
@@ -1774,6 +1810,7 @@ int main() {
     testEngineFaults();
     testEngineCaps();
     testChangeGate();
+    testHostIntentPolicy();
     testRoundTrips();
     testFraming();
     testSaveCrc();

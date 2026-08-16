@@ -418,21 +418,21 @@ public:
     // Faction-relation sync master enable (KENSHICOOP_FACTION_SYNC).
     void setFactionSync(bool v) { factionSync_ = v; }
 
-    // BEFORE engine (protocol 26, both clients): sample baked doors near the
-    // interest centers (~1 Hz) and stream every row whose (open, locked)
-    // moved since the seeded per-hand baseline (change-gated reliable,
-    // per-hand safety resend for rows ever sent). Both clients run the same
-    // detector, so a door change replicates from whichever engine it
-    // happened on (a local click, an NPC, or the write applyDoors made).
+    // BEFORE engine (protocol 26/57): Host samples baked doors and publishes
+    // canonical state. Join samples at 200 ms only to detect a local choice and
+    // send an idempotent intent; settled doors produce no wire traffic.
     void publishDoors(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 26): drain received door rows; each one that
-    // resolves locally is applied through the engine's own door actions
-    // (openDoor/closeDoor + lockDoor/unlockDoor). The baseline updates
-    // BEFORE the write (echo-free); stale rows (per-hand seq guard) and
-    // already-converged rows are skipped; unresolvable hands are skipped
-    // silently (out-of-interest or runtime door - accepted edge).
+    // BEFORE engine (Join, protocol 26/57): apply Host-canonical baked-door
+    // rows. While an intent is pending, older Host rows update the canonical
+    // baseline but do not bounce the optimistic local interaction; the explicit
+    // ack settles it and the actual state then wins.
     void applyDoors(const SyncContext& ctx);
+
+    // BEFORE sampled state (Host, protocol 57): validate baked/placed door
+    // intents, apply through native door actions, and immediately publish an
+    // accept/reject acknowledgement beside the actual canonical state.
+    void applyDoorIntents(const SyncContext& ctx);
 
     // Door-state sync master enable (KENSHICOOP_DOOR_SYNC).
     void setDoorSync(bool v) { doorSync_ = v; }
@@ -457,19 +457,16 @@ public:
     // Placed-building sync master enable (KENSHICOOP_BUILD_SYNC).
     void setBuildSync(bool v) { buildSync_ = v; }
 
-    // BEFORE engine (protocol 28, both clients): sample the doors of every
-    // building in the session build maps (~1 Hz) and stream change-gated
-    // PKT_BUILD_DOOR rows on the TRANSLATED identity (placer's building hand
-    // + door index; own placements key by our hand, minted proxies through
-    // the reverse map) - the protocol-26 symmetric door shape, so a placed
-    // door replicates from whichever engine moved it.
+    // BEFORE engine (protocol 28/57): the Host publishes canonical placed-door
+    // rows on the translated identity. The Join uses the same scan only to send
+    // a local open/lock choice as DoorIntentPacket.
     void publishBuildDoors(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 28): drain received placed-door rows; resolve
+    // BEFORE engine (Join, protocol 28/57): drain canonical placed-door rows; resolve
     // the key through the build maps (own hand or minted local hand), read
     // door #index of that building, and apply through the engine's own door
-    // actions. Baseline updates BEFORE the write (echo-free); per-key seq
-    // guard; unknown/tombstoned keys skip silently.
+    // actions. Pending local intents are held until their explicit ack;
+    // unknown/tombstoned keys skip silently.
     void applyBuildDoors(const SyncContext& ctx);
 
     // Placed-building door + removal sync master enable (KENSHICOOP_BDOOR_SYNC).
@@ -1960,15 +1957,19 @@ private:
     u32           facSeqOut_;
     unsigned long facSampleMs_;
     bool          factionSync_;
-    // Protocol 26 door-state sync, per door hand (the faction shape: known =
-    // baseline, updated on every local change sent AND every received row
-    // applied - the echo guard; lastSendMs = change gate + safety resend;
-    // seqSeen = stale-row guard).
+    // Protocol 26/57 baked-door state + intent tracking. known* is the latest
+    // Host-canonical pair. Host uses lastSendMs/intentSeen for state publication
+    // and idempotent request handling; Join uses seqSeen/pending* for canonical
+    // row ordering and one outstanding optimistic request per door.
     struct DoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
         u32 seqSeen; bool seeded;
+        std::map<u32, u32> intentSeen; // Host: newest request seq per Join
+        u32 pendingSeq; int pendingOpen; int pendingLocked;
+        unsigned long pendingSendMs;
         DoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                    seqSeen(0), seeded(false) {}
+                    seqSeen(0), seeded(false), pendingSeq(0),
+                    pendingOpen(-1), pendingLocked(-1), pendingSendMs(0) {}
     };
     std::map<Key, DoorRow> doorRows_;
     u32           doorSeqOut_;
@@ -2027,13 +2028,17 @@ private:
     u32           buildSeqOut_;
     unsigned long buildSampleMs_;
     bool          buildSync_;
-    // Protocol 28 placed-door rows, keyed by (placer building key, door
-    // index) - the protocol-26 DoorRow shape on the translated identity.
+    // Protocol 28/57 placed-door rows on the translated (building key,index)
+    // identity, with the same canonical/pending contract as DoorRow.
     struct BdoorRow {
         int knownOpen; int knownLocked; unsigned long lastSendMs;
         u32 seqSeen; bool seeded;
+        std::map<u32, u32> intentSeen;
+        u32 pendingSeq; int pendingOpen; int pendingLocked;
+        unsigned long pendingSendMs;
         BdoorRow() : knownOpen(-1), knownLocked(-1), lastSendMs(0),
-                     seqSeen(0), seeded(false) {}
+                     seqSeen(0), seeded(false), pendingSeq(0),
+                     pendingOpen(-1), pendingLocked(-1), pendingSendMs(0) {}
     };
     std::map<std::pair<Key, int>, BdoorRow> bdoorRows_;
     u32           bdoorSeqOut_;
